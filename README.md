@@ -77,7 +77,7 @@ Use one of these two flows:
 Use this flow if you maintain this repo.
 
 Run commands from repo root:
-- `./ton-k8s-operator`
+- this repository root directory (where `Makefile` is)
 
 Requirements:
 - `make`
@@ -149,18 +149,29 @@ If you do use this repo directly, these `make` targets operate on your current `
 - `make uninstall`: removes CRD(s).
 
 Run them from repo root:
-- `./ton-k8s-operator`
+- this repository root directory (where `Makefile` is)
 
 ## Production TON Notes
 
 - `PUBLIC_IP`: by default operator sets `PUBLIC_IP` from node host IP. If your worker IP is private/NATed, set `spec.network.publicIP`.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
 - Bare metal: if Longhorn exists, operator prefers it automatically.
-- `IGNORE_MINIMAL_REQS`: default is `true` for easier local/k3d startup; for production, override with:
-  - `spec.env: [{ name: IGNORE_MINIMAL_REQS, value: "false" }]`
+- `IGNORE_MINIMAL_REQS`: default is `true` for easier local/k3d startup; for production set `spec.env: [{ name: IGNORE_MINIMAL_REQS, value: "false" }]`.
 - Right-size resources in `spec.resources` for TON fullnode/validator workloads.
 
 ## Local Dev (k3d)
+
+`make run` starts the operator manager process on your local machine (not as a Pod in Kubernetes).  
+It uses your current `kubectl` context and watches/reconciles resources in that cluster.
+
+Why use this in local test (k3d):
+- fast development loop (edit code, rerun quickly)
+- easy debugging/logs directly in your terminal
+- no need to build/push operator image for every code change
+
+Why you do not use `make run` in production:
+- production operator should run as an in-cluster Deployment (`make deploy IMG=...`)
+- local process is not highly available and depends on your workstation session
 
 ```bash
 make generate manifests
@@ -174,8 +185,38 @@ In another terminal:
 ```bash
 kubectl apply -f config/samples/ton_v1alpha1_tonnode.yaml
 kubectl get tonnodes
-kubectl get pods -l app.kubernetes.io/instance=tonnode-sample -o wide
+kubectl get pods -l app.kubernetes.io/instance=tonnode -o wide
 kubectl get pvc
+```
+
+### Stop Local Run
+
+- Stop `make run` with `Ctrl+C` in the terminal where it is running.
+
+### Uninstall/Cleanup Local Dev
+
+Delete sample resources:
+
+```bash
+kubectl delete -f config/samples/ton_v1alpha1_tonnode.yaml --ignore-not-found
+```
+
+Remove CRD from current cluster context:
+
+```bash
+make uninstall
+```
+
+If you also deployed operator as Deployment in cluster (via `make deploy`), remove it:
+
+```bash
+make undeploy
+```
+
+Optional cleanup for retained TON PVCs:
+
+```bash
+kubectl delete pvc -l app.kubernetes.io/name=ton-node
 ```
 
 ## Optional configRef Secret Example

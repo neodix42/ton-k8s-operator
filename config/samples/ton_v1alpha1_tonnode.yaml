@@ -4,7 +4,7 @@ metadata:
   labels:
     app.kubernetes.io/name: ton-k8s-operator
     app.kubernetes.io/managed-by: kustomize
-  name: tonnode-sample
+  name: tonnode
 spec:
   image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
   replicas: 3
