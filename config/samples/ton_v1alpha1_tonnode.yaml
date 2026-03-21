@@ -1,0 +1,23 @@
+apiVersion: ton.ton.org/v1alpha1
+kind: TonNode
+metadata:
+  labels:
+    app.kubernetes.io/name: ton-k8s-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: tonnode-sample
+spec:
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+  replicas: 3
+  storage:
+    tonWorkSize: 200Gi
+    myTonCoreSize: 20Gi
+  network:
+    globalConfigURL: https://ton.org/global.config.json
+    validatorPort: 30001
+    liteServerPort: 30003
+    validatorConsolePort: 30002
+  env:
+  - name: MODE
+    value: liteserver
+  - name: DUMP
+    value: "false"
