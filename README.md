@@ -87,7 +87,7 @@ Requirements:
 Build and push controller image:
 
 ```bash
-export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:v0.1.1
+export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:v0.1.2
 make docker-build docker-push IMG=$OPERATOR_IMG
 ```
 
@@ -110,11 +110,20 @@ Requirements:
 - `kubectl`
 - access to a published `install.yaml` URL
 
+Before creating `TonNode`, ensure your cluster has at least one StorageClass:
+
+```bash
+kubectl get sc
+```
+
 Install:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/dist/install.yaml
 ```
+
+This installs only the operator components (CRD + RBAC + controller Deployment).
+It does not create TON node Pods by itself, so TON replica count is `0` until you create a `TonNode` resource.
 
 Verify:
 
@@ -126,8 +135,34 @@ kubectl -n ton-k8s-operator-system get deploy,pods
 Create TON nodes:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/config/samples/ton_v1alpha1_tonnode.yaml
+kubectl apply -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/config/samples/ton_v1alpha1_tonnode.yaml
 kubectl get tonnodes
+```
+
+The sample `TonNode` currently uses `spec.replicas: 3`, so it creates 3 TON Pods.
+
+Create your own replica count:
+
+```yaml
+apiVersion: ton.ton.org/v1alpha1
+kind: TonNode
+metadata:
+  name: tonnode
+spec:
+  replicas: 5
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+```
+
+Apply it:
+
+```bash
+kubectl apply -f tonnode.yaml
+```
+
+Change replicas later:
+
+```bash
+kubectl patch tonnode tonnode --type=merge -p '{"spec":{"replicas":10}}'
 ```
 
 Upgrade:
@@ -136,7 +171,7 @@ Upgrade:
 Uninstall:
 
 ```bash
-kubectl delete -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/dist/install.yaml
+kubectl delete -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/dist/install.yaml
 ```
 
 ### Repo-Based Direct Deploy (advanced)
@@ -156,6 +191,7 @@ Run them from repo root:
 - `PUBLIC_IP`: by default operator sets `PUBLIC_IP` from node host IP. If your worker IP is private/NATed, set `spec.network.publicIP`.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
 - Bare metal: if Longhorn exists, operator prefers it automatically.
+- If no StorageClass exists in the cluster, `TonNode` will stay `Ready=False` with reason `StorageClassMissing`.
 - `IGNORE_MINIMAL_REQS`: default is `true` for easier local/k3d startup; for production set `spec.env: [{ name: IGNORE_MINIMAL_REQS, value: "false" }]`.
 - Right-size resources in `spec.resources` for TON fullnode/validator workloads.
 

@@ -102,6 +102,14 @@ func (r *TonNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if storageClassName == nil {
+		message := "no StorageClass found. Install/provide a StorageClass or set spec.storage.storageClassName"
+		if err := r.updateStatus(ctx, &tonNode, 0, "", false, "StorageClassMissing", message); err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("TonNode blocked waiting for StorageClass", "name", req.NamespacedName)
+		return ctrl.Result{}, nil
+	}
 
 	serviceName := fmt.Sprintf("%s-%s", tonNode.Name, headlessServiceSuffix)
 	if err := r.reconcileHeadlessService(ctx, &tonNode, serviceName); err != nil {
@@ -373,9 +381,11 @@ func (r *TonNodeReconciler) detectStorageClassName(
 	}
 
 	defaultClasses := make([]string, 0)
+	allClasses := make([]string, 0, len(scList.Items))
 	hasLonghorn := false
 	for i := range scList.Items {
 		sc := scList.Items[i]
+		allClasses = append(allClasses, sc.Name)
 		if sc.Name == "longhorn" {
 			hasLonghorn = true
 		}
@@ -394,7 +404,12 @@ func (r *TonNodeReconciler) detectStorageClassName(
 		selected := defaultClasses[0]
 		return &selected, nil
 	}
-	return nil, nil
+
+	// Some clusters define classes but do not mark one as default.
+	// Use a stable fallback to avoid unresolved PVCs in that setup.
+	sort.Strings(allClasses)
+	selected := allClasses[0]
+	return &selected, nil
 }
 
 func (r *TonNodeReconciler) updateStatus(
