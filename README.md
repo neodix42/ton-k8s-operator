@@ -91,7 +91,7 @@ export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:v0.1.2
 make docker-build docker-push IMG=$OPERATOR_IMG
 ```
 
-Generate an install bundle (CRD + RBAC + Deployment in one file):
+Generate an installation bundle (CRD + RBAC + Deployment in one file):
 
 ```bash
 make build-installer IMG=$OPERATOR_IMG
@@ -114,6 +114,30 @@ Before creating `TonNode`, ensure your cluster has at least one StorageClass:
 
 ```bash
 kubectl get sc
+```
+
+If the list is empty, install a simple dynamic provisioner for lab/testing (local-path):
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+kubectl get sc
+```
+
+Then set it explicitly in your `TonNode` (recommended):
+
+```yaml
+spec:
+  storage:
+    storageClassName: local-path
+    tonWorkSize: 20Gi
+    myTonCoreSize: 20Gi
+```
+
+After applying `TonNode`, check PVC binding:
+
+```bash
+kubectl get pvc -w
 ```
 
 Install:
@@ -139,6 +163,17 @@ kubectl apply -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/ref
 kubectl get tonnodes
 ```
 
+if the below command shows no pods:
+```
+kubectl get pods -l app.kubernetes.io/instance=tonnode -o wide
+```
+execute
+```bash
+kubectl get tonnode tonnode -o yaml
+kubectl describe tonnode tonnode
+```
+and find the reason for the pod not being created. It might be for example that the `StorageClass` is not available, i.e. `StorageClassMissing` reason.
+
 The sample `TonNode` currently uses `spec.replicas: 3`, so it creates 3 TON Pods.
 
 Create your own replica count:
@@ -163,6 +198,28 @@ Change replicas later:
 
 ```bash
 kubectl patch tonnode tonnode --type=merge -p '{"spec":{"replicas":10}}'
+```
+
+Delete TON nodes only (keep operator installed):
+
+```bash
+# delete all TonNode resources in default namespace
+kubectl delete tonnodes.ton.ton.org --all
+```
+
+Or for all namespaces:
+
+```bash
+kubectl delete tonnodes.ton.ton.org --all -A
+```
+
+This removes TON StatefulSets/Services/Pods managed by the operator, but keeps the operator deployment/CRD.
+By default, StatefulSet PVC retention is `Retain`, so PVCs remain after node deletion.
+
+If you also want to remove TON data volumes (destructive):
+
+```bash
+kubectl delete pvc -l app.kubernetes.io/name=ton-node -A
 ```
 
 Upgrade:
@@ -194,6 +251,20 @@ Run them from repo root:
 - If no StorageClass exists in the cluster, `TonNode` will stay `Ready=False` with reason `StorageClassMissing`.
 - `IGNORE_MINIMAL_REQS`: default is `true` for easier local/k3d startup; for production set `spec.env: [{ name: IGNORE_MINIMAL_REQS, value: "false" }]`.
 - Right-size resources in `spec.resources` for TON fullnode/validator workloads.
+
+### How TON Storage Is Placed
+
+Data from all TON pods is not stored in one shared place.
+
+With this operator setup:
+- Each TON pod gets its own PVCs (`ton-work-...` and `mytoncore-...`).
+- PVCs are `ReadWriteOnce`, so one PVC is attached to one pod.
+- For 20 replicas, the total PVC count is 40.
+
+If you use `local-path` StorageClass:
+- Data is written to the local disk on the node where that pod volume is provisioned.
+- Storage is distributed across nodes/pods, not centralized.
+- If a node is lost, data tied to that node-local volume is also lost (unless you use replicated storage such as Longhorn).
 
 ## Local Dev (k3d)
 
