@@ -76,7 +76,7 @@ Use one of these two flows:
 
 Use this flow if you maintain this repo.
 
-Run commands from repo root:
+Run commands from the repo root:
 - this repository root directory (where `Makefile` is)
 
 Requirements:
@@ -87,11 +87,11 @@ Requirements:
 Build and push controller image:
 
 ```bash
-export OPERATOR_IMG=ghcr.io/<your-org>/ton-k8s-operator:v0.1.0
+export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:v0.1.1
 make docker-build docker-push IMG=$OPERATOR_IMG
 ```
 
-Generate install bundle (CRD + RBAC + Deployment in one file):
+Generate an install bundle (CRD + RBAC + Deployment in one file):
 
 ```bash
 make build-installer IMG=$OPERATOR_IMG
