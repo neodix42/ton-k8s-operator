@@ -117,13 +117,24 @@ Helm chart publish is automated by GitHub Actions:
 - target registry: `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
 - behavior: workflow computes a publish version from `Chart.yaml` as higher semver of `version` and `appVersion` (without leading `v`), so appVersion-only bumps are still published; if that version already exists, push is skipped
 
-Install from OCI chart:
+Install operator:
 
 ```bash
-helm install ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
-  --version 0.1.2 \
+helm install ton-k8s-operator ./charts/ton-k8s-operator \
   -n ton-k8s-operator-system \
   --create-namespace
+```
+
+Or install operator and create TON nodes in one command:
+
+```bash
+helm upgrade --install ton-k8s-operator ./charts/ton-k8s-operator \
+  -n ton-k8s-operator-system \
+  --create-namespace \
+  --set tonNode.enabled=true \
+  --set tonNode.namespace=default \
+  --set tonNode.replicas=3 \
+  --set tonNode.storage.storageClassName=local-path
 ```
 
 To publish a new version, bump either `version` or `appVersion` in `charts/ton-k8s-operator/Chart.yaml`, then push to `main`.
@@ -139,15 +150,6 @@ Requirements:
 - `helm`
 - access to this chart (`./charts/ton-k8s-operator`) or a packaged `.tgz`
 
-If a packaged chart is published, you can use `wget` + `helm install`:
-
-```bash
-wget https://github.com/neodix42/ton-k8s-operator/releases/download/<tag>/ton-k8s-operator-<chart-version>.tgz
-helm install ton-k8s-operator ./ton-k8s-operator-<chart-version>.tgz \
-  -n ton-k8s-operator-system \
-  --create-namespace
-```
-
 Before creating `TonNode`, ensure your cluster has at least one `StorageClass`:
 
 ```bash
@@ -162,15 +164,7 @@ kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storagecl
 kubectl get sc
 ```
 
-Install operator only:
-
-```bash
-helm install ton-k8s-operator ./charts/ton-k8s-operator \
-  -n ton-k8s-operator-system \
-  --create-namespace
-```
-
-Or from OCI registry (if published):
+Install operator only from OCI registry:
 
 ```bash
 helm install ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
@@ -189,10 +183,23 @@ kubectl get crd tonnodes.ton.ton.org
 kubectl -n ton-k8s-operator-system get deploy,pods
 ```
 
+If an operator is already installed, and you only want to run TON nodes, use one command:
+
+```bash
+helm upgrade ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
+  --version 0.1.2 \
+  -n ton-k8s-operator-system \
+  --reuse-values \
+  --set tonNode.enabled=true \
+  --set tonNode.namespace=default \
+  --set tonNode.replicas=3 \
+  --set tonNode.storage.storageClassName=local-path
+```
+
 Install operator and create TON nodes in one command:
 
 ```bash
-helm upgrade --install ton-k8s-operator ./charts/ton-k8s-operator \
+helm upgrade --install ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
   -n ton-k8s-operator-system \
   --create-namespace \
   --set tonNode.enabled=true \
@@ -204,7 +211,7 @@ helm upgrade --install ton-k8s-operator ./charts/ton-k8s-operator \
 Change TON replica count later:
 
 ```bash
-helm upgrade ton-k8s-operator ./charts/ton-k8s-operator \
+helm upgrade ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
   -n ton-k8s-operator-system \
   --reuse-values \
   --set tonNode.replicas=23
@@ -254,6 +261,19 @@ Uninstall Helm release:
 
 ```bash
 helm uninstall ton-k8s-operator -n ton-k8s-operator-system
+```
+
+Complete Helm cleanup (optional):
+
+```bash
+# remove release
+helm uninstall ton-k8s-operator -n ton-k8s-operator-system
+
+# remove operator namespace
+kubectl delete namespace ton-k8s-operator-system
+
+# remove CRD (destructive: removes all TonNode resources)
+kubectl delete crd tonnodes.ton.ton.org
 ```
 
 Note: CRDs installed from Helm `crds/` are not removed by `helm uninstall`.
