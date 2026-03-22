@@ -60,6 +60,7 @@ If you want per-replica pre-generated keys from Kubernetes Secrets, the next ste
 - Go installed (project currently scaffolds with controller-runtime/Kubebuilder tooling that may use Go toolchain auto-download).
 - Docker
 - kubectl
+- Helm 3
 - k3d (or another Kubernetes cluster)
 
 ## Production Deployment
@@ -70,7 +71,7 @@ Installation means applying:
 - RBAC
 - controller Deployment
 
-Use one of these two flows:
+Use one of these three flows:
 
 ### Flow A: Maintainer (build and publish operator release)
 
@@ -100,17 +101,54 @@ make build-installer IMG=$OPERATOR_IMG
 This creates:
 - `dist/install.yaml`
 
-Publish `dist/install.yaml` (for example in a GitHub release or at a tag path in this repo), then cluster users can install with only `kubectl`.
+Helm chart is in:
+- `charts/ton-k8s-operator`
 
-### Flow B: Cluster User (install published operator, no clone/no make)
+Package chart (optional, for release distribution):
 
-Use this flow if you only want to install and use the operator.
+```bash
+mkdir -p dist/charts
+helm package charts/ton-k8s-operator -d dist/charts
+```
+
+Helm chart publish is automated by GitHub Actions:
+- workflow: `.github/workflows/publish-helm-chart.yml`
+- trigger: every push to `main`
+- target registry: `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
+- behavior: workflow computes a publish version from `Chart.yaml` as higher semver of `version` and `appVersion` (without leading `v`), so appVersion-only bumps are still published; if that version already exists, push is skipped
+
+Install from OCI chart:
+
+```bash
+helm install ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
+  --version 0.1.2 \
+  -n ton-k8s-operator-system \
+  --create-namespace
+```
+
+To publish a new version, bump either `version` or `appVersion` in `charts/ton-k8s-operator/Chart.yaml`, then push to `main`.
+
+Publish `dist/install.yaml` and/or packaged Helm chart (for example, in GitHub Releases).
+
+### Flow B: Cluster User (Helm, recommended)
+
+Use this flow if you want simpler install/upgrade without `make`.
 
 Requirements:
 - `kubectl`
-- access to a published `install.yaml` URL
+- `helm`
+- access to this chart (`./charts/ton-k8s-operator`) or a packaged `.tgz`
 
-Before creating `TonNode`, ensure your cluster has at least one StorageClass:
+If a packaged chart is published, you can use `wget` + `helm install`:
+
+```bash
+wget https://github.com/neodix42/ton-k8s-operator/releases/download/<tag>/ton-k8s-operator-<chart-version>.tgz
+helm install ton-k8s-operator ./ton-k8s-operator-<chart-version>.tgz \
+  -n ton-k8s-operator-system \
+  --create-namespace
+```
+
+Before creating `TonNode`, ensure your cluster has at least one `StorageClass`:
 
 ```bash
 kubectl get sc
@@ -124,30 +162,25 @@ kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storagecl
 kubectl get sc
 ```
 
-Then set it explicitly in your `TonNode` (recommended):
-
-```yaml
-spec:
-  storage:
-    storageClassName: local-path
-    tonWorkSize: 20Gi
-    myTonCoreSize: 20Gi
-```
-
-After applying `TonNode`, check PVC binding:
+Install operator only:
 
 ```bash
-kubectl get pvc -w
+helm install ton-k8s-operator ./charts/ton-k8s-operator \
+  -n ton-k8s-operator-system \
+  --create-namespace
 ```
 
-Install:
+Or from OCI registry (if published):
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/dist/install.yaml
+helm install ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
+  --version 0.1.2 \
+  -n ton-k8s-operator-system \
+  --create-namespace
 ```
 
-This installs only the operator components (CRD + RBAC + controller Deployment).
-It does not create TON node Pods by itself, so TON replica count is `0` until you create a `TonNode` resource.
+This installs CRD + RBAC + controller Deployment.
+It does not create TON node Pods by default (`tonNode.enabled=false`).
 
 Verify:
 
@@ -156,65 +189,51 @@ kubectl get crd tonnodes.ton.ton.org
 kubectl -n ton-k8s-operator-system get deploy,pods
 ```
 
-Create TON nodes:
+Install operator and create TON nodes in one command:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/config/samples/ton_v1alpha1_tonnode.yaml
-kubectl get tonnodes
+helm upgrade --install ton-k8s-operator ./charts/ton-k8s-operator \
+  -n ton-k8s-operator-system \
+  --create-namespace \
+  --set tonNode.enabled=true \
+  --set tonNode.namespace=default \
+  --set tonNode.replicas=3 \
+  --set tonNode.storage.storageClassName=local-path
 ```
 
-if the below command shows no pods:
-```
-kubectl get pods -l app.kubernetes.io/instance=tonnode -o wide
-```
-execute
-```bash
-kubectl get tonnode tonnode -o yaml
-kubectl describe tonnode tonnode
-```
-and find the reason for the pod not being created. It might be for example that the `StorageClass` is not available, i.e. `StorageClassMissing` reason.
-
-The sample `TonNode` currently uses `spec.replicas: 3`, so it creates 3 TON Pods.
-
-Create your own replica count:
-
-```yaml
-apiVersion: ton.ton.org/v1alpha1
-kind: TonNode
-metadata:
-  name: tonnode
-spec:
-  replicas: 5
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
-```
-
-Apply it:
+Change TON replica count later:
 
 ```bash
-kubectl apply -f tonnode.yaml
+helm upgrade ton-k8s-operator ./charts/ton-k8s-operator \
+  -n ton-k8s-operator-system \
+  --reuse-values \
+  --set tonNode.replicas=23
 ```
 
-Change replicas later:
+Check resources:
 
 ```bash
-kubectl patch tonnode tonnode --type=merge -p '{"spec":{"replicas":10}}'
+kubectl get tonnodes -A
+kubectl get pods -A -l app.kubernetes.io/name=ton-node
+kubectl get pvc -A
+```
+
+If pods are not created, inspect status and events:
+
+```bash
+kubectl get tonnode tonnode -n default -o yaml
+kubectl describe tonnode tonnode -n default
+kubectl get events -n default --sort-by=.lastTimestamp | tail -n 30
 ```
 
 Delete TON nodes only (keep operator installed):
-
-```bash
-# delete all TonNode resources in default namespace
-kubectl delete tonnodes.ton.ton.org --all
-```
-
-Or for all namespaces:
 
 ```bash
 kubectl delete tonnodes.ton.ton.org --all -A
 ```
 
 This removes TON StatefulSets/Services/Pods managed by the operator, but keeps the operator deployment/CRD.
-By default, StatefulSet PVC retention is `Retain`, so PVCs remain after node deletion.
+By default, StatefulSet PVC retention is `Retain`, so TON PVCs remain.
 
 If you also want to remove TON data volumes (destructive):
 
@@ -222,10 +241,38 @@ If you also want to remove TON data volumes (destructive):
 kubectl delete pvc -l app.kubernetes.io/name=ton-node -A
 ```
 
-Upgrade:
-- apply a newer published `install.yaml` from a new tag/version.
+Or disable Helm-managed `TonNode` while keeping operator:
 
-Uninstall:
+```bash
+helm upgrade ton-k8s-operator ./charts/ton-k8s-operator \
+  -n ton-k8s-operator-system \
+  --reuse-values \
+  --set tonNode.enabled=false
+```
+
+Uninstall Helm release:
+
+```bash
+helm uninstall ton-k8s-operator -n ton-k8s-operator-system
+```
+
+Note: CRDs installed from Helm `crds/` are not removed by `helm uninstall`.
+If you want to remove CRD too (destructive, removes `TonNode` objects):
+
+```bash
+kubectl delete crd tonnodes.ton.ton.org
+```
+
+### Flow C: Cluster User (raw install.yaml fallback)
+
+If you prefer plain manifests:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/config/samples/ton_v1alpha1_tonnode.yaml
+```
+
+Raw uninstall:
 
 ```bash
 kubectl delete -f https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/dist/install.yaml

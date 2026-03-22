@@ -1,0 +1,107 @@
+name: Publish Helm Chart
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CHART_DIR: charts/ton-k8s-operator
+
+jobs:
+  publish-chart:
+    name: Publish chart to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Read chart metadata
+        id: chart
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart_name="$(awk -F': ' '/^name:/{print $2}' "$CHART_DIR/Chart.yaml" | head -n1)"
+          chart_version="$(awk -F': ' '/^version:/{print $2}' "$CHART_DIR/Chart.yaml" | head -n1 | tr -d '"')"
+          app_version_raw="$(awk -F': ' '/^appVersion:/{print $2}' "$CHART_DIR/Chart.yaml" | head -n1 | tr -d '"')"
+          app_version_semver="${app_version_raw#v}"
+          owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+
+          if ! [[ "$chart_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid chart version in Chart.yaml: $chart_version"
+            exit 1
+          fi
+          if ! [[ "$app_version_semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid appVersion in Chart.yaml: $app_version_raw"
+            exit 1
+          fi
+
+          publish_version="$chart_version"
+          if [[ "$(printf '%s\n%s\n' "$chart_version" "$app_version_semver" | sort -V | tail -n1)" == "$app_version_semver" ]] && [[ "$chart_version" != "$app_version_semver" ]]; then
+            publish_version="$app_version_semver"
+          fi
+
+          echo "name=${chart_name}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${chart_version}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${app_version_raw}" >> "$GITHUB_OUTPUT"
+          echo "publish_version=${publish_version}" >> "$GITHUB_OUTPUT"
+          echo "owner=${owner_lc}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Check if chart version already exists
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart_ref="oci://ghcr.io/${{ steps.chart.outputs.owner }}/charts/${{ steps.chart.outputs.name }}"
+          if helm show chart "$chart_ref" --version "${{ steps.chart.outputs.publish_version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package chart
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/charts
+          helm package "$CHART_DIR" -d dist/charts \
+            --version "${{ steps.chart.outputs.publish_version }}" \
+            --app-version "${{ steps.chart.outputs.app_version }}"
+
+      - name: Push chart to GHCR
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm push "dist/charts/${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.publish_version }}.tgz" "oci://ghcr.io/${{ steps.chart.outputs.owner }}/charts"
+
+      - name: Publish workflow summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart_ref="oci://ghcr.io/${{ steps.chart.outputs.owner }}/charts/${{ steps.chart.outputs.name }}"
+          if [[ "${{ steps.check.outputs.exists }}" == "true" ]]; then
+            echo "Helm chart already exists: ${chart_ref}:${{ steps.chart.outputs.publish_version }}. Skipped push." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Published Helm chart: ${chart_ref}:${{ steps.chart.outputs.publish_version }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Chart.yaml version: ${{ steps.chart.outputs.chart_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Chart.yaml appVersion: ${{ steps.chart.outputs.app_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Publish version: ${{ steps.chart.outputs.publish_version }}" >> "$GITHUB_STEP_SUMMARY"

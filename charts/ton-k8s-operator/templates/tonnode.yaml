@@ -1,0 +1,46 @@
+{{- if .Values.tonNode.enabled }}
+apiVersion: ton.ton.org/v1alpha1
+kind: TonNode
+metadata:
+  name: {{ .Values.tonNode.name }}
+  namespace: {{ default .Release.Namespace .Values.tonNode.namespace }}
+  labels:
+    {{- include "ton-k8s-operator.labels" . | nindent 4 }}
+    {{- with .Values.tonNode.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  image: {{ .Values.tonNode.image }}
+  replicas: {{ .Values.tonNode.replicas }}
+  storage:
+    tonWorkSize: {{ .Values.tonNode.storage.tonWorkSize }}
+    myTonCoreSize: {{ .Values.tonNode.storage.myTonCoreSize }}
+    {{- with .Values.tonNode.storage.storageClassName }}
+    storageClassName: {{ . }}
+    {{- end }}
+    {{- with .Values.tonNode.storage.accessModes }}
+    accessModes:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- with .Values.tonNode.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  network:
+    globalConfigURL: {{ .Values.tonNode.network.globalConfigURL }}
+    validatorPort: {{ .Values.tonNode.network.validatorPort }}
+    liteServerPort: {{ .Values.tonNode.network.liteServerPort }}
+    validatorConsolePort: {{ .Values.tonNode.network.validatorConsolePort }}
+    {{- with .Values.tonNode.network.publicIP }}
+    publicIP: {{ . }}
+    {{- end }}
+  {{- with .Values.tonNode.configRefName }}
+  configRef:
+    name: {{ . }}
+  {{- end }}
+  {{- with .Values.tonNode.env }}
+  env:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+

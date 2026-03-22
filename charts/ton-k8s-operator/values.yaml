@@ -1,0 +1,84 @@
+nameOverride: ""
+fullnameOverride: ""
+
+namespace:
+  create: false
+
+image:
+  repository: ghcr.io/neodix42/ton-k8s-operator
+  tag: v0.1.2
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+replicaCount: 1
+
+leaderElection:
+  enabled: true
+
+metrics:
+  enabled: true
+  service:
+    port: 8443
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+extraArgs: []
+extraEnv: []
+
+tonNode:
+  enabled: false
+  name: tonnode
+  namespace: ""
+  labels: {}
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+  replicas: 3
+  storage:
+    tonWorkSize: 200Gi
+    myTonCoreSize: 20Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+  resources: {}
+  network:
+    globalConfigURL: https://ton.org/global.config.json
+    validatorPort: 30001
+    liteServerPort: 30003
+    validatorConsolePort: 30002
+    publicIP: ""
+  configRefName: ""
+  env:
+    - name: MODE
+      value: liteserver
+    - name: DUMP
+      value: "false"
+

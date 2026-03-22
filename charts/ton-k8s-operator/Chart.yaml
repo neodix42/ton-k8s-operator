@@ -1,0 +1,7 @@
+apiVersion: v2
+name: ton-k8s-operator
+description: Helm chart for TON Kubernetes Operator
+type: application
+version: 0.1.2
+appVersion: "v0.1.2"
+kubeVersion: ">=1.26.0-0"
