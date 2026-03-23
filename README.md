@@ -88,7 +88,7 @@ Requirements:
 Build and push controller image:
 
 ```bash
-export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:v0.1.4
+export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:0.1.5
 make docker-build docker-push IMG=$OPERATOR_IMG
 ```
 
@@ -171,7 +171,7 @@ kubectl get sc
 Bootstrap local install bundle from a pinned release:
 
 ```bash
-export TON_OPERATOR_VERSION=v0.1.4
+export TON_OPERATOR_VERSION=0.1.5
 wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/${TON_OPERATOR_VERSION}/install.sh" \
   | CHART_VERSION="${TON_OPERATOR_VERSION#v}" bash
 ```
