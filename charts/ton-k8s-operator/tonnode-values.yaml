@@ -30,7 +30,7 @@ tonNode:
     - name: TELEMETRY
       value: "true"
     - name: MODE
-      value: validator
+      value: liteserver
     - name: DUMP
       value: "false"
     - name: MYTONCTRL_VERSION

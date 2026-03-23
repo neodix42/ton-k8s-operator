@@ -111,11 +111,15 @@ mkdir -p dist/charts
 helm package charts/ton-k8s-operator -d dist/charts
 ```
 
-Helm chart publish is automated by GitHub Actions:
+Operator image and Helm chart publish are automated by GitHub Actions:
 - workflow: `.github/workflows/publish-helm-chart.yml`
 - trigger: every push to `main`
-- target registry: `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
-- behavior: workflow computes a publish version from `Chart.yaml` as higher semver of `version` and `appVersion` (without leading `v`), so appVersion-only bumps are still published; if that version already exists, push is skipped
+- target registries:
+  - operator image: `ghcr.io/neodix42/ton-k8s-operator:<appVersion>`
+  - chart: `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
+- behavior:
+  - image tag is taken from `Chart.yaml` `appVersion` and pushed if that tag does not already exist
+  - chart publish version is computed as higher semver of `version` and `appVersion` (without leading `v`), so appVersion-only bumps are still published; if that version already exists, push is skipped
 
 Install operator:
 
