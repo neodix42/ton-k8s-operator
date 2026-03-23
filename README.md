@@ -251,7 +251,7 @@ kubectl delete pvc -l app.kubernetes.io/name=ton-node -A
 Or disable Helm-managed `TonNode` while keeping operator:
 
 ```bash
-helm upgrade ton-k8s-operator ./charts/ton-k8s-operator \
+helm upgrade ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
   -n ton-k8s-operator-system \
   --reuse-values \
   --set tonNode.enabled=false
