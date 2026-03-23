@@ -88,7 +88,7 @@ Requirements:
 Build and push controller image:
 
 ```bash
-export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:v0.1.2
+export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:v0.1.3
 make docker-build docker-push IMG=$OPERATOR_IMG
 ```
 
