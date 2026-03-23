@@ -185,7 +185,7 @@ No extra values files need to be created manually.
 Then follow:
 
 ```bash
-cd ./ton-k8s-operator-install/ton-k8s-operator
+cd ./ton-k8s-operator
 
 # a) review defaults
 ls -1 values.yaml operator-values.yaml tonnode-values.yaml
