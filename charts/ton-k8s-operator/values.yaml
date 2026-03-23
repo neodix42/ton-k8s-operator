@@ -77,8 +77,21 @@ tonNode:
     publicIP: ""
   configRefName: ""
   env:
+    - name: TON_BRANCH
+      value: latest
+    - name: ARCHIVE_TTL
+      value: "86400"
+    - name: STATE_TTL
+      value: "86400"
+    - name: VERBOSITY
+      value: "1"
+    - name: IGNORE_MINIMAL_REQS
+      value: "true"
+    - name: TELEMETRY
+      value: "true"
     - name: MODE
       value: liteserver
     - name: DUMP
       value: "false"
-
+    - name: MYTONCTRL_VERSION
+      value: master

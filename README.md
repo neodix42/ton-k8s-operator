@@ -164,80 +164,60 @@ kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storagecl
 kubectl get sc
 ```
 
-Install operator only from OCI registry:
+Bootstrap local install bundle from the published chart:
 
 ```bash
-helm install ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
-  --version 0.1.2 \
-  -n ton-k8s-operator-system \
-  --create-namespace
+wget -qO- https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/install.sh | bash
 ```
 
-This installs CRD + RBAC + controller Deployment.
-It does not create TON node Pods by default (`tonNode.enabled=false`).
+The script:
+- creates a local folder
+- downloads latest chart from `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
+- extracts chart and prints next commands
 
-Verify:
+The extracted chart already includes:
+- `values.yaml`
+- `operator-values.yaml`
+- `tonnode-values.yaml`
 
-```bash
-kubectl get crd tonnodes.ton.ton.org
-kubectl -n ton-k8s-operator-system get deploy,pods
-```
+No extra values files need to be created manually.
 
-If an operator is already installed, and you only want to run TON nodes, use one command:
-
-```bash
-helm upgrade ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
-  --version 0.1.2 \
-  -n ton-k8s-operator-system \
-  --reuse-values \
-  --set tonNode.enabled=true \
-  --set tonNode.namespace=default \
-  --set tonNode.replicas=3 \
-  --set tonNode.storage.storageClassName=local-path
-```
-
-If you want to pass explicit `ton-docker-ctrl` startup parameters:
+Then follow:
 
 ```bash
-helm upgrade ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
-  --version 0.1.2 \
-  -n ton-k8s-operator-system \
-  --reuse-values \
-  --set tonNode.enabled=true \
-  --set tonNode.namespace=default \
-  --set tonNode.replicas=3 \
-  --set tonNode.storage.storageClassName=local-path \
-  --set-string tonNode.image=ghcr.io/ton-blockchain/ton-docker-ctrl:latest \
-  --set tonNode.env[0].name=TON_BRANCH --set-string tonNode.env[0].value=latest \
-  --set tonNode.env[1].name=GLOBAL_CONFIG_URL --set-string tonNode.env[1].value=https://ton.org/global.config.json \
-  --set tonNode.env[2].name=ARCHIVE_TTL --set-string tonNode.env[2].value=86400 \
-  --set tonNode.env[3].name=STATE_TTL --set-string tonNode.env[3].value=86400 \
-  --set tonNode.env[4].name=VERBOSITY --set-string tonNode.env[4].value=3 \
-  --set tonNode.env[5].name=IGNORE_MINIMAL_REQS --set-string tonNode.env[5].value=false \
-  --set tonNode.env[6].name=TELEMETRY --set-string tonNode.env[6].value=true \
-  --set tonNode.env[7].name=DUMP --set-string tonNode.env[7].value=false \
-  --set tonNode.env[8].name=MODE --set-string tonNode.env[8].value=validator \
-  --set tonNode.env[9].name=MYTONCTRL_VERSION --set-string tonNode.env[9].value=master
-```
+cd ./ton-k8s-operator-install/ton-k8s-operator
 
-Install operator and create TON nodes in one command:
+# a) review defaults
+ls -1 values.yaml operator-values.yaml tonnode-values.yaml
 
-```bash
-helm upgrade --install ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
+# b) install operator only
+helm install ton-k8s-operator . \
   -n ton-k8s-operator-system \
   --create-namespace \
-  --set tonNode.enabled=true \
-  --set tonNode.namespace=default \
-  --set tonNode.replicas=3 \
-  --set tonNode.storage.storageClassName=local-path
+  -f operator-values.yaml
+
+# c) install TON nodes
+helm upgrade ton-k8s-operator . \
+  -n ton-k8s-operator-system \
+  -f operator-values.yaml \
+  -f tonnode-values.yaml
+
+# d) verify
+kubectl -n ton-k8s-operator-system get deploy,pods
+kubectl -n default get tonnodes
+kubectl -n default get sts,pods,pvc
 ```
+
+`operator-values.yaml` keeps `tonNode.enabled=false` (operator only).
+`tonnode-values.yaml` enables TON nodes and includes common `ton-docker-ctrl` env parameters.
 
 Change TON replica count later:
 
 ```bash
-helm upgrade ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
+helm upgrade ton-k8s-operator . \
   -n ton-k8s-operator-system \
-  --reuse-values \
+  -f operator-values.yaml \
+  -f tonnode-values.yaml \
   --set tonNode.replicas=23
 ```
 
@@ -275,9 +255,9 @@ kubectl delete pvc -l app.kubernetes.io/name=ton-node -A
 Or disable Helm-managed `TonNode` while keeping operator:
 
 ```bash
-helm upgrade ton-k8s-operator oci://ghcr.io/neodix42/charts/ton-k8s-operator \
+helm upgrade ton-k8s-operator . \
   -n ton-k8s-operator-system \
-  --reuse-values \
+  -f operator-values.yaml \
   --set tonNode.enabled=false
 ```
 

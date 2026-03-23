@@ -1,0 +1,37 @@
+tonNode:
+  enabled: true
+  namespace: default
+  name: tonnode
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+  replicas: 3
+  storage:
+    tonWorkSize: 200Gi
+    myTonCoreSize: 20Gi
+    storageClassName: local-path
+    accessModes:
+      - ReadWriteOnce
+  network:
+    globalConfigURL: https://ton.org/global.config.json
+    validatorPort: 30001
+    liteServerPort: 30003
+    validatorConsolePort: 30002
+    publicIP: ""
+  env:
+    - name: TON_BRANCH
+      value: latest
+    - name: ARCHIVE_TTL
+      value: "86400"
+    - name: STATE_TTL
+      value: "86400"
+    - name: VERBOSITY
+      value: "3"
+    - name: IGNORE_MINIMAL_REQS
+      value: "false"
+    - name: TELEMETRY
+      value: "true"
+    - name: MODE
+      value: validator
+    - name: DUMP
+      value: "false"
+    - name: MYTONCTRL_VERSION
+      value: master
