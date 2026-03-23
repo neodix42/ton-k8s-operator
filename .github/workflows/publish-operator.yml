@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -141,12 +141,24 @@ jobs:
           set -euo pipefail
           helm push "dist/charts/${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.publish_version }}.tgz" "oci://ghcr.io/${{ steps.chart.outputs.owner }}/charts"
 
+      - name: Create/update GitHub release and upload install.sh
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.chart.outputs.app_version }}
+          name: ${{ steps.chart.outputs.app_version }}
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            install.sh
+          overwrite_files: true
+
       - name: Publish workflow summary
         shell: bash
         run: |
           set -euo pipefail
           image_ref="${{ steps.image.outputs.ref }}"
           chart_ref="oci://ghcr.io/${{ steps.chart.outputs.owner }}/charts/${{ steps.chart.outputs.name }}"
+          release_url="https://github.com/${{ github.repository }}/releases/tag/${{ steps.chart.outputs.app_version }}"
 
           if [[ "${{ steps.check-image.outputs.exists }}" == "true" ]]; then
             echo "Operator image already exists: ${image_ref}. Skipped push." >> "$GITHUB_STEP_SUMMARY"
@@ -162,3 +174,4 @@ jobs:
           echo "Chart.yaml version: ${{ steps.chart.outputs.chart_version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Chart.yaml appVersion: ${{ steps.chart.outputs.app_version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Publish version: ${{ steps.chart.outputs.publish_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release: ${release_url}" >> "$GITHUB_STEP_SUMMARY"

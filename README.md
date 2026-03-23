@@ -112,7 +112,7 @@ helm package charts/ton-k8s-operator -d dist/charts
 ```
 
 Operator image and Helm chart publish are automated by GitHub Actions:
-- workflow: `.github/workflows/publish-helm-chart.yml`
+- workflow: `.github/workflows/publish-operator.yml`
 - trigger: every push to `main`
 - target registries:
   - operator image: `ghcr.io/neodix42/ton-k8s-operator:<appVersion>`
@@ -168,23 +168,23 @@ kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storagecl
 kubectl get sc
 ```
 
-Bootstrap local install bundle from the published chart:
+Bootstrap local install bundle from a pinned release:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/neodix42/ton-k8s-operator/refs/heads/main/install.sh | bash
+export TON_OPERATOR_VERSION=v0.1.4
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/${TON_OPERATOR_VERSION}/install.sh" \
+  | CHART_VERSION="${TON_OPERATOR_VERSION#v}" bash
 ```
 
 The script:
 - creates a local folder
-- downloads latest chart from `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
+- downloads chart from `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
 - extracts chart and prints next commands
 
 The extracted chart already includes:
 - `values.yaml`
 - `operator-values.yaml`
 - `tonnode-values.yaml`
-
-No extra values files need to be created manually.
 
 Then follow:
 
@@ -194,7 +194,7 @@ cd ./ton-k8s-operator
 # a) review defaults
 ls -1 values.yaml operator-values.yaml tonnode-values.yaml
 
-# b) install operator only
+# b) install TON k8s operator only
 helm install ton-k8s-operator . \
   -n ton-k8s-operator-system \
   --create-namespace \
@@ -210,10 +210,39 @@ helm upgrade ton-k8s-operator . \
 kubectl -n ton-k8s-operator-system get deploy,pods
 kubectl -n default get tonnodes
 kubectl -n default get sts,pods,pvc
+
+# e) Stop/remove TON nodes and delete operator:
+# stop and remove all TON nodes (keep operator)
+helm upgrade ton-k8s-operator . \
+ -n ton-k8s-operator-system \
+ -f operator-values.yaml \
+ --set tonNode.enabled=false
+kubectl delete tonnodes.ton.ton.org --all -A
+
+# optional destructive TON data cleanup
+kubectl delete pvc -A -l app.kubernetes.io/name=ton-node
+
+# delete operator release + namespace
+helm uninstall ton-k8s-operator -n ton-k8s-operator-system
+kubectl delete namespace ton-k8s-operator-system
+
+# optional destructive CRD cleanup
+kubectl delete crd tonnodes.ton.ton.org
 ```
 
 `operator-values.yaml` keeps `tonNode.enabled=false` (operator only).
 `tonnode-values.yaml` enables TON nodes and includes common `ton-docker-ctrl` env parameters.
+
+### Cloud Install Options
+
+For AWS/GCP/AliCloud, you can use any of these install paths:
+
+- Cloud Shell (fastest): run the same release-pinned command above from AWS CloudShell, GCP Cloud Shell, or Alibaba Cloud Cloud Shell.
+- CI/CD or bastion host: run `helm install/upgrade` from your deployment runner against the target kube-context.
+- GitOps (recommended for production): use Argo CD or Flux with this chart and versioned values files.
+- Terraform: use `helm_release` to install/upgrade declaratively.
+
+Cloud provider dashboards can help create the cluster and open Cloud Shell, but this operator is not currently a managed one-click marketplace add-on. Installation is still done by Helm/kubectl.
 
 Change TON replica count later:
 
@@ -239,30 +268,6 @@ If pods are not created, inspect status and events:
 kubectl get tonnode tonnode -n default -o yaml
 kubectl describe tonnode tonnode -n default
 kubectl get events -n default --sort-by=.lastTimestamp | tail -n 30
-```
-
-Delete TON nodes only (keep operator installed):
-
-```bash
-kubectl delete tonnodes.ton.ton.org --all -A
-```
-
-This removes TON StatefulSets/Services/Pods managed by the operator, but keeps the operator deployment/CRD.
-By default, StatefulSet PVC retention is `Retain`, so TON PVCs remain.
-
-If you also want to remove TON data volumes (destructive):
-
-```bash
-kubectl delete pvc -l app.kubernetes.io/name=ton-node -A
-```
-
-Or disable Helm-managed `TonNode` while keeping operator:
-
-```bash
-helm upgrade ton-k8s-operator . \
-  -n ton-k8s-operator-system \
-  -f operator-values.yaml \
-  --set tonNode.enabled=false
 ```
 
 Uninstall Helm release:
