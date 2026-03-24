@@ -237,29 +237,39 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	publicIP corev1.EnvVar,
 ) corev1.PodTemplateSpec {
 	env := mergeEnvVars(defaultTonEnv(tonNode, publicIP), tonNode.Spec.Env)
+	containerPorts := []corev1.ContainerPort{
+		{
+			Name:          "validator-udp",
+			ContainerPort: desiredValidatorPort(tonNode),
+			Protocol:      corev1.ProtocolUDP,
+		},
+		{
+			Name:          "liteserver-tcp",
+			ContainerPort: desiredLiteServerPort(tonNode),
+			Protocol:      corev1.ProtocolTCP,
+		},
+		{
+			Name:          "console-tcp",
+			ContainerPort: desiredConsolePort(tonNode),
+			Protocol:      corev1.ProtocolTCP,
+		},
+	}
+	if hostPortsEnabled(tonNode) {
+		for i := range containerPorts {
+			if containerPorts[i].Name == "console-tcp" {
+				continue
+			}
+			containerPorts[i].HostPort = containerPorts[i].ContainerPort
+		}
+	}
+
 	container := corev1.Container{
 		Name:            tonContainerName,
 		Image:           desiredImage(tonNode),
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Env:             env,
 		Resources:       tonNode.Spec.Resources,
-		Ports: []corev1.ContainerPort{
-			{
-				Name:          "validator-udp",
-				ContainerPort: desiredValidatorPort(tonNode),
-				Protocol:      corev1.ProtocolUDP,
-			},
-			{
-				Name:          "liteserver-tcp",
-				ContainerPort: desiredLiteServerPort(tonNode),
-				Protocol:      corev1.ProtocolTCP,
-			},
-			{
-				Name:          "console-tcp",
-				ContainerPort: desiredConsolePort(tonNode),
-				Protocol:      corev1.ProtocolTCP,
-			},
-		},
+		Ports:           containerPorts,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
 			{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
@@ -524,6 +534,13 @@ func nodeAddressByType(addresses []corev1.NodeAddress, addressType corev1.NodeAd
 		}
 	}
 	return ""
+}
+
+func hostPortsEnabled(tonNode *tonv1alpha1.TonNode) bool {
+	if tonNode.Spec.Network.HostPortsEnabled == nil {
+		return true
+	}
+	return *tonNode.Spec.Network.HostPortsEnabled
 }
 
 func defaultTonEnv(tonNode *tonv1alpha1.TonNode, publicIP corev1.EnvVar) []corev1.EnvVar {

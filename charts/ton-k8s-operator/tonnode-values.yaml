@@ -15,6 +15,7 @@ tonNode:
     validatorPort: 30001
     liteServerPort: 30003
     validatorConsolePort: 30002
+    hostPortsEnabled: true
     publicIP: ""
   env:
     - name: TON_BRANCH

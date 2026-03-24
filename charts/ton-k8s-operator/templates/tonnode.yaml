@@ -31,6 +31,7 @@ spec:
     validatorPort: {{ .Values.tonNode.network.validatorPort }}
     liteServerPort: {{ .Values.tonNode.network.liteServerPort }}
     validatorConsolePort: {{ .Values.tonNode.network.validatorConsolePort }}
+    hostPortsEnabled: {{ .Values.tonNode.network.hostPortsEnabled }}
     {{- with .Values.tonNode.network.publicIP }}
     publicIP: {{ . }}
     {{- end }}
@@ -43,4 +44,3 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}
-

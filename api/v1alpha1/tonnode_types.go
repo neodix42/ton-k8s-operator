@@ -106,6 +106,12 @@ type TonNodeNetworkSpec struct {
 	// If not available, it falls back to the Pod's host IP.
 	// +optional
 	PublicIP string `json:"publicIP,omitempty"`
+
+	// HostPortsEnabled exposes validator/lite-server ports via hostPort on the node.
+	// Enabled by default for external TON reachability.
+	// +kubebuilder:default:=true
+	// +optional
+	HostPortsEnabled *bool `json:"hostPortsEnabled,omitempty"`
 }
 
 // TonNodeStatus defines the observed state of TonNode.

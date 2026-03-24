@@ -87,6 +87,9 @@ spec:
                       minimum: 1
                       maximum: 65535
                       default: 30002
+                    hostPortsEnabled:
+                      type: boolean
+                      default: true
                     publicIP:
                       type: string
                 configRef:
@@ -117,4 +120,3 @@ spec:
                     x-kubernetes-preserve-unknown-fields: true
       subresources:
         status: {}
-
