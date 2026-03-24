@@ -215,7 +215,8 @@ spec:
                   publicIP:
                     description: |-
                       PublicIP explicitly sets PUBLIC_IP for TON.
-                      If omitted, PUBLIC_IP is sourced from the Pod's host IP.
+                      If omitted and replicas=1, operator prefers the scheduled node ExternalIP.
+                      If not available, it falls back to the Pod's host IP.
                     type: string
                   validatorConsolePort:
                     default: 30002
@@ -458,6 +459,13 @@ kind: ClusterRole
 metadata:
   name: ton-k8s-operator-manager-role
 rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - pods
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:

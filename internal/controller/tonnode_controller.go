@@ -76,6 +76,8 @@ type TonNodeReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -205,13 +207,17 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
 		labels := labelsForTonNode(tonNode)
 		replicas := desiredReplicas(tonNode)
+		publicIP, err := r.desiredPublicIPEnv(ctx, tonNode)
+		if err != nil {
+			return err
+		}
 		sts.Labels = labels
 		sts.Spec.Replicas = ptr.To(replicas)
 		sts.Spec.ServiceName = serviceName
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 		sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType}
-		sts.Spec.Template = r.desiredPodTemplate(tonNode, labels)
+		sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP)
 		sts.Spec.VolumeClaimTemplates = desiredVolumeClaims(tonNode, storageClassName)
 		return controllerutil.SetControllerReference(tonNode, sts, r.Scheme)
 	})
@@ -228,8 +234,9 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 func (r *TonNodeReconciler) desiredPodTemplate(
 	tonNode *tonv1alpha1.TonNode,
 	labels map[string]string,
+	publicIP corev1.EnvVar,
 ) corev1.PodTemplateSpec {
-	env := mergeEnvVars(defaultTonEnv(tonNode), tonNode.Spec.Env)
+	env := mergeEnvVars(defaultTonEnv(tonNode, publicIP), tonNode.Spec.Env)
 	container := corev1.Container{
 		Name:            tonContainerName,
 		Image:           desiredImage(tonNode),
@@ -444,8 +451,8 @@ func (r *TonNodeReconciler) updateStatus(
 	return r.Status().Update(ctx, tonNode)
 }
 
-func defaultTonEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
-	publicIP := corev1.EnvVar{
+func hostIPPublicEnvVar() corev1.EnvVar {
+	return corev1.EnvVar{
 		Name: "PUBLIC_IP",
 		ValueFrom: &corev1.EnvVarSource{
 			FieldRef: &corev1.ObjectFieldSelector{
@@ -453,10 +460,73 @@ func defaultTonEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
 			},
 		},
 	}
+}
+
+func (r *TonNodeReconciler) desiredPublicIPEnv(
+	ctx context.Context,
+	tonNode *tonv1alpha1.TonNode,
+) (corev1.EnvVar, error) {
 	if ip := strings.TrimSpace(tonNode.Spec.Network.PublicIP); ip != "" {
-		publicIP = corev1.EnvVar{Name: "PUBLIC_IP", Value: ip}
+		return corev1.EnvVar{Name: "PUBLIC_IP", Value: ip}, nil
 	}
 
+	// We can safely resolve a single external IP automatically only for one replica.
+	if desiredReplicas(tonNode) == 1 {
+		ip, err := r.resolveNodeExternalIP(ctx, tonNode)
+		if err != nil {
+			return corev1.EnvVar{}, err
+		}
+		if ip != "" {
+			return corev1.EnvVar{Name: "PUBLIC_IP", Value: ip}, nil
+		}
+	}
+
+	return hostIPPublicEnvVar(), nil
+}
+
+func (r *TonNodeReconciler) resolveNodeExternalIP(
+	ctx context.Context,
+	tonNode *tonv1alpha1.TonNode,
+) (string, error) {
+	pod := &corev1.Pod{}
+	podName := fmt.Sprintf("%s-0", tonNode.Name)
+	if err := r.Get(ctx, client.ObjectKey{Name: podName, Namespace: tonNode.Namespace}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	nodeName := strings.TrimSpace(pod.Spec.NodeName)
+	if nodeName == "" {
+		return "", nil
+	}
+
+	node := &corev1.Node{}
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return nodeAddressByType(node.Status.Addresses, corev1.NodeExternalIP), nil
+}
+
+func nodeAddressByType(addresses []corev1.NodeAddress, addressType corev1.NodeAddressType) string {
+	for _, address := range addresses {
+		if address.Type != addressType {
+			continue
+		}
+		ip := strings.TrimSpace(address.Address)
+		if ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+func defaultTonEnv(tonNode *tonv1alpha1.TonNode, publicIP corev1.EnvVar) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		publicIP,
 		{Name: "GLOBAL_CONFIG_URL", Value: desiredGlobalConfigURL(tonNode)},

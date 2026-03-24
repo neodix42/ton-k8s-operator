@@ -21,7 +21,7 @@ This operator creates and manages:
   3. cluster default StorageClass
   4. no class (cluster policy decides)
 - Passes TON env vars expected by `ton-docker-ctrl`:
-  - `PUBLIC_IP` (defaults from `status.hostIP` if not set)
+  - `PUBLIC_IP` (explicit `spec.network.publicIP`, otherwise auto node `ExternalIP` for single-replica; fallback `status.hostIP`)
   - `GLOBAL_CONFIG_URL`
   - `VALIDATOR_PORT`
   - `LITESERVER_PORT`
@@ -244,6 +244,113 @@ For AWS/GCP/AliCloud, you can use any of these install paths:
 
 Cloud provider dashboards can help create the cluster and open Cloud Shell, but this operator is not currently a managed one-click marketplace add-on. Installation is still done by Helm/kubectl.
 
+### Upgrade Workflow (When Image Changes)
+
+Use this workflow when the operator image and/or TON node image changes.
+
+Maintainer release workflow:
+
+```bash
+# bump all project version pins
+./upgrade.sh 0.1.6
+
+# commit + push to main
+git add .
+git commit -m "release: 0.1.6"
+git push origin main
+```
+
+`publish-operator.yml` will then publish:
+- operator image: `ghcr.io/neodix42/ton-k8s-operator:0.1.6`
+- chart: `oci://ghcr.io/neodix42/charts/ton-k8s-operator:0.1.6`
+- release asset: `install.sh` on GitHub Release `0.1.6`
+
+Cluster upgrade workflow:
+
+```bash
+# fetch new release installer and chart
+export TON_OPERATOR_VERSION=0.1.6
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/${TON_OPERATOR_VERSION}/install.sh" \
+  | CHART_VERSION="${TON_OPERATOR_VERSION#v}" bash
+cd ./ton-k8s-operator
+
+# review values before upgrade
+cat operator-values.yaml
+cat tonnode-values.yaml
+```
+
+Upgrade operator only:
+
+```bash
+helm upgrade ton-k8s-operator . \
+  -n ton-k8s-operator-system \
+  -f operator-values.yaml \
+  --atomic --wait --timeout 20m
+```
+
+Upgrade operator and TON nodes:
+
+```bash
+helm upgrade ton-k8s-operator . \
+  -n ton-k8s-operator-system \
+  -f operator-values.yaml \
+  -f tonnode-values.yaml \
+  --atomic --wait --timeout 40m
+```
+
+If only TON image is changed, keep an operator version and update the node image explicitly:
+
+```bash
+helm upgrade ton-k8s-operator . \
+  -n ton-k8s-operator-system \
+  -f operator-values.yaml \
+  -f tonnode-values.yaml \
+  --set-string tonNode.image=ghcr.io/ton-blockchain/ton-docker-ctrl:<new-tag> \
+  --atomic --wait --timeout 40m
+```
+
+Monitor rollout:
+
+```bash
+kubectl -n ton-k8s-operator-system rollout status deploy/ton-k8s-operator-controller-manager --timeout=10m
+kubectl -n default rollout status sts/tonnode --timeout=40m
+kubectl -n default get tonnodes
+kubectl -n default get pods -l app.kubernetes.io/name=ton-node -o wide
+kubectl -n ton-k8s-operator-system logs deploy/ton-k8s-operator-controller-manager --tail=200
+kubectl -n default get events --sort-by=.lastTimestamp | tail -n 40
+```
+
+Rollback:
+
+```bash
+# find previous revision
+helm history ton-k8s-operator -n ton-k8s-operator-system
+
+# rollback release (operator + tonnode manifests managed by Helm)
+helm rollback ton-k8s-operator <REVISION> \
+  -n ton-k8s-operator-system \
+  --wait --timeout 20m
+```
+
+Image-specific rollback (when needed):
+
+```bash
+# rollback operator image tag explicitly
+helm upgrade ton-k8s-operator . \
+  -n ton-k8s-operator-system \
+  -f operator-values.yaml \
+  --set image.tag=<old-version> \
+  --atomic --wait --timeout 20m
+
+# rollback TON node image explicitly
+helm upgrade ton-k8s-operator . \
+  -n ton-k8s-operator-system \
+  -f operator-values.yaml \
+  -f tonnode-values.yaml \
+  --set-string tonNode.image=ghcr.io/ton-blockchain/ton-docker-ctrl:<old-tag> \
+  --atomic --wait --timeout 40m
+```
+
 Change TON replica count later:
 
 ```bash
@@ -325,7 +432,7 @@ Run them from repo root:
 
 ## Production TON Notes
 
-- `PUBLIC_IP`: by default operator sets `PUBLIC_IP` from node host IP. If your worker IP is private/NATed, set `spec.network.publicIP`.
+- `PUBLIC_IP`: by default, for `replicas=1`, operator tries node `ExternalIP`, then falls back to node host IP. For multi-replica or private/NAT workers, set `spec.network.publicIP`.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
 - Bare metal: if Longhorn exists, operator prefers it automatically.
 - If no StorageClass exists in the cluster, `TonNode` will stay `Ready=False` with reason `StorageClassMissing`.

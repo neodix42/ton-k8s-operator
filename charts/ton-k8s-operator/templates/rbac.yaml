@@ -49,6 +49,13 @@ rules:
   - apiGroups:
       - ""
     resources:
+      - nodes
+      - pods
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
       - secrets
     verbs:
       - get
@@ -259,4 +266,3 @@ subjects:
     name: {{ include "ton-k8s-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
-

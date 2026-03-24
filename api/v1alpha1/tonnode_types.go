@@ -102,7 +102,8 @@ type TonNodeNetworkSpec struct {
 	ValidatorConsolePort int32 `json:"validatorConsolePort,omitempty"`
 
 	// PublicIP explicitly sets PUBLIC_IP for TON.
-	// If omitted, PUBLIC_IP is sourced from the Pod's host IP.
+	// If omitted and replicas=1, operator prefers the scheduled node ExternalIP.
+	// If not available, it falls back to the Pod's host IP.
 	// +optional
 	PublicIP string `json:"publicIP,omitempty"`
 }
