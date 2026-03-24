@@ -175,9 +175,7 @@ kubectl get sc
 Bootstrap local install bundle from a pinned release:
 
 ```bash
-export TON_OPERATOR_VERSION=0.1.7
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/${TON_OPERATOR_VERSION}/install.sh" \
-  | CHART_VERSION="${TON_OPERATOR_VERSION#v}" bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.7/install.sh" | bash
 ```
 
 The script:
@@ -256,26 +254,24 @@ Maintainer release workflow:
 
 ```bash
 # bump all project version pins
-./upgrade.sh 0.1.6
+./upgrade.sh 0.1.7
 
 # commit + push to main
 git add .
-git commit -m "release: 0.1.6"
+git commit -m "release: 0.1.7"
 git push origin main
 ```
 
 `publish-operator.yml` will then publish:
-- operator image: `ghcr.io/neodix42/ton-k8s-operator:0.1.6`
-- chart: `oci://ghcr.io/neodix42/charts/ton-k8s-operator:0.1.6`
-- release asset: `install.sh` on GitHub Release `0.1.6`
+- operator image: `ghcr.io/neodix42/ton-k8s-operator:0.1.7`
+- chart: `oci://ghcr.io/neodix42/charts/ton-k8s-operator:0.1.7`
+- release asset: `install.sh` on GitHub Release `0.1.7`
 
 Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-export TON_OPERATOR_VERSION=0.1.7
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/${TON_OPERATOR_VERSION}/install.sh" \
-  | CHART_VERSION="${TON_OPERATOR_VERSION#v}" bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.7/install.sh" | bash
 cd ./ton-k8s-operator
 
 # review values before upgrade

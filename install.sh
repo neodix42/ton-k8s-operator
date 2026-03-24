@@ -3,7 +3,7 @@ set -euo pipefail
 
 CHART_REF="${CHART_REF:-oci://ghcr.io/neodix42/charts/ton-k8s-operator}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD/ton-k8s-operator}"
-CHART_VERSION="${CHART_VERSION:-}"
+CHART_VERSION="0.1.7"
 
 require_bin() {
   local bin="$1"
@@ -27,12 +27,8 @@ cd "$INSTALL_DIR"
 
 rm -f ton-k8s-operator-*.tgz
 
-echo "Downloading chart from: $CHART_REF"
-if [[ -n "$CHART_VERSION" ]]; then
-  helm pull "$CHART_REF" --version "$CHART_VERSION"
-else
-  helm pull "$CHART_REF"
-fi
+echo "Downloading chart from: $CHART_REF (version: $CHART_VERSION)"
+helm pull "$CHART_REF" --version "$CHART_VERSION"
 
 ARCHIVE="$(ls -1 ton-k8s-operator-*.tgz 2>/dev/null | head -n1 || true)"
 if [[ -z "$ARCHIVE" ]]; then
