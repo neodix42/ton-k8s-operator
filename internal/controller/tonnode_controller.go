@@ -47,6 +47,10 @@ const (
 	defaultReplicas        int32 = 1
 	defaultTonWorkSize           = "200Gi"
 	defaultMyTonCoreSize         = "20Gi"
+	defaultCPURequest            = "16000m"
+	defaultMemoryRequest         = "64Gi"
+	defaultCPULimit              = "128000m"
+	defaultMemoryLimit           = "256Gi"
 	defaultGlobalConfigURL       = "https://ton.org/global.config.json"
 	defaultValidatorPort   int32 = 30001
 	defaultLiteServerPort  int32 = 30003
@@ -268,7 +272,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		Image:           desiredImage(tonNode),
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Env:             env,
-		Resources:       tonNode.Spec.Resources,
+		Resources:       desiredResources(tonNode),
 		Ports:           containerPorts,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
@@ -590,6 +594,33 @@ func desiredImage(tonNode *tonv1alpha1.TonNode) string {
 		return image
 	}
 	return defaultImage
+}
+
+func desiredResources(tonNode *tonv1alpha1.TonNode) corev1.ResourceRequirements {
+	desired := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(defaultCPURequest),
+			corev1.ResourceMemory: resource.MustParse(defaultMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(defaultCPULimit),
+			corev1.ResourceMemory: resource.MustParse(defaultMemoryLimit),
+		},
+	}
+
+	for name, quantity := range tonNode.Spec.Resources.Requests {
+		desired.Requests[name] = quantity
+	}
+	for name, quantity := range tonNode.Spec.Resources.Limits {
+		desired.Limits[name] = quantity
+	}
+
+	if len(tonNode.Spec.Resources.Claims) > 0 {
+		desired.Claims = make([]corev1.ResourceClaim, len(tonNode.Spec.Resources.Claims))
+		copy(desired.Claims, tonNode.Spec.Resources.Claims)
+	}
+
+	return desired
 }
 
 func desiredReplicas(tonNode *tonv1alpha1.TonNode) int32 {

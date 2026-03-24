@@ -10,6 +10,13 @@ tonNode:
     storageClassName: local-path
     accessModes:
       - ReadWriteOnce
+  resources:
+    requests:
+      cpu: 16000m
+      memory: 64Gi
+    limits:
+      cpu: 128000m
+      memory: 256Gi
   network:
     globalConfigURL: https://ton.org/global.config.json
     validatorPort: 30001

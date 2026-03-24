@@ -6,6 +6,7 @@ import (
 
 	tonv1alpha1 "github.com/neodix/ton-k8s-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
@@ -217,6 +218,39 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 	})
 }
 
+func TestDesiredResources(t *testing.T) {
+	t.Run("uses defaults when spec resources are empty", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{}
+		resources := desiredResources(tonNode)
+
+		assertQuantityEqual(t, resources.Requests[corev1.ResourceCPU], defaultCPURequest, "requests.cpu")
+		assertQuantityEqual(t, resources.Requests[corev1.ResourceMemory], defaultMemoryRequest, "requests.memory")
+		assertQuantityEqual(t, resources.Limits[corev1.ResourceCPU], defaultCPULimit, "limits.cpu")
+		assertQuantityEqual(t, resources.Limits[corev1.ResourceMemory], defaultMemoryLimit, "limits.memory")
+	})
+
+	t.Run("merges user overrides with defaults", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			Spec: tonv1alpha1.TonNodeSpec{
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("20000m"),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("300Gi"),
+					},
+				},
+			},
+		}
+		resources := desiredResources(tonNode)
+
+		assertQuantityEqual(t, resources.Requests[corev1.ResourceCPU], "20000m", "requests.cpu")
+		assertQuantityEqual(t, resources.Requests[corev1.ResourceMemory], defaultMemoryRequest, "requests.memory")
+		assertQuantityEqual(t, resources.Limits[corev1.ResourceCPU], defaultCPULimit, "limits.cpu")
+		assertQuantityEqual(t, resources.Limits[corev1.ResourceMemory], "300Gi", "limits.memory")
+	})
+}
+
 func containerPortByName(t *testing.T, ports []corev1.ContainerPort, name string) corev1.ContainerPort {
 	t.Helper()
 	for _, port := range ports {
@@ -226,4 +260,12 @@ func containerPortByName(t *testing.T, ports []corev1.ContainerPort, name string
 	}
 	t.Fatalf("port %q not found", name)
 	return corev1.ContainerPort{}
+}
+
+func assertQuantityEqual(t *testing.T, actual resource.Quantity, expected string, field string) {
+	t.Helper()
+	want := resource.MustParse(expected)
+	if actual.Cmp(want) != 0 {
+		t.Fatalf("%s = %s, want %s", field, actual.String(), expected)
+	}
 }

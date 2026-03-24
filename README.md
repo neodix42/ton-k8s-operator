@@ -31,6 +31,9 @@ This operator creates and manages:
   - `LITESERVER_PORT`
   - `VALIDATOR_CONSOLE_PORT`
 - Sets `IGNORE_MINIMAL_REQS=true` by default (can be overridden through `spec.env`).
+- Applies default pod resources (overridable via `spec.resources`):
+  - requests: `cpu=16000m`, `memory=64Gi`
+  - limits: `cpu=128000m`, `memory=256Gi`
 
 ## TonNode Spec
 
