@@ -270,7 +270,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	container := corev1.Container{
 		Name:            tonContainerName,
 		Image:           desiredImage(tonNode),
-		ImagePullPolicy: corev1.PullIfNotPresent,
+		ImagePullPolicy: desiredImagePullPolicy(tonNode),
 		Env:             env,
 		Resources:       desiredResources(tonNode),
 		Ports:           containerPorts,
@@ -594,6 +594,36 @@ func desiredImage(tonNode *tonv1alpha1.TonNode) string {
 		return image
 	}
 	return defaultImage
+}
+
+func desiredImagePullPolicy(tonNode *tonv1alpha1.TonNode) corev1.PullPolicy {
+	if imageUsesLatestTag(desiredImage(tonNode)) {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
+func imageUsesLatestTag(image string) bool {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return false
+	}
+
+	if strings.Contains(image, "@") {
+		return false
+	}
+
+	lastSegment := image
+	if idx := strings.LastIndex(image, "/"); idx >= 0 {
+		lastSegment = image[idx+1:]
+	}
+
+	if idx := strings.LastIndex(lastSegment, ":"); idx >= 0 {
+		return lastSegment[idx+1:] == "latest"
+	}
+
+	// No explicit tag defaults to "latest" in container runtimes.
+	return true
 }
 
 func desiredResources(tonNode *tonv1alpha1.TonNode) corev1.ResourceRequirements {

@@ -251,6 +251,49 @@ func TestDesiredResources(t *testing.T) {
 	})
 }
 
+func TestDesiredImagePullPolicy(t *testing.T) {
+	tests := []struct {
+		name  string
+		image string
+		want  corev1.PullPolicy
+	}{
+		{
+			name:  "latest tag uses pull always",
+			image: "ghcr.io/ton-blockchain/ton-docker-ctrl:latest",
+			want:  corev1.PullAlways,
+		},
+		{
+			name:  "image without tag is treated as latest",
+			image: "ghcr.io/ton-blockchain/ton-docker-ctrl",
+			want:  corev1.PullAlways,
+		},
+		{
+			name:  "versioned tag uses if not present",
+			image: "ghcr.io/ton-blockchain/ton-docker-ctrl:0.1.7",
+			want:  corev1.PullIfNotPresent,
+		},
+		{
+			name:  "digest pin uses if not present",
+			image: "ghcr.io/ton-blockchain/ton-docker-ctrl@sha256:0123456789abcdef",
+			want:  corev1.PullIfNotPresent,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tonNode := &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					Image: tt.image,
+				},
+			}
+			got := desiredImagePullPolicy(tonNode)
+			if got != tt.want {
+				t.Fatalf("desiredImagePullPolicy(%q) = %q, want %q", tt.image, got, tt.want)
+			}
+		})
+	}
+}
+
 func containerPortByName(t *testing.T, ports []corev1.ContainerPort, name string) corev1.ContainerPort {
 	t.Helper()
 	for _, port := range ports {
