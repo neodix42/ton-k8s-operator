@@ -31,6 +31,8 @@ tonNode:
       value: "86400"
     - name: STATE_TTL
       value: "86400"
+    - name: SYNC_BEFORE
+      value: "60"
     - name: VERBOSITY
       value: "3"
     - name: IGNORE_MINIMAL_REQS

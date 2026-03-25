@@ -175,7 +175,7 @@ kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storagecl
 kubectl get sc
 ```
 
-Bootstrap local install bundle from a pinned release:
+Bootstrap a local installation bundle from a pinned release:
 
 ```bash
 wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.8/install.sh" | bash
@@ -439,7 +439,7 @@ Run them from repo root:
 - `hostPortsEnabled`: default is `true`. This is required for direct TON reachability on bare-metal/public-node setups.
 - Private cloud workers (no public node IP): provide per-node/per-replica public forwarding; one shared LB endpoint/port pair is not sufficient for many TON replicas.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
-- Bare metal: if Longhorn exists, operator prefers it automatically.
+- Bare metal: if Longhorn exists, the operator prefers it automatically.
 - If no StorageClass exists in the cluster, `TonNode` will stay `Ready=False` with reason `StorageClassMissing`.
 - `IGNORE_MINIMAL_REQS`: default is `true` for easier local/k3d startup; for production set `spec.env: [{ name: IGNORE_MINIMAL_REQS, value: "false" }]`.
 - Right-size resources in `spec.resources` for TON fullnode/validator workloads.
@@ -500,7 +500,7 @@ Delete sample resources:
 kubectl delete -f config/samples/ton_v1alpha1_tonnode.yaml --ignore-not-found
 ```
 
-Remove CRD from current cluster context:
+Remove CRD from the current cluster context:
 
 ```bash
 make uninstall
