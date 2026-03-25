@@ -95,7 +95,7 @@ Requirements:
 Build and push controller image:
 
 ```bash
-export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:0.1.8
+export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:0.1.9
 make docker-build docker-push IMG=$OPERATOR_IMG
 ```
 
@@ -178,7 +178,7 @@ kubectl get sc
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.8/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.9/install.sh" | bash
 ```
 
 The script:
@@ -274,7 +274,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.8/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.9/install.sh" | bash
 cd ./ton-k8s-operator
 
 # review values before upgrade
