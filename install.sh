@@ -44,11 +44,12 @@ if [[ ! -f "$CHART_DIR/Chart.yaml" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$CHART_DIR/operator-values.yaml" || ! -f "$CHART_DIR/tonnode-values.yaml" ]]; then
-  echo "Error: downloaded chart does not include operator-values.yaml and tonnode-values.yaml." >&2
+if [[ ! -f "$CHART_DIR/operator-values.yaml" || ! -f "$CHART_DIR/tonnode-values.yaml" || ! -f "$CHART_DIR/kubeton" ]]; then
+  echo "Error: downloaded chart does not include operator-values.yaml, tonnode-values.yaml and kubeton." >&2
   echo "Publish a newer chart version from this repo, then run install.sh again." >&2
   exit 1
 fi
+chmod +x "$CHART_DIR/kubeton"
 
 RESOLVED_VERSION="${ARCHIVE#ton-k8s-operator-}"
 RESOLVED_VERSION="${RESOLVED_VERSION%.tgz}"
@@ -61,45 +62,31 @@ Chart path: $CHART_DIR
 
 Next steps:
 
-a) Review default values files (already bundled in the chart):
+a) Review default values files:
    cd "$CHART_DIR"
-   ls -1 values.yaml operator-values.yaml tonnode-values.yaml
    ${EDITOR:-vi} operator-values.yaml
    ${EDITOR:-vi} tonnode-values.yaml
 
-b) Install operator:
-   helm install ton-k8s-operator . \\
-     -n ton-k8s-operator-system \\
-     --create-namespace \\
-     -f operator-values.yaml
+   # helper script for common TON fleet operations
+   ./kubeton help
 
-c) Install TON nodes:
-   helm upgrade ton-k8s-operator . \\
-     -n ton-k8s-operator-system \\
-     -f operator-values.yaml \\
-     -f tonnode-values.yaml
+b) Install operator:
+   ./kubeton install
+
+c) Start 10 TON nodes:
+  ./kubeton start 10
 
 d) Verify:
    kubectl -n ton-k8s-operator-system get deploy,pods
    kubectl -n default get tonnodes
    kubectl -n default get sts,pods,pvc
 
-e) Stop/remove TON nodes and delete operator:
-   # stop and remove all TON nodes (keep operator)
-   helm upgrade ton-k8s-operator . \\
-     -n ton-k8s-operator-system \\
-     -f operator-values.yaml \\
-     --set tonNode.enabled=false
-   kubectl delete tonnodes.ton.ton.org --all -A
+e) Stop/remove TON nodes
+   ./kubeton stop
 
-   # optional destructive TON data cleanup
-   kubectl delete pvc -A -l app.kubernetes.io/name=ton-node
+f) Drop TON nodes and storage (PVCs)
+   ./kubeton drop
 
-   # delete operator release + namespace
-   helm uninstall ton-k8s-operator -n ton-k8s-operator-system
-   kubectl delete namespace ton-k8s-operator-system
-
-   # optional destructive CRD cleanup
-   kubectl delete crd tonnodes.ton.ton.org
-
+g) Delete operator release + namespace
+   ./kubeton uninstall
 EOF

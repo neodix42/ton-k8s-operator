@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RELEASE_NAME="${RELEASE_NAME:-ton-k8s-operator}"
+OP_NAMESPACE="${OP_NAMESPACE:-ton-k8s-operator-system}"
+CHART_DIR="${CHART_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+OP_VALUES_FILE="${OP_VALUES_FILE:-$CHART_DIR/operator-values.yaml}"
+TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
+TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  kubeton <command>
+
+Commands:
+  install      Install operator only (Helm install with operator-values.yaml).
+  start        Start TON fleet (Helm upgrade with operator-values.yaml + tonnode-values.yaml).
+  start <num>  Same as start, but overrides tonNode.replicas=<num>.
+  stop         Stop TON fleet (tonNode.enabled=false).
+  drop         Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
+  uninstall    Stop/drop TON fleet + uninstall operator release (with confirmation).
+  status       Run "sync" in each TON pod and print table with node/pod/sync status.
+  exec <cmd>   Run a command in each TON pod and print table with node/pod/exit code.
+
+Environment overrides:
+  RELEASE_NAME, OP_NAMESPACE, CHART_DIR, OP_VALUES_FILE, TON_VALUES_FILE, TON_POD_LABEL
+EOF
+}
+
+require_bin() {
+  local bin="$1"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "Error: required command not found: $bin" >&2
+    exit 1
+  fi
+}
+
+confirm_or_exit() {
+  local prompt="$1"
+  local answer
+  read -r -p "$prompt [y/N]: " answer
+  case "${answer}" in
+    y|Y|yes|YES) ;;
+    *) echo "Cancelled."; exit 1 ;;
+  esac
+}
+
+list_ton_pods() {
+  kubectl get pods -A -l "$TON_POD_LABEL" \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+}
+
+dash_line() {
+  local width="$1"
+  printf '%*s' "$width" '' | tr ' ' '-'
+}
+
+print_aligned_table_3col() {
+  local h1="$1"
+  local h2="$2"
+  local h3="$3"
+  shift 3
+  local -a rows=("$@")
+  local w1=${#h1}
+  local w2=${#h2}
+  local w3=${#h3}
+  local row c1 c2 c3
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 <<<"$row"
+    (( ${#c1} > w1 )) && w1=${#c1}
+    (( ${#c2} > w2 )) && w2=${#c2}
+    (( ${#c3} > w3 )) && w3=${#c3}
+  done
+
+  printf "| %-*s | %-*s | %-*s |\n" "$w1" "$h1" "$w2" "$h2" "$w3" "$h3"
+  printf "|-%s-|-%s-|-%s-|\n" "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 <<<"$row"
+    printf "| %-*s | %-*s | %-*s |\n" "$w1" "$c1" "$w2" "$c2" "$w3" "$c3"
+  done
+}
+
+run_install() {
+  require_bin helm
+  helm install "$RELEASE_NAME" "$CHART_DIR" \
+    -n "$OP_NAMESPACE" \
+    --create-namespace \
+    -f "$OP_VALUES_FILE"
+}
+
+run_start() {
+  require_bin helm
+  local replicas="${1:-}"
+  if [[ -n "$replicas" ]]; then
+    if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+      echo "Error: replicas must be a positive integer." >&2
+      exit 1
+    fi
+    helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
+      -n "$OP_NAMESPACE" \
+      -f "$OP_VALUES_FILE" \
+      -f "$TON_VALUES_FILE" \
+      --set "tonNode.replicas=$replicas"
+    return
+  fi
+
+  helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
+    -n "$OP_NAMESPACE" \
+    -f "$OP_VALUES_FILE" \
+    -f "$TON_VALUES_FILE"
+}
+
+run_stop() {
+  require_bin helm
+  helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
+    -n "$OP_NAMESPACE" \
+    -f "$OP_VALUES_FILE" \
+    --set tonNode.enabled=false
+}
+
+run_drop() {
+  require_bin helm
+  require_bin kubectl
+  confirm_or_exit "This will stop TON pods and DELETE TON PVC data. Continue?"
+  run_stop
+  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
+  kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
+}
+
+run_uninstall() {
+  require_bin helm
+  require_bin kubectl
+  confirm_or_exit "This will stop/delete TON pods and PVCs, and uninstall operator. Continue?"
+  run_stop
+  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
+  kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
+  helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
+  kubectl delete namespace "$OP_NAMESPACE" --ignore-not-found
+}
+
+run_status() {
+  require_bin kubectl
+  mapfile -t pod_rows < <(list_ton_pods)
+  if [[ ${#pod_rows[@]} -eq 0 || -z "${pod_rows[0]}" ]]; then
+    echo "No TON pods found."
+    return
+  fi
+
+  local -a table_rows=()
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pod node_name <<<"$row"
+
+    sync_output=""
+    if sync_output="$(kubectl -n "$ns" exec "$pod" -- bash -lc 'sync' 2>/dev/null)"; then
+      sync_output="${sync_output%%$'\n'*}"
+      sync_output="$(printf '%s' "$sync_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      [[ -z "$sync_output" ]] && sync_output="N/A"
+    else
+      sync_output="N/A"
+    fi
+    sync_output="${sync_output//$'\t'/ }"
+    [[ -z "$node_name" ]] && node_name="N/A"
+    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$sync_output")
+  done
+
+  print_aligned_table_3col "server name" "pod name" "sync" "${table_rows[@]}"
+}
+
+run_exec() {
+  require_bin kubectl
+  local cmd="${*:-}"
+  if [[ -z "$cmd" ]]; then
+    echo "Error: missing command for exec." >&2
+    usage
+    exit 1
+  fi
+
+  mapfile -t pod_rows < <(list_ton_pods)
+  if [[ ${#pod_rows[@]} -eq 0 || -z "${pod_rows[0]}" ]]; then
+    echo "No TON pods found."
+    return
+  fi
+
+  local -a table_rows=()
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pod node_name <<<"$row"
+
+    if kubectl -n "$ns" exec "$pod" -- bash -lc "$cmd" >/dev/null 2>&1; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
+    [[ -z "$node_name" ]] && node_name="N/A"
+    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$exit_code")
+  done
+
+  print_aligned_table_3col "server name" "pod name" "exit code" "${table_rows[@]}"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    install)
+      run_install
+      ;;
+    start)
+      run_start "${1:-}"
+      ;;
+    stop)
+      run_stop
+      ;;
+    drop)
+      run_drop
+      ;;
+    uninstall)
+      run_uninstall
+      ;;
+    status)
+      run_status
+      ;;
+    exec)
+      run_exec "$@"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      echo "Error: unknown command '$command'." >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

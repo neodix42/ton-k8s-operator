@@ -190,6 +190,7 @@ The extracted chart already includes:
 - `values.yaml`
 - `operator-values.yaml`
 - `tonnode-values.yaml`
+- `kubeton`
 
 Then follow:
 
@@ -197,39 +198,34 @@ Then follow:
 cd ./ton-k8s-operator
 
 # a) review defaults
-ls -1 values.yaml operator-values.yaml tonnode-values.yaml
+ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
+
+# helper script for common fleet operations
+./kubeton help
+./kubeton install
+./kubeton start
+./kubeton status
+./kubeton exec "sync"
 
 # b) install TON k8s operator only
-helm install ton-k8s-operator . \
-  -n ton-k8s-operator-system \
-  --create-namespace \
-  -f operator-values.yaml
+./kubeton install
 
-# c) install TON nodes
-helm upgrade ton-k8s-operator . \
-  -n ton-k8s-operator-system \
-  -f operator-values.yaml \
-  -f tonnode-values.yaml
+# c) start 10 TON nodes
+./kubeton start 10
 
 # d) verify
 kubectl -n ton-k8s-operator-system get deploy,pods
 kubectl -n default get tonnodes
 kubectl -n default get sts,pods,pvc
 
-# e) Stop/remove TON nodes and delete operator:
-# stop and remove all TON nodes (keep operator)
-helm upgrade ton-k8s-operator . \
- -n ton-k8s-operator-system \
- -f operator-values.yaml \
- --set tonNode.enabled=false
-kubectl delete tonnodes.ton.ton.org --all -A
+# e) stop and remove all TON nodes (keep operator)
+./kubeton stop
 
-# optional destructive TON data cleanup
-kubectl delete pvc -A -l app.kubernetes.io/name=ton-node
+# drops TON nodes and storage (PVCs)
+./kubeton drop
 
 # delete operator release + namespace
-helm uninstall ton-k8s-operator -n ton-k8s-operator-system
-kubectl delete namespace ton-k8s-operator-system
+./kubeton uninstall
 
 # optional destructive CRD cleanup
 kubectl delete crd tonnodes.ton.ton.org
