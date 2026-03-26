@@ -7,6 +7,7 @@ CHART_DIR="${CHART_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 OP_VALUES_FILE="${OP_VALUES_FILE:-$CHART_DIR/operator-values.yaml}"
 TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
 TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
+TON_IMAGE_REPO="${TON_IMAGE_REPO:-ghcr.io/ton-blockchain/ton-docker-ctrl}"
 
 usage() {
   cat <<'EOF'
@@ -17,6 +18,7 @@ Commands:
   install      Install operator only (Helm install with operator-values.yaml).
   start        Start TON fleet (Helm upgrade with operator-values.yaml + tonnode-values.yaml).
   start <num>  Same as start, but overrides tonNode.replicas=<num>.
+  upgrade      Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
   stop         Stop TON fleet (tonNode.enabled=false).
   drop         Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall    Stop/drop TON fleet + uninstall operator release (with confirmation).
@@ -24,7 +26,7 @@ Commands:
   exec <cmd>   Run a command in each TON pod and print table with node/pod/exit code.
 
 Environment overrides:
-  RELEASE_NAME, OP_NAMESPACE, CHART_DIR, OP_VALUES_FILE, TON_VALUES_FILE, TON_POD_LABEL
+  RELEASE_NAME, OP_NAMESPACE, CHART_DIR, OP_VALUES_FILE, TON_VALUES_FILE, TON_POD_LABEL, TON_IMAGE_REPO
 EOF
 }
 
@@ -142,6 +144,33 @@ folder_size_gb() {
   echo "N/A"
 }
 
+sync_value() {
+  local ns="$1"
+  local pod="$2"
+  local output=""
+
+  # Try non-interactive shell first, but explicitly enable aliases from bashrc.
+  output="$(kubectl -n "$ns" exec "$pod" -- bash -lc 'shopt -s expand_aliases; if [[ -f ~/.bashrc ]]; then source ~/.bashrc >/dev/null 2>&1; fi; sync' 2>/dev/null || true)"
+  output="${output//$'\r'/}"
+  output="$(printf '%s\n' "$output" | awk 'NF{print; exit}')"
+  output="$(printf '%s' "$output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+  # Fallback to interactive shell if alias is defined only there.
+  if [[ -z "$output" ]]; then
+    output="$(kubectl -n "$ns" exec "$pod" -- bash -ic 'sync' 2>/dev/null || true)"
+    output="${output//$'\r'/}"
+    output="$(printf '%s\n' "$output" | awk 'NF{print; exit}')"
+    output="$(printf '%s' "$output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  fi
+
+  if [[ -z "$output" ]]; then
+    echo "N/A"
+    return
+  fi
+
+  echo "$output"
+}
+
 run_install() {
   require_bin helm
   helm install "$RELEASE_NAME" "$CHART_DIR" \
@@ -170,6 +199,28 @@ run_start() {
     -n "$OP_NAMESPACE" \
     -f "$OP_VALUES_FILE" \
     -f "$TON_VALUES_FILE"
+}
+
+run_upgrade() {
+  require_bin helm
+  if [[ $# -gt 1 ]]; then
+    echo "Error: usage: kubeton upgrade [tag]" >&2
+    exit 1
+  fi
+  local tag="${1:-latest}"
+  if [[ "$tag" =~ [[:space:]] ]]; then
+    echo "Error: image tag must not contain whitespace." >&2
+    exit 1
+  fi
+
+  helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
+    -n "$OP_NAMESPACE" \
+    -f "$OP_VALUES_FILE" \
+    -f "$TON_VALUES_FILE" \
+    --set-string "tonNode.image=${TON_IMAGE_REPO}:${tag}" \
+    --rollback-on-failure \
+    --wait \
+    --timeout 40m
 }
 
 run_stop() {
@@ -215,14 +266,7 @@ run_status() {
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pod node_name <<<"$row"
 
-    sync_output=""
-    if sync_output="$(kubectl -n "$ns" exec "$pod" -- bash -lc 'sync' 2>/dev/null)"; then
-      sync_output="${sync_output%%$'\n'*}"
-      sync_output="$(printf '%s' "$sync_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-      [[ -z "$sync_output" ]] && sync_output="N/A"
-    else
-      sync_output="N/A"
-    fi
+    sync_output="$(sync_value "$ns" "$pod")"
     sync_output="${sync_output//$'\t'/ }"
     [[ -z "$node_name" ]] && node_name="N/A"
     cell_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/celldb")"
@@ -275,6 +319,9 @@ main() {
       ;;
     start)
       run_start "${1:-}"
+      ;;
+    upgrade)
+      run_upgrade "$@"
       ;;
     stop)
       run_stop

@@ -21,4 +21,4 @@ spec:
   - name: MODE
     value: liteserver
   - name: DUMP
-    value: "false"
+    value: "true"

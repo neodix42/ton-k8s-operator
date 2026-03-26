@@ -204,6 +204,8 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton help
 ./kubeton install
 ./kubeton start
+./kubeton upgrade
+./kubeton upgrade <tag>
 ./kubeton status
 ./kubeton exec "sync"
 
@@ -284,7 +286,7 @@ Upgrade operator only:
 helm upgrade ton-k8s-operator . \
   -n ton-k8s-operator-system \
   -f operator-values.yaml \
-  --atomic --wait --timeout 20m
+  --rollback-on-failure --wait --timeout 20m
 ```
 
 Upgrade operator and TON nodes:
@@ -294,7 +296,7 @@ helm upgrade ton-k8s-operator . \
   -n ton-k8s-operator-system \
   -f operator-values.yaml \
   -f tonnode-values.yaml \
-  --atomic --wait --timeout 40m
+  --rollback-on-failure --wait --timeout 40m
 ```
 
 If only TON image is changed, keep an operator version and update the node image explicitly:
@@ -305,7 +307,7 @@ helm upgrade ton-k8s-operator . \
   -f operator-values.yaml \
   -f tonnode-values.yaml \
   --set-string tonNode.image=ghcr.io/ton-blockchain/ton-docker-ctrl:<new-tag> \
-  --atomic --wait --timeout 40m
+  --rollback-on-failure --wait --timeout 40m
 ```
 
 Monitor rollout:
@@ -339,7 +341,7 @@ helm upgrade ton-k8s-operator . \
   -n ton-k8s-operator-system \
   -f operator-values.yaml \
   --set image.tag=<old-version> \
-  --atomic --wait --timeout 20m
+  --rollback-on-failure --wait --timeout 20m
 
 # rollback TON node image explicitly
 helm upgrade ton-k8s-operator . \
@@ -347,7 +349,7 @@ helm upgrade ton-k8s-operator . \
   -f operator-values.yaml \
   -f tonnode-values.yaml \
   --set-string tonNode.image=ghcr.io/ton-blockchain/ton-docker-ctrl:<old-tag> \
-  --atomic --wait --timeout 40m
+  --rollback-on-failure --wait --timeout 40m
 ```
 
 Change TON replica count later:
