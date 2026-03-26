@@ -20,7 +20,7 @@ Commands:
   stop         Stop TON fleet (tonNode.enabled=false).
   drop         Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall    Stop/drop TON fleet + uninstall operator release (with confirmation).
-  status       Run "sync" in each TON pod and print table with node/pod/sync status.
+  status       Run "sync" and db size checks in each TON pod; print node/pod/sync/cell db/archive db.
   exec <cmd>   Run a command in each TON pod and print table with node/pod/exit code.
 
 Environment overrides:
@@ -80,6 +80,66 @@ print_aligned_table_3col() {
     IFS=$'\t' read -r c1 c2 c3 <<<"$row"
     printf "| %-*s | %-*s | %-*s |\n" "$w1" "$c1" "$w2" "$c2" "$w3" "$c3"
   done
+}
+
+print_aligned_table_5col() {
+  local h1="$1"
+  local h2="$2"
+  local h3="$3"
+  local h4="$4"
+  local h5="$5"
+  shift 5
+  local -a rows=("$@")
+  local w1=${#h1}
+  local w2=${#h2}
+  local w3=${#h3}
+  local w4=${#h4}
+  local w5=${#h5}
+  local row c1 c2 c3 c4 c5
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 <<<"$row"
+    (( ${#c1} > w1 )) && w1=${#c1}
+    (( ${#c2} > w2 )) && w2=${#c2}
+    (( ${#c3} > w3 )) && w3=${#c3}
+    (( ${#c4} > w4 )) && w4=${#c4}
+    (( ${#c5} > w5 )) && w5=${#c5}
+  done
+
+  printf "| %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+    "$w1" "$h1" "$w2" "$h2" "$w3" "$h3" "$w4" "$h4" "$w5" "$h5"
+  printf "|-%s-|-%s-|-%s-|-%s-|-%s-|\n" \
+    "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")" "$(dash_line "$w4")" "$(dash_line "$w5")"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 <<<"$row"
+    printf "| %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+      "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5"
+  done
+}
+
+bytes_to_gb() {
+  local bytes="$1"
+  if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+    echo "N/A"
+    return
+  fi
+  awk -v b="$bytes" 'BEGIN { printf "%.2f GB", b/1024/1024/1024 }'
+}
+
+folder_size_gb() {
+  local ns="$1"
+  local pod="$2"
+  local folder="$3"
+  local bytes=""
+
+  if bytes="$(kubectl -n "$ns" exec "$pod" -- bash -lc "du -s -B1 \"$folder\" 2>/dev/null | awk '{print \$1}'" 2>/dev/null)"; then
+    bytes="${bytes%%$'\n'*}"
+    bytes="$(printf '%s' "$bytes" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    bytes_to_gb "$bytes"
+    return
+  fi
+
+  echo "N/A"
 }
 
 run_install() {
@@ -149,6 +209,8 @@ run_status() {
   fi
 
   local -a table_rows=()
+  local cell_db_size
+  local archive_db_size
   for row in "${pod_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pod node_name <<<"$row"
@@ -163,10 +225,12 @@ run_status() {
     fi
     sync_output="${sync_output//$'\t'/ }"
     [[ -z "$node_name" ]] && node_name="N/A"
-    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$sync_output")
+    cell_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/celldb")"
+    archive_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/archive")"
+    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$sync_output"$'\t'"$cell_db_size"$'\t'"$archive_db_size")
   done
 
-  print_aligned_table_3col "server name" "pod name" "sync" "${table_rows[@]}"
+  print_aligned_table_5col "server name" "pod name" "sync" "cell db" "archive db" "${table_rows[@]}"
 }
 
 run_exec() {
