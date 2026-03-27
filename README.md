@@ -178,6 +178,37 @@ kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storagecl
 kubectl get sc
 ```
 
+Bare-metal default setup is now automated by `kubeton`:
+- detects bare-metal cluster (`spec.providerID` empty on all nodes)
+- installs Longhorn v1 (`LONGHORN_CHART_VERSION`, default `1.10.0`)
+- creates encrypted StorageClass `encrypted-sc` (LUKS/dm-crypt, `aes-xts-plain64`, `sha256`, `argon2i`, replica count `3`)
+- installs Vault (`VAULT_CHART_VERSION`, default `0.30.0`)
+- initializes/unseals Vault and configures Transit key `ton-validator`
+- creates TON secret `ton-vault-creds` in namespace `default`
+- deploys TonNode with key-management enabled by default
+
+You can run bootstrap explicitly:
+
+```bash
+./kubeton bootstrap-baremetal
+```
+
+Or just run `./kubeton start`; it will bootstrap automatically before TON deployment on bare-metal clusters.
+
+Security note:
+- bootstrap stores Vault init material in `vault/ton-vault-bootstrap`; rotate/restrict access after bootstrap.
+
+Cloud behavior:
+- bare-metal bootstrap is skipped by default
+- before `./kubeton start`, configure prerequisites manually:
+  - encrypted StorageClass named `encrypted-sc` (or adjust env/values)
+  - Vault credential secret `ton-vault-creds` in TON namespace (`default` by default)
+
+If your cloud setup uses custom names, override with env vars:
+- `ENCRYPTED_SC_NAME`
+- `TON_VAULT_CREDS_SECRET`
+- `TON_NAMESPACE`
+
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
@@ -206,6 +237,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # helper script for common fleet operations
 ./kubeton help
 ./kubeton install
+./kubeton bootstrap-baremetal
 ./kubeton start
 ./kubeton upgrade
 ./kubeton upgrade <tag>
@@ -237,7 +269,7 @@ kubectl delete crd tonnodes.ton.ton.org
 ```
 
 `operator-values.yaml` keeps `tonNode.enabled=false` (operator only).
-`tonnode-values.yaml` enables TON nodes and includes common `ton-docker-ctrl` env parameters.
+`tonnode-values.yaml` enables TON nodes, enables key-management by default (`vault`, `ton-vault-creds`, `encrypted-sc`), and includes common `ton-docker-ctrl` env parameters.
 
 ### Cloud Install Options
 

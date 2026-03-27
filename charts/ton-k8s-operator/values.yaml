@@ -84,9 +84,9 @@ tonNode:
     publicIP: ""
   configRefName: ""
   keyManagement:
-    enabled: false
+    enabled: true
     provider: vault
-    credentialsSecretRef: ""
+    credentialsSecretRef: ton-vault-creds
     vaultTransitKey: ton-validator
     kmsKeyID: ""
     kmsVendor: aws
@@ -95,7 +95,7 @@ tonNode:
       walletsSizeLimit: 512Mi
     encryptedBundle:
       pvcSize: 5Gi
-      storageClassName: ""
+      storageClassName: encrypted-sc
       accessModes:
         - ReadWriteOnce
       fileName: keys.bundle.enc

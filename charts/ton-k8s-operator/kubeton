@@ -8,6 +8,30 @@ OP_VALUES_FILE="${OP_VALUES_FILE:-$CHART_DIR/operator-values.yaml}"
 TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
 TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
 TON_IMAGE_REPO="${TON_IMAGE_REPO:-ghcr.io/ton-blockchain/ton-docker-ctrl}"
+TON_NAMESPACE="${TON_NAMESPACE:-default}"
+
+AUTO_BAREMETAL_BOOTSTRAP="${AUTO_BAREMETAL_BOOTSTRAP:-true}"
+FORCE_BAREMETAL_BOOTSTRAP="${FORCE_BAREMETAL_BOOTSTRAP:-false}"
+SKIP_KEY_PREREQ_CHECK="${SKIP_KEY_PREREQ_CHECK:-false}"
+
+LONGHORN_RELEASE_NAME="${LONGHORN_RELEASE_NAME:-longhorn}"
+LONGHORN_NAMESPACE="${LONGHORN_NAMESPACE:-longhorn-system}"
+LONGHORN_CHART="${LONGHORN_CHART:-longhorn/longhorn}"
+LONGHORN_CHART_VERSION="${LONGHORN_CHART_VERSION:-1.10.0}"
+LONGHORN_DEFAULT_REPLICA_COUNT="${LONGHORN_DEFAULT_REPLICA_COUNT:-3}"
+ENCRYPTED_SC_NAME="${ENCRYPTED_SC_NAME:-encrypted-sc}"
+LONGHORN_CRYPTO_SECRET_NAME="${LONGHORN_CRYPTO_SECRET_NAME:-longhorn-crypto}"
+
+VAULT_RELEASE_NAME="${VAULT_RELEASE_NAME:-vault}"
+VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
+VAULT_CHART="${VAULT_CHART:-hashicorp/vault}"
+VAULT_CHART_VERSION="${VAULT_CHART_VERSION:-0.30.0}"
+VAULT_TRANSIT_KEY="${VAULT_TRANSIT_KEY:-ton-validator}"
+VAULT_TON_POLICY_NAME="${VAULT_TON_POLICY_NAME:-tonnode-transit}"
+VAULT_BOOTSTRAP_SECRET="${VAULT_BOOTSTRAP_SECRET:-ton-vault-bootstrap}"
+TON_VAULT_CREDS_SECRET="${TON_VAULT_CREDS_SECRET:-ton-vault-creds}"
+VAULT_ADDR_INTERNAL="${VAULT_ADDR_INTERNAL:-http://${VAULT_RELEASE_NAME}.${VAULT_NAMESPACE}.svc:8200}"
+VAULT_TOKEN_PERIOD="${VAULT_TOKEN_PERIOD:-720h}"
 
 usage() {
   cat <<'EOF'
@@ -15,18 +39,26 @@ Usage:
   kubeton <command>
 
 Commands:
-  install      Install operator only (Helm install with operator-values.yaml).
-  start        Start TON fleet (Helm upgrade with operator-values.yaml + tonnode-values.yaml).
-  start <num>  Same as start, but overrides tonNode.replicas=<num>.
-  upgrade      Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
-  stop         Stop TON fleet (tonNode.enabled=false).
-  drop         Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
-  uninstall    Stop/drop TON fleet + uninstall operator release (with confirmation).
-  status       Run "sync" and db size checks in each TON pod; print node/pod/sync/cell db/archive db.
-  exec <cmd>   Run a command in each TON pod and print table with node/pod/exit code.
+  install              Install operator only (Helm install with operator-values.yaml).
+  bootstrap-baremetal  Install Longhorn(v1)+Vault and create TON key prerequisites.
+  start                Start TON fleet (Helm upgrade with operator-values.yaml + tonnode-values.yaml).
+  start <num>          Same as start, but overrides tonNode.replicas=<num>.
+  upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
+  stop                 Stop TON fleet (tonNode.enabled=false).
+  drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
+  uninstall            Stop/drop TON fleet + uninstall operator release (with confirmation).
+  status               Run "sync" and db size checks in each TON pod; print node/pod/sync/cell db/archive db.
+  exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
 
 Environment overrides:
   RELEASE_NAME, OP_NAMESPACE, CHART_DIR, OP_VALUES_FILE, TON_VALUES_FILE, TON_POD_LABEL, TON_IMAGE_REPO
+  TON_NAMESPACE
+  AUTO_BAREMETAL_BOOTSTRAP, FORCE_BAREMETAL_BOOTSTRAP, SKIP_KEY_PREREQ_CHECK
+  LONGHORN_RELEASE_NAME, LONGHORN_NAMESPACE, LONGHORN_CHART, LONGHORN_CHART_VERSION
+  LONGHORN_DEFAULT_REPLICA_COUNT, ENCRYPTED_SC_NAME, LONGHORN_CRYPTO_SECRET_NAME
+  VAULT_RELEASE_NAME, VAULT_NAMESPACE, VAULT_CHART, VAULT_CHART_VERSION
+  VAULT_TRANSIT_KEY, VAULT_TON_POLICY_NAME, VAULT_BOOTSTRAP_SECRET
+  TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
 EOF
 }
 
@@ -38,6 +70,13 @@ require_bin() {
   fi
 }
 
+is_true() {
+  case "${1:-}" in
+    1|true|TRUE|True|yes|YES|Yes|y|Y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 confirm_or_exit() {
   local prompt="$1"
   local answer
@@ -46,6 +85,218 @@ confirm_or_exit() {
     y|Y|yes|YES) ;;
     *) echo "Cancelled."; exit 1 ;;
   esac
+}
+
+ensure_namespace() {
+  local ns="$1"
+  kubectl get namespace "$ns" >/dev/null 2>&1 || kubectl create namespace "$ns" >/dev/null
+}
+
+cluster_is_baremetal() {
+  local provider_ids compact
+  provider_ids="$(kubectl get nodes -o jsonpath='{range .items[*]}{.spec.providerID}{"\n"}{end}')"
+  compact="$(printf '%s' "$provider_ids" | tr -d '[:space:]')"
+  [[ -z "$compact" ]]
+}
+
+should_bootstrap_baremetal() {
+  if ! is_true "$AUTO_BAREMETAL_BOOTSTRAP"; then
+    return 1
+  fi
+  if is_true "$FORCE_BAREMETAL_BOOTSTRAP"; then
+    return 0
+  fi
+  cluster_is_baremetal
+}
+
+ensure_helm_repo() {
+  local name="$1"
+  local url="$2"
+  helm repo add "$name" "$url" --force-update >/dev/null
+}
+
+ensure_longhorn_installed() {
+  require_bin helm
+  require_bin kubectl
+  if [[ ! "$LONGHORN_CHART_VERSION" =~ ^1\. ]]; then
+    echo "Error: LONGHORN_CHART_VERSION must be a v1.x release, got: $LONGHORN_CHART_VERSION" >&2
+    exit 1
+  fi
+
+  ensure_helm_repo "longhorn" "https://charts.longhorn.io"
+  helm repo update longhorn >/dev/null
+
+  echo "[baremetal] Installing/ensuring Longhorn ${LONGHORN_CHART_VERSION} ..."
+  helm upgrade --install "$LONGHORN_RELEASE_NAME" "$LONGHORN_CHART" \
+    --version "$LONGHORN_CHART_VERSION" \
+    -n "$LONGHORN_NAMESPACE" \
+    --create-namespace \
+    --set "defaultSettings.defaultReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
+    --set "persistence.defaultClassReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
+    --wait \
+    --timeout 40m
+}
+
+ensure_longhorn_crypto_secret() {
+  require_bin openssl
+  if kubectl -n "$LONGHORN_NAMESPACE" get secret "$LONGHORN_CRYPTO_SECRET_NAME" >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "[baremetal] Creating Longhorn encryption secret ${LONGHORN_CRYPTO_SECRET_NAME} ..."
+  kubectl -n "$LONGHORN_NAMESPACE" create secret generic "$LONGHORN_CRYPTO_SECRET_NAME" \
+    --from-literal=CRYPTO_KEY_VALUE="$(openssl rand -base64 48)" \
+    --from-literal=CRYPTO_KEY_PROVIDER=secret \
+    --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
+    --from-literal=CRYPTO_KEY_HASH=sha256 \
+    --from-literal=CRYPTO_KEY_SIZE=256 \
+    --from-literal=CRYPTO_PBKDF=argon2i >/dev/null
+}
+
+ensure_encrypted_storage_class() {
+  echo "[baremetal] Applying encrypted StorageClass ${ENCRYPTED_SC_NAME} ..."
+  cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ${ENCRYPTED_SC_NAME}
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "${LONGHORN_DEFAULT_REPLICA_COUNT}"
+  staleReplicaTimeout: "2880"
+  encrypted: "true"
+  csi.storage.k8s.io/provisioner-secret-name: "${LONGHORN_CRYPTO_SECRET_NAME}"
+  csi.storage.k8s.io/provisioner-secret-namespace: "${LONGHORN_NAMESPACE}"
+  csi.storage.k8s.io/node-publish-secret-name: "${LONGHORN_CRYPTO_SECRET_NAME}"
+  csi.storage.k8s.io/node-publish-secret-namespace: "${LONGHORN_NAMESPACE}"
+  csi.storage.k8s.io/node-stage-secret-name: "${LONGHORN_CRYPTO_SECRET_NAME}"
+  csi.storage.k8s.io/node-stage-secret-namespace: "${LONGHORN_NAMESPACE}"
+  csi.storage.k8s.io/node-expand-secret-name: "${LONGHORN_CRYPTO_SECRET_NAME}"
+  csi.storage.k8s.io/node-expand-secret-namespace: "${LONGHORN_NAMESPACE}"
+EOF
+}
+
+ensure_vault_installed() {
+  require_bin helm
+  ensure_helm_repo "hashicorp" "https://helm.releases.hashicorp.com"
+  helm repo update hashicorp >/dev/null
+
+  echo "[baremetal] Installing/ensuring Vault chart ${VAULT_CHART_VERSION} ..."
+  helm upgrade --install "$VAULT_RELEASE_NAME" "$VAULT_CHART" \
+    --version "$VAULT_CHART_VERSION" \
+    -n "$VAULT_NAMESPACE" \
+    --create-namespace \
+    --set "server.ha.enabled=false" \
+    --set "server.standalone.enabled=true" \
+    --set "server.dataStorage.enabled=true" \
+    --set "server.dataStorage.storageClass=longhorn" \
+    --set "injector.enabled=false" \
+    --wait \
+    --timeout 30m
+}
+
+vault_exec() {
+  kubectl -n "$VAULT_NAMESPACE" exec "${VAULT_RELEASE_NAME}-0" -- "$@"
+}
+
+initialize_and_unseal_vault() {
+  local status init_out unseal_key root_token
+
+  status="$(vault_exec vault status 2>/dev/null || true)"
+  if printf '%s\n' "$status" | grep -Eq '^Initialized[[:space:]]+false'; then
+    echo "[baremetal] Initializing Vault ..."
+    init_out="$(vault_exec vault operator init -key-shares=1 -key-threshold=1)"
+    unseal_key="$(printf '%s\n' "$init_out" | awk -F': ' '/Unseal Key 1:/ {print $2; exit}')"
+    root_token="$(printf '%s\n' "$init_out" | awk -F': ' '/Initial Root Token:/ {print $2; exit}')"
+    if [[ -z "$unseal_key" || -z "$root_token" ]]; then
+      echo "Error: failed to parse Vault init output." >&2
+      exit 1
+    fi
+    kubectl -n "$VAULT_NAMESPACE" create secret generic "$VAULT_BOOTSTRAP_SECRET" \
+      --from-literal=unseal_key="$unseal_key" \
+      --from-literal=root_token="$root_token" \
+      --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  fi
+
+  if ! kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" >/dev/null 2>&1; then
+    echo "Error: missing Vault bootstrap secret $VAULT_BOOTSTRAP_SECRET in namespace $VAULT_NAMESPACE" >&2
+    exit 1
+  fi
+
+  unseal_key="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.unseal_key}' | base64 -d)"
+  root_token="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.root_token}' | base64 -d)"
+
+  status="$(vault_exec vault status 2>/dev/null || true)"
+  if printf '%s\n' "$status" | grep -Eq '^Sealed[[:space:]]+true'; then
+    echo "[baremetal] Unsealing Vault ..."
+    vault_exec vault operator unseal "$unseal_key" >/dev/null
+  fi
+
+  printf '%s' "$root_token"
+}
+
+configure_vault_for_ton() {
+  local root_token="$1"
+  local ton_token
+
+  echo "[baremetal] Configuring Vault Transit key and policy ..."
+  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault secrets list | grep -q '^transit/' || vault secrets enable -path=transit transit"
+  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault read transit/keys/${VAULT_TRANSIT_KEY} >/dev/null 2>&1 || vault write -f transit/keys/${VAULT_TRANSIT_KEY}"
+  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; printf '%s\n' 'path \"transit/encrypt/${VAULT_TRANSIT_KEY}\" { capabilities = [\"update\"] }' 'path \"transit/decrypt/${VAULT_TRANSIT_KEY}\" { capabilities = [\"update\"] }' | vault policy write ${VAULT_TON_POLICY_NAME} -"
+  ton_token="$(vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault token create -policy=${VAULT_TON_POLICY_NAME} -period=${VAULT_TOKEN_PERIOD} -orphan -field=token")"
+  ton_token="$(printf '%s' "$ton_token" | tr -d '[:space:]')"
+  if [[ -z "$ton_token" ]]; then
+    echo "Error: failed to create TON Vault token." >&2
+    exit 1
+  fi
+
+  ensure_namespace "$TON_NAMESPACE"
+  kubectl -n "$TON_NAMESPACE" create secret generic "$TON_VAULT_CREDS_SECRET" \
+    --from-literal=VAULT_ADDR="$VAULT_ADDR_INTERNAL" \
+    --from-literal=VAULT_TOKEN="$ton_token" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+}
+
+ensure_baremetal_stack() {
+  require_bin kubectl
+  require_bin helm
+  require_bin openssl
+  require_bin base64
+
+  ensure_longhorn_installed
+  ensure_longhorn_crypto_secret
+  ensure_encrypted_storage_class
+  ensure_vault_installed
+  local root_token
+  root_token="$(initialize_and_unseal_vault)"
+  configure_vault_for_ton "$root_token"
+}
+
+validate_external_key_prereqs() {
+  if is_true "$SKIP_KEY_PREREQ_CHECK"; then
+    return
+  fi
+  if ! kubectl get storageclass "$ENCRYPTED_SC_NAME" >/dev/null 2>&1; then
+    echo "Error: missing StorageClass $ENCRYPTED_SC_NAME. Configure cloud/bare-metal prerequisite first." >&2
+    exit 1
+  fi
+  if ! kubectl -n "$TON_NAMESPACE" get secret "$TON_VAULT_CREDS_SECRET" >/dev/null 2>&1; then
+    echo "Error: missing secret $TON_VAULT_CREDS_SECRET in namespace $TON_NAMESPACE." >&2
+    echo "Configure Vault/KMS prerequisites first or enable AUTO_BAREMETAL_BOOTSTRAP on bare metal." >&2
+    exit 1
+  fi
+}
+
+append_baremetal_key_overrides() {
+  local -n target="$1"
+  target+=(--set "tonNode.keyManagement.enabled=true")
+  target+=(--set-string "tonNode.keyManagement.provider=vault")
+  target+=(--set-string "tonNode.keyManagement.credentialsSecretRef=${TON_VAULT_CREDS_SECRET}")
+  target+=(--set-string "tonNode.keyManagement.vaultTransitKey=${VAULT_TRANSIT_KEY}")
+  target+=(--set-string "tonNode.keyManagement.encryptedBundle.storageClassName=${ENCRYPTED_SC_NAME}")
 }
 
 list_ton_pods() {
@@ -149,13 +400,11 @@ sync_value() {
   local pod="$2"
   local output=""
 
-  # Try non-interactive shell first, but explicitly enable aliases from bashrc.
   output="$(kubectl -n "$ns" exec "$pod" -- bash -lc 'shopt -s expand_aliases; if [[ -f ~/.bashrc ]]; then source ~/.bashrc >/dev/null 2>&1; fi; sync' 2>/dev/null || true)"
   output="${output//$'\r'/}"
   output="$(printf '%s\n' "$output" | awk 'NF{print; exit}')"
   output="$(printf '%s' "$output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
-  # Fallback to interactive shell if alias is defined only there.
   if [[ -z "$output" ]]; then
     output="$(kubectl -n "$ns" exec "$pod" -- bash -ic 'sync' 2>/dev/null || true)"
     output="${output//$'\r'/}"
@@ -179,9 +428,32 @@ run_install() {
     -f "$OP_VALUES_FILE"
 }
 
+run_bootstrap_baremetal() {
+  require_bin kubectl
+  require_bin helm
+  if ! cluster_is_baremetal && ! is_true "$FORCE_BAREMETAL_BOOTSTRAP"; then
+    echo "Cluster looks like cloud/managed (node providerID is set)."
+    echo "Use FORCE_BAREMETAL_BOOTSTRAP=true if you really want to bootstrap Longhorn+Vault here."
+    exit 1
+  fi
+  ensure_baremetal_stack
+  echo "[baremetal] Bootstrap completed."
+}
+
 run_start() {
   require_bin helm
+  require_bin kubectl
+
   local replicas="${1:-}"
+  local -a extra_overrides=()
+
+  if should_bootstrap_baremetal; then
+    ensure_baremetal_stack
+    append_baremetal_key_overrides extra_overrides
+  else
+    validate_external_key_prereqs
+  fi
+
   if [[ -n "$replicas" ]]; then
     if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
       echo "Error: replicas must be a positive integer." >&2
@@ -191,18 +463,21 @@ run_start() {
       -n "$OP_NAMESPACE" \
       -f "$OP_VALUES_FILE" \
       -f "$TON_VALUES_FILE" \
-      --set "tonNode.replicas=$replicas"
+      --set "tonNode.replicas=$replicas" \
+      "${extra_overrides[@]}"
     return
   fi
 
   helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
     -n "$OP_NAMESPACE" \
     -f "$OP_VALUES_FILE" \
-    -f "$TON_VALUES_FILE"
+    -f "$TON_VALUES_FILE" \
+    "${extra_overrides[@]}"
 }
 
 run_upgrade() {
   require_bin helm
+  require_bin kubectl
   if [[ $# -gt 1 ]]; then
     echo "Error: usage: kubeton upgrade [tag]" >&2
     exit 1
@@ -213,11 +488,20 @@ run_upgrade() {
     exit 1
   fi
 
+  local -a extra_overrides=()
+  if should_bootstrap_baremetal; then
+    ensure_baremetal_stack
+    append_baremetal_key_overrides extra_overrides
+  else
+    validate_external_key_prereqs
+  fi
+
   helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
     -n "$OP_NAMESPACE" \
     -f "$OP_VALUES_FILE" \
     -f "$TON_VALUES_FILE" \
     --set-string "tonNode.image=${TON_IMAGE_REPO}:${tag}" \
+    "${extra_overrides[@]}" \
     --rollback-on-failure \
     --wait \
     --timeout 40m
@@ -316,6 +600,9 @@ main() {
   case "$command" in
     install)
       run_install
+      ;;
+    bootstrap-baremetal)
+      run_bootstrap_baremetal
       ;;
     start)
       run_start "${1:-}"

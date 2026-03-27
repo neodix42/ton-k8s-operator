@@ -7,7 +7,7 @@ tonNode:
   storage:
     tonWorkSize: 200Gi
     myTonCoreSize: 20Gi
-    storageClassName: local-path
+    storageClassName: ""
     accessModes:
       - ReadWriteOnce
   resources:
@@ -25,9 +25,9 @@ tonNode:
     hostPortsEnabled: true
     publicIP: ""
   keyManagement:
-    enabled: false
+    enabled: true
     provider: vault
-    credentialsSecretRef: ""
+    credentialsSecretRef: ton-vault-creds
     vaultTransitKey: ton-validator
     kmsKeyID: ""
     kmsVendor: aws
@@ -36,7 +36,7 @@ tonNode:
       walletsSizeLimit: 512Mi
     encryptedBundle:
       pvcSize: 5Gi
-      storageClassName: ""
+      storageClassName: encrypted-sc
       accessModes:
         - ReadWriteOnce
       fileName: keys.bundle.enc

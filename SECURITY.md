@@ -141,6 +141,11 @@ kubectl -n default create secret generic tonnode-key-provider \
   --from-literal=VAULT_NAMESPACE=ton
 ```
 
+Bare-metal automated profile (`kubeton start` or `kubeton bootstrap-baremetal`) creates:
+- in-cluster Vault deployment
+- Transit key and policy
+- TON credential secret `ton-vault-creds` in TON namespace (default `default`)
+
 ### 4.2 AWS KMS (`provider: kms`, `kmsVendor: aws`)
 
 Usually required in secret (unless workload identity/IRSA is used):
@@ -264,3 +269,22 @@ Note: this is outside the operator scope and must be implemented by cluster admi
 2. Sidecar uses a temporary plaintext archive during backup inside container ephemeral FS.
 3. KMS mode depends on required CLI/tooling present in `keyManagement.agent.image`.
 4. This model protects key files at rest and in regular runtime flows, not memory forensics or kernel compromise.
+
+## 10. Bare-Metal Auto Bootstrap
+
+`kubeton` now includes a bare-metal bootstrap profile that runs before TON deployment:
+
+1. installs Longhorn v1 (`LONGHORN_CHART_VERSION`, default `1.10.0`)
+2. creates Longhorn crypto secret and encrypted StorageClass `encrypted-sc`
+3. installs Vault chart (`VAULT_CHART_VERSION`, default `0.30.0`)
+4. initializes/unseals Vault, enables Transit, creates Transit key `ton-validator`
+5. creates Vault policy + token and writes TON secret `ton-vault-creds`
+6. deploys TonNode with key-management enabled and encrypted bundle storage class set to `encrypted-sc`
+
+Operational note:
+- bootstrap stores Vault unseal/root material in Kubernetes secret `ton-vault-bootstrap` (namespace `vault`)
+- rotate and restrict access to this secret, or replace bootstrap flow with your production Vault process
+
+Cloud clusters:
+- bare-metal bootstrap is skipped by default
+- admins must provide prerequisites (encrypted StorageClass + Vault/KMS credentials secret) before TON start
