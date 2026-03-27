@@ -43,27 +43,39 @@ import (
 )
 
 const (
-	defaultImage                 = "ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
-	defaultReplicas        int32 = 1
-	defaultTonWorkSize           = "200Gi"
-	defaultMyTonCoreSize         = "20Gi"
-	defaultCPURequest            = "16000m"
-	defaultMemoryRequest         = "64Gi"
-	defaultCPULimit              = "128000m"
-	defaultMemoryLimit           = "256Gi"
-	defaultGlobalConfigURL       = "https://ton.org/global.config.json"
-	defaultValidatorPort   int32 = 30001
-	defaultLiteServerPort  int32 = 30003
-	defaultConsolePort     int32 = 30002
+	defaultImage                       = "ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
+	defaultReplicas              int32 = 1
+	defaultTonWorkSize                 = "200Gi"
+	defaultMyTonCoreSize               = "20Gi"
+	defaultCPURequest                  = "16000m"
+	defaultMemoryRequest               = "64Gi"
+	defaultCPULimit                    = "128000m"
+	defaultMemoryLimit                 = "256Gi"
+	defaultGlobalConfigURL             = "https://ton.org/global.config.json"
+	defaultValidatorPort         int32 = 30001
+	defaultLiteServerPort        int32 = 30003
+	defaultConsolePort           int32 = 30002
+	defaultKeyProvider                 = "vault"
+	defaultKeyAgentImage               = "ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
+	defaultKeysTmpfsSize               = "128Mi"
+	defaultWalletsTmpfsSize            = "512Mi"
+	defaultKeyBundlePVCSize            = "5Gi"
+	defaultKeyBundleFileName           = "keys.bundle.enc"
+	defaultKeyBundleMetaFileName       = "keys.bundle.meta"
+	defaultKeyBackupIntervalSec        = int32(300)
 
 	tonContainerName = "ton-node"
 	tonWorkClaimName = "ton-work"
 	myTonCoreClaim   = "mytoncore"
+	keyBundleClaim   = "keybundle"
 
 	headlessServiceSuffix    = "headless"
 	bootstrapConfigVolume    = "bootstrap-config"
 	bootstrapConfigMountPath = "/bootstrap"
 	configSecretKey          = "config.json"
+	keysTmpfsVolume          = "ton-keys-tmpfs"
+	walletsTmpfsVolume       = "wallets-tmpfs"
+	keyBundleMountPath       = "/var/ton-key-bundle"
 
 	readyConditionType = "Ready"
 )
@@ -97,6 +109,13 @@ func (r *TonNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	replicas := desiredReplicas(&tonNode)
 	if tonNode.Spec.ConfigRef != nil && replicas > 1 {
 		message := "spec.configRef supports replicas=1 only to avoid sharing a single config.json across replicas"
+		if err := r.updateStatus(ctx, &tonNode, 0, "", false, "InvalidSpec", message); err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("TonNode spec is not reconcilable", "name", req.NamespacedName, "reason", message)
+		return ctrl.Result{}, nil
+	}
+	if message := validateKeyManagementSpec(&tonNode); message != "" {
 		if err := r.updateStatus(ctx, &tonNode, 0, "", false, "InvalidSpec", message); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -267,6 +286,18 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		}
 	}
 
+	volumeMounts := []corev1.VolumeMount{
+		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
+		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
+	}
+	if keyManagementEnabled(tonNode) {
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
+			corev1.VolumeMount{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
+			corev1.VolumeMount{Name: keyBundleClaim, MountPath: keyBundleMountPath},
+		)
+	}
+
 	container := corev1.Container{
 		Name:            tonContainerName,
 		Image:           desiredImage(tonNode),
@@ -274,34 +305,53 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		Env:             env,
 		Resources:       desiredResources(tonNode),
 		Ports:           containerPorts,
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
-			{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
-		},
+		VolumeMounts:    volumeMounts,
 	}
 
 	podSpec := corev1.PodSpec{
 		Affinity:   requiredPodAntiAffinity(labels),
 		Containers: []corev1.Container{container},
 	}
-
-	if tonNode.Spec.ConfigRef != nil {
-		podSpec.InitContainers = []corev1.Container{
-			{
-				Name:            "bootstrap-config",
-				Image:           "busybox:1.36",
-				ImagePullPolicy: corev1.PullIfNotPresent,
-				Command: []string{
-					"sh",
-					"-c",
-					"if [ -f /bootstrap/config.json ] && [ ! -f /var/ton-work/db/config.json ]; then cp /bootstrap/config.json /var/ton-work/db/config.json; fi",
-				},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: bootstrapConfigVolume, MountPath: bootstrapConfigMountPath, ReadOnly: true},
-					{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
+	if keyManagementEnabled(tonNode) {
+		podSpec.Volumes = append(podSpec.Volumes,
+			corev1.Volume{
+				Name: keysTmpfsVolume,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{
+						Medium:    corev1.StorageMediumMemory,
+						SizeLimit: ptr.To(parseQuantityOrDefault(desiredKeysTmpfsSize(tonNode), defaultKeysTmpfsSize)),
+					},
 				},
 			},
-		}
+			corev1.Volume{
+				Name: walletsTmpfsVolume,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{
+						Medium:    corev1.StorageMediumMemory,
+						SizeLimit: ptr.To(parseQuantityOrDefault(desiredWalletsTmpfsSize(tonNode), defaultWalletsTmpfsSize)),
+					},
+				},
+			},
+		)
+		podSpec.InitContainers = append(podSpec.InitContainers, desiredKeyRestoreInitContainer(tonNode))
+		podSpec.Containers = append(podSpec.Containers, desiredKeyBackupSidecar(tonNode))
+	}
+
+	if tonNode.Spec.ConfigRef != nil {
+		podSpec.InitContainers = append(podSpec.InitContainers, corev1.Container{
+			Name:            "bootstrap-config",
+			Image:           "busybox:1.36",
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Command: []string{
+				"sh",
+				"-c",
+				"if [ -f /bootstrap/config.json ] && [ ! -f /var/ton-work/db/config.json ]; then cp /bootstrap/config.json /var/ton-work/db/config.json; fi",
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: bootstrapConfigVolume, MountPath: bootstrapConfigMountPath, ReadOnly: true},
+				{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
+			},
+		})
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
 			Name: bootstrapConfigVolume,
 			VolumeSource: corev1.VolumeSource{
@@ -334,7 +384,7 @@ func desiredVolumeClaims(
 	tonWorkSize := parseQuantityOrDefault(tonNode.Spec.Storage.TonWorkSize, defaultTonWorkSize)
 	myTonCoreSize := parseQuantityOrDefault(tonNode.Spec.Storage.MyTonCoreSize, defaultMyTonCoreSize)
 
-	return []corev1.PersistentVolumeClaim{
+	claims := []corev1.PersistentVolumeClaim{
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: tonWorkClaimName},
 			Spec: corev1.PersistentVolumeClaimSpec{
@@ -360,7 +410,614 @@ func desiredVolumeClaims(
 			},
 		},
 	}
+
+	if !keyManagementEnabled(tonNode) {
+		return claims
+	}
+
+	keyAccessModes := desiredKeyBundleAccessModes(tonNode)
+	keyStorageClassName := desiredKeyBundleStorageClassName(tonNode, storageClassName)
+	keyBundleSize := parseQuantityOrDefault(desiredKeyBundlePVCSize(tonNode), defaultKeyBundlePVCSize)
+	claims = append(claims, corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: keyBundleClaim},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      keyAccessModes,
+			StorageClassName: keyStorageClassName,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: keyBundleSize,
+				},
+			},
+		},
+	})
+
+	return claims
 }
+
+func keyManagementEnabled(tonNode *tonv1alpha1.TonNode) bool {
+	return tonNode.Spec.KeyManagement != nil && tonNode.Spec.KeyManagement.Enabled
+}
+
+func validateKeyManagementSpec(tonNode *tonv1alpha1.TonNode) string {
+	if !keyManagementEnabled(tonNode) {
+		return ""
+	}
+
+	keySpec := tonNode.Spec.KeyManagement
+	if keySpec.CredentialsSecretRef == nil || strings.TrimSpace(keySpec.CredentialsSecretRef.Name) == "" {
+		return "spec.keyManagement.credentialsSecretRef.name is required when key management is enabled"
+	}
+
+	switch desiredKeyProvider(tonNode) {
+	case "vault":
+		if strings.TrimSpace(desiredVaultTransitKey(tonNode)) == "" {
+			return "spec.keyManagement.vaultTransitKey is required for provider=vault"
+		}
+	case "kms":
+		if strings.TrimSpace(desiredKMSKeyID(tonNode)) == "" {
+			return "spec.keyManagement.kmsKeyID is required for provider=kms"
+		}
+		switch desiredKMSVendor(tonNode) {
+		case "aws", "gcp":
+			// ok
+		default:
+			return "spec.keyManagement.kmsVendor must be aws or gcp for provider=kms"
+		}
+	default:
+		return "spec.keyManagement.provider must be vault or kms"
+	}
+
+	if desiredKeyBackupIntervalSeconds(tonNode) < 30 {
+		return "spec.keyManagement.encryptedBundle.backupIntervalSeconds must be >= 30"
+	}
+
+	return ""
+}
+
+func desiredKeyProvider(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultKeyProvider
+	}
+	if provider := strings.TrimSpace(tonNode.Spec.KeyManagement.Provider); provider != "" {
+		return strings.ToLower(provider)
+	}
+	return defaultKeyProvider
+}
+
+func desiredVaultTransitKey(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return ""
+	}
+	return strings.TrimSpace(tonNode.Spec.KeyManagement.VaultTransitKey)
+}
+
+func desiredKMSKeyID(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return ""
+	}
+	return strings.TrimSpace(tonNode.Spec.KeyManagement.KMSKeyID)
+}
+
+func desiredKMSVendor(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(tonNode.Spec.KeyManagement.KMSVendor))
+}
+
+func desiredKeyAgentImage(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultKeyAgentImage
+	}
+	if image := strings.TrimSpace(tonNode.Spec.KeyManagement.Agent.Image); image != "" {
+		return image
+	}
+	return defaultKeyAgentImage
+}
+
+func desiredKeyAgentImagePullPolicy(tonNode *tonv1alpha1.TonNode) corev1.PullPolicy {
+	if imageUsesLatestTag(desiredKeyAgentImage(tonNode)) {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
+func desiredKeyAgentResources(tonNode *tonv1alpha1.TonNode) corev1.ResourceRequirements {
+	if tonNode.Spec.KeyManagement == nil {
+		return corev1.ResourceRequirements{}
+	}
+	return tonNode.Spec.KeyManagement.Agent.Resources
+}
+
+func desiredKeysTmpfsSize(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultKeysTmpfsSize
+	}
+	size := strings.TrimSpace(tonNode.Spec.KeyManagement.InMemory.KeysSizeLimit)
+	if size == "" {
+		return defaultKeysTmpfsSize
+	}
+	return size
+}
+
+func desiredWalletsTmpfsSize(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultWalletsTmpfsSize
+	}
+	size := strings.TrimSpace(tonNode.Spec.KeyManagement.InMemory.WalletsSizeLimit)
+	if size == "" {
+		return defaultWalletsTmpfsSize
+	}
+	return size
+}
+
+func desiredKeyBundlePVCSize(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultKeyBundlePVCSize
+	}
+	size := strings.TrimSpace(tonNode.Spec.KeyManagement.EncryptedBundle.PVCSize)
+	if size == "" {
+		return defaultKeyBundlePVCSize
+	}
+	return size
+}
+
+func desiredKeyBundleStorageClassName(
+	tonNode *tonv1alpha1.TonNode,
+	defaultStorageClassName *string,
+) *string {
+	if tonNode.Spec.KeyManagement == nil || tonNode.Spec.KeyManagement.EncryptedBundle.StorageClassName == nil {
+		return defaultStorageClassName
+	}
+	name := strings.TrimSpace(*tonNode.Spec.KeyManagement.EncryptedBundle.StorageClassName)
+	if name == "" {
+		return defaultStorageClassName
+	}
+	return &name
+}
+
+func desiredKeyBundleAccessModes(tonNode *tonv1alpha1.TonNode) []corev1.PersistentVolumeAccessMode {
+	if tonNode.Spec.KeyManagement == nil || len(tonNode.Spec.KeyManagement.EncryptedBundle.AccessModes) == 0 {
+		return []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	}
+	return tonNode.Spec.KeyManagement.EncryptedBundle.AccessModes
+}
+
+func desiredKeyBundleFileName(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultKeyBundleFileName
+	}
+	name := strings.TrimSpace(tonNode.Spec.KeyManagement.EncryptedBundle.FileName)
+	if name == "" {
+		return defaultKeyBundleFileName
+	}
+	return name
+}
+
+func desiredKeyBundleMetaFileName(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultKeyBundleMetaFileName
+	}
+	name := strings.TrimSpace(tonNode.Spec.KeyManagement.EncryptedBundle.MetaFileName)
+	if name == "" {
+		return defaultKeyBundleMetaFileName
+	}
+	return name
+}
+
+func desiredKeyBackupIntervalSeconds(tonNode *tonv1alpha1.TonNode) int32 {
+	if tonNode.Spec.KeyManagement == nil {
+		return defaultKeyBackupIntervalSec
+	}
+	interval := tonNode.Spec.KeyManagement.EncryptedBundle.BackupIntervalSeconds
+	if interval <= 0 {
+		return defaultKeyBackupIntervalSec
+	}
+	return interval
+}
+
+func desiredKeyAgentSecretName(tonNode *tonv1alpha1.TonNode) string {
+	if tonNode.Spec.KeyManagement == nil || tonNode.Spec.KeyManagement.CredentialsSecretRef == nil {
+		return ""
+	}
+	return strings.TrimSpace(tonNode.Spec.KeyManagement.CredentialsSecretRef.Name)
+}
+
+func desiredKeyAgentEnvFrom(tonNode *tonv1alpha1.TonNode) []corev1.EnvFromSource {
+	secretName := desiredKeyAgentSecretName(tonNode)
+	if secretName == "" {
+		return nil
+	}
+	return []corev1.EnvFromSource{
+		{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Optional:             ptr.To(false),
+			},
+		},
+	}
+}
+
+func desiredKeyAgentEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: "KEY_PROVIDER", Value: desiredKeyProvider(tonNode)},
+		{Name: "KEY_BUNDLE_FILE", Value: desiredKeyBundleFileName(tonNode)},
+		{Name: "KEY_BUNDLE_META_FILE", Value: desiredKeyBundleMetaFileName(tonNode)},
+		{Name: "KEY_BACKUP_INTERVAL_SECONDS", Value: strconv.Itoa(int(desiredKeyBackupIntervalSeconds(tonNode)))},
+	}
+	if value := desiredVaultTransitKey(tonNode); value != "" {
+		env = append(env, corev1.EnvVar{Name: "VAULT_TRANSIT_KEY", Value: value})
+	}
+	if value := desiredKMSKeyID(tonNode); value != "" {
+		env = append(env, corev1.EnvVar{Name: "KMS_KEY_ID", Value: value})
+	}
+	if value := desiredKMSVendor(tonNode); value != "" {
+		env = append(env, corev1.EnvVar{Name: "KMS_VENDOR", Value: value})
+	}
+	return env
+}
+
+func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
+	return []corev1.VolumeMount{
+		{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
+		{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
+		{Name: keyBundleClaim, MountPath: keyBundleMountPath},
+	}
+}
+
+func desiredKeyRestoreInitContainer(tonNode *tonv1alpha1.TonNode) corev1.Container {
+	return corev1.Container{
+		Name:            "key-restore",
+		Image:           desiredKeyAgentImage(tonNode),
+		ImagePullPolicy: desiredKeyAgentImagePullPolicy(tonNode),
+		Command:         []string{"sh", "-ec", keyRestoreScript},
+		Env:             desiredKeyAgentEnv(tonNode),
+		EnvFrom:         desiredKeyAgentEnvFrom(tonNode),
+		Resources:       desiredKeyAgentResources(tonNode),
+		VolumeMounts:    desiredKeyAgentVolumeMounts(),
+	}
+}
+
+func desiredKeyBackupSidecar(tonNode *tonv1alpha1.TonNode) corev1.Container {
+	return corev1.Container{
+		Name:            "key-backup",
+		Image:           desiredKeyAgentImage(tonNode),
+		ImagePullPolicy: desiredKeyAgentImagePullPolicy(tonNode),
+		Command:         []string{"sh", "-ec", keyBackupScript},
+		Env:             desiredKeyAgentEnv(tonNode),
+		EnvFrom:         desiredKeyAgentEnvFrom(tonNode),
+		Resources:       desiredKeyAgentResources(tonNode),
+		VolumeMounts:    desiredKeyAgentVolumeMounts(),
+	}
+}
+
+const keyRestoreScript = `
+set -eu
+
+KEYS_DIR="/var/ton-work/keys"
+WALLETS_DIR="/usr/local/bin/mytoncore/wallets"
+BUNDLE_DIR="/var/ton-key-bundle"
+BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
+META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
+
+need_bin() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required binary: $1" >&2
+    exit 1
+  }
+}
+
+read_meta_value() {
+  key="$1"
+  awk -F= -v wanted="$key" '$1 == wanted {print substr($0, index($0, "=") + 1); exit}' "$META_FILE"
+}
+
+vault_decrypt() {
+  wrapped="$1"
+  need_bin curl
+  need_bin jq
+  if [ -z "${VAULT_ADDR:-}" ] || [ -z "${VAULT_TOKEN:-}" ] || [ -z "${VAULT_TRANSIT_KEY:-}" ]; then
+    echo "vault provider requires VAULT_ADDR, VAULT_TOKEN and VAULT_TRANSIT_KEY" >&2
+    return 1
+  fi
+
+  payload="$(printf '{"ciphertext":"%s"}' "$wrapped")"
+  if [ -n "${VAULT_NAMESPACE:-}" ]; then
+    resp="$(curl -fsS \
+      -H "X-Vault-Token: ${VAULT_TOKEN}" \
+      -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+      -H "Content-Type: application/json" \
+      --request POST \
+      --data "$payload" \
+      "${VAULT_ADDR%/}/v1/transit/decrypt/${VAULT_TRANSIT_KEY}")"
+  else
+    resp="$(curl -fsS \
+      -H "X-Vault-Token: ${VAULT_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --request POST \
+      --data "$payload" \
+      "${VAULT_ADDR%/}/v1/transit/decrypt/${VAULT_TRANSIT_KEY}")"
+  fi
+
+  printf '%s' "$resp" | jq -r '.data.plaintext' | base64 -d
+}
+
+kms_decrypt() {
+  wrapped="$1"
+  case "${KMS_VENDOR:-}" in
+    aws)
+      need_bin aws
+      if [ -z "${KMS_KEY_ID:-}" ]; then
+        echo "kms provider requires KMS_KEY_ID for aws" >&2
+        return 1
+      fi
+      blob_file="$(mktemp)"
+      printf '%s' "$wrapped" | base64 -d >"$blob_file"
+      plaintext_b64="$(aws kms decrypt --key-id "$KMS_KEY_ID" --ciphertext-blob "fileb://${blob_file}" --query Plaintext --output text)"
+      rm -f "$blob_file"
+      printf '%s' "$plaintext_b64" | base64 -d
+      ;;
+    gcp)
+      need_bin gcloud
+      if [ -z "${KMS_PROJECT_ID:-}" ] || [ -z "${KMS_LOCATION:-}" ] || [ -z "${KMS_KEY_RING:-}" ] || [ -z "${KMS_KEY_ID:-}" ]; then
+        echo "gcp kms requires KMS_PROJECT_ID, KMS_LOCATION, KMS_KEY_RING and KMS_KEY_ID" >&2
+        return 1
+      fi
+      cipher_file="$(mktemp)"
+      plain_file="$(mktemp)"
+      printf '%s' "$wrapped" | base64 -d >"$cipher_file"
+      gcloud kms decrypt \
+        --project "$KMS_PROJECT_ID" \
+        --location "$KMS_LOCATION" \
+        --keyring "$KMS_KEY_RING" \
+        --key "$KMS_KEY_ID" \
+        --ciphertext-file "$cipher_file" \
+        --plaintext-file "$plain_file" >/dev/null
+      cat "$plain_file"
+      rm -f "$cipher_file" "$plain_file"
+      ;;
+    *)
+      echo "unsupported KMS_VENDOR=${KMS_VENDOR:-}" >&2
+      return 1
+      ;;
+  esac
+}
+
+unwrap_data_key() {
+  wrapped="$1"
+  case "${KEY_PROVIDER:-}" in
+    vault)
+      vault_decrypt "$wrapped"
+      ;;
+    kms)
+      kms_decrypt "$wrapped"
+      ;;
+    *)
+      echo "unsupported KEY_PROVIDER=${KEY_PROVIDER:-}" >&2
+      return 1
+      ;;
+  esac
+}
+
+need_bin tar
+need_bin openssl
+need_bin base64
+mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$BUNDLE_DIR"
+
+if [ ! -s "$BUNDLE_FILE" ] || [ ! -s "$META_FILE" ]; then
+  echo "no encrypted key bundle found; first run will create one"
+  exit 0
+fi
+
+wrapped_key="$(read_meta_value wrapped_key)"
+if [ -z "$wrapped_key" ]; then
+  echo "key bundle metadata missing wrapped_key" >&2
+  exit 1
+fi
+
+DATA_KEY_B64="$(unwrap_data_key "$wrapped_key")"
+if [ -z "$DATA_KEY_B64" ]; then
+  echo "failed to unwrap data key" >&2
+  exit 1
+fi
+export DATA_KEY_B64
+
+work_dir="$(mktemp -d)"
+trap 'rm -rf "$work_dir"' EXIT
+
+openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 \
+  -pass env:DATA_KEY_B64 \
+  -in "$BUNDLE_FILE" \
+  -out "$work_dir/bundle.tar.gz"
+
+mkdir -p "$work_dir/unpacked"
+tar -xzf "$work_dir/bundle.tar.gz" -C "$work_dir/unpacked"
+
+find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+find "$WALLETS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+
+if [ -d "$work_dir/unpacked/keys" ]; then
+  cp -a "$work_dir/unpacked/keys/." "$KEYS_DIR/"
+fi
+if [ -d "$work_dir/unpacked/wallets" ]; then
+  cp -a "$work_dir/unpacked/wallets/." "$WALLETS_DIR/"
+fi
+
+chmod 700 "$KEYS_DIR" "$WALLETS_DIR" || true
+echo "encrypted key bundle restored"
+`
+
+const keyBackupScript = `
+set -eu
+
+KEYS_DIR="/var/ton-work/keys"
+WALLETS_DIR="/usr/local/bin/mytoncore/wallets"
+BUNDLE_DIR="/var/ton-key-bundle"
+BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
+META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
+
+need_bin() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required binary: $1" >&2
+    exit 1
+  }
+}
+
+vault_encrypt() {
+  data_key_b64="$1"
+  need_bin curl
+  need_bin jq
+  if [ -z "${VAULT_ADDR:-}" ] || [ -z "${VAULT_TOKEN:-}" ] || [ -z "${VAULT_TRANSIT_KEY:-}" ]; then
+    echo "vault provider requires VAULT_ADDR, VAULT_TOKEN and VAULT_TRANSIT_KEY" >&2
+    return 1
+  fi
+
+  plaintext="$(printf '%s' "$data_key_b64" | base64 | tr -d '\n')"
+  payload="$(printf '{"plaintext":"%s"}' "$plaintext")"
+  if [ -n "${VAULT_NAMESPACE:-}" ]; then
+    resp="$(curl -fsS \
+      -H "X-Vault-Token: ${VAULT_TOKEN}" \
+      -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
+      -H "Content-Type: application/json" \
+      --request POST \
+      --data "$payload" \
+      "${VAULT_ADDR%/}/v1/transit/encrypt/${VAULT_TRANSIT_KEY}")"
+  else
+    resp="$(curl -fsS \
+      -H "X-Vault-Token: ${VAULT_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --request POST \
+      --data "$payload" \
+      "${VAULT_ADDR%/}/v1/transit/encrypt/${VAULT_TRANSIT_KEY}")"
+  fi
+
+  printf '%s' "$resp" | jq -r '.data.ciphertext'
+}
+
+kms_encrypt() {
+  data_key_b64="$1"
+  case "${KMS_VENDOR:-}" in
+    aws)
+      need_bin aws
+      if [ -z "${KMS_KEY_ID:-}" ]; then
+        echo "kms provider requires KMS_KEY_ID for aws" >&2
+        return 1
+      fi
+      plain_file="$(mktemp)"
+      printf '%s' "$data_key_b64" >"$plain_file"
+      aws kms encrypt --key-id "$KMS_KEY_ID" --plaintext "fileb://${plain_file}" --query CiphertextBlob --output text
+      rm -f "$plain_file"
+      ;;
+    gcp)
+      need_bin gcloud
+      if [ -z "${KMS_PROJECT_ID:-}" ] || [ -z "${KMS_LOCATION:-}" ] || [ -z "${KMS_KEY_RING:-}" ] || [ -z "${KMS_KEY_ID:-}" ]; then
+        echo "gcp kms requires KMS_PROJECT_ID, KMS_LOCATION, KMS_KEY_RING and KMS_KEY_ID" >&2
+        return 1
+      fi
+      plain_file="$(mktemp)"
+      cipher_file="$(mktemp)"
+      printf '%s' "$data_key_b64" >"$plain_file"
+      gcloud kms encrypt \
+        --project "$KMS_PROJECT_ID" \
+        --location "$KMS_LOCATION" \
+        --keyring "$KMS_KEY_RING" \
+        --key "$KMS_KEY_ID" \
+        --plaintext-file "$plain_file" \
+        --ciphertext-file "$cipher_file" >/dev/null
+      base64 <"$cipher_file" | tr -d '\n'
+      rm -f "$plain_file" "$cipher_file"
+      ;;
+    *)
+      echo "unsupported KMS_VENDOR=${KMS_VENDOR:-}" >&2
+      return 1
+      ;;
+  esac
+}
+
+wrap_data_key() {
+  data_key_b64="$1"
+  case "${KEY_PROVIDER:-}" in
+    vault)
+      vault_encrypt "$data_key_b64"
+      ;;
+    kms)
+      kms_encrypt "$data_key_b64"
+      ;;
+    *)
+      echo "unsupported KEY_PROVIDER=${KEY_PROVIDER:-}" >&2
+      return 1
+      ;;
+  esac
+}
+
+keys_present() {
+  if find "$KEYS_DIR" -mindepth 1 -print -quit | grep -q .; then
+    return 0
+  fi
+  if find "$WALLETS_DIR" -mindepth 1 -print -quit | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
+perform_backup() {
+  need_bin tar
+  need_bin openssl
+  need_bin base64
+  mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$BUNDLE_DIR"
+
+  if ! keys_present; then
+    echo "key material not present yet; backup skipped"
+    return 0
+  fi
+
+  work_dir="$(mktemp -d)"
+
+  mkdir -p "$work_dir/stage/keys" "$work_dir/stage/wallets"
+  cp -a "$KEYS_DIR/." "$work_dir/stage/keys/" 2>/dev/null || true
+  cp -a "$WALLETS_DIR/." "$work_dir/stage/wallets/" 2>/dev/null || true
+  tar -czf "$work_dir/bundle.tar.gz" -C "$work_dir/stage" keys wallets
+
+  DATA_KEY_B64="$(openssl rand -base64 48 | tr -d '\n')"
+  export DATA_KEY_B64
+  wrapped_key="$(wrap_data_key "$DATA_KEY_B64")"
+  if [ -z "$wrapped_key" ]; then
+    echo "failed to wrap data key" >&2
+    exit 1
+  fi
+
+  openssl enc -aes-256-cbc -pbkdf2 -md sha256 \
+    -pass env:DATA_KEY_B64 \
+    -in "$work_dir/bundle.tar.gz" \
+    -out "$work_dir/bundle.enc"
+
+  {
+    echo "provider=${KEY_PROVIDER}"
+    echo "wrapped_key=${wrapped_key}"
+    echo "algorithm=aes-256-cbc-pbkdf2"
+    echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$work_dir/bundle.meta"
+
+  mv "$work_dir/bundle.enc" "$BUNDLE_FILE"
+  mv "$work_dir/bundle.meta" "$META_FILE"
+  chmod 600 "$BUNDLE_FILE" "$META_FILE" || true
+  unset DATA_KEY_B64
+  rm -rf "$work_dir"
+  echo "encrypted key bundle updated"
+}
+
+shutdown() {
+  perform_backup
+  exit 0
+}
+trap shutdown TERM INT
+
+while true; do
+  perform_backup
+  sleep "$KEY_BACKUP_INTERVAL_SECONDS" &
+  wait $!
+done
+`
 
 func requiredPodAntiAffinity(labels map[string]string) *corev1.Affinity {
 	return &corev1.Affinity{

@@ -44,6 +44,7 @@ The CRD includes:
 - `resources`
 - `network`
 - `configRef`
+- `keyManagement`
 - `env`
 
 See sample:
@@ -51,16 +52,18 @@ See sample:
 
 ## Key and Secret Strategy
 
-`ton-docker-ctrl` generates `/var/ton-work/db/config.json` (including Ed25519 private keys) on first startup and persists it in the replica PVC.
+Each replica stores TON state in per-pod PVCs and generates keys on the first start.
 
-Current operator behavior:
-- Default mode (recommended for multi-replica): each replica gets its own PVC and independently generates unique keys/config on first boot.
-- Optional bootstrap mode: `spec.configRef` can point to a Secret containing `config.json`; the operator copies it only if config does not exist yet.
+Secure key workflow is available via `spec.keyManagement`:
+- plaintext key directories mounted on tmpfs (memory only)
+- encrypted key bundle persisted on dedicated `keybundle` PVC
+- init container restores/decrypts a bundle before TON start
+- sidecar periodically re-encrypts and stores a bundle via Vault/KMS root-of-trust
 
-Safety rule implemented:
-- `configRef` is currently supported only when `replicas=1`, to avoid cloning one key set across multiple TON nodes.
+`configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
 
-If you want per-replica pre-generated keys from Kubernetes Secrets, the next step is ordinal-aware secret mapping (for example `tonnode-0`, `tonnode-1`, ...).
+For full design, threat model, provider requirements, and hardening steps, see:
+- `SECURITY.md`
 
 ## Prerequisites
 

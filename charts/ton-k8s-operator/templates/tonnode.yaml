@@ -39,6 +39,51 @@ spec:
   configRef:
     name: {{ . }}
   {{- end }}
+  {{- with .Values.tonNode.keyManagement }}
+  {{- if .enabled }}
+  keyManagement:
+    enabled: true
+    provider: {{ .provider }}
+    {{- with .credentialsSecretRef }}
+    credentialsSecretRef:
+      name: {{ . }}
+    {{- end }}
+    {{- if eq .provider "vault" }}
+    {{- with .vaultTransitKey }}
+    vaultTransitKey: {{ . }}
+    {{- end }}
+    {{- end }}
+    {{- if eq .provider "kms" }}
+    {{- with .kmsKeyID }}
+    kmsKeyID: {{ . }}
+    {{- end }}
+    {{- with .kmsVendor }}
+    kmsVendor: {{ . }}
+    {{- end }}
+    {{- end }}
+    inMemory:
+      keysSizeLimit: {{ .inMemory.keysSizeLimit }}
+      walletsSizeLimit: {{ .inMemory.walletsSizeLimit }}
+    encryptedBundle:
+      pvcSize: {{ .encryptedBundle.pvcSize }}
+      {{- with .encryptedBundle.storageClassName }}
+      storageClassName: {{ . }}
+      {{- end }}
+      {{- with .encryptedBundle.accessModes }}
+      accessModes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      fileName: {{ .encryptedBundle.fileName }}
+      metaFileName: {{ .encryptedBundle.metaFileName }}
+      backupIntervalSeconds: {{ .encryptedBundle.backupIntervalSeconds }}
+    agent:
+      image: {{ .agent.image }}
+      {{- with .agent.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- end }}
+  {{- end }}
   {{- with .Values.tonNode.env }}
   env:
     {{- toYaml . | nindent 4 }}

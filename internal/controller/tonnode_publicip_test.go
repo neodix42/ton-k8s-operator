@@ -294,6 +294,208 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateKeyManagementSpec(t *testing.T) {
+	tests := []struct {
+		name    string
+		tonNode *tonv1alpha1.TonNode
+		wantErr bool
+	}{
+		{
+			name:    "disabled key management is valid",
+			tonNode: &tonv1alpha1.TonNode{},
+			wantErr: false,
+		},
+		{
+			name: "enabled without credentials secret is invalid",
+			tonNode: &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+						Enabled:         true,
+						Provider:        "vault",
+						VaultTransitKey: "ton-validator",
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "enabled vault without transit key is invalid",
+			tonNode: &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+						Enabled:  true,
+						Provider: "vault",
+						CredentialsSecretRef: &corev1.LocalObjectReference{
+							Name: "vault-creds",
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "enabled kms without vendor is invalid",
+			tonNode: &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+						Enabled:  true,
+						Provider: "kms",
+						KMSKeyID: "projects/proj/locations/global/keyRings/ring/cryptoKeys/key",
+						CredentialsSecretRef: &corev1.LocalObjectReference{
+							Name: "kms-creds",
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "enabled vault with required fields is valid",
+			tonNode: &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+						Enabled:         true,
+						Provider:        "vault",
+						VaultTransitKey: "ton-validator",
+						CredentialsSecretRef: &corev1.LocalObjectReference{
+							Name: "vault-creds",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "enabled kms with required fields is valid",
+			tonNode: &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+						Enabled:   true,
+						Provider:  "kms",
+						KMSKeyID:  "arn:aws:kms:eu-central-1:111111111111:key/abcd",
+						KMSVendor: "aws",
+						CredentialsSecretRef: &corev1.LocalObjectReference{
+							Name: "kms-creds",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateKeyManagementSpec(tt.tonNode)
+			if tt.wantErr && got == "" {
+				t.Fatalf("validateKeyManagementSpec() expected error, got empty message")
+			}
+			if !tt.wantErr && got != "" {
+				t.Fatalf("validateKeyManagementSpec() unexpected error: %s", got)
+			}
+		})
+	}
+}
+
+func TestDesiredPodTemplateKeyManagement(t *testing.T) {
+	reconciler := &TonNodeReconciler{}
+	labels := map[string]string{"app.kubernetes.io/instance": "tonnode"}
+	publicIP := corev1.EnvVar{Name: "PUBLIC_IP", Value: "95.217.73.161"}
+
+	tonNode := &tonv1alpha1.TonNode{
+		Spec: tonv1alpha1.TonNodeSpec{
+			KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+				Enabled:         true,
+				Provider:        "vault",
+				VaultTransitKey: "ton-validator",
+				CredentialsSecretRef: &corev1.LocalObjectReference{
+					Name: "vault-creds",
+				},
+			},
+		},
+	}
+
+	tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP)
+
+	if len(tpl.Spec.Containers) != 2 {
+		t.Fatalf("expected two containers (ton + sidecar), got %d", len(tpl.Spec.Containers))
+	}
+	if len(tpl.Spec.InitContainers) != 1 {
+		t.Fatalf("expected one init container (key-restore), got %d", len(tpl.Spec.InitContainers))
+	}
+	if tpl.Spec.InitContainers[0].Name != "key-restore" {
+		t.Fatalf("expected init container key-restore, got %q", tpl.Spec.InitContainers[0].Name)
+	}
+	if tpl.Spec.Containers[1].Name != "key-backup" {
+		t.Fatalf("expected sidecar key-backup, got %q", tpl.Spec.Containers[1].Name)
+	}
+
+	main := tpl.Spec.Containers[0]
+	if !hasMount(main.VolumeMounts, keysTmpfsVolume, "/var/ton-work/keys") {
+		t.Fatalf("main container missing keys tmpfs mount")
+	}
+	if !hasMount(main.VolumeMounts, walletsTmpfsVolume, "/usr/local/bin/mytoncore/wallets") {
+		t.Fatalf("main container missing wallets tmpfs mount")
+	}
+	if !hasMount(main.VolumeMounts, keyBundleClaim, keyBundleMountPath) {
+		t.Fatalf("main container missing key bundle mount")
+	}
+
+	if !hasMemoryVolume(tpl.Spec.Volumes, keysTmpfsVolume) {
+		t.Fatalf("pod spec missing memory emptyDir volume %q", keysTmpfsVolume)
+	}
+	if !hasMemoryVolume(tpl.Spec.Volumes, walletsTmpfsVolume) {
+		t.Fatalf("pod spec missing memory emptyDir volume %q", walletsTmpfsVolume)
+	}
+
+	sidecar := tpl.Spec.Containers[1]
+	if !hasEnv(sidecar.Env, "KEY_PROVIDER", "vault") {
+		t.Fatalf("sidecar missing KEY_PROVIDER=vault env")
+	}
+	if len(sidecar.EnvFrom) != 1 || sidecar.EnvFrom[0].SecretRef == nil || sidecar.EnvFrom[0].SecretRef.Name != "vault-creds" {
+		t.Fatalf("sidecar must consume credentials secret vault-creds")
+	}
+}
+
+func TestDesiredVolumeClaimsWithKeyManagement(t *testing.T) {
+	encryptedSC := "encrypted-sc"
+	tonNode := &tonv1alpha1.TonNode{
+		Spec: tonv1alpha1.TonNodeSpec{
+			KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+				Enabled: true,
+				EncryptedBundle: tonv1alpha1.TonNodeEncryptedBundleSpec{
+					PVCSize:          "7Gi",
+					StorageClassName: &encryptedSC,
+					AccessModes: []corev1.PersistentVolumeAccessMode{
+						corev1.ReadWriteOnce,
+					},
+				},
+			},
+		},
+	}
+
+	defaultSC := "default-sc"
+	claims := desiredVolumeClaims(tonNode, &defaultSC)
+	if len(claims) != 3 {
+		t.Fatalf("expected 3 PVC templates with key management, got %d", len(claims))
+	}
+
+	var keyClaim *corev1.PersistentVolumeClaim
+	for i := range claims {
+		if claims[i].Name == keyBundleClaim {
+			keyClaim = &claims[i]
+			break
+		}
+	}
+	if keyClaim == nil {
+		t.Fatalf("missing %q PVC template", keyBundleClaim)
+	}
+	if keyClaim.Spec.StorageClassName == nil || *keyClaim.Spec.StorageClassName != encryptedSC {
+		t.Fatalf("key bundle PVC storageClass = %v, want %s", keyClaim.Spec.StorageClassName, encryptedSC)
+	}
+	assertQuantityEqual(t, keyClaim.Spec.Resources.Requests[corev1.ResourceStorage], "7Gi", "key bundle pvc size")
+}
+
 func containerPortByName(t *testing.T, ports []corev1.ContainerPort, name string) corev1.ContainerPort {
 	t.Helper()
 	for _, port := range ports {
@@ -311,4 +513,34 @@ func assertQuantityEqual(t *testing.T, actual resource.Quantity, expected string
 	if actual.Cmp(want) != 0 {
 		t.Fatalf("%s = %s, want %s", field, actual.String(), expected)
 	}
+}
+
+func hasMount(mounts []corev1.VolumeMount, name string, path string) bool {
+	for _, mount := range mounts {
+		if mount.Name == name && mount.MountPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMemoryVolume(volumes []corev1.Volume, name string) bool {
+	for _, volume := range volumes {
+		if volume.Name != name || volume.EmptyDir == nil {
+			continue
+		}
+		if volume.EmptyDir.Medium == corev1.StorageMediumMemory {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEnv(envVars []corev1.EnvVar, name string, value string) bool {
+	for _, envVar := range envVars {
+		if envVar.Name == name && envVar.Value == value {
+			return true
+		}
+	}
+	return false
 }

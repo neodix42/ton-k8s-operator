@@ -17,6 +17,8 @@ spec:
     liteServerPort: 30003
     validatorConsolePort: 30002
     hostPortsEnabled: true
+  keyManagement:
+    enabled: false
   env:
   - name: MODE
     value: liteserver

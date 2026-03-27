@@ -54,6 +54,10 @@ type TonNodeSpec struct {
 	// Env allows passing extra environment variables to the TON container.
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// KeyManagement enables secure key handling with in-memory keys and encrypted bundles.
+	// +optional
+	KeyManagement *TonNodeKeyManagementSpec `json:"keyManagement,omitempty"`
 }
 
 // TonNodeStorageSpec defines persistent storage settings.
@@ -112,6 +116,98 @@ type TonNodeNetworkSpec struct {
 	// +kubebuilder:default:=true
 	// +optional
 	HostPortsEnabled *bool `json:"hostPortsEnabled,omitempty"`
+}
+
+// TonNodeKeyManagementSpec defines key protection workflow.
+type TonNodeKeyManagementSpec struct {
+	// Enabled toggles secure key handling.
+	// +kubebuilder:default:=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Provider selects the root-of-trust system used to wrap data keys.
+	// +kubebuilder:validation:Enum=vault;kms
+	// +kubebuilder:default:="vault"
+	Provider string `json:"provider,omitempty"`
+
+	// CredentialsSecretRef points to credentials/config required by the selected provider.
+	// +optional
+	CredentialsSecretRef *corev1.LocalObjectReference `json:"credentialsSecretRef,omitempty"`
+
+	// VaultTransitKey is required when provider=vault.
+	// +optional
+	VaultTransitKey string `json:"vaultTransitKey,omitempty"`
+
+	// KMSKeyID is required when provider=kms.
+	// +optional
+	KMSKeyID string `json:"kmsKeyID,omitempty"`
+
+	// KMSVendor selects the KMS CLI flow used by the key agent when provider=kms.
+	// +kubebuilder:validation:Enum=aws;gcp
+	// +optional
+	KMSVendor string `json:"kmsVendor,omitempty"`
+
+	// InMemory configures tmpfs mounts for live key files.
+	// +optional
+	InMemory TonNodeInMemoryKeySpec `json:"inMemory,omitempty"`
+
+	// EncryptedBundle configures where encrypted key bundles are stored at rest.
+	// +optional
+	EncryptedBundle TonNodeEncryptedBundleSpec `json:"encryptedBundle,omitempty"`
+
+	// Agent configures helper containers that restore and backup encrypted bundles.
+	// +optional
+	Agent TonNodeKeyAgentSpec `json:"agent,omitempty"`
+}
+
+// TonNodeInMemoryKeySpec defines tmpfs sizing for live key directories.
+type TonNodeInMemoryKeySpec struct {
+	// KeysSizeLimit is the tmpfs size limit for /var/ton-work/keys.
+	// +kubebuilder:default:="128Mi"
+	KeysSizeLimit string `json:"keysSizeLimit,omitempty"`
+
+	// WalletsSizeLimit is the tmpfs size limit for /usr/local/bin/mytoncore/wallets.
+	// +kubebuilder:default:="512Mi"
+	WalletsSizeLimit string `json:"walletsSizeLimit,omitempty"`
+}
+
+// TonNodeEncryptedBundleSpec defines encrypted key bundle persistence settings.
+type TonNodeEncryptedBundleSpec struct {
+	// PVCSize is the PVC size used for encrypted key bundles.
+	// +kubebuilder:default:="5Gi"
+	PVCSize string `json:"pvcSize,omitempty"`
+
+	// StorageClassName explicitly selects the StorageClass for encrypted bundles.
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// AccessModes configures PVC access modes for encrypted bundles.
+	// Defaults to ReadWriteOnce when omitted.
+	// +optional
+	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+
+	// FileName is the encrypted bundle filename.
+	// +kubebuilder:default:="keys.bundle.enc"
+	FileName string `json:"fileName,omitempty"`
+
+	// MetaFileName stores wrapped key metadata for bundle decryption.
+	// +kubebuilder:default:="keys.bundle.meta"
+	MetaFileName string `json:"metaFileName,omitempty"`
+
+	// BackupIntervalSeconds controls periodic encrypted bundle backup interval.
+	// +kubebuilder:validation:Minimum=30
+	// +kubebuilder:default:=300
+	BackupIntervalSeconds int32 `json:"backupIntervalSeconds,omitempty"`
+}
+
+// TonNodeKeyAgentSpec defines helper container settings for key restore/backup.
+type TonNodeKeyAgentSpec struct {
+	// Image is the init/sidecar image used for key management scripts.
+	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
+	Image string `json:"image,omitempty"`
+
+	// Resources defines CPU and memory requests/limits for key helper containers.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // TonNodeStatus defines the observed state of TonNode.

@@ -24,6 +24,27 @@ tonNode:
     validatorConsolePort: 30002
     hostPortsEnabled: true
     publicIP: ""
+  keyManagement:
+    enabled: false
+    provider: vault
+    credentialsSecretRef: ""
+    vaultTransitKey: ton-validator
+    kmsKeyID: ""
+    kmsVendor: aws
+    inMemory:
+      keysSizeLimit: 128Mi
+      walletsSizeLimit: 512Mi
+    encryptedBundle:
+      pvcSize: 5Gi
+      storageClassName: ""
+      accessModes:
+        - ReadWriteOnce
+      fileName: keys.bundle.enc
+      metaFileName: keys.bundle.meta
+      backupIntervalSeconds: 300
+    agent:
+      image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+      resources: {}
   env:
     - name: TON_BRANCH
       value: latest
