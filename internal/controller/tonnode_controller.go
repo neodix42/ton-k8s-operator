@@ -642,6 +642,8 @@ func desiredKeyAgentEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
 
 func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
+		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
+		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
 		{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
 		{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
 		{Name: keyBundleClaim, MountPath: keyBundleMountPath},
@@ -678,7 +680,11 @@ const keyRestoreScript = `
 set -eu
 
 KEYS_DIR="/var/ton-work/keys"
-WALLETS_DIR="/usr/local/bin/mytoncore/wallets"
+MYTONCORE_DIR="/usr/local/bin/mytoncore"
+WALLETS_DIR="${MYTONCORE_DIR}/wallets"
+TON_DB_DIR="/var/ton-work/db"
+DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
+DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
@@ -785,7 +791,7 @@ unwrap_data_key() {
 need_bin tar
 need_bin openssl
 need_bin base64
-mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$BUNDLE_DIR"
+mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
 if [ ! -s "$BUNDLE_FILE" ] || [ ! -s "$META_FILE" ]; then
   echo "no encrypted key bundle found; first run will create one"
@@ -817,16 +823,26 @@ mkdir -p "$work_dir/unpacked"
 tar -xzf "$work_dir/bundle.tar.gz" -C "$work_dir/unpacked"
 
 find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-find "$WALLETS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+rm -f "$DB_CONFIG_FILE" || true
+rm -rf "$DB_KEYRING_DIR" || true
 
 if [ -d "$work_dir/unpacked/keys" ]; then
   cp -a "$work_dir/unpacked/keys/." "$KEYS_DIR/"
 fi
-if [ -d "$work_dir/unpacked/wallets" ]; then
-  cp -a "$work_dir/unpacked/wallets/." "$WALLETS_DIR/"
+if [ -d "$work_dir/unpacked/mytoncore" ]; then
+  cp -a "$work_dir/unpacked/mytoncore/." "$MYTONCORE_DIR/"
+fi
+if [ -f "$work_dir/unpacked/tondb/config.json" ]; then
+  cp -a "$work_dir/unpacked/tondb/config.json" "$DB_CONFIG_FILE"
+fi
+if [ -d "$work_dir/unpacked/tondb/keyring" ]; then
+  cp -a "$work_dir/unpacked/tondb/keyring" "$DB_KEYRING_DIR"
 fi
 
-chmod 700 "$KEYS_DIR" "$WALLETS_DIR" || true
+chmod 700 "$KEYS_DIR" "$MYTONCORE_DIR" "$WALLETS_DIR" || true
+chmod 700 "$DB_KEYRING_DIR" || true
+chmod 600 "$DB_CONFIG_FILE" || true
 echo "encrypted key bundle restored"
 `
 
@@ -834,7 +850,11 @@ const keyBackupScript = `
 set -eu
 
 KEYS_DIR="/var/ton-work/keys"
-WALLETS_DIR="/usr/local/bin/mytoncore/wallets"
+MYTONCORE_DIR="/usr/local/bin/mytoncore"
+WALLETS_DIR="${MYTONCORE_DIR}/wallets"
+TON_DB_DIR="/var/ton-work/db"
+DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
+DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
@@ -936,11 +956,17 @@ wrap_data_key() {
   esac
 }
 
-keys_present() {
+backup_sources_present() {
   if find "$KEYS_DIR" -mindepth 1 -print -quit | grep -q .; then
     return 0
   fi
-  if find "$WALLETS_DIR" -mindepth 1 -print -quit | grep -q .; then
+  if find "$MYTONCORE_DIR" -mindepth 1 -print -quit | grep -q .; then
+    return 0
+  fi
+  if [ -s "$DB_CONFIG_FILE" ]; then
+    return 0
+  fi
+  if [ -d "$DB_KEYRING_DIR" ] && find "$DB_KEYRING_DIR" -mindepth 1 -print -quit | grep -q .; then
     return 0
   fi
   return 1
@@ -950,19 +976,25 @@ perform_backup() {
   need_bin tar
   need_bin openssl
   need_bin base64
-  mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$BUNDLE_DIR"
+  mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
-  if ! keys_present; then
+  if ! backup_sources_present; then
     echo "key material not present yet; backup skipped"
     return 0
   fi
 
   work_dir="$(mktemp -d)"
 
-  mkdir -p "$work_dir/stage/keys" "$work_dir/stage/wallets"
+  mkdir -p "$work_dir/stage/keys" "$work_dir/stage/mytoncore" "$work_dir/stage/tondb"
   cp -a "$KEYS_DIR/." "$work_dir/stage/keys/" 2>/dev/null || true
-  cp -a "$WALLETS_DIR/." "$work_dir/stage/wallets/" 2>/dev/null || true
-  tar -czf "$work_dir/bundle.tar.gz" -C "$work_dir/stage" keys wallets
+  cp -a "$MYTONCORE_DIR/." "$work_dir/stage/mytoncore/" 2>/dev/null || true
+  if [ -f "$DB_CONFIG_FILE" ]; then
+    cp -a "$DB_CONFIG_FILE" "$work_dir/stage/tondb/config.json"
+  fi
+  if [ -d "$DB_KEYRING_DIR" ]; then
+    cp -a "$DB_KEYRING_DIR" "$work_dir/stage/tondb/keyring"
+  fi
+  tar -czf "$work_dir/bundle.tar.gz" -C "$work_dir/stage" .
 
   DATA_KEY_B64="$(openssl rand -base64 48 | tr -d '\n')"
   export DATA_KEY_B64
@@ -992,7 +1024,7 @@ perform_backup() {
   echo "encrypted key bundle updated"
 }
 
-mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$BUNDLE_DIR"
+mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
 echo "manual backup mode enabled"
 

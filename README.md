@@ -62,6 +62,19 @@ Secure key workflow is available via `spec.keyManagement`:
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
+- restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
+- per replica (default names):
+- `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.enc`
+- `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.meta`
+- `<output-dir>/<namespace>/<statefulset>/<ordinal>/SHA256SUMS`
+- `keys.bundle.enc` is an encrypted tar archive containing all files from pod paths:
+- `/var/ton-work/keys/**` (for example: `client.pub`, `liteserver.pub`, `client`, `server.pub`)
+- `/var/ton-work/db/config.json`
+- `/var/ton-work/db/keyring/**`
+- `/usr/local/bin/mytoncore/**` (entire folder, including wallets and mytoncore state files)
+- `keys.bundle.meta` contains bundle metadata: `provider`, `wrapped_key`, `algorithm`, `created_at`
+- TON DB data outside this set (for example `/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`) is not part of this key bundle backup.
+- if `spec.keyManagement.encryptedBundle.fileName` or `metaFileName` is customized, exported filenames follow those values.
 
 Manual backup is mandatory:
 - run `./kubeton backup-keys` immediately after first key generation/initial setup
@@ -249,6 +262,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton upgrade
 ./kubeton upgrade <tag>
 ./kubeton backup-keys
+./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton status
 ./kubeton exec "sync"
 

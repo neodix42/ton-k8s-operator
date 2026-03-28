@@ -45,6 +45,7 @@ Commands:
   start <num>          Same as start, but overrides tonNode.replicas=<num>.
   upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
+  restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
   stop                 Stop TON fleet (tonNode.enabled=false).
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + uninstall operator release (with confirmation).
@@ -371,6 +372,48 @@ trigger_key_backup_once() {
 
   echo "Error: timeout waiting for manual key backup completion in ${ns}/${pod}" >&2
   return 1
+}
+
+restore_bundle_to_pvc() {
+  local ns="$1"
+  local pvc="$2"
+  local src_bundle_dir="$3"
+  local helper_pod="kubeton-restore-$RANDOM"
+
+  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${helper_pod}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: restore
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: keybundle
+          mountPath: /bundle
+  volumes:
+    - name: keybundle
+      persistentVolumeClaim:
+        claimName: ${pvc}
+EOF
+
+  if ! kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout=120s >/dev/null; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! kubectl -n "$ns" exec "$helper_pod" -- sh -ec 'find /bundle -mindepth 1 -maxdepth 1 -exec rm -rf {} +' >/dev/null 2>&1; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! kubectl -n "$ns" cp "${src_bundle_dir}/." "${helper_pod}:/bundle" >/dev/null; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    return 1
+  fi
+  kubectl -n "$ns" exec "$helper_pod" -- sh -ec 'find /bundle -type f -exec chmod 600 {} +' >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
 }
 
 dash_line() {
@@ -713,6 +756,125 @@ EOF
   echo "Encrypted key bundle backup complete: $output_dir"
 }
 
+run_restore_keys() {
+  require_bin kubectl
+  require_bin sha256sum
+
+  if [[ $# -ne 1 ]]; then
+    echo "Error: usage: kubeton restore-keys <input-dir>" >&2
+    exit 1
+  fi
+  local input_dir="$1"
+  if [[ ! -d "$input_dir" ]]; then
+    echo "Error: restore input dir not found: $input_dir" >&2
+    exit 1
+  fi
+  input_dir="$(cd "$input_dir" && pwd)"
+
+  mapfile -t sts_rows < <(list_ton_statefulsets)
+  if [[ ${#sts_rows[@]} -eq 0 || -z "${sts_rows[0]}" ]]; then
+    echo "No TON StatefulSets found."
+    return
+  fi
+
+  confirm_or_exit "This will overwrite encrypted key bundles from ${input_dir} and restart TON StatefulSets. Continue?"
+
+  local -a ns_list=()
+  local -a sts_list=()
+  local -a replicas_list=()
+  local row ns sts replicas i ordinal pvc item_dir bundle_dir
+  for row in "${sts_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts replicas <<<"$row"
+    replicas="${replicas:-0}"
+    ns_list+=("$ns")
+    sts_list+=("$sts")
+    replicas_list+=("$replicas")
+  done
+
+  local restore_required=1
+  cleanup_restore() {
+    [[ "$restore_required" -ne 1 ]] && return 0
+    local i
+    for i in "${!sts_list[@]}"; do
+      kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas="${replicas_list[$i]}" >/dev/null 2>&1 || true
+    done
+  }
+  trap cleanup_restore EXIT INT TERM
+
+  for i in "${!sts_list[@]}"; do
+    ns="${ns_list[$i]}"
+    sts="${sts_list[$i]}"
+    replicas="${replicas_list[$i]}"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=0
+    fi
+    if (( replicas == 0 )); then
+      continue
+    fi
+    for ordinal in $(seq 0 $((replicas - 1))); do
+      item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
+      bundle_dir="${item_dir}/bundle"
+      if [[ ! -d "$bundle_dir" ]]; then
+        echo "Error: missing bundle dir for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
+        exit 1
+      fi
+      if [[ -f "${item_dir}/SHA256SUMS" ]]; then
+        if ! (cd "$item_dir" && sha256sum -c SHA256SUMS >/dev/null); then
+          echo "Error: SHA256SUMS verification failed for ${item_dir}" >&2
+          exit 1
+        fi
+      else
+        echo "Warning: missing ${item_dir}/SHA256SUMS; skipping checksum verification"
+      fi
+    done
+  done
+
+  echo "Scaling TON StatefulSets to 0 ..."
+  for i in "${!sts_list[@]}"; do
+    kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas=0 >/dev/null
+  done
+  for i in "${!sts_list[@]}"; do
+    wait_statefulset_pods_gone "${ns_list[$i]}" "${sts_list[$i]}"
+  done
+
+  echo "Restoring encrypted bundles from $input_dir ..."
+  for i in "${!sts_list[@]}"; do
+    ns="${ns_list[$i]}"
+    sts="${sts_list[$i]}"
+    replicas="${replicas_list[$i]}"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=0
+    fi
+    if (( replicas == 0 )); then
+      continue
+    fi
+
+    for ordinal in $(seq 0 $((replicas - 1))); do
+      pvc="keybundle-${sts}-${ordinal}"
+      item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
+      bundle_dir="${item_dir}/bundle"
+      if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+        echo "Error: missing PVC ${ns}/${pvc}" >&2
+        exit 1
+      fi
+      if ! restore_bundle_to_pvc "$ns" "$pvc" "$bundle_dir"; then
+        echo "Error: failed to restore ${ns}/${pvc} from ${bundle_dir}" >&2
+        exit 1
+      fi
+    done
+  done
+
+  echo "Restoring TON StatefulSets replicas ..."
+  for i in "${!sts_list[@]}"; do
+    kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas="${replicas_list[$i]}" >/dev/null
+  done
+
+  restore_required=0
+  trap - EXIT INT TERM
+  echo "Encrypted key bundle restore complete. Pods will restore key material during startup."
+}
+
 run_stop() {
   require_bin helm
   helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
@@ -818,6 +980,9 @@ main() {
       ;;
     backup-keys)
       run_backup_keys "${1:-}"
+      ;;
+    restore-keys)
+      run_restore_keys "$@"
       ;;
     stop)
       run_stop

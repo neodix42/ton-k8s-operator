@@ -199,10 +199,36 @@ Use the helper script to perform a quiesced encrypted backup:
 4. Script computes `SHA256SUMS`.
 5. Script scales TON StatefulSets to `0`, exports bundles, then restores original replica counts.
 
+Exact exported files per replica (`<output-dir>/<namespace>/<statefulset>/<ordinal>/`):
+- `bundle/keys.bundle.enc`
+- `bundle/keys.bundle.meta`
+- `SHA256SUMS`
+- `keys.bundle.enc` decrypts to a tar archive with top-level folders:
+- `keys/` = all files from pod path `/var/ton-work/keys/**`
+- `mytoncore/` = all files from pod path `/usr/local/bin/mytoncore/**`
+- `tondb/` = selected TON DB key files:
+- `tondb/config.json` from pod path `/var/ton-work/db/config.json`
+- `tondb/keyring/**` from pod path `/var/ton-work/db/keyring/**`
+- common examples included from `keys/`: `client.pub`, `liteserver.pub`, `client`, `server.pub`
+- common examples included from `mytoncore/`: `wallets/validator_wallet_001.pk` (and other mytoncore files)
+- `keys.bundle.meta` stores metadata fields used for restore: `provider`, `wrapped_key`, `algorithm`, `created_at`
+- TON DB data outside this set (`/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`, etc.) is not included.
+- if `spec.keyManagement.encryptedBundle.fileName` / `metaFileName` are customized, backup uses those exact filenames instead of defaults.
+
 Mandatory operation rules:
 - run `./kubeton backup-keys` immediately after initial node setup (first key generation)
 - run `./kubeton backup-keys` after every validator/wallet key change or rotation
 - do not run destructive operations (`drop`, `uninstall`, PVC deletion) before a successful manual backup
+
+### 5.4 Manual admin restore
+
+Use:
+
+1. `./kubeton restore-keys <input-dir>`
+2. Script validates `SHA256SUMS` where present.
+3. Script scales TON StatefulSets to `0`.
+4. Script overwrites each `keybundle-<statefulset>-<ordinal>` PVC from `<input-dir>/<namespace>/<statefulset>/<ordinal>/bundle`.
+5. Script restores StatefulSet replicas; `key-restore` init container decrypts bundle and restores files into pod paths.
 
 ## 6. Storage Encryption for Keys Only
 
