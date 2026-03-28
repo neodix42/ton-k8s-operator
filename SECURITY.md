@@ -225,10 +225,20 @@ Mandatory operation rules:
 Use:
 
 1. `./kubeton restore-keys <input-dir>`
-2. Script validates `SHA256SUMS` where present.
-3. Script scales TON StatefulSets to `0`.
+2. Script scales TON StatefulSets to `0` automatically.
+3. For each current replica ordinal, script validates `SHA256SUMS` when present.
 4. Script overwrites each `keybundle-<statefulset>-<ordinal>` PVC from `<input-dir>/<namespace>/<statefulset>/<ordinal>/bundle`.
-5. Script restores StatefulSet replicas; `key-restore` init container decrypts bundle and restores files into pod paths.
+5. Missing backup dirs are reported and skipped; restore continues for other replicas.
+6. Script restores StatefulSet replicas; `key-restore` init container decrypts bundle and restores files into pod paths.
+
+Root-of-trust continuity requirement:
+- Vault mode: restore works only if the same Vault Transit key material/history is still available.
+- KMS mode: restore works only if the same KMS key resource can decrypt previously wrapped data keys.
+- If Vault is reinitialized (new storage/new keys) or old KMS key is deleted/disabled, old bundles are not decryptable.
+
+Operational note about `drop`/`uninstall`:
+- `kubeton drop` and `kubeton uninstall` remove TON resources/PVCs (and operator release for uninstall), but do not remove Vault/Longhorn installations by default.
+- If admins manually delete Vault data (or the whole cluster), Transit key history is lost and encrypted bundles cannot be decrypted.
 
 ## 6. Storage Encryption for Keys Only
 

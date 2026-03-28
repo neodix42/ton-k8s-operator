@@ -777,7 +777,7 @@ run_restore_keys() {
     return
   fi
 
-  confirm_or_exit "This will overwrite encrypted key bundles from ${input_dir} and restart TON StatefulSets. Continue?"
+  confirm_or_exit "This will overwrite encrypted key bundles from ${input_dir} and restart TON StatefulSets. Missing replica backups will be reported and skipped. Continue?"
 
   local -a ns_list=()
   local -a sts_list=()
@@ -802,34 +802,6 @@ run_restore_keys() {
   }
   trap cleanup_restore EXIT INT TERM
 
-  for i in "${!sts_list[@]}"; do
-    ns="${ns_list[$i]}"
-    sts="${sts_list[$i]}"
-    replicas="${replicas_list[$i]}"
-    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
-      replicas=0
-    fi
-    if (( replicas == 0 )); then
-      continue
-    fi
-    for ordinal in $(seq 0 $((replicas - 1))); do
-      item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
-      bundle_dir="${item_dir}/bundle"
-      if [[ ! -d "$bundle_dir" ]]; then
-        echo "Error: missing bundle dir for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
-        exit 1
-      fi
-      if [[ -f "${item_dir}/SHA256SUMS" ]]; then
-        if ! (cd "$item_dir" && sha256sum -c SHA256SUMS >/dev/null); then
-          echo "Error: SHA256SUMS verification failed for ${item_dir}" >&2
-          exit 1
-        fi
-      else
-        echo "Warning: missing ${item_dir}/SHA256SUMS; skipping checksum verification"
-      fi
-    done
-  done
-
   echo "Scaling TON StatefulSets to 0 ..."
   for i in "${!sts_list[@]}"; do
     kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas=0 >/dev/null
@@ -839,6 +811,9 @@ run_restore_keys() {
   done
 
   echo "Restoring encrypted bundles from $input_dir ..."
+  local restored_count=0
+  local skipped_missing_count=0
+  local failed_count=0
   for i in "${!sts_list[@]}"; do
     ns="${ns_list[$i]}"
     sts="${sts_list[$i]}"
@@ -854,14 +829,31 @@ run_restore_keys() {
       pvc="keybundle-${sts}-${ordinal}"
       item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
       bundle_dir="${item_dir}/bundle"
+      if [[ ! -d "$bundle_dir" ]]; then
+        echo "Warning: missing backup bundle for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
+        ((skipped_missing_count++))
+        continue
+      fi
+      if [[ -f "${item_dir}/SHA256SUMS" ]]; then
+        if ! (cd "$item_dir" && sha256sum -c SHA256SUMS >/dev/null); then
+          echo "Warning: SHA256SUMS verification failed for ${item_dir}; skipping this replica" >&2
+          ((failed_count++))
+          continue
+        fi
+      else
+        echo "Warning: missing ${item_dir}/SHA256SUMS; continuing without checksum verification"
+      fi
       if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
-        echo "Error: missing PVC ${ns}/${pvc}" >&2
-        exit 1
+        echo "Warning: missing PVC ${ns}/${pvc}; skipping this replica" >&2
+        ((failed_count++))
+        continue
       fi
       if ! restore_bundle_to_pvc "$ns" "$pvc" "$bundle_dir"; then
-        echo "Error: failed to restore ${ns}/${pvc} from ${bundle_dir}" >&2
-        exit 1
+        echo "Warning: failed to restore ${ns}/${pvc} from ${bundle_dir}; skipping this replica" >&2
+        ((failed_count++))
+        continue
       fi
+      ((restored_count++))
     done
   done
 
@@ -872,6 +864,10 @@ run_restore_keys() {
 
   restore_required=0
   trap - EXIT INT TERM
+  echo "Restore summary: restored=${restored_count}, skipped_missing=${skipped_missing_count}, failed=${failed_count}"
+  if (( restored_count == 0 )); then
+    echo "Warning: no replica bundles were restored."
+  fi
   echo "Encrypted key bundle restore complete. Pods will restore key material during startup."
 }
 

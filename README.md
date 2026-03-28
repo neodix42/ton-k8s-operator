@@ -80,6 +80,15 @@ Manual backup is mandatory:
 - run `./kubeton backup-keys` immediately after first key generation/initial setup
 - run it again after any key change/rotation before maintenance, upgrade, or destructive actions
 
+Restore prerequisites:
+- `./kubeton restore-keys <input-dir>` automatically scales TON StatefulSets to `0`, restores available replica bundles, then scales back to previous replica counts.
+- if backup directory is missing for some replica ordinal, restore reports it and continues with other replicas.
+- encrypted bundles can be decrypted only if the same root-of-trust is still available:
+- Vault mode: same Vault Transit key history/material (same logical key with old versions available).
+- KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
+- `kubeton drop` / `kubeton uninstall` remove TON resources/PVCs and operator release, but do not remove Vault/Longhorn installations by default.
+- if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
+
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
 
 For full design, threat model, provider requirements, and hardening steps, see:
