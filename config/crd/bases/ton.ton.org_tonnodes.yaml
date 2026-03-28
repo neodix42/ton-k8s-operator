@@ -293,13 +293,6 @@ spec:
                         items:
                           type: string
                         type: array
-                      backupIntervalSeconds:
-                        default: 300
-                        description: BackupIntervalSeconds controls periodic encrypted
-                          bundle backup interval.
-                        format: int32
-                        minimum: 30
-                        type: integer
                       fileName:
                         default: keys.bundle.enc
                         description: FileName is the encrypted bundle filename.

@@ -192,11 +192,6 @@ type TonNodeEncryptedBundleSpec struct {
 	// MetaFileName stores wrapped key metadata for bundle decryption.
 	// +kubebuilder:default:="keys.bundle.meta"
 	MetaFileName string `json:"metaFileName,omitempty"`
-
-	// BackupIntervalSeconds controls periodic encrypted bundle backup interval.
-	// +kubebuilder:validation:Minimum=30
-	// +kubebuilder:default:=300
-	BackupIntervalSeconds int32 `json:"backupIntervalSeconds,omitempty"`
 }
 
 // TonNodeKeyAgentSpec defines helper container settings for key restore/backup.

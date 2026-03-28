@@ -58,7 +58,14 @@ Secure key workflow is available via `spec.keyManagement`:
 - plaintext key directories mounted on tmpfs (memory only)
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
-- sidecar periodically re-encrypts and stores a bundle via Vault/KMS root-of-trust
+- sidecar runs in manual mode and writes encrypted bundles only when explicitly triggered by `kubeton backup-keys`
+
+Manual encrypted bundle backup is available with:
+- `./kubeton backup-keys [output-dir]`
+
+Manual backup is mandatory:
+- run `./kubeton backup-keys` immediately after first key generation/initial setup
+- run it again after any key change/rotation before maintenance, upgrade, or destructive actions
 
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
 
@@ -241,6 +248,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton start
 ./kubeton upgrade
 ./kubeton upgrade <tag>
+./kubeton backup-keys
 ./kubeton status
 ./kubeton exec "sync"
 

@@ -61,10 +61,10 @@ When `spec.keyManagement.enabled=true`, operator configures:
 - restores plaintext key files into tmpfs mounts before TON starts
 
 4. Backup sidecar (`key-backup`):
-- periodically packages current tmpfs keys
+- packages current tmpfs keys
 - envelope-encrypts bundle
 - persists only encrypted files to `keybundle` PVC
-- runs backup again on pod termination signal (`SIGTERM`)
+- runs in manual mode only and performs backup only when explicitly triggered
 
 ## 3. CRD Configuration
 
@@ -90,7 +90,6 @@ spec:
         - ReadWriteOnce
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
-      backupIntervalSeconds: 300
     agent:
       image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
 ```
@@ -113,7 +112,6 @@ Validation rules enforced by the operator:
 - `credentialsSecretRef.name` is required when enabled
 - `provider=vault` requires `vaultTransitKey`
 - `provider=kms` requires `kmsKeyID` and `kmsVendor` (`aws` or `gcp`)
-- `encryptedBundle.backupIntervalSeconds >= 30`
 
 ## 4. Provider Secret Requirements
 
@@ -181,15 +179,30 @@ Authentication should be done via Workload Identity or by mounting a service acc
 5. Restores plaintext key files to tmpfs mounts.
 6. TON main container starts.
 
-### 5.2 Backup path (runtime / termination)
+### 5.2 Backup path (manual trigger)
 
 1. `key-backup` scans tmpfs key folders.
 2. Creates tarball in sidecar temp storage.
 3. Generates random data key.
 4. Wraps data key with Vault/KMS.
 5. Encrypts tarball with data key.
-6. Writes encrypted bundle + metadata atomically to keybundle PVC.
-7. Repeats by interval and on termination signal.
+6. Writes an encrypted bundle + metadata atomically to keybundle PVC.
+7. Sidecar stays idle until an explicit backup trigger file is created.
+
+### 5.3 Manual admin backup (required)
+
+Use the helper script to perform a quiesced encrypted backup:
+
+1. `./kubeton backup-keys [output-dir]`
+2. Script triggers one explicit encrypted backup in each running TON pod.
+3. Script copies only encrypted bundle PVC contents to local backup directory.
+4. Script computes `SHA256SUMS`.
+5. Script scales TON StatefulSets to `0`, exports bundles, then restores original replica counts.
+
+Mandatory operation rules:
+- run `./kubeton backup-keys` immediately after initial node setup (first key generation)
+- run `./kubeton backup-keys` after every validator/wallet key change or rotation
+- do not run destructive operations (`drop`, `uninstall`, PVC deletion) before a successful manual backup
 
 ## 6. Storage Encryption for Keys Only
 

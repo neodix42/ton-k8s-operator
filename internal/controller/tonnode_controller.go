@@ -62,7 +62,6 @@ const (
 	defaultKeyBundlePVCSize            = "5Gi"
 	defaultKeyBundleFileName           = "keys.bundle.enc"
 	defaultKeyBundleMetaFileName       = "keys.bundle.meta"
-	defaultKeyBackupIntervalSec        = int32(300)
 
 	tonContainerName = "ton-node"
 	tonWorkClaimName = "ton-work"
@@ -467,10 +466,6 @@ func validateKeyManagementSpec(tonNode *tonv1alpha1.TonNode) string {
 		return "spec.keyManagement.provider must be vault or kms"
 	}
 
-	if desiredKeyBackupIntervalSeconds(tonNode) < 30 {
-		return "spec.keyManagement.encryptedBundle.backupIntervalSeconds must be >= 30"
-	}
-
 	return ""
 }
 
@@ -605,17 +600,6 @@ func desiredKeyBundleMetaFileName(tonNode *tonv1alpha1.TonNode) string {
 	return name
 }
 
-func desiredKeyBackupIntervalSeconds(tonNode *tonv1alpha1.TonNode) int32 {
-	if tonNode.Spec.KeyManagement == nil {
-		return defaultKeyBackupIntervalSec
-	}
-	interval := tonNode.Spec.KeyManagement.EncryptedBundle.BackupIntervalSeconds
-	if interval <= 0 {
-		return defaultKeyBackupIntervalSec
-	}
-	return interval
-}
-
 func desiredKeyAgentSecretName(tonNode *tonv1alpha1.TonNode) string {
 	if tonNode.Spec.KeyManagement == nil || tonNode.Spec.KeyManagement.CredentialsSecretRef == nil {
 		return ""
@@ -643,7 +627,6 @@ func desiredKeyAgentEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
 		{Name: "KEY_PROVIDER", Value: desiredKeyProvider(tonNode)},
 		{Name: "KEY_BUNDLE_FILE", Value: desiredKeyBundleFileName(tonNode)},
 		{Name: "KEY_BUNDLE_META_FILE", Value: desiredKeyBundleMetaFileName(tonNode)},
-		{Name: "KEY_BACKUP_INTERVAL_SECONDS", Value: strconv.Itoa(int(desiredKeyBackupIntervalSeconds(tonNode)))},
 	}
 	if value := desiredVaultTransitKey(tonNode); value != "" {
 		env = append(env, corev1.EnvVar{Name: "VAULT_TRANSIT_KEY", Value: value})
@@ -855,6 +838,9 @@ WALLETS_DIR="/usr/local/bin/mytoncore/wallets"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
+REQUEST_FILE="/tmp/key-backup.request"
+DONE_FILE="/tmp/key-backup.done"
+FAIL_FILE="/tmp/key-backup.failed"
 
 need_bin() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -983,7 +969,7 @@ perform_backup() {
   wrapped_key="$(wrap_data_key "$DATA_KEY_B64")"
   if [ -z "$wrapped_key" ]; then
     echo "failed to wrap data key" >&2
-    exit 1
+    return 1
   fi
 
   openssl enc -aes-256-cbc -pbkdf2 -md sha256 \
@@ -1006,15 +992,20 @@ perform_backup() {
   echo "encrypted key bundle updated"
 }
 
-shutdown() {
-  perform_backup
-  exit 0
-}
-trap shutdown TERM INT
+mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$BUNDLE_DIR"
+rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
+echo "manual backup mode enabled"
 
 while true; do
-  perform_backup
-  sleep "$KEY_BACKUP_INTERVAL_SECONDS" &
+  if [ -f "$REQUEST_FILE" ]; then
+    rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
+    if perform_backup; then
+      date -u +%Y-%m-%dT%H:%M:%SZ >"$DONE_FILE"
+    else
+      echo "backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$FAIL_FILE"
+    fi
+  fi
+  sleep 2 &
   wait $!
 done
 `

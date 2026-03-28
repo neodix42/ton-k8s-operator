@@ -75,7 +75,6 @@ spec:
       {{- end }}
       fileName: {{ .encryptedBundle.fileName }}
       metaFileName: {{ .encryptedBundle.metaFileName }}
-      backupIntervalSeconds: {{ .encryptedBundle.backupIntervalSeconds }}
     agent:
       image: {{ .agent.image }}
       {{- with .agent.resources }}

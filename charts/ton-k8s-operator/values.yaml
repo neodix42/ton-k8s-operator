@@ -100,7 +100,6 @@ tonNode:
         - ReadWriteOnce
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
-      backupIntervalSeconds: 300
     agent:
       image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
       resources: {}
