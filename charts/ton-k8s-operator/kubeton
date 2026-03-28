@@ -133,7 +133,7 @@ ensure_longhorn_installed() {
     --version "$LONGHORN_CHART_VERSION" \
     -n "$LONGHORN_NAMESPACE" \
     --create-namespace \
-    --set "defaultSettings.defaultReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
+    --set-string "defaultSettings.defaultReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
     --set "persistence.defaultClassReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
     --wait \
     --timeout 40m
