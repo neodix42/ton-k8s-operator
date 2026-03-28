@@ -86,7 +86,8 @@ Restore prerequisites:
 - encrypted bundles can be decrypted only if the same root-of-trust is still available:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
-- `kubeton drop` / `kubeton uninstall` remove TON resources/PVCs and operator release, but do not remove Vault/Longhorn installations by default.
+- `kubeton drop` removes TON resources/PVCs only.
+- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, and `encrypted-sc` StorageClass.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
@@ -292,7 +293,7 @@ kubectl -n default get sts,pods,pvc
 # drops TON nodes and storage (PVCs)
 ./kubeton drop
 
-# delete operator release + namespace
+# delete operator release + Longhorn
 ./kubeton uninstall
 
 # optional destructive CRD cleanup

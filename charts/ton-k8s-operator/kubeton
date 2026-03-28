@@ -48,7 +48,7 @@ Commands:
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
   stop                 Stop TON fleet (tonNode.enabled=false).
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
-  uninstall            Stop/drop TON fleet + uninstall operator release (with confirmation).
+  uninstall            Stop/drop TON fleet + uninstall operator and Longhorn (with confirmation).
   status               Run "sync" and db size checks in each TON pod; print node/pod/sync/cell db/archive db.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
 
@@ -117,6 +117,36 @@ ensure_helm_repo() {
   helm repo add "$name" "$url" --force-update >/dev/null
 }
 
+run_with_namespace_progress() {
+  local label="$1"
+  local ns="$2"
+  shift 2
+
+  "$@" &
+  local cmd_pid=$!
+  local start_ts now_ts elapsed pods total ready
+  start_ts="$(date +%s)"
+
+  while kill -0 "$cmd_pid" >/dev/null 2>&1; do
+    sleep 10
+    if ! kill -0 "$cmd_pid" >/dev/null 2>&1; then
+      break
+    fi
+    now_ts="$(date +%s)"
+    elapsed=$((now_ts - start_ts))
+    pods="$(kubectl -n "$ns" get pods --no-headers 2>/dev/null || true)"
+    if [[ -n "$pods" ]]; then
+      total="$(printf '%s\n' "$pods" | awk 'NF{c++} END{print c+0}')"
+      ready="$(printf '%s\n' "$pods" | awk 'NF{split($2,a,"/"); if (a[1]==a[2]) c++} END{print c+0}')"
+      echo "[progress] ${label}: ${ready}/${total} pods ready (elapsed ${elapsed}s)"
+    else
+      echo "[progress] ${label}: waiting for first pods (elapsed ${elapsed}s)"
+    fi
+  done
+
+  wait "$cmd_pid"
+}
+
 ensure_longhorn_installed() {
   require_bin helm
   require_bin kubectl
@@ -129,12 +159,15 @@ ensure_longhorn_installed() {
   helm repo update longhorn >/dev/null
 
   echo "[baremetal] Installing/ensuring Longhorn ${LONGHORN_CHART_VERSION} ..."
-  helm upgrade --install "$LONGHORN_RELEASE_NAME" "$LONGHORN_CHART" \
+  echo "[baremetal] Waiting for Longhorn components to become Ready (timeout 40m) ..."
+  run_with_namespace_progress "longhorn" "$LONGHORN_NAMESPACE" \
+    helm upgrade --install "$LONGHORN_RELEASE_NAME" "$LONGHORN_CHART" \
     --version "$LONGHORN_CHART_VERSION" \
     -n "$LONGHORN_NAMESPACE" \
     --create-namespace \
     --set-string "defaultSettings.defaultReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
     --set "persistence.defaultClassReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
+    --disable-openapi-validation \
     --wait \
     --timeout 40m
 }
@@ -187,7 +220,9 @@ ensure_vault_installed() {
   helm repo update hashicorp >/dev/null
 
   echo "[baremetal] Installing/ensuring Vault chart ${VAULT_CHART_VERSION} ..."
-  helm upgrade --install "$VAULT_RELEASE_NAME" "$VAULT_CHART" \
+  echo "[baremetal] Waiting for Vault components to become Ready (timeout 30m) ..."
+  run_with_namespace_progress "vault" "$VAULT_NAMESPACE" \
+    helm upgrade --install "$VAULT_RELEASE_NAME" "$VAULT_CHART" \
     --version "$VAULT_CHART_VERSION" \
     -n "$VAULT_NAMESPACE" \
     --create-namespace \
@@ -891,12 +926,15 @@ run_drop() {
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "This will stop/delete TON pods and PVCs, and uninstall operator. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. Continue?"
   run_stop
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
   kubectl delete namespace "$OP_NAMESPACE" --ignore-not-found
+  kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" || true
+  kubectl delete namespace "$LONGHORN_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
 }
 
 run_status() {

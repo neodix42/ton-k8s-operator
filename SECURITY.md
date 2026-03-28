@@ -237,7 +237,8 @@ Root-of-trust continuity requirement:
 - If Vault is reinitialized (new storage/new keys) or old KMS key is deleted/disabled, old bundles are not decryptable.
 
 Operational note about `drop`/`uninstall`:
-- `kubeton drop` and `kubeton uninstall` remove TON resources/PVCs (and operator release for uninstall), but do not remove Vault/Longhorn installations by default.
+- `kubeton drop` removes TON resources/PVCs only.
+- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, and `encrypted-sc` StorageClass.
 - If admins manually delete Vault data (or the whole cluster), Transit key history is lost and encrypted bundles cannot be decrypted.
 
 ## 6. Storage Encryption for Keys Only
