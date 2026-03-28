@@ -29,6 +29,8 @@ VAULT_CHART_VERSION="${VAULT_CHART_VERSION:-0.30.0}"
 VAULT_TRANSIT_KEY="${VAULT_TRANSIT_KEY:-ton-validator}"
 VAULT_TON_POLICY_NAME="${VAULT_TON_POLICY_NAME:-tonnode-transit}"
 VAULT_BOOTSTRAP_SECRET="${VAULT_BOOTSTRAP_SECRET:-ton-vault-bootstrap}"
+VAULT_BOOTSTRAP_UNSEAL_KEY="${VAULT_BOOTSTRAP_UNSEAL_KEY:-}"
+VAULT_BOOTSTRAP_ROOT_TOKEN="${VAULT_BOOTSTRAP_ROOT_TOKEN:-}"
 TON_VAULT_CREDS_SECRET="${TON_VAULT_CREDS_SECRET:-ton-vault-creds}"
 VAULT_ADDR_INTERNAL="${VAULT_ADDR_INTERNAL:-http://${VAULT_RELEASE_NAME}.${VAULT_NAMESPACE}.svc:8200}"
 VAULT_TOKEN_PERIOD="${VAULT_TOKEN_PERIOD:-720h}"
@@ -60,6 +62,7 @@ Environment overrides:
   LONGHORN_DEFAULT_REPLICA_COUNT, ENCRYPTED_SC_NAME, LONGHORN_CRYPTO_SECRET_NAME
   VAULT_RELEASE_NAME, VAULT_NAMESPACE, VAULT_CHART, VAULT_CHART_VERSION
   VAULT_TRANSIT_KEY, VAULT_TON_POLICY_NAME, VAULT_BOOTSTRAP_SECRET
+  VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
   TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
 EOF
 }
@@ -239,11 +242,43 @@ vault_exec() {
   kubectl -n "$VAULT_NAMESPACE" exec "${VAULT_RELEASE_NAME}-0" -- "$@"
 }
 
-initialize_and_unseal_vault() {
-  local status init_out unseal_key root_token
+vault_status_with_retry() {
+  local deadline=$(( $(date +%s) + 180 ))
+  local status initialized
+  while (( $(date +%s) < deadline )); do
+    status="$(vault_exec vault status 2>/dev/null || true)"
+    initialized="$(printf '%s\n' "$status" | awk '/^Initialized[[:space:]]+/ {print tolower($2); exit}')"
+    if [[ "$initialized" == "true" || "$initialized" == "false" ]]; then
+      printf '%s' "$status"
+      return 0
+    fi
+    sleep 3
+  done
+  printf '%s' "${status:-}"
+  return 1
+}
 
-  status="$(vault_exec vault status 2>/dev/null || true)"
-  if printf '%s\n' "$status" | grep -Eq '^Initialized[[:space:]]+false'; then
+ensure_vault_bootstrap_secret_from_env() {
+  if [[ -z "$VAULT_BOOTSTRAP_UNSEAL_KEY" || -z "$VAULT_BOOTSTRAP_ROOT_TOKEN" ]]; then
+    return 1
+  fi
+  echo "[baremetal] Recreating missing Vault bootstrap secret ${VAULT_BOOTSTRAP_SECRET} from environment ..."
+  kubectl -n "$VAULT_NAMESPACE" create secret generic "$VAULT_BOOTSTRAP_SECRET" \
+    --from-literal=unseal_key="$VAULT_BOOTSTRAP_UNSEAL_KEY" \
+    --from-literal=root_token="$VAULT_BOOTSTRAP_ROOT_TOKEN" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+}
+
+initialize_and_unseal_vault() {
+  local status init_out unseal_key root_token initialized sealed
+
+  if ! status="$(vault_status_with_retry)"; then
+    echo "Error: failed to get parseable Vault status from ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0." >&2
+    echo "Check pod logs: kubectl -n ${VAULT_NAMESPACE} logs ${VAULT_RELEASE_NAME}-0" >&2
+    exit 1
+  fi
+  initialized="$(printf '%s\n' "$status" | awk '/^Initialized[[:space:]]+/ {print tolower($2); exit}')"
+  if [[ "$initialized" == "false" ]]; then
     echo "[baremetal] Initializing Vault ..."
     init_out="$(vault_exec vault operator init -key-shares=1 -key-threshold=1)"
     unseal_key="$(printf '%s\n' "$init_out" | awk -F': ' '/Unseal Key 1:/ {print $2; exit}')"
@@ -256,18 +291,36 @@ initialize_and_unseal_vault() {
       --from-literal=unseal_key="$unseal_key" \
       --from-literal=root_token="$root_token" \
       --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  elif [[ "$initialized" != "true" ]]; then
+    echo "Error: unable to parse Vault initialized state." >&2
+    echo "Vault status output:" >&2
+    printf '%s\n' "$status" >&2
+    exit 1
   fi
 
   if ! kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" >/dev/null 2>&1; then
-    echo "Error: missing Vault bootstrap secret $VAULT_BOOTSTRAP_SECRET in namespace $VAULT_NAMESPACE" >&2
-    exit 1
+    if [[ "$initialized" == "true" ]] && ensure_vault_bootstrap_secret_from_env; then
+      :
+    else
+      echo "Error: missing Vault bootstrap secret $VAULT_BOOTSTRAP_SECRET in namespace $VAULT_NAMESPACE" >&2
+      if [[ "$initialized" == "true" ]]; then
+        echo "Vault is already initialized. Provide existing credentials via:" >&2
+        echo "  VAULT_BOOTSTRAP_UNSEAL_KEY=<unseal-key> VAULT_BOOTSTRAP_ROOT_TOKEN=<root-token> ./kubeton start" >&2
+      fi
+      exit 1
+    fi
   fi
 
   unseal_key="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.unseal_key}' | base64 -d)"
   root_token="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.root_token}' | base64 -d)"
+  if [[ -z "$unseal_key" || -z "$root_token" ]]; then
+    echo "Error: Vault bootstrap secret ${VAULT_BOOTSTRAP_SECRET} is missing required keys." >&2
+    exit 1
+  fi
 
-  status="$(vault_exec vault status 2>/dev/null || true)"
-  if printf '%s\n' "$status" | grep -Eq '^Sealed[[:space:]]+true'; then
+  status="$(vault_status_with_retry || true)"
+  sealed="$(printf '%s\n' "$status" | awk '/^Sealed[[:space:]]+/ {print tolower($2); exit}')"
+  if [[ "$sealed" == "true" ]]; then
     echo "[baremetal] Unsealing Vault ..."
     vault_exec vault operator unseal "$unseal_key" >/dev/null
   fi
@@ -923,17 +976,58 @@ run_drop() {
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
 }
 
+cleanup_longhorn_force() {
+  echo "[uninstall] Forcing Longhorn cleanup ..."
+
+  kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration -o name 2>/dev/null \
+    | grep -Ei 'longhorn' \
+    | xargs -r kubectl delete --ignore-not-found >/dev/null 2>&1 || true
+
+  local resource
+  for resource in $(kubectl api-resources --api-group=longhorn.io -o name 2>/dev/null || true); do
+    kubectl get -A "$resource" -o name 2>/dev/null \
+      | xargs -r -I{} kubectl patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+  done
+
+  kubectl get crd -o name 2>/dev/null \
+    | grep 'longhorn.io' \
+    | xargs -r -n1 kubectl delete --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+  kubectl get crd -o name 2>/dev/null \
+    | grep 'longhorn.io' \
+    | xargs -r -I{} kubectl patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+
+  if kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
+    if command -v jq >/dev/null 2>&1; then
+      kubectl get ns "$LONGHORN_NAMESPACE" -o json \
+        | jq '.spec.finalizers=[]' \
+        | kubectl replace --raw "/api/v1/namespaces/${LONGHORN_NAMESPACE}/finalize" -f - >/dev/null 2>&1 || true
+    else
+      kubectl patch namespace "$LONGHORN_NAMESPACE" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    fi
+    kubectl delete namespace "$LONGHORN_NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+}
+
+uninstall_longhorn() {
+  if helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE"; then
+    return 0
+  fi
+  echo "Warning: Longhorn Helm uninstall failed; running forced cleanup fallback." >&2
+  cleanup_longhorn_force
+}
+
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
   run_stop
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
   kubectl delete namespace "$OP_NAMESPACE" --ignore-not-found
   kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
-  helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" || true
+  uninstall_longhorn || true
   kubectl delete namespace "$LONGHORN_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
 }
 
