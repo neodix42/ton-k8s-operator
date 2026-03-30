@@ -197,6 +197,164 @@ spec:
                 default: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
                 description: Image is the TON node container image.
                 type: string
+              keyManagement:
+                description: KeyManagement enables secure key handling with in-memory
+                  keys and encrypted bundles.
+                properties:
+                  agent:
+                    description: Agent configures helper containers that restore and
+                      backup encrypted bundles.
+                    properties:
+                      image:
+                        default: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+                        description: Image is the init/sidecar image used for key
+                          management scripts.
+                        type: string
+                      resources:
+                        description: Resources defines CPU and memory requests/limits
+                          for key helper containers.
+                        properties:
+                          claims:
+                            description: |-
+                              Claims lists the names of resources, defined in spec.resourceClaims,
+                              that are used by this container.
+
+                              This is an alpha field and requires enabling the
+                              DynamicResourceAllocation feature gate.
+
+                              This field is immutable. It can only be set for containers.
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: |-
+                                    Name must match the name of one entry in pod.spec.resourceClaims of
+                                    the Pod where this field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                                request:
+                                  description: |-
+                                    Request is the name chosen for a request in the referenced claim.
+                                    If empty, everything from the claim is made available, otherwise
+                                    only the result of this request.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Limits describes the maximum amount of compute resources allowed.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests describes the minimum amount of compute resources required.
+                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                        type: object
+                    type: object
+                  credentialsSecretRef:
+                    description: CredentialsSecretRef points to credentials/config
+                      required by the selected provider.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  enabled:
+                    default: false
+                    description: Enabled toggles secure key handling.
+                    type: boolean
+                  encryptedBundle:
+                    description: EncryptedBundle configures where encrypted key bundles
+                      are stored at rest.
+                    properties:
+                      accessModes:
+                        description: |-
+                          AccessModes configures PVC access modes for encrypted bundles.
+                          Defaults to ReadWriteOnce when omitted.
+                        items:
+                          type: string
+                        type: array
+                      fileName:
+                        default: keys.bundle.enc
+                        description: FileName is the encrypted bundle filename.
+                        type: string
+                      metaFileName:
+                        default: keys.bundle.meta
+                        description: MetaFileName stores wrapped key metadata for
+                          bundle decryption.
+                        type: string
+                      pvcSize:
+                        default: 5Gi
+                        description: PVCSize is the PVC size used for encrypted key
+                          bundles.
+                        type: string
+                      storageClassName:
+                        description: StorageClassName explicitly selects the StorageClass
+                          for encrypted bundles.
+                        type: string
+                    type: object
+                  inMemory:
+                    description: InMemory configures tmpfs mounts for live key files.
+                    properties:
+                      keysSizeLimit:
+                        default: 128Mi
+                        description: KeysSizeLimit is the tmpfs size limit for /var/ton-work/keys.
+                        type: string
+                      walletsSizeLimit:
+                        default: 512Mi
+                        description: WalletsSizeLimit is the tmpfs size limit for
+                          /usr/local/bin/mytoncore/wallets.
+                        type: string
+                    type: object
+                  kmsKeyID:
+                    description: KMSKeyID is required when provider=kms.
+                    type: string
+                  kmsVendor:
+                    description: KMSVendor selects the KMS CLI flow used by the key
+                      agent when provider=kms.
+                    enum:
+                    - aws
+                    - gcp
+                    type: string
+                  provider:
+                    default: vault
+                    description: Provider selects the root-of-trust system used to
+                      wrap data keys.
+                    enum:
+                    - vault
+                    - kms
+                    type: string
+                  vaultTransitKey:
+                    description: VaultTransitKey is required when provider=vault.
+                    type: string
+                type: object
               network:
                 description: Network defines TON networking parameters passed via
                   environment variables.
@@ -733,7 +891,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: ghcr.io/neodix42/ton-k8s-operator:0.1.14
+        image: ghcr.io/neodix42/ton-k8s-operator:dev-local
         livenessProbe:
           httpGet:
             path: /healthz

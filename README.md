@@ -87,7 +87,8 @@ Restore prerequisites:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
 - `kubeton drop` removes TON resources/PVCs only.
-- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, and `encrypted-sc` StorageClass.
+- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
@@ -111,79 +112,7 @@ Installation means applying:
 - RBAC
 - controller Deployment
 
-Use one of these three flows:
-
-### Flow A: Maintainer (build and publish operator release)
-
-Use this flow if you maintain this repo.
-
-Run commands from the repo root:
-- this repository root directory (where `Makefile` is)
-
-Requirements:
-- `make`
-- `docker`
-- `kubectl`
-
-Build and push controller image:
-
-```bash
-export OPERATOR_IMG=ghcr.io/neodix42/ton-k8s-operator:0.1.14
-make docker-build docker-push IMG=$OPERATOR_IMG
-```
-
-Generate an installation bundle (CRD + RBAC + Deployment in one file):
-
-```bash
-make build-installer IMG=$OPERATOR_IMG
-```
-
-This creates:
-- `dist/install.yaml`
-
-Helm chart is in:
-- `charts/ton-k8s-operator`
-
-Package chart (optional, for release distribution):
-
-```bash
-mkdir -p dist/charts
-helm package charts/ton-k8s-operator -d dist/charts
-```
-
-Operator image and Helm chart publish are automated by GitHub Actions:
-- workflow: `.github/workflows/publish-operator.yml`
-- trigger: every push to `main`
-- target registries:
-  - operator image: `ghcr.io/neodix42/ton-k8s-operator:<appVersion>`
-  - chart: `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
-- behavior:
-  - image tag is taken from `Chart.yaml` `appVersion` and pushed if that tag does not already exist
-  - chart publish version is computed as higher semver of `version` and `appVersion` (without leading `v`), so appVersion-only bumps are still published; if that version already exists, push is skipped
-
-Install operator:
-
-```bash
-helm install ton-k8s-operator ./charts/ton-k8s-operator \
-  -n ton-k8s-operator-system \
-  --create-namespace
-```
-
-Or install operator and create TON nodes in one command:
-
-```bash
-helm upgrade --install ton-k8s-operator ./charts/ton-k8s-operator \
-  -n ton-k8s-operator-system \
-  --create-namespace \
-  --set tonNode.enabled=true \
-  --set tonNode.namespace=default \
-  --set tonNode.replicas=3 \
-  --set tonNode.storage.storageClassName=local-path
-```
-
-To publish a new version, bump either `version` or `appVersion` in `charts/ton-k8s-operator/Chart.yaml`, then push to `main`.
-
-Publish `dist/install.yaml` and/or packaged Helm chart (for example, in GitHub Releases).
+Use one of these production-safe flows:
 
 ### Flow B: Cluster User (Helm, recommended)
 
@@ -208,14 +137,17 @@ kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storagecl
 kubectl get sc
 ```
 
-Bare-metal default setup is now automated by `kubeton`:
-- detects bare-metal cluster (`spec.providerID` empty on all nodes)
-- installs Longhorn v1 (`LONGHORN_CHART_VERSION`, default `1.10.0`)
-- creates encrypted StorageClass `encrypted-sc` (LUKS/dm-crypt, `aes-xts-plain64`, `sha256`, `argon2i`, replica count `3`)
+Bare-metal/local-dev default setup is automated by `kubeton`:
+- detects bare-metal cluster (`spec.providerID` empty on all nodes) or local k3d cluster (context/node name starts with `k3d-`)
+- on bare-metal: installs Longhorn v1 (`LONGHORN_CHART_VERSION`, default `1.10.0`) and creates encrypted StorageClass `encrypted-sc` (LUKS/dm-crypt, `aes-xts-plain64`, `sha256`, `argon2i`, replica count `3`)
+- on local k3d: skips Longhorn install and creates `encrypted-sc` from an existing local StorageClass (`LOCALDEV_BASE_SC`, default `local-path`) for dev convenience
 - installs Vault (`VAULT_CHART_VERSION`, default `0.30.0`)
 - initializes/unseals Vault and configures Transit key `ton-validator`
 - creates TON secret `ton-vault-creds` in namespace `default`
 - deploys TonNode with key-management enabled by default
+
+Local k3d note:
+- `encrypted-sc` on k3d is a development fallback and does not provide Longhorn-backed disk encryption.
 
 You can run bootstrap explicitly:
 
@@ -223,13 +155,14 @@ You can run bootstrap explicitly:
 ./kubeton bootstrap-baremetal
 ```
 
-Or just run `./kubeton start`; it will bootstrap automatically before TON deployment on bare-metal clusters.
+Or just run `./kubeton start`; it bootstraps automatically before TON deployment on bare-metal and local k3d clusters.
 
 Security note:
 - bootstrap stores Vault init material in `vault/ton-vault-bootstrap`; rotate/restrict access after bootstrap.
 
 Cloud behavior:
 - bare-metal bootstrap is skipped by default
+- local k3d bootstrap is enabled by default
 - before `./kubeton start`, configure prerequisites manually:
   - encrypted StorageClass named `encrypted-sc` (or adjust env/values)
   - Vault credential secret `ton-vault-creds` in TON namespace (`default` by default)
@@ -273,6 +206,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton upgrade <tag>
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
+./kubeton verify
 ./kubeton status
 ./kubeton exec "sync"
 
@@ -283,9 +217,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton start 10
 
 # d) verify
-kubectl -n ton-k8s-operator-system get deploy,pods
-kubectl -n default get tonnodes
-kubectl -n default get sts,pods,pvc
+./kubeton verify
 
 # e) stop and remove all TON nodes (keep operator)
 ./kubeton stop
@@ -293,11 +225,12 @@ kubectl -n default get sts,pods,pvc
 # drops TON nodes and storage (PVCs)
 ./kubeton drop
 
-# delete operator release + Longhorn
+# delete operator release + Longhorn (keeps TonNode CRD)
 ./kubeton uninstall
 
-# optional destructive CRD cleanup
-kubectl delete crd tonnodes.ton.ton.org
+# OR full destructive cleanup including TonNode CRD
+# kept separate from uninstall because CRD deletion is cluster-scoped
+./kubeton purge
 ```
 
 `operator-values.yaml` keeps `tonNode.enabled=false` (operator only).
@@ -471,6 +404,12 @@ If you want to remove CRD too (destructive, removes `TonNode` objects):
 kubectl delete crd tonnodes.ton.ton.org
 ```
 
+For `kubeton`-based full destructive cleanup (including CRD), use:
+
+```bash
+./kubeton purge
+```
+
 ### Flow C: Cluster User (raw install.yaml fallback)
 
 If you prefer plain manifests:
@@ -523,19 +462,77 @@ If you use `local-path` StorageClass:
 - Storage is distributed across nodes/pods, not centralized.
 - If a node is lost, data tied to that node-local volume is also lost (unless you use replicated storage such as Longhorn).
 
-## Local Dev (k3d)
+## Local Development and Testing (k3d)
+
+Use this workflow for local development from this repository.  
+Production deployments should use release artifacts/charts, not this dev-repo flow.
+
+Prerequisites:
+- `k3d`
+- `docker`
+- `kubectl`
+- `helm`
+- `make`
+
+### Flow A: Maintainer (local build and test)
+
+Run from repository root:
+
+```bash
+./devrun.sh
+```
+
+`devrun.sh` executes:
+- builds local operator image (`OPERATOR_IMG`, default `ghcr.io/neodix42/ton-k8s-operator:dev-local`)
+- generates `dist/install.yaml`
+- if the current cluster is `k3d`, imports the image into that cluster (`K3D_CLUSTER_NAME` can override autodetection)
+- updates `charts/ton-k8s-operator/operator-values.yaml` `image.repository` and `image.tag` to match `OPERATOR_IMG`
+
+`kubeton` is included in:
+- `charts/ton-k8s-operator/kubeton`
+
+Deploy operator and TON nodes:
+
+```bash
+cd charts/ton-k8s-operator
+
+# operator only
+./kubeton install
+
+# operator + TON nodes (uses tonnode-values.yaml defaults)
+./kubeton start
+
+# operator + TON nodes with explicit replicas
+./kubeton start 10
+```
+
+On k3d, `./kubeton start` automatically bootstraps Vault and StorageClass `encrypted-sc` (local fallback) if missing.
+
+Verify:
+
+```bash
+./kubeton verify
+```
+
+Stop and cleanup local dev deployment:
+
+```bash
+cd charts/ton-k8s-operator
+./kubeton stop
+./kubeton drop
+
+# safe cleanup (keeps TonNode CRD)
+./kubeton uninstall
+
+# OR full destructive cleanup (includes TonNode CRD)
+# separated from uninstall because CRD deletion is cluster-scoped
+./kubeton purge
+```
+
+### Alternative: Run Controller On Host (`make run`)
 
 `make run` starts the operator manager process on your local machine (not as a Pod in Kubernetes).  
 It uses your current `kubectl` context and watches/reconciles resources in that cluster.
-
-Why use this in local test (k3d):
-- fast development loop (edit code, rerun quickly)
-- easy debugging/logs directly in your terminal
-- no need to build/push operator image for every code change
-
-Why you do not use `make run` in production:
-- production operator should run as an in-cluster Deployment (`make deploy IMG=...`)
-- local process is not highly available and depends on your workstation session
 
 ```bash
 make generate manifests
@@ -553,33 +550,15 @@ kubectl get pods -l app.kubernetes.io/instance=tonnode -o wide
 kubectl get pvc
 ```
 
-### Stop Local Run
-
+Stop local run:
 - Stop `make run` with `Ctrl+C` in the terminal where it is running.
 
-### Uninstall/Cleanup Local Dev
-
-Delete sample resources:
+Cleanup host-run resources:
 
 ```bash
 kubectl delete -f config/samples/ton_v1alpha1_tonnode.yaml --ignore-not-found
-```
-
-Remove CRD from the current cluster context:
-
-```bash
 make uninstall
-```
-
-If you also deployed operator as Deployment in cluster (via `make deploy`), remove it:
-
-```bash
 make undeploy
-```
-
-Optional cleanup for retained TON PVCs:
-
-```bash
 kubectl delete pvc -l app.kubernetes.io/name=ton-node
 ```
 
