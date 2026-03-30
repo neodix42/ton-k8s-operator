@@ -87,7 +87,7 @@ Restore prerequisites:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
 - `kubeton drop` removes TON resources/PVCs only.
-- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
 - `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
@@ -148,6 +148,7 @@ Bare-metal/local-dev default setup is automated by `kubeton`:
 
 Local k3d note:
 - `encrypted-sc` on k3d is a development fallback and does not provide Longhorn-backed disk encryption.
+l- if local Vault bootstrap credentials become stale (for example after manual Vault namespace deletion), `kubeton start` attempts one automatic Vault reinstall/reinitialize recovery on k3d.
 
 You can run bootstrap explicitly:
 
@@ -225,7 +226,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # drops TON nodes and storage (PVCs)
 ./kubeton drop
 
-# delete operator release + Longhorn (keeps TonNode CRD)
+# delete operator release + Longhorn + Vault (keeps TonNode CRD)
 ./kubeton uninstall
 
 # OR full destructive cleanup including TonNode CRD
@@ -410,6 +411,8 @@ For `kubeton`-based full destructive cleanup (including CRD), use:
 ./kubeton purge
 ```
 
+`kubeton purge` includes uninstall of operator, Longhorn, and Vault resources, then deletes TonNode CRD.
+
 ### Flow C: Cluster User (raw install.yaml fallback)
 
 If you prefer plain manifests:
@@ -522,6 +525,7 @@ cd charts/ton-k8s-operator
 ./kubeton drop
 
 # safe cleanup (keeps TonNode CRD)
+# removes operator + Longhorn + Vault resources
 ./kubeton uninstall
 
 # OR full destructive cleanup (includes TonNode CRD)

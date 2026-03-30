@@ -685,6 +685,8 @@ WALLETS_DIR="${MYTONCORE_DIR}/wallets"
 TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
 DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
+SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"
+MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
@@ -794,6 +796,10 @@ need_bin base64
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
 if [ ! -s "$BUNDLE_FILE" ] || [ ! -s "$META_FILE" ]; then
+  if [ ! -d "$SYSTEMD_UNITS_DIR" ] && [ -f "$MTC_DONE_FILE" ]; then
+    echo "systemd-units missing while mtc_done exists; clearing mtc_done to force bootstrap regeneration"
+    rm -f "$MTC_DONE_FILE" || true
+  fi
   echo "no encrypted key bundle found; first run will create one"
   exit 0
 fi
@@ -843,6 +849,10 @@ fi
 chmod 700 "$KEYS_DIR" "$MYTONCORE_DIR" "$WALLETS_DIR" || true
 chmod 700 "$DB_KEYRING_DIR" || true
 chmod 600 "$DB_CONFIG_FILE" || true
+if [ ! -d "$SYSTEMD_UNITS_DIR" ] && [ -f "$MTC_DONE_FILE" ]; then
+  echo "systemd-units missing after restore while mtc_done exists; clearing mtc_done to force bootstrap regeneration"
+  rm -f "$MTC_DONE_FILE" || true
+fi
 echo "encrypted key bundle restored"
 `
 

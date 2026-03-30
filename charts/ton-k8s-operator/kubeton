@@ -51,7 +51,7 @@ Commands:
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
   stop                 Stop TON fleet (tonNode.enabled=false).
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
-  uninstall            Stop/drop TON fleet + uninstall operator and Longhorn (with confirmation; keeps TonNode CRD).
+  uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
   purge                Full destructive cleanup: uninstall + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
   verify               Verify operator and TON resources (deploy/pods, tonnodes, sts/pods/pvc).
   status               Run "sync" and db size checks in each TON pod; print node/pod/sync/cell db/archive db.
@@ -104,6 +104,53 @@ confirm_or_exit() {
 ensure_namespace() {
   local ns="$1"
   kubectl get namespace "$ns" >/dev/null 2>&1 || kubectl create namespace "$ns" >/dev/null
+}
+
+wait_namespace_gone() {
+  local ns="$1"
+  local timeout_seconds="${2:-180}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local phase
+
+  while kubectl get namespace "$ns" >/dev/null 2>&1; do
+    phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if (( $(date +%s) >= deadline )); then
+      if [[ "$phase" == "Terminating" ]]; then
+        echo "[localdev] Namespace ${ns} is stuck Terminating; clearing finalizers ..."
+        kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        deadline=$(( $(date +%s) + 60 ))
+      else
+        echo "Error: namespace ${ns} still exists after waiting ${timeout_seconds}s." >&2
+        return 1
+      fi
+    fi
+    sleep 2
+  done
+  return 0
+}
+
+ensure_namespace_not_terminating() {
+  local ns="$1"
+  local timeout_seconds="${2:-180}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local phase
+
+  while kubectl get namespace "$ns" >/dev/null 2>&1; do
+    phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [[ "$phase" != "Terminating" ]]; then
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      echo "[localdev] Namespace ${ns} is stuck Terminating; clearing finalizers ..."
+      kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
+      kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      deadline=$(( $(date +%s) + 60 ))
+    fi
+    sleep 2
+  done
+
+  return 0
 }
 
 cluster_is_baremetal() {
@@ -314,6 +361,7 @@ EOF
 ensure_vault_installed() {
   local vault_storage_class="${1:-longhorn}"
   require_bin helm
+  ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240
   ensure_helm_repo "hashicorp" "https://helm.releases.hashicorp.com"
   helm repo update hashicorp >/dev/null
 
@@ -335,6 +383,13 @@ ensure_vault_installed() {
 
 vault_exec() {
   kubectl -n "$VAULT_NAMESPACE" exec "${VAULT_RELEASE_NAME}-0" -- "$@"
+}
+
+reset_localdev_vault() {
+  echo "[localdev] Resetting Vault release/namespace for local recovery ..."
+  helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" >/dev/null 2>&1 || true
+  kubectl delete namespace "$VAULT_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  wait_namespace_gone "$VAULT_NAMESPACE" 240 || true
 }
 
 vault_status_with_retry() {
@@ -381,7 +436,7 @@ initialize_and_unseal_vault() {
   fi
   initialized="$(printf '%s\n' "$status" | awk '/^Initialized[[:space:]]+/ {print tolower($2); exit}')"
   if [[ "$initialized" == "false" ]]; then
-    echo "[baremetal] Initializing Vault ..."
+    echo "[baremetal] Initializing Vault ..." >&2
     init_out="$(vault_exec vault operator init -key-shares=1 -key-threshold=1)"
     unseal_key="$(printf '%s\n' "$init_out" | awk -F': ' '/Unseal Key 1:/ {print $2; exit}')"
     root_token="$(printf '%s\n' "$init_out" | awk -F': ' '/Initial Root Token:/ {print $2; exit}')"
@@ -427,7 +482,7 @@ initialize_and_unseal_vault() {
   status="$(vault_status_with_retry || true)"
   sealed="$(printf '%s\n' "$status" | awk '/^Sealed[[:space:]]+/ {print tolower($2); exit}')"
   if [[ "$sealed" == "true" ]]; then
-    echo "[baremetal] Unsealing Vault ..."
+    echo "[baremetal] Unsealing Vault ..." >&2
     vault_exec vault operator unseal "$unseal_key" >/dev/null
   fi
 
@@ -441,25 +496,27 @@ configure_vault_for_ton() {
   root_token="$(sanitize_compact "$root_token")"
   if [[ -z "$root_token" ]]; then
     echo "Error: empty root token for Vault configuration." >&2
-    exit 1
+    return 1
   fi
 
   echo "[baremetal] Configuring Vault Transit key and policy ..."
-  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault secrets list | grep -q '^transit/' || vault secrets enable -path=transit transit"
-  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault read transit/keys/${VAULT_TRANSIT_KEY} >/dev/null 2>&1 || vault write -f transit/keys/${VAULT_TRANSIT_KEY}"
-  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; printf '%s\n' 'path \"transit/encrypt/${VAULT_TRANSIT_KEY}\" { capabilities = [\"update\"] }' 'path \"transit/decrypt/${VAULT_TRANSIT_KEY}\" { capabilities = [\"update\"] }' | vault policy write ${VAULT_TON_POLICY_NAME} -"
-  ton_token="$(vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault token create -policy=${VAULT_TON_POLICY_NAME} -period=${VAULT_TOKEN_PERIOD} -orphan -field=token")"
+  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault secrets list | grep -q '^transit/' || vault secrets enable -path=transit transit" || return 1
+  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault read transit/keys/${VAULT_TRANSIT_KEY} >/dev/null 2>&1 || vault write -f transit/keys/${VAULT_TRANSIT_KEY}" || return 1
+  vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; printf '%s\n' 'path \"transit/encrypt/${VAULT_TRANSIT_KEY}\" { capabilities = [\"update\"] }' 'path \"transit/decrypt/${VAULT_TRANSIT_KEY}\" { capabilities = [\"update\"] }' | vault policy write ${VAULT_TON_POLICY_NAME} -" || return 1
+  ton_token="$(vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault token create -policy=${VAULT_TON_POLICY_NAME} -period=${VAULT_TOKEN_PERIOD} -orphan -field=token")" || return 1
   ton_token="$(sanitize_compact "$ton_token")"
   if [[ -z "$ton_token" ]]; then
     echo "Error: failed to create TON Vault token." >&2
-    exit 1
+    return 1
   fi
 
   ensure_namespace "$TON_NAMESPACE"
   kubectl -n "$TON_NAMESPACE" create secret generic "$TON_VAULT_CREDS_SECRET" \
     --from-literal=VAULT_ADDR="$VAULT_ADDR_INTERNAL" \
     --from-literal=VAULT_TOKEN="$ton_token" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
+
+  return 0
 }
 
 ensure_baremetal_stack() {
@@ -483,12 +540,22 @@ ensure_localdev_stack() {
   require_bin base64
 
   local base_sc
+  local root_token
   base_sc="$(resolve_localdev_storage_class)"
   ensure_localdev_encrypted_storage_class "$base_sc"
   ensure_vault_installed "$base_sc"
-  local root_token
   root_token="$(initialize_and_unseal_vault)"
-  configure_vault_for_ton "$root_token"
+
+  if ! configure_vault_for_ton "$root_token"; then
+    echo "[localdev] Vault configuration failed; reinstalling Vault and reinitializing ..." >&2
+    reset_localdev_vault
+    ensure_vault_installed "$base_sc"
+    root_token="$(initialize_and_unseal_vault)"
+    if ! configure_vault_for_ton "$root_token"; then
+      echo "Error: Vault configuration is still failing after local recovery." >&2
+      exit 1
+    fi
+  fi
 }
 
 ensure_auto_bootstrap_stack() {
@@ -1154,6 +1221,17 @@ uninstall_longhorn() {
   cleanup_longhorn_force
 }
 
+uninstall_vault() {
+  if ! helm status "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" >/dev/null 2>&1; then
+    return 0
+  fi
+  if helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE"; then
+    return 0
+  fi
+  echo "Warning: Vault Helm uninstall failed; namespace cleanup will still be attempted." >&2
+  return 1
+}
+
 run_uninstall_core() {
   run_stop
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
@@ -1163,19 +1241,21 @@ run_uninstall_core() {
   kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
   uninstall_longhorn || true
   kubectl delete namespace "$LONGHORN_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  uninstall_vault || true
+  kubectl delete namespace "$VAULT_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
 }
 
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
   run_uninstall_core
 }
 
 run_purge() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "DANGER: purge runs full uninstall and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
+  confirm_or_exit "DANGER: purge runs full uninstall (operator + Longhorn + Vault + StorageClass cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
   run_uninstall_core
   kubectl delete crd tonnodes.ton.ton.org --ignore-not-found
 }
