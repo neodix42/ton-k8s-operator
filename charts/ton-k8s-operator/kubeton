@@ -782,7 +782,7 @@ restore_bundle_to_pvc() {
   local ns="$1"
   local pvc="$2"
   local src_bundle_dir="$3"
-  local helper_pod="kubeton-restore-$RANDOM"
+  local helper_pod="kubeton-restore-$RANDOM-$RANDOM"
 
   cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
@@ -818,6 +818,108 @@ EOF
   fi
   kubectl -n "$ns" exec "$helper_pod" -- sh -ec 'find /bundle -type f -exec chmod 600 {} +' >/dev/null 2>&1 || true
   kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+restore_replica_from_backup() {
+  local ns="$1"
+  local sts="$2"
+  local ordinal="$3"
+  local input_dir="$4"
+
+  local pvc="keybundle-${sts}-${ordinal}"
+  local item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
+  local bundle_dir="${item_dir}/bundle"
+
+  if [[ ! -d "$bundle_dir" ]]; then
+    echo "Warning: missing backup bundle for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
+    return 10
+  fi
+
+  if [[ -f "${item_dir}/SHA256SUMS" ]]; then
+    if ! (cd "$item_dir" && sha256sum -c SHA256SUMS >/dev/null); then
+      echo "Warning: SHA256SUMS verification failed for ${item_dir}; skipping this replica" >&2
+      return 11
+    fi
+  else
+    echo "Warning: missing ${item_dir}/SHA256SUMS; continuing without checksum verification"
+  fi
+
+  if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+    echo "Warning: missing PVC ${ns}/${pvc}; skipping this replica" >&2
+    return 11
+  fi
+
+  if ! restore_bundle_to_pvc "$ns" "$pvc" "$bundle_dir"; then
+    echo "Warning: failed to restore ${ns}/${pvc} from ${bundle_dir}; skipping this replica" >&2
+    return 11
+  fi
+
+  return 0
+}
+
+export_bundle_from_pvc() {
+  local ns="$1"
+  local sts="$2"
+  local ordinal="$3"
+  local output_dir="$4"
+  local pvc="keybundle-${sts}-${ordinal}"
+  local item_dir="$output_dir/$ns/$sts/$ordinal"
+  local bundle_dir="$item_dir/bundle"
+  local helper_pod="kubeton-backup-${sts}-${ordinal}-$RANDOM-$RANDOM"
+
+  if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+    echo "Warning: missing PVC ${ns}/${pvc}, skipping"
+    return 0
+  fi
+
+  mkdir -p "$bundle_dir"
+
+  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${helper_pod}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: backup
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: keybundle
+          mountPath: /bundle
+          readOnly: true
+  volumes:
+    - name: keybundle
+      persistentVolumeClaim:
+        claimName: ${pvc}
+        readOnly: true
+EOF
+
+  if ! kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout=120s >/dev/null; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    echo "Error: helper pod ${ns}/${helper_pod} did not become Ready." >&2
+    return 1
+  fi
+
+  if ! kubectl -n "$ns" cp "${helper_pod}:/bundle/." "$bundle_dir" >/dev/null; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    echo "Error: failed to copy encrypted bundle from ${ns}/${helper_pod}." >&2
+    return 1
+  fi
+
+  if find "$bundle_dir" -type f -print -quit | grep -q .; then
+    if ! (cd "$item_dir" && find bundle -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS); then
+      kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+      echo "Error: failed to write SHA256SUMS for ${ns}/${sts}/${ordinal}." >&2
+      return 1
+    fi
+  else
+    echo "Warning: ${ns}/${pvc} bundle directory is empty"
+  fi
+
+  kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+  return 0
 }
 
 dash_line() {
@@ -1074,7 +1176,9 @@ run_backup_keys() {
   }
   trap cleanup_restore EXIT INT TERM
 
-  echo "Triggering manual encrypted bundle backup in each TON pod ..."
+  echo "Triggering manual encrypted bundle backup in each TON pod (parallel) ..."
+  local -a trigger_pids=()
+  local -a trigger_descs=()
   for i in "${!sts_list[@]}"; do
     ns="${ns_list[$i]}"
     sts="${sts_list[$i]}"
@@ -1088,9 +1192,23 @@ run_backup_keys() {
 
     for ordinal in $(seq 0 $((replicas - 1))); do
       pod="${sts}-${ordinal}"
-      trigger_key_backup_once "$ns" "$pod"
+      trigger_key_backup_once "$ns" "$pod" &
+      trigger_pids+=("$!")
+      trigger_descs+=("${ns}/${pod}")
     done
   done
+
+  local trigger_failed=0
+  for i in "${!trigger_pids[@]}"; do
+    if ! wait "${trigger_pids[$i]}"; then
+      echo "Error: key backup trigger failed for ${trigger_descs[$i]}." >&2
+      trigger_failed=1
+    fi
+  done
+  if [[ "$trigger_failed" -ne 0 ]]; then
+    echo "Error: one or more pod backup triggers failed." >&2
+    return 1
+  fi
 
   pause_operator_reconcile operator_deploy_names operator_deploy_replicas
   operator_paused=1
@@ -1103,7 +1221,9 @@ run_backup_keys() {
     wait_statefulset_pods_gone "${ns_list[$i]}" "${sts_list[$i]}"
   done
 
-  echo "Exporting encrypted bundles to $output_dir ..."
+  echo "Exporting encrypted bundles to $output_dir (parallel) ..."
+  local -a export_pids=()
+  local -a export_descs=()
   for i in "${!sts_list[@]}"; do
     ns="${ns_list[$i]}"
     sts="${sts_list[$i]}"
@@ -1117,51 +1237,23 @@ run_backup_keys() {
     fi
 
     for ordinal in $(seq 0 $((replicas - 1))); do
-      local pvc="keybundle-${sts}-${ordinal}"
-      if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
-        echo "Warning: missing PVC ${ns}/${pvc}, skipping"
-        continue
-      fi
-
-      local item_dir="$output_dir/$ns/$sts/$ordinal"
-      mkdir -p "$item_dir"
-      local bundle_dir="$item_dir/bundle"
-      mkdir -p "$bundle_dir"
-
-      local helper_pod="kubeton-backup-${sts}-${ordinal}-$RANDOM"
-      cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${helper_pod}
-spec:
-  restartPolicy: Never
-  containers:
-    - name: backup
-      image: busybox:1.36
-      command: ["sh", "-c", "sleep 3600"]
-      volumeMounts:
-        - name: keybundle
-          mountPath: /bundle
-          readOnly: true
-  volumes:
-    - name: keybundle
-      persistentVolumeClaim:
-        claimName: ${pvc}
-        readOnly: true
-EOF
-      kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout=120s >/dev/null
-
-      kubectl -n "$ns" cp "${helper_pod}:/bundle/." "$bundle_dir" >/dev/null
-      if find "$bundle_dir" -type f -print -quit | grep -q .; then
-        (cd "$item_dir" && find bundle -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
-      else
-        echo "Warning: ${ns}/${pvc} bundle directory is empty"
-      fi
-
-      kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null
+      export_bundle_from_pvc "$ns" "$sts" "$ordinal" "$output_dir" &
+      export_pids+=("$!")
+      export_descs+=("${ns}/${sts}/${ordinal}")
     done
   done
+
+  local export_failed=0
+  for i in "${!export_pids[@]}"; do
+    if ! wait "${export_pids[$i]}"; then
+      echo "Error: encrypted bundle export failed for ${export_descs[$i]}." >&2
+      export_failed=1
+    fi
+  done
+  if [[ "$export_failed" -ne 0 ]]; then
+    echo "Error: one or more encrypted bundle exports failed." >&2
+    return 1
+  fi
 
   echo "Restoring TON StatefulSets replicas ..."
   for i in "${!sts_list[@]}"; do
@@ -1205,7 +1297,7 @@ run_restore_keys() {
   local -a replicas_list=()
   local -a operator_deploy_names=()
   local -a operator_deploy_replicas=()
-  local row ns sts replicas i ordinal pvc item_dir bundle_dir
+  local row ns sts replicas i ordinal
   local operator_paused=0
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
@@ -1240,10 +1332,12 @@ run_restore_keys() {
     wait_statefulset_pods_gone "${ns_list[$i]}" "${sts_list[$i]}"
   done
 
-  echo "Restoring encrypted bundles from $input_dir ..."
+  echo "Restoring encrypted bundles from $input_dir (parallel) ..."
   local restored_count=0
   local skipped_missing_count=0
   local failed_count=0
+  local -a restore_pids=()
+  local -a restore_descs=()
   for i in "${!sts_list[@]}"; do
     ns="${ns_list[$i]}"
     sts="${sts_list[$i]}"
@@ -1256,35 +1350,31 @@ run_restore_keys() {
     fi
 
     for ordinal in $(seq 0 $((replicas - 1))); do
-      pvc="keybundle-${sts}-${ordinal}"
-      item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
-      bundle_dir="${item_dir}/bundle"
-      if [[ ! -d "$bundle_dir" ]]; then
-        echo "Warning: missing backup bundle for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
-        ((skipped_missing_count+=1))
-        continue
-      fi
-      if [[ -f "${item_dir}/SHA256SUMS" ]]; then
-        if ! (cd "$item_dir" && sha256sum -c SHA256SUMS >/dev/null); then
-          echo "Warning: SHA256SUMS verification failed for ${item_dir}; skipping this replica" >&2
-          ((failed_count+=1))
-          continue
-        fi
-      else
-        echo "Warning: missing ${item_dir}/SHA256SUMS; continuing without checksum verification"
-      fi
-      if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
-        echo "Warning: missing PVC ${ns}/${pvc}; skipping this replica" >&2
-        ((failed_count+=1))
-        continue
-      fi
-      if ! restore_bundle_to_pvc "$ns" "$pvc" "$bundle_dir"; then
-        echo "Warning: failed to restore ${ns}/${pvc} from ${bundle_dir}; skipping this replica" >&2
-        ((failed_count+=1))
-        continue
-      fi
-      ((restored_count+=1))
+      restore_replica_from_backup "$ns" "$sts" "$ordinal" "$input_dir" &
+      restore_pids+=("$!")
+      restore_descs+=("${ns}/${sts}/${ordinal}")
     done
+  done
+
+  for i in "${!restore_pids[@]}"; do
+    local restore_rc=0
+    if wait "${restore_pids[$i]}"; then
+      restore_rc=0
+    else
+      restore_rc=$?
+    fi
+    case "$restore_rc" in
+      0)
+        ((restored_count+=1))
+        ;;
+      10)
+        ((skipped_missing_count+=1))
+        ;;
+      *)
+        echo "Error: encrypted bundle restore failed for ${restore_descs[$i]}." >&2
+        ((failed_count+=1))
+        ;;
+    esac
   done
 
   echo "Restoring TON StatefulSets replicas ..."
