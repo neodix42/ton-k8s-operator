@@ -225,6 +225,53 @@ ensure_helm_repo() {
   helm repo add "$name" "$url" --force-update >/dev/null
 }
 
+cleanup_longhorn_webhook_configs() {
+  kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration -o name 2>/dev/null \
+    | grep -Ei 'longhorn' \
+    | xargs -r kubectl delete --ignore-not-found >/dev/null 2>&1 || true
+}
+
+clear_longhorn_namespace_resource_finalizers() {
+  local resource
+  for resource in $(kubectl api-resources --api-group=longhorn.io -o name 2>/dev/null || true); do
+    kubectl -n "$LONGHORN_NAMESPACE" get "$resource" -o name 2>/dev/null \
+      | xargs -r -I{} kubectl -n "$LONGHORN_NAMESPACE" patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+  done
+}
+
+force_finalize_namespace() {
+  local ns="$1"
+
+  kubectl patch namespace "$ns" --type=json -p='[{"op":"replace","path":"/spec/finalizers","value":[]}]' >/dev/null 2>&1 || true
+  kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
+
+  if command -v jq >/dev/null 2>&1; then
+    kubectl get ns "$ns" -o json 2>/dev/null \
+      | jq '.spec.finalizers=[]' \
+      | kubectl replace --raw "/api/v1/namespaces/${ns}/finalize" -f - >/dev/null 2>&1 || true
+  fi
+
+  kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+
+recover_stuck_longhorn_namespace() {
+  local phase
+  if ! kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  phase="$(kubectl get namespace "$LONGHORN_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [[ "$phase" != "Terminating" ]]; then
+    return 0
+  fi
+
+  echo "[baremetal] Namespace ${LONGHORN_NAMESPACE} is Terminating; cleaning stale Longhorn webhooks/finalizers ..."
+  cleanup_longhorn_webhook_configs
+  clear_longhorn_namespace_resource_finalizers
+  force_finalize_namespace "$LONGHORN_NAMESPACE"
+  wait_namespace_gone "$LONGHORN_NAMESPACE" 240 || true
+}
+
 run_with_namespace_progress() {
   local label="$1"
   local ns="$2"
@@ -262,6 +309,12 @@ ensure_longhorn_installed() {
     echo "Error: LONGHORN_CHART_VERSION must be a v1.x release, got: $LONGHORN_CHART_VERSION" >&2
     exit 1
   fi
+
+  recover_stuck_longhorn_namespace
+
+  # Previous failed uninstall can leave namespace in Terminating state.
+  # Helm install cannot create release secrets there until namespace recovers.
+  ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
 
   ensure_helm_repo "longhorn" "https://charts.longhorn.io"
   helm repo update longhorn >/dev/null
