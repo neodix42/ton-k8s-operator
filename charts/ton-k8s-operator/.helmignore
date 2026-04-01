@@ -1,0 +1,6 @@
+# Prevent large local backup artifacts from inflating Helm release payloads.
+key-backups/
+
+# Common local/package artifacts.
+*.tgz
+.DS_Store

@@ -601,13 +601,64 @@ list_ton_statefulsets() {
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
 }
 
+set_ton_replicas() {
+  local ns="$1"
+  local name="$2"
+  local replicas="$3"
+
+  kubectl -n "$ns" scale statefulset "$name" --replicas="$replicas" >/dev/null
+}
+
+pause_operator_reconcile() {
+  local -n deploy_names_ref="$1"
+  local -n deploy_replicas_ref="$2"
+
+  mapfile -t deploy_rows < <(kubectl -n "$OP_NAMESPACE" get deploy -l "app.kubernetes.io/instance=${RELEASE_NAME}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}')
+  if [[ ${#deploy_rows[@]} -eq 0 || -z "${deploy_rows[0]}" ]]; then
+    echo "Warning: no operator deployments found in namespace ${OP_NAMESPACE}; backup/restore may race with reconciliation." >&2
+    return 0
+  fi
+
+  local row name replicas
+  for row in "${deploy_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r name replicas <<<"$row"
+    [[ -z "$name" ]] && continue
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=1
+    fi
+    deploy_names_ref+=("$name")
+    deploy_replicas_ref+=("$replicas")
+  done
+
+  echo "Pausing operator reconciliation (scaling deployments in ${OP_NAMESPACE} to 0) ..."
+  local i
+  for i in "${!deploy_names_ref[@]}"; do
+    kubectl -n "$OP_NAMESPACE" scale deployment "${deploy_names_ref[$i]}" --replicas=0 >/dev/null
+  done
+}
+
+resume_operator_reconcile() {
+  local -n deploy_names_ref="$1"
+  local -n deploy_replicas_ref="$2"
+  local i
+
+  [[ ${#deploy_names_ref[@]} -eq 0 ]] && return 0
+
+  echo "Resuming operator reconciliation in ${OP_NAMESPACE} ..."
+  for i in "${!deploy_names_ref[@]}"; do
+    kubectl -n "$OP_NAMESPACE" scale deployment "${deploy_names_ref[$i]}" --replicas="${deploy_replicas_ref[$i]}" >/dev/null 2>&1 || true
+  done
+}
+
 wait_statefulset_pods_gone() {
   local ns="$1"
   local sts="$2"
   local deadline=$(( $(date +%s) + 900 ))
   while (( $(date +%s) < deadline )); do
     local count
-    count="$(kubectl -n "$ns" get pods -l "app.kubernetes.io/instance=${sts}" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')"
+    count="$(kubectl -n "$ns" get pods -l "app.kubernetes.io/instance=${sts},app.kubernetes.io/name=ton-node" -o name 2>/dev/null | wc -l | tr -d '[:space:]')"
     if [[ "${count:-0}" == "0" ]]; then
       return 0
     fi
@@ -924,7 +975,9 @@ run_backup_keys() {
   require_bin sha256sum
   require_bin date
 
-  local output_dir="${1:-$CHART_DIR/key-backups/$(date -u +%Y%m%dT%H%M%SZ)}"
+  local default_output_root
+  default_output_root="$(cd "$CHART_DIR/.." && pwd)/key-backups"
+  local output_dir="${1:-$default_output_root/$(date -u +%Y%m%dT%H%M%SZ)}"
   if [[ $# -gt 1 ]]; then
     echo "Error: usage: kubeton backup-keys [output-dir]" >&2
     exit 1
@@ -942,7 +995,10 @@ run_backup_keys() {
   local -a ns_list=()
   local -a sts_list=()
   local -a replicas_list=()
+  local -a operator_deploy_names=()
+  local -a operator_deploy_replicas=()
   local row ns sts replicas i ordinal pod
+  local operator_paused=0
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns sts replicas <<<"$row"
@@ -954,11 +1010,14 @@ run_backup_keys() {
 
   local restore_required=1
   cleanup_restore() {
-    [[ "$restore_required" -ne 1 ]] && return 0
+    [[ "${restore_required:-0}" -ne 1 ]] && return 0
     local i
     for i in "${!sts_list[@]}"; do
-      kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas="${replicas_list[$i]}" >/dev/null 2>&1 || true
+      set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}" >/dev/null 2>&1 || true
     done
+    if [[ "${operator_paused:-0}" -eq 1 ]]; then
+      resume_operator_reconcile operator_deploy_names operator_deploy_replicas || true
+    fi
   }
   trap cleanup_restore EXIT INT TERM
 
@@ -980,9 +1039,12 @@ run_backup_keys() {
     done
   done
 
+  pause_operator_reconcile operator_deploy_names operator_deploy_replicas
+  operator_paused=1
+
   echo "Scaling TON StatefulSets to 0 ..."
   for i in "${!sts_list[@]}"; do
-    kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas=0 >/dev/null
+    set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" 0
   done
   for i in "${!sts_list[@]}"; do
     wait_statefulset_pods_gone "${ns_list[$i]}" "${sts_list[$i]}"
@@ -1010,6 +1072,8 @@ run_backup_keys() {
 
       local item_dir="$output_dir/$ns/$sts/$ordinal"
       mkdir -p "$item_dir"
+      local bundle_dir="$item_dir/bundle"
+      mkdir -p "$bundle_dir"
 
       local helper_pod="kubeton-backup-${sts}-${ordinal}-$RANDOM"
       cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
@@ -1035,8 +1099,8 @@ spec:
 EOF
       kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout=120s >/dev/null
 
-      kubectl -n "$ns" cp "${helper_pod}:/bundle" "$item_dir" >/dev/null
-      if find "$item_dir/bundle" -type f -print -quit | grep -q .; then
+      kubectl -n "$ns" cp "${helper_pod}:/bundle/." "$bundle_dir" >/dev/null
+      if find "$bundle_dir" -type f -print -quit | grep -q .; then
         (cd "$item_dir" && find bundle -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
       else
         echo "Warning: ${ns}/${pvc} bundle directory is empty"
@@ -1048,8 +1112,12 @@ EOF
 
   echo "Restoring TON StatefulSets replicas ..."
   for i in "${!sts_list[@]}"; do
-    kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas="${replicas_list[$i]}" >/dev/null
+    set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}"
   done
+  if [[ "$operator_paused" -eq 1 ]]; then
+    resume_operator_reconcile operator_deploy_names operator_deploy_replicas
+    operator_paused=0
+  fi
 
   restore_required=0
   trap - EXIT INT TERM
@@ -1082,7 +1150,10 @@ run_restore_keys() {
   local -a ns_list=()
   local -a sts_list=()
   local -a replicas_list=()
+  local -a operator_deploy_names=()
+  local -a operator_deploy_replicas=()
   local row ns sts replicas i ordinal pvc item_dir bundle_dir
+  local operator_paused=0
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns sts replicas <<<"$row"
@@ -1094,17 +1165,23 @@ run_restore_keys() {
 
   local restore_required=1
   cleanup_restore() {
-    [[ "$restore_required" -ne 1 ]] && return 0
+    [[ "${restore_required:-0}" -ne 1 ]] && return 0
     local i
     for i in "${!sts_list[@]}"; do
-      kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas="${replicas_list[$i]}" >/dev/null 2>&1 || true
+      set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}" >/dev/null 2>&1 || true
     done
+    if [[ "${operator_paused:-0}" -eq 1 ]]; then
+      resume_operator_reconcile operator_deploy_names operator_deploy_replicas || true
+    fi
   }
   trap cleanup_restore EXIT INT TERM
 
+  pause_operator_reconcile operator_deploy_names operator_deploy_replicas
+  operator_paused=1
+
   echo "Scaling TON StatefulSets to 0 ..."
   for i in "${!sts_list[@]}"; do
-    kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas=0 >/dev/null
+    set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" 0
   done
   for i in "${!sts_list[@]}"; do
     wait_statefulset_pods_gone "${ns_list[$i]}" "${sts_list[$i]}"
@@ -1131,13 +1208,13 @@ run_restore_keys() {
       bundle_dir="${item_dir}/bundle"
       if [[ ! -d "$bundle_dir" ]]; then
         echo "Warning: missing backup bundle for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
-        ((skipped_missing_count++))
+        ((skipped_missing_count+=1))
         continue
       fi
       if [[ -f "${item_dir}/SHA256SUMS" ]]; then
         if ! (cd "$item_dir" && sha256sum -c SHA256SUMS >/dev/null); then
           echo "Warning: SHA256SUMS verification failed for ${item_dir}; skipping this replica" >&2
-          ((failed_count++))
+          ((failed_count+=1))
           continue
         fi
       else
@@ -1145,22 +1222,26 @@ run_restore_keys() {
       fi
       if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
         echo "Warning: missing PVC ${ns}/${pvc}; skipping this replica" >&2
-        ((failed_count++))
+        ((failed_count+=1))
         continue
       fi
       if ! restore_bundle_to_pvc "$ns" "$pvc" "$bundle_dir"; then
         echo "Warning: failed to restore ${ns}/${pvc} from ${bundle_dir}; skipping this replica" >&2
-        ((failed_count++))
+        ((failed_count+=1))
         continue
       fi
-      ((restored_count++))
+      ((restored_count+=1))
     done
   done
 
   echo "Restoring TON StatefulSets replicas ..."
   for i in "${!sts_list[@]}"; do
-    kubectl -n "${ns_list[$i]}" scale statefulset "${sts_list[$i]}" --replicas="${replicas_list[$i]}" >/dev/null
+    set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}"
   done
+  if [[ "$operator_paused" -eq 1 ]]; then
+    resume_operator_reconcile operator_deploy_names operator_deploy_replicas
+    operator_paused=0
+  fi
 
   restore_required=0
   trap - EXIT INT TERM
