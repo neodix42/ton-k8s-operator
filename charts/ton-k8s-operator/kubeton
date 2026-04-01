@@ -272,6 +272,45 @@ recover_stuck_longhorn_namespace() {
   wait_namespace_gone "$LONGHORN_NAMESPACE" 240 || true
 }
 
+delete_namespace_with_progress() {
+  local ns="$1"
+  local timeout_seconds="${2:-300}"
+  local start_ts now_ts elapsed phase pods
+
+  if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
+    echo "[uninstall] Namespace ${ns} already absent."
+    return 0
+  fi
+
+  echo "[uninstall] Deleting namespace ${ns} ..."
+  kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+  start_ts="$(date +%s)"
+  while kubectl get namespace "$ns" >/dev/null 2>&1; do
+    now_ts="$(date +%s)"
+    elapsed=$((now_ts - start_ts))
+    phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    pods="$(kubectl -n "$ns" get pods --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    [[ -z "$pods" ]] && pods="0"
+    echo "[progress] namespace ${ns}: phase=${phase:-unknown}, pods=${pods} (elapsed ${elapsed}s)"
+
+    if (( elapsed >= timeout_seconds )); then
+      echo "Warning: namespace ${ns} still exists after ${timeout_seconds}s; forcing cleanup attempt." >&2
+      if [[ "$ns" == "$LONGHORN_NAMESPACE" ]]; then
+        recover_stuck_longhorn_namespace || true
+      else
+        kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      fi
+      start_ts="$(date +%s)"
+    fi
+    sleep 10
+  done
+
+  echo "[uninstall] Namespace ${ns} removed."
+  return 0
+}
+
 run_with_namespace_progress() {
   local label="$1"
   local ns="$2"
@@ -1521,16 +1560,31 @@ uninstall_vault() {
 }
 
 run_uninstall_core() {
+  echo "[uninstall] Step 1/8: disabling TON resources in Helm release ${RELEASE_NAME} ..."
   run_stop_without_backup
+
+  echo "[uninstall] Step 2/8: deleting TonNode custom resources ..."
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
+
+  echo "[uninstall] Step 3/8: deleting TON PVCs ..."
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
+
+  echo "[uninstall] Step 4/8: uninstalling operator Helm release ${RELEASE_NAME} ..."
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
-  kubectl delete namespace "$OP_NAMESPACE" --ignore-not-found
+  delete_namespace_with_progress "$OP_NAMESPACE" 300
+
+  echo "[uninstall] Step 5/8: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
   kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
+
+  echo "[uninstall] Step 6/8: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   uninstall_longhorn || true
-  kubectl delete namespace "$LONGHORN_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  delete_namespace_with_progress "$LONGHORN_NAMESPACE" 360
+
+  echo "[uninstall] Step 7/8: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
   uninstall_vault || true
-  kubectl delete namespace "$VAULT_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  delete_namespace_with_progress "$VAULT_NAMESPACE" 300
+
+  echo "[uninstall] Step 8/8: uninstall core complete."
 }
 
 run_uninstall() {
@@ -1545,7 +1599,9 @@ run_purge() {
   require_bin kubectl
   confirm_or_exit "DANGER: purge runs full uninstall (operator + Longhorn + Vault + StorageClass cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
   run_uninstall_core
+  echo "[purge] Deleting CRD tonnodes.ton.ton.org ..."
   kubectl delete crd tonnodes.ton.ton.org --ignore-not-found
+  echo "[purge] Completed."
 }
 
 run_verify() {
