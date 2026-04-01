@@ -35,6 +35,7 @@ VAULT_BOOTSTRAP_ROOT_TOKEN="${VAULT_BOOTSTRAP_ROOT_TOKEN:-}"
 TON_VAULT_CREDS_SECRET="${TON_VAULT_CREDS_SECRET:-ton-vault-creds}"
 VAULT_ADDR_INTERNAL="${VAULT_ADDR_INTERNAL:-http://${VAULT_RELEASE_NAME}.${VAULT_NAMESPACE}.svc:8200}"
 VAULT_TOKEN_PERIOD="${VAULT_TOKEN_PERIOD:-720h}"
+NAMESPACE_DELETE_PROGRESS_TIMEOUT="${NAMESPACE_DELETE_PROGRESS_TIMEOUT:-60}"
 
 usage() {
   cat <<'EOF'
@@ -68,6 +69,7 @@ Environment overrides:
   VAULT_TRANSIT_KEY, VAULT_TON_POLICY_NAME, VAULT_BOOTSTRAP_SECRET
   VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
   TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
+  NAMESPACE_DELETE_PROGRESS_TIMEOUT
   SKIP_STOP_KEY_BACKUP
 EOF
 }
@@ -112,11 +114,18 @@ wait_namespace_gone() {
   local timeout_seconds="${2:-180}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
   local phase
+  local force_attempts=0
+  local max_force_attempts=4
 
   while kubectl get namespace "$ns" >/dev/null 2>&1; do
     phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     if (( $(date +%s) >= deadline )); then
       if [[ "$phase" == "Terminating" ]]; then
+        if (( force_attempts >= max_force_attempts )); then
+          echo "Error: namespace ${ns} is still Terminating after ${max_force_attempts} forced cleanup attempts." >&2
+          return 1
+        fi
+        ((force_attempts+=1))
         echo "[localdev] Namespace ${ns} is stuck Terminating; clearing finalizers ..."
         kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
         kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -136,6 +145,8 @@ ensure_namespace_not_terminating() {
   local timeout_seconds="${2:-180}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
   local phase
+  local force_attempts=0
+  local max_force_attempts=4
 
   while kubectl get namespace "$ns" >/dev/null 2>&1; do
     phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
@@ -143,6 +154,11 @@ ensure_namespace_not_terminating() {
       return 0
     fi
     if (( $(date +%s) >= deadline )); then
+      if (( force_attempts >= max_force_attempts )); then
+        echo "Error: namespace ${ns} remains Terminating after ${max_force_attempts} forced cleanup attempts." >&2
+        return 1
+      fi
+      ((force_attempts+=1))
       echo "[localdev] Namespace ${ns} is stuck Terminating; clearing finalizers ..."
       kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
       kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -269,13 +285,62 @@ recover_stuck_longhorn_namespace() {
   cleanup_longhorn_webhook_configs
   clear_longhorn_namespace_resource_finalizers
   force_finalize_namespace "$LONGHORN_NAMESPACE"
-  wait_namespace_gone "$LONGHORN_NAMESPACE" 240 || true
+  wait_namespace_gone "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
+}
+
+cleanup_vault_force() {
+  echo "[uninstall] Forcing Vault cleanup ..."
+
+  if ! kubectl get namespace "$VAULT_NAMESPACE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Ensure workload references are gone so pvc-protection can clear.
+  kubectl -n "$VAULT_NAMESPACE" delete statefulset vault --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$VAULT_NAMESPACE" delete pod --all --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
+
+  local pvc pv
+  for pvc in $(kubectl -n "$VAULT_NAMESPACE" get pvc -o name 2>/dev/null || true); do
+    kubectl -n "$VAULT_NAMESPACE" patch "$pvc" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    pv="$(kubectl -n "$VAULT_NAMESPACE" get "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+    if [[ -n "$pv" ]]; then
+      kubectl patch "pv/${pv}" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    fi
+  done
+  kubectl -n "$VAULT_NAMESPACE" delete pvc --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+  local resource
+  for resource in $(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null || true); do
+    kubectl -n "$VAULT_NAMESPACE" get "$resource" -o name 2>/dev/null \
+      | xargs -r -I{} kubectl -n "$VAULT_NAMESPACE" patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    kubectl -n "$VAULT_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  force_finalize_namespace "$VAULT_NAMESPACE"
+  wait_namespace_gone "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
+}
+
+recover_stuck_vault_namespace() {
+  local phase
+  if ! kubectl get namespace "$VAULT_NAMESPACE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  phase="$(kubectl get namespace "$VAULT_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [[ "$phase" != "Terminating" ]]; then
+    return 0
+  fi
+
+  echo "[baremetal] Namespace ${VAULT_NAMESPACE} is Terminating; cleaning stuck Vault pods/PVC/finalizers ..."
+  cleanup_vault_force
 }
 
 delete_namespace_with_progress() {
   local ns="$1"
-  local timeout_seconds="${2:-300}"
+  local timeout_seconds="${2:-$NAMESPACE_DELETE_PROGRESS_TIMEOUT}"
   local start_ts now_ts elapsed phase pods
+  local force_attempts=0
+  local max_force_attempts=3
 
   if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
     echo "[uninstall] Namespace ${ns} already absent."
@@ -295,9 +360,16 @@ delete_namespace_with_progress() {
     echo "[progress] namespace ${ns}: phase=${phase:-unknown}, pods=${pods} (elapsed ${elapsed}s)"
 
     if (( elapsed >= timeout_seconds )); then
+      if (( force_attempts >= max_force_attempts )); then
+        echo "Warning: namespace ${ns} still exists after ${max_force_attempts} forced cleanup attempts; continuing uninstall." >&2
+        return 0
+      fi
+      ((force_attempts+=1))
       echo "Warning: namespace ${ns} still exists after ${timeout_seconds}s; forcing cleanup attempt." >&2
       if [[ "$ns" == "$LONGHORN_NAMESPACE" ]]; then
         recover_stuck_longhorn_namespace || true
+      elif [[ "$ns" == "$VAULT_NAMESPACE" ]]; then
+        recover_stuck_vault_namespace || true
       else
         kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
         kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -1579,7 +1651,7 @@ cleanup_longhorn_force() {
     echo "[uninstall] Removing Helm release metadata in ${LONGHORN_NAMESPACE} ..."
     kubectl -n "$LONGHORN_NAMESPACE" delete secret,configmap -l "owner=helm,name=${LONGHORN_RELEASE_NAME}" --ignore-not-found >/dev/null 2>&1 || true
     force_finalize_namespace "$LONGHORN_NAMESPACE"
-    wait_namespace_gone "$LONGHORN_NAMESPACE" 360 || true
+    wait_namespace_gone "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
   fi
 }
 
@@ -1604,11 +1676,16 @@ uninstall_vault() {
   if ! helm status "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" >/dev/null 2>&1; then
     return 0
   fi
+  echo "[uninstall] Running Helm uninstall for Vault release ${VAULT_RELEASE_NAME} ..."
   if helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE"; then
     return 0
   fi
-  echo "Warning: Vault Helm uninstall failed; namespace cleanup will still be attempted." >&2
-  return 1
+  echo "Warning: Vault Helm uninstall failed; retrying with --no-hooks." >&2
+  if helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" --no-hooks >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Warning: Vault Helm uninstall --no-hooks failed; running forced cleanup fallback." >&2
+  cleanup_vault_force
 }
 
 run_uninstall_core() {
@@ -1623,18 +1700,20 @@ run_uninstall_core() {
 
   echo "[uninstall] Step 4/8: uninstalling operator Helm release ${RELEASE_NAME} ..."
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
-  delete_namespace_with_progress "$OP_NAMESPACE" 300
+  delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
   echo "[uninstall] Step 5/8: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
   kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
 
   echo "[uninstall] Step 6/8: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   uninstall_longhorn || true
-  delete_namespace_with_progress "$LONGHORN_NAMESPACE" 360
+  cleanup_longhorn_force || true
+  delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
   echo "[uninstall] Step 7/8: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
   uninstall_vault || true
-  delete_namespace_with_progress "$VAULT_NAMESPACE" 300
+  cleanup_vault_force || true
+  delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
   echo "[uninstall] Step 8/8: uninstall core complete."
 }
