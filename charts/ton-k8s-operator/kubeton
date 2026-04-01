@@ -1507,14 +1507,26 @@ run_drop() {
 cleanup_longhorn_force() {
   echo "[uninstall] Forcing Longhorn cleanup ..."
 
-  kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration -o name 2>/dev/null \
-    | grep -Ei 'longhorn' \
-    | xargs -r kubectl delete --ignore-not-found >/dev/null 2>&1 || true
+  cleanup_longhorn_webhook_configs
+
+  if kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
+    echo "[uninstall] Deleting Longhorn uninstall/install jobs ..."
+    kubectl -n "$LONGHORN_NAMESPACE" delete job longhorn-uninstall longhorn-install --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    echo "[uninstall] Deleting Longhorn namespaced workload resources ..."
+    kubectl -n "$LONGHORN_NAMESPACE" delete all --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
 
   local resource
-  for resource in $(kubectl api-resources --api-group=longhorn.io -o name 2>/dev/null || true); do
-    kubectl get -A "$resource" -o name 2>/dev/null \
+  for resource in $(kubectl api-resources --api-group=longhorn.io --namespaced=true -o name 2>/dev/null || true); do
+    kubectl -n "$LONGHORN_NAMESPACE" get "$resource" -o name 2>/dev/null \
+      | xargs -r -I{} kubectl -n "$LONGHORN_NAMESPACE" patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    kubectl -n "$LONGHORN_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  for resource in $(kubectl api-resources --api-group=longhorn.io --namespaced=false -o name 2>/dev/null || true); do
+    kubectl get "$resource" -o name 2>/dev/null \
       | xargs -r -I{} kubectl patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    kubectl delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done
 
   kubectl get crd -o name 2>/dev/null \
@@ -1526,14 +1538,10 @@ cleanup_longhorn_force() {
     | xargs -r -I{} kubectl patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
 
   if kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
-    if command -v jq >/dev/null 2>&1; then
-      kubectl get ns "$LONGHORN_NAMESPACE" -o json \
-        | jq '.spec.finalizers=[]' \
-        | kubectl replace --raw "/api/v1/namespaces/${LONGHORN_NAMESPACE}/finalize" -f - >/dev/null 2>&1 || true
-    else
-      kubectl patch namespace "$LONGHORN_NAMESPACE" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    fi
-    kubectl delete namespace "$LONGHORN_NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    echo "[uninstall] Removing Helm release metadata in ${LONGHORN_NAMESPACE} ..."
+    kubectl -n "$LONGHORN_NAMESPACE" delete secret,configmap -l "owner=helm,name=${LONGHORN_RELEASE_NAME}" --ignore-not-found >/dev/null 2>&1 || true
+    force_finalize_namespace "$LONGHORN_NAMESPACE"
+    wait_namespace_gone "$LONGHORN_NAMESPACE" 360 || true
   fi
 }
 
@@ -1541,10 +1549,15 @@ uninstall_longhorn() {
   if ! helm status "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
     return 0
   fi
+  echo "[uninstall] Running Helm uninstall for Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   if helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE"; then
     return 0
   fi
-  echo "Warning: Longhorn Helm uninstall failed; running forced cleanup fallback." >&2
+  echo "Warning: Longhorn Helm uninstall failed; retrying with --no-hooks." >&2
+  if helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" --no-hooks >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Warning: Longhorn Helm uninstall --no-hooks failed; running forced cleanup fallback." >&2
   cleanup_longhorn_force
 }
 
