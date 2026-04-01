@@ -22,6 +22,7 @@ LONGHORN_DEFAULT_REPLICA_COUNT="${LONGHORN_DEFAULT_REPLICA_COUNT:-3}"
 ENCRYPTED_SC_NAME="${ENCRYPTED_SC_NAME:-encrypted-sc}"
 LONGHORN_CRYPTO_SECRET_NAME="${LONGHORN_CRYPTO_SECRET_NAME:-longhorn-crypto}"
 LOCALDEV_BASE_SC="${LOCALDEV_BASE_SC:-local-path}"
+ALLOW_DESTRUCTIVE_LONGHORN_REPAIR="${ALLOW_DESTRUCTIVE_LONGHORN_REPAIR:-false}"
 
 VAULT_RELEASE_NAME="${VAULT_RELEASE_NAME:-vault}"
 VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
@@ -64,7 +65,7 @@ Environment overrides:
   AUTO_BAREMETAL_BOOTSTRAP, FORCE_BAREMETAL_BOOTSTRAP, SKIP_KEY_PREREQ_CHECK
   LONGHORN_RELEASE_NAME, LONGHORN_NAMESPACE, LONGHORN_CHART, LONGHORN_CHART_VERSION
   LONGHORN_DEFAULT_REPLICA_COUNT, ENCRYPTED_SC_NAME, LONGHORN_CRYPTO_SECRET_NAME
-  LOCALDEV_BASE_SC
+  LOCALDEV_BASE_SC, ALLOW_DESTRUCTIVE_LONGHORN_REPAIR
   VAULT_RELEASE_NAME, VAULT_NAMESPACE, VAULT_CHART, VAULT_CHART_VERSION
   VAULT_TRANSIT_KEY, VAULT_TON_POLICY_NAME, VAULT_BOOTSTRAP_SECRET
   VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
@@ -426,6 +427,20 @@ longhorn_release_metadata_present() {
 
 repair_stale_longhorn_release() {
   local status="$1"
+  local reason
+
+  if [[ -n "$status" ]]; then
+    reason="status=${status}"
+  else
+    reason="orphaned_helm_metadata"
+  fi
+
+  if ! is_true "$ALLOW_DESTRUCTIVE_LONGHORN_REPAIR"; then
+    echo "Error: detected stale Longhorn release (${reason}), but destructive auto-repair is disabled." >&2
+    echo "Refusing to delete Longhorn resources during start/bootstrap." >&2
+    echo "If you really want this automatic cleanup, rerun with: ALLOW_DESTRUCTIVE_LONGHORN_REPAIR=true ./kubeton start" >&2
+    return 1
+  fi
 
   if [[ -n "$status" ]]; then
     echo "[baremetal] Longhorn Helm release is in state '${status}', resetting stale release state ..."
@@ -459,7 +474,7 @@ ensure_longhorn_installed() {
     repair_stale_longhorn_release "$lh_status"
     recover_stuck_longhorn_namespace
     ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
-  elif kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && longhorn_release_metadata_present; then
+  elif [[ -z "$lh_status" ]] && kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && longhorn_release_metadata_present; then
     repair_stale_longhorn_release ""
     recover_stuck_longhorn_namespace
     ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
@@ -611,6 +626,23 @@ vault_status_with_retry() {
   return 1
 }
 
+verify_vault_data_path_writable() {
+  local check_out
+  check_out="$(vault_exec sh -ec '
+    test -d /vault/data
+    touch /vault/data/.kubeton-rw-test
+    rm -f /vault/data/.kubeton-rw-test
+  ' 2>&1)" && return 0
+
+  echo "Error: Vault data path /vault/data is not writable in ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0." >&2
+  if [[ -n "$check_out" ]]; then
+    echo "Detail: $(printf '%s' "$check_out" | tr '\n' ' ')" >&2
+  fi
+  echo "This usually means the underlying PVC/PV/Longhorn volume is unhealthy (for example I/O error)." >&2
+  echo "Check: kubectl -n ${VAULT_NAMESPACE} describe pod ${VAULT_RELEASE_NAME}-0 ; kubectl -n ${VAULT_NAMESPACE} get pvc ; kubectl -n longhorn-system get volumes.longhorn.io -o wide" >&2
+  return 1
+}
+
 ensure_vault_bootstrap_secret_from_env() {
   local env_unseal_key env_root_token
   if [[ -z "$VAULT_BOOTSTRAP_UNSEAL_KEY" || -z "$VAULT_BOOTSTRAP_ROOT_TOKEN" ]]; then
@@ -701,6 +733,7 @@ configure_vault_for_ton() {
     echo "Error: empty root token for Vault configuration." >&2
     return 1
   fi
+  verify_vault_data_path_writable || return 1
 
   echo "[baremetal] Configuring Vault Transit key and policy ..."
   vault_exec sh -ec "export VAULT_TOKEN='${root_token}'; vault secrets list | grep -q '^transit/' || vault secrets enable -path=transit transit" || return 1
