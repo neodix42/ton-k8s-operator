@@ -341,6 +341,32 @@ run_with_namespace_progress() {
   wait "$cmd_pid"
 }
 
+longhorn_release_status() {
+  helm status "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" 2>/dev/null \
+    | awk -F': ' '/^STATUS:/ {print tolower($2); exit}'
+}
+
+longhorn_release_metadata_present() {
+  local count
+  count="$(kubectl -n "$LONGHORN_NAMESPACE" get secret,configmap -l "owner=helm,name=${LONGHORN_RELEASE_NAME}" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}' || true)"
+  [[ "${count:-0}" != "0" ]]
+}
+
+repair_stale_longhorn_release() {
+  local status="$1"
+
+  if [[ -n "$status" ]]; then
+    echo "[baremetal] Longhorn Helm release is in state '${status}', resetting stale release state ..."
+  else
+    echo "[baremetal] Longhorn Helm metadata exists without a healthy deployed release; resetting stale release state ..."
+  fi
+
+  # Uninstall hook can fail when deleting-confirmation-flag is false.
+  helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" --no-hooks >/dev/null 2>&1 || true
+  kubectl -n "$LONGHORN_NAMESPACE" delete secret,configmap -l "owner=helm,name=${LONGHORN_RELEASE_NAME}" --ignore-not-found >/dev/null 2>&1 || true
+  cleanup_longhorn_force || true
+}
+
 ensure_longhorn_installed() {
   require_bin helm
   require_bin kubectl
@@ -354,6 +380,18 @@ ensure_longhorn_installed() {
   # Previous failed uninstall can leave namespace in Terminating state.
   # Helm install cannot create release secrets there until namespace recovers.
   ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+
+  local lh_status=""
+  lh_status="$(longhorn_release_status || true)"
+  if [[ -n "$lh_status" && "$lh_status" != "deployed" ]]; then
+    repair_stale_longhorn_release "$lh_status"
+    recover_stuck_longhorn_namespace
+    ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+  elif kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && longhorn_release_metadata_present; then
+    repair_stale_longhorn_release ""
+    recover_stuck_longhorn_namespace
+    ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+  fi
 
   ensure_helm_repo "longhorn" "https://charts.longhorn.io"
   helm repo update longhorn >/dev/null
@@ -1550,6 +1588,7 @@ uninstall_longhorn() {
     return 0
   fi
   echo "[uninstall] Running Helm uninstall for Longhorn release ${LONGHORN_RELEASE_NAME} ..."
+  kubectl -n "$LONGHORN_NAMESPACE" patch settings.longhorn.io deleting-confirmation-flag --type=merge -p '{"value":"true"}' >/dev/null 2>&1 || true
   if helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE"; then
     return 0
   fi
