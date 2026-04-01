@@ -189,6 +189,9 @@ Authentication should be done via Workload Identity or by mounting a service acc
 6. Writes an encrypted bundle + metadata atomically to keybundle PVC.
 7. Sidecar stays idle until an explicit backup trigger file is created.
 
+`kubeton stop` now issues this explicit trigger for each running TON pod before scaling TON down
+(unless `SKIP_STOP_KEY_BACKUP=true` is set).
+
 ### 5.3 Manual admin backup (required)
 
 Use the helper script to perform a quiesced encrypted backup:
@@ -218,7 +221,7 @@ Exact exported files per replica (`<output-dir>/<namespace>/<statefulset>/<ordin
 Mandatory operation rules:
 - run `./kubeton backup-keys` immediately after initial node setup (first key generation)
 - run `./kubeton backup-keys` after every validator/wallet key change or rotation
-- do not run destructive operations (`drop`, `uninstall`, PVC deletion) before a successful manual backup
+- keep using `./kubeton backup-keys` before destructive operations (`drop`, `uninstall`, PVC deletion) to keep an exported offline copy
 
 ### 5.4 Manual admin restore
 

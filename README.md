@@ -58,10 +58,12 @@ Secure key workflow is available via `spec.keyManagement`:
 - plaintext key directories mounted on tmpfs (memory only)
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
-- sidecar runs in manual mode and writes encrypted bundles only when explicitly triggered by `kubeton backup-keys`
+- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` safety backup
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
+- `./kubeton stop` now triggers one encrypted backup per running TON pod before scaling TON down
+- skip stop-time backup only when needed: `SKIP_STOP_KEY_BACKUP=true ./kubeton stop`
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
 - per replica (default names):
 - `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.enc`
@@ -76,9 +78,9 @@ Manual encrypted bundle backup is available with:
 - TON DB data outside this set (for example `/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`) is not part of this key bundle backup.
 - if `spec.keyManagement.encryptedBundle.fileName` or `metaFileName` is customized, exported filenames follow those values.
 
-Manual backup is mandatory:
+Manual backup is still required for external/exported copies and destructive workflows:
 - run `./kubeton backup-keys` immediately after first key generation/initial setup
-- run it again after any key change/rotation before maintenance, upgrade, or destructive actions
+- run it again after any key change/rotation before maintenance, upgrade, or cluster-level operations
 
 Restore prerequisites:
 - `./kubeton restore-keys <input-dir>` automatically scales TON StatefulSets to `0`, restores available replica bundles, then scales back to previous replica counts.

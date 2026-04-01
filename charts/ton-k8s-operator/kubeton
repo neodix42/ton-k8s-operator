@@ -49,7 +49,7 @@ Commands:
   upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
-  stop                 Stop TON fleet (tonNode.enabled=false).
+  stop                 Stop TON fleet (tonNode.enabled=false) after stop-time key backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
   purge                Full destructive cleanup: uninstall + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
@@ -68,6 +68,7 @@ Environment overrides:
   VAULT_TRANSIT_KEY, VAULT_TON_POLICY_NAME, VAULT_BOOTSTRAP_SECRET
   VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
   TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
+  SKIP_STOP_KEY_BACKUP
 EOF
 }
 
@@ -663,6 +664,16 @@ trigger_key_backup_once() {
   return 1
 }
 
+pod_has_encrypted_bundle() {
+  local ns="$1"
+  local pod="$2"
+  kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec '
+    bundle_file="${KEY_BUNDLE_FILE:-keys.bundle.enc}"
+    meta_file="${KEY_BUNDLE_META_FILE:-keys.bundle.meta}"
+    [ -s "/var/ton-key-bundle/${bundle_file}" ] && [ -s "/var/ton-key-bundle/${meta_file}" ]
+  ' >/dev/null 2>&1
+}
+
 restore_bundle_to_pvc() {
   local ns="$1"
   local pvc="$2"
@@ -1160,7 +1171,7 @@ run_restore_keys() {
   echo "Encrypted key bundle restore complete. Pods will restore key material during startup."
 }
 
-run_stop() {
+run_stop_without_backup() {
   require_bin helm
   helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
     -n "$OP_NAMESPACE" \
@@ -1168,11 +1179,64 @@ run_stop() {
     --set tonNode.enabled=false
 }
 
+run_stop_backup() {
+  require_bin kubectl
+
+  mapfile -t pod_rows < <(list_ton_pods)
+  if [[ ${#pod_rows[@]} -eq 0 || -z "${pod_rows[0]}" ]]; then
+    echo "No TON pods found; skipping stop-time key backup."
+    return 0
+  fi
+
+  echo "Triggering stop-time encrypted key backup in running TON pods ..."
+  local -a failed_pods=()
+  local row ns pod
+  local skipped_count=0
+  local backed_up_count=0
+  local container_names=""
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pod _ <<<"$row"
+
+    container_names="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || true)"
+    if ! grep -qw "key-backup" <<<"$container_names"; then
+      echo "Warning: ${ns}/${pod} has no key-backup sidecar; skipping stop-time backup." >&2
+      ((skipped_count+=1))
+      continue
+    fi
+
+    if trigger_key_backup_once "$ns" "$pod" && pod_has_encrypted_bundle "$ns" "$pod"; then
+      ((backed_up_count+=1))
+      continue
+    fi
+    echo "Error: ${ns}/${pod} did not produce encrypted bundle files after stop-time backup trigger." >&2
+    failed_pods+=("${ns}/${pod}")
+  done
+
+  if [[ ${#failed_pods[@]} -gt 0 ]]; then
+    echo "Error: stop-time key backup failed for: ${failed_pods[*]}" >&2
+    echo "Refusing to stop TON pods to avoid losing in-memory keys." >&2
+    echo "If you want to force stop anyway, run: SKIP_STOP_KEY_BACKUP=true ./kubeton stop" >&2
+    return 1
+  fi
+
+  echo "Stop-time key backup summary: backed_up=${backed_up_count}, skipped=${skipped_count}"
+}
+
+run_stop() {
+  if is_true "${SKIP_STOP_KEY_BACKUP:-false}"; then
+    echo "SKIP_STOP_KEY_BACKUP=true, skipping stop-time key backup."
+  else
+    run_stop_backup
+  fi
+  run_stop_without_backup
+}
+
 run_drop() {
   require_bin helm
   require_bin kubectl
   confirm_or_exit "This will stop TON pods and DELETE TON PVC data. Continue?"
-  run_stop
+  run_stop_without_backup
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
 }
@@ -1233,7 +1297,7 @@ uninstall_vault() {
 }
 
 run_uninstall_core() {
-  run_stop
+  run_stop_without_backup
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
