@@ -194,6 +194,13 @@ func (in *TonNodeSpec) DeepCopyInto(out *TonNodeSpec) {
 	}
 	in.Storage.DeepCopyInto(&out.Storage)
 	in.Resources.DeepCopyInto(&out.Resources)
+	if in.NodeSelector != nil {
+		in, out := &in.NodeSelector, &out.NodeSelector
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	in.Network.DeepCopyInto(&out.Network)
 	if in.ConfigRef != nil {
 		in, out := &in.ConfigRef, &out.ConfigRef

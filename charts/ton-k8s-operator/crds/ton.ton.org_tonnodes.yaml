@@ -390,6 +390,12 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector constrains TON pods to nodes with matching
+                  labels.
+                type: object
               replicas:
                 default: 1
                 description: Replicas is the desired number of TON nodes.

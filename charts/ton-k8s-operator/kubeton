@@ -39,6 +39,7 @@ VAULT_ADDR_INTERNAL="${VAULT_ADDR_INTERNAL:-http://${VAULT_RELEASE_NAME}.${VAULT
 VAULT_TOKEN_PERIOD="${VAULT_TOKEN_PERIOD:-720h}"
 NAMESPACE_DELETE_PROGRESS_TIMEOUT="${NAMESPACE_DELETE_PROGRESS_TIMEOUT:-60}"
 KUBETON_PAUSE_ANNOTATION_KEY="${KUBETON_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeton-paused-replicas}"
+KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 
 usage() {
   cat <<'EOF'
@@ -158,6 +159,124 @@ selector_pairs_to_longhorn_setting() {
     out+="${key}:${value}"
   done
   printf '%s' "$out"
+}
+
+is_default_longhorn_node_selector() {
+  local selector="$1"
+  local -a selector_pairs=()
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  [[ ${#selector_pairs[@]} -eq 1 && "${selector_pairs[0]}" == "node.longhorn.io/create-default-disk=true" ]]
+}
+
+desired_longhorn_node_count() {
+  local desired="${KUBETON_TARGET_TON_REPLICAS:-}"
+  if ! [[ "$desired" =~ ^[1-9][0-9]*$ ]]; then
+    desired="${LONGHORN_DEFAULT_REPLICA_COUNT:-}"
+  fi
+  if ! [[ "$desired" =~ ^[1-9][0-9]*$ ]]; then
+    desired="1"
+  fi
+  printf '%s' "$desired"
+}
+
+auto_label_default_longhorn_nodes() {
+  local required_count="${1:-}"
+  local -a target_nodes=()
+  local -a matched_nodes=()
+  local -A already_labeled=()
+  local node
+  local currently_labeled=0
+  local labeled_now=0
+  local max_count=0
+
+  if ! [[ "$required_count" =~ ^[1-9][0-9]*$ ]]; then
+    required_count="$(desired_longhorn_node_count)"
+  fi
+
+  mapfile -t matched_nodes < <(kubectl get nodes -l 'node.longhorn.io/create-default-disk=true' -o name 2>/dev/null | sed 's#^node/##' | awk 'NF' | sort)
+  currently_labeled="${#matched_nodes[@]}"
+  if (( currently_labeled >= required_count )); then
+    return 0
+  fi
+  for node in "${matched_nodes[@]}"; do
+    [[ -z "$node" ]] && continue
+    already_labeled["$node"]=1
+  done
+
+  mapfile -t target_nodes < <(kubectl get nodes -l '!node-role.kubernetes.io/control-plane,!node-role.kubernetes.io/master' -o name 2>/dev/null | sed 's#^node/##' | awk 'NF' | sort)
+  if [[ ${#target_nodes[@]} -eq 0 ]]; then
+    mapfile -t target_nodes < <(kubectl get nodes -o name 2>/dev/null | sed 's#^node/##' | awk 'NF' | sort)
+  fi
+
+  if [[ ${#target_nodes[@]} -eq 0 ]]; then
+    echo "Error: automatic labeling failed; no Kubernetes nodes found." >&2
+    return 1
+  fi
+
+  max_count="${#target_nodes[@]}"
+  if (( required_count > max_count )); then
+    echo "Warning: requested ${required_count} Longhorn node(s) for default selector but only ${max_count} node(s) are available." >&2
+    required_count="$max_count"
+  fi
+
+  echo "[baremetal] Ensuring default Longhorn label on ${required_count} node(s) ..."
+  for node in "${target_nodes[@]}"; do
+    [[ -z "$node" ]] && continue
+    if [[ -n "${already_labeled[$node]:-}" ]]; then
+      continue
+    fi
+    if (( currently_labeled + labeled_now >= required_count )); then
+      break
+    fi
+    kubectl label node "$node" node.longhorn.io/create-default-disk=true --overwrite >/dev/null
+    ((labeled_now+=1))
+  done
+}
+
+build_ton_node_selector_values_file() {
+  local selector="$1"
+  local -a selector_pairs=()
+  local values_file
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  if [[ ${#selector_pairs[@]} -eq 0 ]]; then
+    echo "Error: LONGHORN_NODE_SELECTOR is set but has no valid key=value pairs." >&2
+    return 1
+  fi
+
+  values_file="$(mktemp -t kubeton-ton-selector.XXXXXX.yaml)"
+  {
+    echo "tonNode:"
+    echo "  nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 4
+  } >"$values_file"
+
+  printf '%s' "$values_file"
+}
+
+resolve_ton_replicas_from_values_file() {
+  local values_file="$1"
+  local replicas=""
+
+  [[ -f "$values_file" ]] || return 1
+  replicas="$(awk '
+    /^[[:space:]]*tonNode:[[:space:]]*$/ {in_ton=1; next}
+    in_ton && /^[^[:space:]]/ {in_ton=0}
+    in_ton && /^[[:space:]]*replicas:[[:space:]]*[0-9]+([[:space:]]|$)/ {
+      sub(/.*replicas:[[:space:]]*/, "", $0)
+      sub(/[[:space:]]*#.*/, "", $0)
+      sub(/[[:space:]].*/, "", $0)
+      print $0
+      exit
+    }
+  ' "$values_file" 2>/dev/null || true)"
+
+  if [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$replicas"
+    return 0
+  fi
+  return 1
 }
 
 build_longhorn_selector_values_file() {
@@ -595,6 +714,7 @@ ensure_longhorn_installed() {
     local kubectl_selector=""
     local pair
     local matched_nodes=0
+    local desired_nodes=0
 
     parse_selector_pairs "$LONGHORN_NODE_SELECTOR" selector_pairs || return 1
     for pair in "${selector_pairs[@]}"; do
@@ -605,10 +725,21 @@ ensure_longhorn_installed() {
     done
 
     matched_nodes="$(kubectl get nodes -l "$kubectl_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    if is_default_longhorn_node_selector "$LONGHORN_NODE_SELECTOR"; then
+      desired_nodes="$(desired_longhorn_node_count)"
+      if (( matched_nodes < desired_nodes )); then
+        auto_label_default_longhorn_nodes "$desired_nodes" || true
+      fi
+      matched_nodes="$(kubectl get nodes -l "$kubectl_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    fi
     if [[ "${matched_nodes:-0}" == "0" ]]; then
       echo "Error: LONGHORN_NODE_SELECTOR='${LONGHORN_NODE_SELECTOR}' matched 0 Kubernetes nodes." >&2
-      echo "Label at least one node and retry. Example:" >&2
-      echo "  kubectl label node <node-name> node.longhorn.io/create-default-disk=true" >&2
+      if is_default_longhorn_node_selector "$LONGHORN_NODE_SELECTOR"; then
+        echo "Auto-labeling was attempted but no matching nodes are available yet." >&2
+      else
+        echo "Label at least one node and retry. Example:" >&2
+        echo "  kubectl label node <node-name> node.longhorn.io/create-default-disk=true" >&2
+      fi
       return 1
     fi
     if [[ "$LONGHORN_DEFAULT_REPLICA_COUNT" =~ ^[0-9]+$ ]] && (( matched_nodes < LONGHORN_DEFAULT_REPLICA_COUNT )); then
@@ -1164,6 +1295,9 @@ run_add() {
     exit 1
   fi
 
+  new_replicas=$((replicas + 1))
+  KUBETON_TARGET_TON_REPLICAS="$new_replicas"
+
   if should_bootstrap_baremetal; then
     require_bin helm
     ensure_longhorn_installed
@@ -1173,7 +1307,6 @@ run_add() {
   validate_external_key_prereqs
 
   new_ordinal="$replicas"
-  new_replicas=$((replicas + 1))
 
   echo "Preparing PVCs for new replica ${ns}/${sts}-${new_ordinal} ..."
   for claim_prefix in "${claim_prefixes[@]}"; do
@@ -1673,34 +1806,59 @@ run_start() {
   require_bin kubectl
 
   local replicas="${1:-}"
+  local desired_replicas_for_start=""
   local -a extra_overrides=()
-
-  if should_bootstrap_baremetal; then
-    ensure_auto_bootstrap_stack
-    append_baremetal_key_overrides extra_overrides
-  else
-    validate_external_key_prereqs
-  fi
+  local ton_selector_values_file=""
+  local -a helm_cmd=()
+  local helm_rc=0
 
   if [[ -n "$replicas" ]]; then
     if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
       echo "Error: replicas must be a positive integer." >&2
       exit 1
     fi
-    helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
-      -n "$OP_NAMESPACE" \
-      -f "$OP_VALUES_FILE" \
-      -f "$TON_VALUES_FILE" \
-      --set "tonNode.replicas=$replicas" \
-      "${extra_overrides[@]}"
-    return
+    desired_replicas_for_start="$replicas"
+  else
+    desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
+    if ! [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
+      desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
+    fi
+  fi
+  if [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
+    KUBETON_TARGET_TON_REPLICAS="$desired_replicas_for_start"
   fi
 
-  helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
-    -n "$OP_NAMESPACE" \
-    -f "$OP_VALUES_FILE" \
-    -f "$TON_VALUES_FILE" \
-    "${extra_overrides[@]}"
+  if should_bootstrap_baremetal; then
+    ensure_auto_bootstrap_stack
+    append_baremetal_key_overrides extra_overrides
+    if ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
+      ton_selector_values_file="$(build_ton_node_selector_values_file "$LONGHORN_NODE_SELECTOR")"
+      extra_overrides+=(-f "$ton_selector_values_file")
+    fi
+  else
+    validate_external_key_prereqs
+  fi
+
+  helm_cmd=(
+    helm upgrade "$RELEASE_NAME" "$CHART_DIR"
+    -n "$OP_NAMESPACE"
+    -f "$OP_VALUES_FILE"
+    -f "$TON_VALUES_FILE"
+  )
+
+  if [[ -n "$replicas" ]]; then
+    helm_cmd+=(--set "tonNode.replicas=$replicas")
+  fi
+  helm_cmd+=("${extra_overrides[@]}")
+
+  "${helm_cmd[@]}" || helm_rc=$?
+
+  if [[ -n "$ton_selector_values_file" ]]; then
+    rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+  fi
+  if (( helm_rc != 0 )); then
+    return "$helm_rc"
+  fi
 }
 
 run_upgrade() {
@@ -1717,22 +1875,39 @@ run_upgrade() {
   fi
 
   local -a extra_overrides=()
+  local ton_selector_values_file=""
+  local -a helm_cmd=()
+  local helm_rc=0
   if should_bootstrap_baremetal; then
     ensure_auto_bootstrap_stack
     append_baremetal_key_overrides extra_overrides
+    if ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
+      ton_selector_values_file="$(build_ton_node_selector_values_file "$LONGHORN_NODE_SELECTOR")"
+      extra_overrides+=(-f "$ton_selector_values_file")
+    fi
   else
     validate_external_key_prereqs
   fi
 
-  helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
-    -n "$OP_NAMESPACE" \
-    -f "$OP_VALUES_FILE" \
-    -f "$TON_VALUES_FILE" \
-    --set-string "tonNode.image=${TON_IMAGE_REPO}:${tag}" \
-    "${extra_overrides[@]}" \
-    --rollback-on-failure \
-    --wait \
+  helm_cmd=(
+    helm upgrade "$RELEASE_NAME" "$CHART_DIR"
+    -n "$OP_NAMESPACE"
+    -f "$OP_VALUES_FILE"
+    -f "$TON_VALUES_FILE"
+    --set-string "tonNode.image=${TON_IMAGE_REPO}:${tag}"
+    "${extra_overrides[@]}"
+    --rollback-on-failure
+    --wait
     --timeout 40m
+  )
+  "${helm_cmd[@]}" || helm_rc=$?
+
+  if [[ -n "$ton_selector_values_file" ]]; then
+    rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+  fi
+  if (( helm_rc != 0 )); then
+    return "$helm_rc"
+  fi
 }
 
 run_backup_keys() {

@@ -26,6 +26,10 @@ spec:
   resources:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .Values.tonNode.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   network:
     globalConfigURL: {{ .Values.tonNode.network.globalConfigURL }}
     validatorPort: {{ .Values.tonNode.network.validatorPort }}

@@ -147,6 +147,8 @@ kubectl get sc
 Bare-metal/local-dev default setup is automated by `kubeton`:
 - detects bare-metal cluster (`spec.providerID` empty on all nodes) or local k3d cluster (context/node name starts with `k3d-`)
 - on bare-metal: installs Longhorn v1 (`LONGHORN_CHART_VERSION`, default `1.10.0`) and creates encrypted StorageClass `encrypted-sc` (LUKS/dm-crypt, `aes-xts-plain64`, `sha256`, `argon2i`, replica count `3`)
+- on bare-metal, `kubeton start` aligns TON pod placement with `LONGHORN_NODE_SELECTOR` by setting `tonNode.nodeSelector` automatically
+- with default `LONGHORN_NODE_SELECTOR=node.longhorn.io/create-default-disk=true`: if there are not enough labeled nodes, `kubeton start` auto-labels only the required number of nodes (based on requested TON replicas)
 - on local k3d: skips Longhorn install and creates `encrypted-sc` from an existing local StorageClass (`LOCALDEV_BASE_SC`, default `local-path`) for dev convenience
 - installs Vault (`VAULT_CHART_VERSION`, default `0.30.0`)
 - initializes/unseals Vault and configures Transit key `ton-validator`

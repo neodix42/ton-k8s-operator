@@ -308,8 +308,9 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	}
 
 	podSpec := corev1.PodSpec{
-		Affinity:   requiredPodAntiAffinity(labels),
-		Containers: []corev1.Container{container},
+		NodeSelector: desiredNodeSelector(tonNode),
+		Affinity:     requiredPodAntiAffinity(labels),
+		Containers:   []corev1.Container{container},
 	}
 	if keyManagementEnabled(tonNode) {
 		podSpec.Volumes = append(podSpec.Volumes,
@@ -1081,6 +1082,17 @@ func requiredPodAntiAffinity(labels map[string]string) *corev1.Affinity {
 			},
 		},
 	}
+}
+
+func desiredNodeSelector(tonNode *tonv1alpha1.TonNode) map[string]string {
+	if len(tonNode.Spec.NodeSelector) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(tonNode.Spec.NodeSelector))
+	for key, value := range tonNode.Spec.NodeSelector {
+		out[key] = value
+	}
+	return out
 }
 
 func (r *TonNodeReconciler) detectStorageClassName(

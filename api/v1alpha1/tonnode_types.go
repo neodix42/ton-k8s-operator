@@ -42,6 +42,10 @@ type TonNodeSpec struct {
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 
+	// NodeSelector constrains TON pods to nodes with matching labels.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
 	// Network defines TON networking parameters passed via environment variables.
 	Network TonNodeNetworkSpec `json:"network,omitempty"`
 
