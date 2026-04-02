@@ -76,17 +76,21 @@ b) Install operator:
 c) Start 10 TON nodes:
   ./kubeton start 10
 
-d) Verify:
+d) Scale one replica at a time:
+   ./kubeton add
+   ./kubeton del   # removes highest ordinal (tail) replica
+
+e) Verify:
    kubectl -n ton-k8s-operator-system get deploy,pods
    kubectl -n default get tonnodes
    kubectl -n default get sts,pods,pvc
 
-e) Stop/remove TON nodes
+f) Stop/remove TON nodes
    ./kubeton stop
 
-f) Drop TON nodes and storage (PVCs)
+g) Drop TON nodes and storage (PVCs)
    ./kubeton drop
 
-g) Delete operator release + namespace
+h) Delete operator release + namespace
    ./kubeton uninstall
 EOF

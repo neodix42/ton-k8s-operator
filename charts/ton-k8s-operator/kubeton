@@ -49,6 +49,8 @@ Commands:
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
   start                Start TON fleet (Helm upgrade with operator-values.yaml + tonnode-values.yaml).
   start <num>          Same as start, but overrides tonNode.replicas=<num>.
+  add                  Add one TON replica to the existing TON StatefulSet.
+  del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
@@ -982,6 +984,280 @@ set_ton_replicas() {
   local replicas="$3"
 
   kubectl -n "$ns" scale statefulset "$name" --replicas="$replicas" >/dev/null
+}
+
+wait_pvc_bound() {
+  local ns="$1"
+  local pvc="$2"
+  local timeout_seconds="${3:-300}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local phase=""
+
+  while (( $(date +%s) < deadline )); do
+    phase="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [[ "$phase" == "Bound" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for PVC ${ns}/${pvc} to become Bound (last phase='${phase:-unknown}')." >&2
+  return 1
+}
+
+wait_pod_ready() {
+  local ns="$1"
+  local pod="$2"
+  local timeout_seconds="${3:-900}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+
+  while (( $(date +%s) < deadline )); do
+    if kubectl -n "$ns" wait --for=condition=Ready "pod/${pod}" --timeout=10s >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for pod ${ns}/${pod} to become Ready." >&2
+  return 1
+}
+
+wait_pod_gone() {
+  local ns="$1"
+  local pod="$2"
+  local timeout_seconds="${3:-600}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+
+  while (( $(date +%s) < deadline )); do
+    if ! kubectl -n "$ns" get pod "$pod" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for pod ${ns}/${pod} to be deleted." >&2
+  return 1
+}
+
+create_replica_pvc_from_ordinal0() {
+  local ns="$1"
+  local sts="$2"
+  local claim_prefix="$3"
+  local ordinal="$4"
+  local source_pvc="${claim_prefix}-${sts}-0"
+  local target_pvc="${claim_prefix}-${sts}-${ordinal}"
+  local storage_request storage_class volume_mode access_modes_raw
+  local -a access_modes=()
+
+  if kubectl -n "$ns" get pvc "$target_pvc" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! kubectl -n "$ns" get pvc "$source_pvc" >/dev/null 2>&1; then
+    return 10
+  fi
+
+  storage_request="$(kubectl -n "$ns" get pvc "$source_pvc" -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null || true)"
+  storage_class="$(kubectl -n "$ns" get pvc "$source_pvc" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+  volume_mode="$(kubectl -n "$ns" get pvc "$source_pvc" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)"
+  access_modes_raw="$(kubectl -n "$ns" get pvc "$source_pvc" -o jsonpath='{.spec.accessModes[*]}' 2>/dev/null || true)"
+  read -r -a access_modes <<<"$access_modes_raw"
+
+  if [[ -z "$storage_request" ]]; then
+    echo "Error: failed to derive storage request from ${ns}/${source_pvc}." >&2
+    return 1
+  fi
+  if [[ ${#access_modes[@]} -eq 0 ]]; then
+    access_modes=("ReadWriteOnce")
+  fi
+
+  {
+    echo "apiVersion: v1"
+    echo "kind: PersistentVolumeClaim"
+    echo "metadata:"
+    echo "  name: ${target_pvc}"
+    echo "  namespace: ${ns}"
+    echo "spec:"
+    echo "  accessModes:"
+    local mode
+    for mode in "${access_modes[@]}"; do
+      echo "  - ${mode}"
+    done
+    if [[ -n "$storage_class" ]]; then
+      echo "  storageClassName: ${storage_class}"
+    fi
+    if [[ -n "$volume_mode" ]]; then
+      echo "  volumeMode: ${volume_mode}"
+    fi
+    echo "  resources:"
+    echo "    requests:"
+    echo "      storage: ${storage_request}"
+  } | kubectl apply -f - >/dev/null
+
+  return 0
+}
+
+get_single_ton_statefulset() {
+  local -n out_ns="$1"
+  local -n out_sts="$2"
+  local -n out_replicas="$3"
+  local -a rows=()
+  local row ns sts replicas count=0
+
+  mapfile -t rows < <(list_ton_statefulsets)
+  if [[ ${#rows[@]} -eq 0 || -z "${rows[0]}" ]]; then
+    echo "Error: no TON StatefulSets found." >&2
+    return 1
+  fi
+
+  for row in "${rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts replicas <<<"$row"
+    [[ -z "$ns" || -z "$sts" ]] && continue
+    out_ns="$ns"
+    out_sts="$sts"
+    out_replicas="${replicas:-0}"
+    ((count+=1))
+  done
+
+  if (( count == 1 )); then
+    return 0
+  fi
+
+  echo "Error: found ${count} TON StatefulSets; add command requires exactly one." >&2
+  for row in "${rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts replicas <<<"$row"
+    echo "  - ${ns}/${sts} replicas=${replicas:-0}" >&2
+  done
+  return 1
+}
+
+run_add() {
+  require_bin kubectl
+  local ns sts replicas
+  local new_ordinal new_replicas
+  local new_pod node_name
+  local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
+  local -a prepared_pvcs=()
+  local claim_prefix pvc pv
+
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton add" >&2
+    exit 1
+  fi
+
+  get_single_ton_statefulset ns sts replicas || exit 1
+  if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+    echo "Error: invalid replicas value for ${ns}/${sts}: ${replicas}" >&2
+    exit 1
+  fi
+
+  if should_bootstrap_baremetal; then
+    require_bin helm
+    ensure_longhorn_installed
+    ensure_longhorn_crypto_secret
+    ensure_encrypted_storage_class
+  fi
+  validate_external_key_prereqs
+
+  new_ordinal="$replicas"
+  new_replicas=$((replicas + 1))
+
+  echo "Preparing PVCs for new replica ${ns}/${sts}-${new_ordinal} ..."
+  for claim_prefix in "${claim_prefixes[@]}"; do
+    if create_replica_pvc_from_ordinal0 "$ns" "$sts" "$claim_prefix" "$new_ordinal"; then
+      prepared_pvcs+=("${claim_prefix}-${sts}-${new_ordinal}")
+    else
+      case "$?" in
+        10)
+          ;;
+        *)
+          echo "Error: failed to prepare PVC for claim prefix ${claim_prefix}." >&2
+          exit 1
+          ;;
+      esac
+    fi
+  done
+
+  for pvc in "${prepared_pvcs[@]}"; do
+    wait_pvc_bound "$ns" "$pvc" 300
+    pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+    if [[ -n "$pv" ]]; then
+      kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$pv" >/dev/null 2>&1 || true
+    fi
+  done
+
+  echo "Scaling ${ns}/${sts} from ${replicas} to ${new_replicas} ..."
+  set_ton_replicas "$ns" "$sts" "$new_replicas"
+
+  new_pod="${sts}-${new_ordinal}"
+  echo "Waiting for ${ns}/${new_pod} to become Ready ..."
+  wait_pod_ready "$ns" "$new_pod" 1200
+
+  node_name="$(kubectl -n "$ns" get pod "$new_pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+  [[ -z "$node_name" ]] && node_name="N/A"
+  echo "Added TON replica: ${ns}/${new_pod} on node ${node_name}."
+  echo "Next step: execute ./kubeton backup-keys"
+}
+
+run_del() {
+  require_bin kubectl
+  if [[ $# -ne 0 ]]; then
+    echo "Error: kubeton del does not take a pod name; it always removes the tail replica (highest ordinal)." >&2
+    echo "Error: usage: kubeton del" >&2
+    exit 1
+  fi
+
+  local ns sts replicas ordinal pod
+  local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
+  local -a pvc_names=()
+  local -a pv_names=()
+  local claim_prefix pvc pv
+
+  get_single_ton_statefulset ns sts replicas || exit 1
+
+  replicas="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+    echo "Error: cannot read replicas for ${ns}/${sts}." >&2
+    exit 1
+  fi
+  if (( replicas <= 0 )); then
+    echo "Error: StatefulSet ${ns}/${sts} has no replicas to delete." >&2
+    exit 1
+  fi
+
+  ordinal=$((replicas - 1))
+  pod="${sts}-${ordinal}"
+
+  confirm_or_exit "This will remove the tail TON replica ${ns}/${pod}, delete its PVC/PV (including Longhorn volume if present), and scale ${sts} to $((replicas - 1)). Continue?"
+
+  for claim_prefix in "${claim_prefixes[@]}"; do
+    pvc="${claim_prefix}-${sts}-${ordinal}"
+    pvc_names+=("$pvc")
+    pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+    if [[ -n "$pv" ]]; then
+      pv_names+=("$pv")
+    fi
+  done
+
+  echo "Scaling ${ns}/${sts} from ${replicas} to $((replicas - 1)) ..."
+  set_ton_replicas "$ns" "$sts" "$((replicas - 1))"
+  wait_pod_gone "$ns" "$pod" 600 || true
+
+  echo "Deleting PVCs for ${ns}/${pod} ..."
+  for pvc in "${pvc_names[@]}"; do
+    kubectl -n "$ns" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  if [[ ${#pv_names[@]} -gt 0 ]]; then
+    echo "Deleting PV and Longhorn volume resources ..."
+  fi
+  for pv in "${pv_names[@]}"; do
+    kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  echo "Replica ${ns}/${pod} deleted."
 }
 
 pause_operator_reconcile() {
@@ -1986,6 +2262,12 @@ main() {
       ;;
     start)
       run_start "${1:-}"
+      ;;
+    add)
+      run_add "$@"
+      ;;
+    del)
+      run_del "$@"
       ;;
     upgrade)
       run_upgrade "$@"

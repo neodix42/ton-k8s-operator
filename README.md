@@ -84,7 +84,10 @@ Manual backup is still required for external/exported copies and destructive wor
 
 Restore prerequisites:
 - `./kubeton restore-keys <input-dir>` automatically scales TON StatefulSets to `0`, restores available replica bundles, then scales back to previous replica counts.
-- if backup directory is missing for some replica ordinal, restore reports it and continues with other replicas.
+- if the backup directory is missing for some replica ordinal, restore reports it and continues with other replicas.
+- for one-by-one scaling, use:
+- `./kubeton add` to add one replica.
+- `./kubeton del` to remove one replica; it always removes the highest ordinal (tail) pod and does not accept a pod name.
 - encrypted bundles can be decrypted only if the same root-of-trust is still available:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
@@ -218,6 +221,10 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # c) start 10 TON nodes
 ./kubeton start 10
+
+# c2) scale by one replica
+./kubeton add
+./kubeton del   # always removes the highest ordinal (tail) replica
 
 # d) verify
 ./kubeton verify
