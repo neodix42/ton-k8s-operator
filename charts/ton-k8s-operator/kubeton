@@ -64,7 +64,7 @@ Commands:
   uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
   purge                Full destructive cleanup: uninstall + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
   verify               Verify operator and TON resources (deploy/pods, tonnodes, sts/pods/pvc).
-  status               Run "sync" and db size checks in each TON pod; print node/pod/sync/cell db/archive db.
+  status               Run wallet/sync/db checks in each TON pod; print node/pod/wallet/sync/cell db/archive db.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
 
 Environment overrides:
@@ -1978,6 +1978,44 @@ print_aligned_table_5col() {
   done
 }
 
+print_aligned_table_6col() {
+  local h1="$1"
+  local h2="$2"
+  local h3="$3"
+  local h4="$4"
+  local h5="$5"
+  local h6="$6"
+  shift 6
+  local -a rows=("$@")
+  local w1=${#h1}
+  local w2=${#h2}
+  local w3=${#h3}
+  local w4=${#h4}
+  local w5=${#h5}
+  local w6=${#h6}
+  local row c1 c2 c3 c4 c5 c6
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 <<<"$row"
+    (( ${#c1} > w1 )) && w1=${#c1}
+    (( ${#c2} > w2 )) && w2=${#c2}
+    (( ${#c3} > w3 )) && w3=${#c3}
+    (( ${#c4} > w4 )) && w4=${#c4}
+    (( ${#c5} > w5 )) && w5=${#c5}
+    (( ${#c6} > w6 )) && w6=${#c6}
+  done
+
+  printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+    "$w1" "$h1" "$w2" "$h2" "$w3" "$h3" "$w4" "$h4" "$w5" "$h5" "$w6" "$h6"
+  printf "|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n" \
+    "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")" "$(dash_line "$w4")" "$(dash_line "$w5")" "$(dash_line "$w6")"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 <<<"$row"
+    printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+      "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5" "$w6" "$c6"
+  done
+}
+
 bytes_to_gb() {
   local bytes="$1"
   if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
@@ -2026,6 +2064,40 @@ sync_value() {
   fi
 
   echo "$output"
+}
+
+wallet_value() {
+  local ns="$1"
+  local pod="$2"
+  local output=""
+  local wallet=""
+
+  output="$(kubectl -n "$ns" exec "$pod" -- bash -lc '
+    shopt -s expand_aliases
+    if [[ -f ~/.bashrc ]]; then
+      source ~/.bashrc >/dev/null 2>&1
+    fi
+    if command -v mytonctrl >/dev/null 2>&1; then
+      echo status fast | mytonctrl
+    fi
+  ' 2>/dev/null || true)"
+  output="${output//$'\r'/}"
+  wallet="$(printf '%s\n' "$output" | awk -F': ' '/^Local validator wallet address:/ {print $2; exit}')"
+  wallet="$(trim_whitespace "$wallet")"
+
+  if [[ -z "$wallet" ]]; then
+    output="$(kubectl -n "$ns" exec "$pod" -- bash -ic 'echo status fast | mytonctrl' 2>/dev/null || true)"
+    output="${output//$'\r'/}"
+    wallet="$(printf '%s\n' "$output" | awk -F': ' '/^Local validator wallet address:/ {print $2; exit}')"
+    wallet="$(trim_whitespace "$wallet")"
+  fi
+
+  if [[ -z "$wallet" ]]; then
+    echo "N/A"
+    return
+  fi
+
+  echo "$wallet"
 }
 
 run_install() {
@@ -2768,21 +2840,25 @@ run_status() {
   fi
 
   local -a table_rows=()
+  local wallet_output
+  local sync_output
   local cell_db_size
   local archive_db_size
   for row in "${pod_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pod node_name <<<"$row"
 
+    wallet_output="$(wallet_value "$ns" "$pod")"
+    wallet_output="${wallet_output//$'\t'/ }"
     sync_output="$(sync_value "$ns" "$pod")"
     sync_output="${sync_output//$'\t'/ }"
     [[ -z "$node_name" ]] && node_name="N/A"
     cell_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/celldb")"
     archive_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/archive")"
-    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$sync_output"$'\t'"$cell_db_size"$'\t'"$archive_db_size")
+    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$wallet_output"$'\t'"$sync_output"$'\t'"$cell_db_size"$'\t'"$archive_db_size")
   done
 
-  print_aligned_table_5col "server name" "pod name" "sync" "cell db" "archive db" "${table_rows[@]}"
+  print_aligned_table_6col "server name" "pod name" "wallet" "sync" "cell db" "archive db" "${table_rows[@]}"
 }
 
 run_exec() {
