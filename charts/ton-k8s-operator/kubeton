@@ -23,6 +23,7 @@ ENCRYPTED_SC_NAME="${ENCRYPTED_SC_NAME:-encrypted-sc}"
 LONGHORN_CRYPTO_SECRET_NAME="${LONGHORN_CRYPTO_SECRET_NAME:-longhorn-crypto}"
 LOCALDEV_BASE_SC="${LOCALDEV_BASE_SC:-local-path}"
 ALLOW_DESTRUCTIVE_LONGHORN_REPAIR="${ALLOW_DESTRUCTIVE_LONGHORN_REPAIR:-false}"
+LONGHORN_NODE_SELECTOR="${LONGHORN_NODE_SELECTOR:-node.longhorn.io/create-default-disk=true}"
 
 VAULT_RELEASE_NAME="${VAULT_RELEASE_NAME:-vault}"
 VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
@@ -65,7 +66,7 @@ Environment overrides:
   AUTO_BAREMETAL_BOOTSTRAP, FORCE_BAREMETAL_BOOTSTRAP, SKIP_KEY_PREREQ_CHECK
   LONGHORN_RELEASE_NAME, LONGHORN_NAMESPACE, LONGHORN_CHART, LONGHORN_CHART_VERSION
   LONGHORN_DEFAULT_REPLICA_COUNT, ENCRYPTED_SC_NAME, LONGHORN_CRYPTO_SECRET_NAME
-  LOCALDEV_BASE_SC, ALLOW_DESTRUCTIVE_LONGHORN_REPAIR
+  LOCALDEV_BASE_SC, ALLOW_DESTRUCTIVE_LONGHORN_REPAIR, LONGHORN_NODE_SELECTOR
   VAULT_RELEASE_NAME, VAULT_NAMESPACE, VAULT_CHART, VAULT_CHART_VERSION
   VAULT_TRANSIT_KEY, VAULT_TON_POLICY_NAME, VAULT_BOOTSTRAP_SECRET
   VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
@@ -86,6 +87,104 @@ require_bin() {
 sanitize_compact() {
   # Keep printable token/key characters only and remove all control/whitespace noise.
   printf '%s' "${1:-}" | tr -d '\000-\037\177' | tr -d '[:space:]'
+}
+
+trim_whitespace() {
+  printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+yaml_quote() {
+  local value="${1:-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+parse_selector_pairs() {
+  local selector="$1"
+  local -n out_pairs="$2"
+  local -a tokens=()
+  local token key value
+
+  out_pairs=()
+  selector="$(trim_whitespace "$selector")"
+  [[ -z "$selector" ]] && return 0
+
+  IFS=',' read -r -a tokens <<<"$selector"
+  for token in "${tokens[@]}"; do
+    token="$(trim_whitespace "$token")"
+    [[ -z "$token" ]] && continue
+    if [[ "$token" != *=* ]]; then
+      echo "Error: invalid node selector token '${token}', expected key=value." >&2
+      return 1
+    fi
+    key="$(trim_whitespace "${token%%=*}")"
+    value="$(trim_whitespace "${token#*=}")"
+    if [[ -z "$key" || -z "$value" ]]; then
+      echo "Error: invalid node selector token '${token}', empty key or value." >&2
+      return 1
+    fi
+    out_pairs+=("${key}=${value}")
+  done
+}
+
+write_yaml_map_from_pairs() {
+  local -n pairs_ref="$1"
+  local indent="${2:-2}"
+  local padding pair key value
+
+  padding="$(printf '%*s' "$indent" '')"
+  for pair in "${pairs_ref[@]}"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    printf '%s%s: %s\n' "$padding" "$(yaml_quote "$key")" "$(yaml_quote "$value")"
+  done
+}
+
+selector_pairs_to_longhorn_setting() {
+  local -n pairs_ref="$1"
+  local out="" pair key value
+
+  for pair in "${pairs_ref[@]}"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    [[ -n "$out" ]] && out+=";"
+    out+="${key}:${value}"
+  done
+  printf '%s' "$out"
+}
+
+build_longhorn_selector_values_file() {
+  local selector="$1"
+  local -a selector_pairs=()
+  local setting_value values_file
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  if [[ ${#selector_pairs[@]} -eq 0 ]]; then
+    echo "Error: LONGHORN_NODE_SELECTOR is set but has no valid key=value pairs." >&2
+    return 1
+  fi
+
+  setting_value="$(selector_pairs_to_longhorn_setting selector_pairs)"
+  values_file="$(mktemp -t kubeton-longhorn-selector.XXXXXX.yaml)"
+  {
+    echo "global:"
+    echo "  nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 4
+    echo "longhornManager:"
+    echo "  nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 4
+    echo "longhornDriver:"
+    echo "  nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 4
+    echo "longhornUI:"
+    echo "  nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 4
+    echo "defaultSettings:"
+    echo "  systemManagedComponentsNodeSelector: $(yaml_quote "$setting_value")"
+  } >"$values_file"
+
+  printf '%s' "$values_file"
 }
 
 is_true() {
@@ -483,10 +582,44 @@ ensure_longhorn_installed() {
   ensure_helm_repo "longhorn" "https://charts.longhorn.io"
   helm repo update longhorn >/dev/null
 
+  local longhorn_selector_values_file=""
+  local -a longhorn_extra_args=()
+  if [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
+    local -a selector_pairs=()
+    local kubectl_selector=""
+    local pair
+    local matched_nodes=0
+
+    parse_selector_pairs "$LONGHORN_NODE_SELECTOR" selector_pairs || return 1
+    for pair in "${selector_pairs[@]}"; do
+      if [[ -n "$kubectl_selector" ]]; then
+        kubectl_selector+=","
+      fi
+      kubectl_selector+="$pair"
+    done
+
+    matched_nodes="$(kubectl get nodes -l "$kubectl_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    if [[ "${matched_nodes:-0}" == "0" ]]; then
+      echo "Error: LONGHORN_NODE_SELECTOR='${LONGHORN_NODE_SELECTOR}' matched 0 Kubernetes nodes." >&2
+      echo "Label at least one node and retry. Example:" >&2
+      echo "  kubectl label node <node-name> node.longhorn.io/create-default-disk=true" >&2
+      return 1
+    fi
+    if [[ "$LONGHORN_DEFAULT_REPLICA_COUNT" =~ ^[0-9]+$ ]] && (( matched_nodes < LONGHORN_DEFAULT_REPLICA_COUNT )); then
+      echo "Warning: LONGHORN_NODE_SELECTOR matches ${matched_nodes} nodes, which is less than LONGHORN_DEFAULT_REPLICA_COUNT=${LONGHORN_DEFAULT_REPLICA_COUNT}." >&2
+    fi
+
+    longhorn_selector_values_file="$(build_longhorn_selector_values_file "$LONGHORN_NODE_SELECTOR")"
+    longhorn_extra_args+=(-f "$longhorn_selector_values_file")
+    echo "[baremetal] Restricting Longhorn components to nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
+  fi
+
   echo "[baremetal] Installing/ensuring Longhorn ${LONGHORN_CHART_VERSION} ..."
   echo "[baremetal] Waiting for Longhorn components to become Ready (timeout 40m) ..."
+  local install_rc=0
   run_with_namespace_progress "longhorn" "$LONGHORN_NAMESPACE" \
     helm upgrade --install "$LONGHORN_RELEASE_NAME" "$LONGHORN_CHART" \
+    "${longhorn_extra_args[@]}" \
     --version "$LONGHORN_CHART_VERSION" \
     -n "$LONGHORN_NAMESPACE" \
     --create-namespace \
@@ -494,7 +627,14 @@ ensure_longhorn_installed() {
     --set "persistence.defaultClassReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
     --disable-openapi-validation \
     --wait \
-    --timeout 40m
+    --timeout 40m || install_rc=$?
+
+  if [[ -n "$longhorn_selector_values_file" ]]; then
+    rm -f "$longhorn_selector_values_file" >/dev/null 2>&1 || true
+  fi
+  if (( install_rc != 0 )); then
+    return "$install_rc"
+  fi
 }
 
 ensure_longhorn_crypto_secret() {
