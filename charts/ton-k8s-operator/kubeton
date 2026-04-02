@@ -1137,6 +1137,35 @@ ensure_auto_bootstrap_stack() {
   ensure_baremetal_stack
 }
 
+vault_runtime_ready() {
+  if ! kubectl -n "$VAULT_NAMESPACE" get pod "${VAULT_RELEASE_NAME}-0" >/dev/null 2>&1; then
+    return 1
+  fi
+  kubectl -n "$VAULT_NAMESPACE" wait --for=condition=Ready "pod/${VAULT_RELEASE_NAME}-0" --timeout=5s >/dev/null 2>&1
+}
+
+ensure_auto_bootstrap_stack_if_needed() {
+  local missing_reasons=()
+
+  if ! kubectl get storageclass "$ENCRYPTED_SC_NAME" >/dev/null 2>&1; then
+    missing_reasons+=("StorageClass ${ENCRYPTED_SC_NAME} is missing")
+  fi
+  if ! kubectl -n "$TON_NAMESPACE" get secret "$TON_VAULT_CREDS_SECRET" >/dev/null 2>&1; then
+    missing_reasons+=("secret ${TON_NAMESPACE}/${TON_VAULT_CREDS_SECRET} is missing")
+  fi
+  if ! vault_runtime_ready; then
+    missing_reasons+=("Vault pod ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0 is not Ready")
+  fi
+
+  if (( ${#missing_reasons[@]} == 0 )); then
+    echo "[bootstrap] Reusing existing Vault/StorageClass prerequisites."
+    return 0
+  fi
+
+  printf '[bootstrap] Prerequisites missing/unhealthy, running bootstrap: %s\n' "$(IFS='; '; echo "${missing_reasons[*]}")"
+  ensure_auto_bootstrap_stack
+}
+
 validate_external_key_prereqs() {
   if is_true "$SKIP_KEY_PREREQ_CHECK"; then
     return
@@ -1196,6 +1225,23 @@ wait_pvc_bound() {
 
   echo "Error: timeout waiting for PVC ${ns}/${pvc} to become Bound (last phase='${phase:-unknown}')." >&2
   return 1
+}
+
+pvc_uses_wait_for_first_consumer() {
+  local ns="$1"
+  local pvc="$2"
+  local storage_class=""
+  local mode=""
+
+  storage_class="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+  storage_class="$(trim_whitespace "$storage_class")"
+  if [[ -z "$storage_class" ]]; then
+    return 1
+  fi
+
+  mode="$(kubectl get storageclass "$storage_class" -o jsonpath='{.volumeBindingMode}' 2>/dev/null || true)"
+  mode="$(trim_whitespace "$mode")"
+  [[ "$mode" == "WaitForFirstConsumer" ]]
 }
 
 wait_pvc_gone() {
@@ -1449,10 +1495,7 @@ run_add() {
   KUBETON_TARGET_TON_REPLICAS="$new_replicas"
 
   if should_bootstrap_baremetal; then
-    require_bin helm
-    ensure_longhorn_installed
-    ensure_longhorn_crypto_secret
-    ensure_encrypted_storage_class
+    ensure_auto_bootstrap_stack_if_needed
   fi
   validate_external_key_prereqs
 
@@ -1475,7 +1518,11 @@ run_add() {
   done
 
   for pvc in "${prepared_pvcs[@]}"; do
-    wait_pvc_bound "$ns" "$pvc" 300
+    if pvc_uses_wait_for_first_consumer "$ns" "$pvc"; then
+      echo "PVC ${ns}/${pvc} uses WaitForFirstConsumer; skipping pre-scale Bound wait."
+    else
+      wait_pvc_bound "$ns" "$pvc" 300
+    fi
     pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
     if [[ -n "$pv" ]]; then
       kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$pv" >/dev/null 2>&1 || true
@@ -1483,7 +1530,11 @@ run_add() {
   done
 
   echo "Scaling ${ns}/${sts} from ${replicas} to ${new_replicas} ..."
-  set_ton_replicas "$ns" "$sts" "$new_replicas"
+  if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge -p "{\"spec\":{\"replicas\":${new_replicas}}}" >/dev/null
+  else
+    set_ton_replicas "$ns" "$sts" "$new_replicas"
+  fi
 
   new_pod="${sts}-${new_ordinal}"
   echo "Waiting for ${ns}/${new_pod} to become Ready ..."
@@ -1536,7 +1587,11 @@ run_del() {
   done
 
   echo "Scaling ${ns}/${sts} from ${replicas} to $((replicas - 1)) ..."
-  set_ton_replicas "$ns" "$sts" "$((replicas - 1))"
+  if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge -p "{\"spec\":{\"replicas\":$((replicas - 1))}}" >/dev/null
+  else
+    set_ton_replicas "$ns" "$sts" "$((replicas - 1))"
+  fi
   wait_pod_gone "$ns" "$pod" 600 || true
 
   echo "Deleting PVCs for ${ns}/${pod} ..."
@@ -1581,10 +1636,7 @@ run_recreate() {
   input_dir="$(cd "$input_dir" && pwd)"
 
   if should_bootstrap_baremetal; then
-    require_bin helm
-    ensure_longhorn_installed
-    ensure_longhorn_crypto_secret
-    ensure_encrypted_storage_class
+    ensure_auto_bootstrap_stack_if_needed
   fi
   validate_external_key_prereqs
 
@@ -2935,7 +2987,9 @@ uninstall_vault() {
 
 run_uninstall_core() {
   echo "[uninstall] Step 1/8: disabling TON resources in Helm release ${RELEASE_NAME} ..."
-  run_stop_without_backup
+  if ! run_stop_without_backup; then
+    echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing uninstall cleanup." >&2
+  fi
 
   echo "[uninstall] Step 2/8: deleting TonNode custom resources ..."
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
