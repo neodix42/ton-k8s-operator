@@ -62,8 +62,8 @@ Secure key workflow is available via `spec.keyManagement`:
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
-- `./kubeton pause` triggers one encrypted backup per running TON pod, then sets TonNode replicas to `0` (keeps TonNode/StatefulSet/PVC resources)
-- `./kubeton resume` restores all paused TON replicas using values saved by `pause`
+- `./kubeton pause` triggers one encrypted backup per running TON pod, then scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
+- `./kubeton resume` restores paused TON replicas using values saved by `pause` and re-enables operator reconciliation
 - `./kubeton stop` triggers one encrypted backup per running TON pod, then disables TonNode in Helm (`tonNode.enabled=false`)
 - skip stop-time backup only when needed: `SKIP_STOP_KEY_BACKUP=true ./kubeton pause` (or `./kubeton stop`)
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
@@ -148,6 +148,7 @@ Bare-metal/local-dev default setup is automated by `kubeton`:
 - detects bare-metal cluster (`spec.providerID` empty on all nodes) or local k3d cluster (context/node name starts with `k3d-`)
 - on bare-metal: installs Longhorn v1 (`LONGHORN_CHART_VERSION`, default `1.10.0`) and creates encrypted StorageClass `encrypted-sc` (LUKS/dm-crypt, `aes-xts-plain64`, `sha256`, `argon2i`, replica count `3`)
 - on bare-metal, `kubeton start` aligns TON pod placement with `LONGHORN_NODE_SELECTOR` by setting `tonNode.nodeSelector` automatically
+- on bare-metal, Vault server pod is also constrained to `LONGHORN_NODE_SELECTOR` so its PVC can attach only on nodes with Longhorn CSI
 - with default `LONGHORN_NODE_SELECTOR=node.longhorn.io/create-default-disk=true`: if there are not enough labeled nodes, `kubeton start` auto-labels only the required number of nodes (based on requested TON replicas)
 - on local k3d: skips Longhorn install and creates `encrypted-sc` from an existing local StorageClass (`LOCALDEV_BASE_SC`, default `local-path`) for dev convenience
 - installs Vault (`VAULT_CHART_VERSION`, default `0.30.0`)
@@ -495,9 +496,24 @@ Prerequisites:
 - `helm`
 - `make`
 
+Create a local k3d cluster (example with 5 agent nodes):
+
+```bash
+k3d cluster create --agents 5
+kubectl config current-context
+kubectl get nodes -o wide
+```
+
+Drop the whole k3d cluster:
+
+```bash
+# if using the default cluster name
+k3d cluster delete
+```
+
 ### Flow A: Maintainer (local build and test)
 
-Run from repository root:
+Run from the repository root:
 
 ```bash
 ./devrun.sh

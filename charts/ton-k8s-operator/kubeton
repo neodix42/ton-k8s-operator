@@ -39,6 +39,7 @@ VAULT_ADDR_INTERNAL="${VAULT_ADDR_INTERNAL:-http://${VAULT_RELEASE_NAME}.${VAULT
 VAULT_TOKEN_PERIOD="${VAULT_TOKEN_PERIOD:-720h}"
 NAMESPACE_DELETE_PROGRESS_TIMEOUT="${NAMESPACE_DELETE_PROGRESS_TIMEOUT:-60}"
 KUBETON_PAUSE_ANNOTATION_KEY="${KUBETON_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeton-paused-replicas}"
+KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY="${KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeton-operator-paused-replicas}"
 KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 
 usage() {
@@ -57,8 +58,8 @@ Commands:
   upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
-  pause                Pause TON fleet after stop-time key backup (sets TonNode replicas=0; keeps TonNode/StatefulSet/PVC).
-  resume               Resume TON fleet from pause (restores all paused replicas).
+  pause                Pause TON fleet after stop-time key backup (scales StatefulSets to 0; keeps TonNode/StatefulSet/PVC).
+  resume               Resume TON fleet from pause (restores paused replicas and resumes operator reconciliation).
   stop                 Stop TON fleet after stop-time key backup (sets tonNode.enabled=false via Helm; removes TonNode/StatefulSet).
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
@@ -79,7 +80,7 @@ Environment overrides:
   VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
   TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
   NAMESPACE_DELETE_PROGRESS_TIMEOUT
-  KUBETON_PAUSE_ANNOTATION_KEY
+  KUBETON_PAUSE_ANNOTATION_KEY, KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY
   SKIP_STOP_KEY_BACKUP
 EOF
 }
@@ -308,6 +309,27 @@ build_longhorn_selector_values_file() {
     write_yaml_map_from_pairs selector_pairs 4
     echo "defaultSettings:"
     echo "  systemManagedComponentsNodeSelector: $(yaml_quote "$setting_value")"
+  } >"$values_file"
+
+  printf '%s' "$values_file"
+}
+
+build_vault_selector_values_file() {
+  local selector="$1"
+  local -a selector_pairs=()
+  local values_file
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  if [[ ${#selector_pairs[@]} -eq 0 ]]; then
+    echo "Error: LONGHORN_NODE_SELECTOR is set but has no valid key=value pairs." >&2
+    return 1
+  fi
+
+  values_file="$(mktemp -t kubeton-vault-selector.XXXXXX.yaml)"
+  {
+    echo "server:"
+    echo "  nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 4
   } >"$values_file"
 
   printf '%s' "$values_file"
@@ -856,15 +878,43 @@ EOF
 
 ensure_vault_installed() {
   local vault_storage_class="${1:-longhorn}"
+  local vault_selector_values_file=""
+  local -a vault_extra_args=()
   require_bin helm
   ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240
   ensure_helm_repo "hashicorp" "https://helm.releases.hashicorp.com"
   helm repo update hashicorp >/dev/null
 
+  if ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
+    local -a selector_pairs=()
+    local kubectl_selector=""
+    local pair
+    local matched_nodes=0
+
+    parse_selector_pairs "$LONGHORN_NODE_SELECTOR" selector_pairs || return 1
+    for pair in "${selector_pairs[@]}"; do
+      if [[ -n "$kubectl_selector" ]]; then
+        kubectl_selector+=","
+      fi
+      kubectl_selector+="$pair"
+    done
+    matched_nodes="$(kubectl get nodes -l "$kubectl_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    if [[ "${matched_nodes:-0}" == "0" ]]; then
+      echo "Error: Vault cannot be scheduled because LONGHORN_NODE_SELECTOR='${LONGHORN_NODE_SELECTOR}' matched 0 nodes." >&2
+      return 1
+    fi
+
+    vault_selector_values_file="$(build_vault_selector_values_file "$LONGHORN_NODE_SELECTOR")"
+    vault_extra_args+=(-f "$vault_selector_values_file")
+    echo "[baremetal] Restricting Vault server to Longhorn nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
+  fi
+
   echo "[bootstrap] Installing/ensuring Vault chart ${VAULT_CHART_VERSION} ..."
   echo "[bootstrap] Waiting for Vault components to become Ready (timeout 30m) ..."
+  local install_rc=0
   run_with_namespace_progress "vault" "$VAULT_NAMESPACE" \
     helm upgrade --install "$VAULT_RELEASE_NAME" "$VAULT_CHART" \
+    "${vault_extra_args[@]}" \
     --version "$VAULT_CHART_VERSION" \
     -n "$VAULT_NAMESPACE" \
     --create-namespace \
@@ -874,7 +924,14 @@ ensure_vault_installed() {
     --set-string "server.dataStorage.storageClass=${vault_storage_class}" \
     --set "injector.enabled=false" \
     --wait \
-    --timeout 30m
+    --timeout 30m || install_rc=$?
+
+  if [[ -n "$vault_selector_values_file" ]]; then
+    rm -f "$vault_selector_values_file" >/dev/null 2>&1 || true
+  fi
+  if (( install_rc != 0 )); then
+    return "$install_rc"
+  fi
 }
 
 vault_exec() {
@@ -1254,7 +1311,7 @@ get_single_ton_statefulset() {
   local -n out_sts="$2"
   local -n out_replicas="$3"
   local -a rows=()
-  local row ns sts replicas count=0
+  local row row_ns row_sts row_replicas count=0
 
   mapfile -t rows < <(list_ton_statefulsets)
   if [[ ${#rows[@]} -eq 0 || -z "${rows[0]}" ]]; then
@@ -1264,11 +1321,11 @@ get_single_ton_statefulset() {
 
   for row in "${rows[@]}"; do
     [[ -z "$row" ]] && continue
-    IFS=$'\t' read -r ns sts replicas <<<"$row"
-    [[ -z "$ns" || -z "$sts" ]] && continue
-    out_ns="$ns"
-    out_sts="$sts"
-    out_replicas="${replicas:-0}"
+    IFS=$'\t' read -r row_ns row_sts row_replicas <<<"$row"
+    [[ -z "$row_ns" || -z "$row_sts" ]] && continue
+    out_ns="$row_ns"
+    out_sts="$row_sts"
+    out_replicas="${row_replicas:-0}"
     ((count+=1))
   done
 
@@ -1279,8 +1336,8 @@ get_single_ton_statefulset() {
   echo "Error: found ${count} TON StatefulSets; add command requires exactly one." >&2
   for row in "${rows[@]}"; do
     [[ -z "$row" ]] && continue
-    IFS=$'\t' read -r ns sts replicas <<<"$row"
-    echo "  - ${ns}/${sts} replicas=${replicas:-0}" >&2
+    IFS=$'\t' read -r row_ns row_sts row_replicas <<<"$row"
+    echo "  - ${row_ns}/${row_sts} replicas=${row_replicas:-0}" >&2
   done
   return 1
 }
@@ -1370,7 +1427,7 @@ get_annotation_value() {
 
 run_add() {
   require_bin kubectl
-  local ns sts replicas
+  local ns="" sts="" replicas=""
   local new_ordinal new_replicas
   local new_pod node_name
   local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
@@ -1658,6 +1715,74 @@ resume_operator_reconcile() {
   for i in "${!deploy_names_ref[@]}"; do
     kubectl -n "$OP_NAMESPACE" scale deployment "${deploy_names_ref[$i]}" --replicas="${deploy_replicas_ref[$i]}" >/dev/null 2>&1 || true
   done
+}
+
+pause_operator_for_fleet_pause() {
+  local -a deploy_rows=()
+  local row name replicas saved_replicas annotation_value
+  local paused_count=0
+
+  mapfile -t deploy_rows < <(kubectl -n "$OP_NAMESPACE" get deploy -l "app.kubernetes.io/instance=${RELEASE_NAME}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}')
+  if [[ ${#deploy_rows[@]} -eq 0 || -z "${deploy_rows[0]}" ]]; then
+    echo "Warning: no operator deployments found in namespace ${OP_NAMESPACE}; pause may race with reconciliation." >&2
+    return 0
+  fi
+
+  echo "Pausing operator reconciliation for fleet pause (scaling deployments in ${OP_NAMESPACE} to 0) ..."
+  for row in "${deploy_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r name replicas <<<"$row"
+    [[ -z "$name" ]] && continue
+
+    annotation_value="$(get_annotation_value deployment "$OP_NAMESPACE" "$name" "$KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY")"
+    if [[ "$annotation_value" =~ ^[1-9][0-9]*$ ]]; then
+      saved_replicas="$annotation_value"
+    elif [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+      saved_replicas="$replicas"
+    else
+      saved_replicas="1"
+    fi
+
+    kubectl -n "$OP_NAMESPACE" patch deployment "$name" --type=merge \
+      -p "{\"metadata\":{\"annotations\":{\"${KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY}\":\"${saved_replicas}\"}}}" >/dev/null 2>&1 || true
+    kubectl -n "$OP_NAMESPACE" scale deployment "$name" --replicas=0 >/dev/null 2>&1 || true
+    ((paused_count+=1))
+  done
+
+  echo "Operator pause summary: deployments_scaled=${paused_count}"
+}
+
+resume_operator_after_fleet_pause() {
+  local -a deploy_rows=()
+  local row name replicas annotation_value
+  local restored_count=0
+  local skipped_count=0
+
+  mapfile -t deploy_rows < <(kubectl -n "$OP_NAMESPACE" get deploy -l "app.kubernetes.io/instance=${RELEASE_NAME}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}')
+  if [[ ${#deploy_rows[@]} -eq 0 || -z "${deploy_rows[0]}" ]]; then
+    return 0
+  fi
+
+  echo "Resuming operator reconciliation after fleet pause ..."
+  for row in "${deploy_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r name replicas <<<"$row"
+    [[ -z "$name" ]] && continue
+
+    annotation_value="$(get_annotation_value deployment "$OP_NAMESPACE" "$name" "$KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY")"
+    if [[ "$annotation_value" =~ ^[1-9][0-9]*$ ]]; then
+      kubectl -n "$OP_NAMESPACE" scale deployment "$name" --replicas="$annotation_value" >/dev/null 2>&1 || true
+      ((restored_count+=1))
+    else
+      ((skipped_count+=1))
+    fi
+    kubectl -n "$OP_NAMESPACE" patch deployment "$name" --type=merge \
+      -p "{\"metadata\":{\"annotations\":{\"${KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+  done
+
+  echo "Operator resume summary: deployments_restored=${restored_count}, skipped=${skipped_count}"
 }
 
 wait_statefulset_pods_gone() {
@@ -2586,10 +2711,24 @@ run_pause() {
 
   local row ns sts replicas
   local pause_annotation
-  local paused_tonnodes=0
+  local annotated_tonnodes=0
   local scaled_statefulsets=0
+  local operator_paused=0
+  local pause_incomplete=1
 
-  echo "Pausing TON fleet by setting TonNode replicas to 0 ..."
+  cleanup_pause() {
+    [[ "${pause_incomplete:-0}" -ne 1 ]] && return 0
+    if [[ "${operator_paused:-0}" -eq 1 ]]; then
+      echo "Pause failed; restoring operator reconciliation ..." >&2
+      resume_operator_after_fleet_pause || true
+    fi
+  }
+  trap cleanup_pause EXIT INT TERM
+
+  pause_operator_for_fleet_pause
+  operator_paused=1
+
+  echo "Pausing TON fleet by scaling StatefulSets to 0 ..."
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns sts replicas <<<"$row"
@@ -2603,12 +2742,13 @@ run_pause() {
     pause_annotation="${replicas}"
 
     if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
-      kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}},\"spec\":{\"replicas\":0}}" >/dev/null
-      ((paused_tonnodes+=1))
-      continue
+      kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge \
+        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}}}" >/dev/null
+      ((annotated_tonnodes+=1))
+    else
+      echo "Warning: TonNode ${ns}/${sts} not found; storing pause annotation on StatefulSet only." >&2
     fi
 
-    echo "Warning: TonNode ${ns}/${sts} not found; scaling StatefulSet ${ns}/${sts} to 0 directly." >&2
     kubectl -n "$ns" patch statefulset "$sts" --type=merge -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}}}" >/dev/null 2>&1 || true
     set_ton_replicas "$ns" "$sts" 0
     ((scaled_statefulsets+=1))
@@ -2622,7 +2762,9 @@ run_pause() {
     wait_statefulset_pods_gone "$ns" "$sts"
   done
 
-  echo "Pause summary: tonnodes_updated=${paused_tonnodes}, statefulsets_scaled=${scaled_statefulsets}"
+  pause_incomplete=0
+  trap - EXIT INT TERM
+  echo "Pause summary: tonnodes_annotated=${annotated_tonnodes}, statefulsets_scaled=${scaled_statefulsets}, operator_paused=1"
 }
 
 run_resume() {
@@ -2643,6 +2785,7 @@ run_resume() {
   mapfile -t sts_rows < <(list_ton_statefulsets)
   if [[ ${#sts_rows[@]} -eq 0 || -z "${sts_rows[0]}" ]]; then
     echo "No TON StatefulSets found."
+    resume_operator_after_fleet_pause
     return
   fi
 
@@ -2660,10 +2803,17 @@ run_resume() {
     target_replicas=""
     if kubectl -n "$row_ns" get tonnodes.ton.ton.org "$row_sts" >/dev/null 2>&1; then
       pause_annotation="$(get_annotation_value tonnodes.ton.ton.org "$row_ns" "$row_sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
-      if [[ "$pause_annotation" =~ ^[0-9]+$ ]] && (( pause_annotation > row_replicas )); then
-        target_replicas="$pause_annotation"
-        kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null
-        ((resumed_tonnodes+=1))
+      if [[ "$pause_annotation" =~ ^[0-9]+$ ]]; then
+        if (( pause_annotation > row_replicas )); then
+          target_replicas="$pause_annotation"
+          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
+            -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null
+          ((resumed_tonnodes+=1))
+        else
+          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
+            -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+          ((skipped+=1))
+        fi
       else
         if (( row_replicas == 0 )); then
           ((paused_without_annotation+=1))
@@ -2674,11 +2824,15 @@ run_resume() {
     fi
 
     pause_annotation="$(get_annotation_value statefulset "$row_ns" "$row_sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
-    if [[ "$pause_annotation" =~ ^[0-9]+$ ]] && (( pause_annotation > row_replicas )); then
-      target_replicas="$pause_annotation"
-      set_ton_replicas "$row_ns" "$row_sts" "$target_replicas"
+    if [[ "$pause_annotation" =~ ^[0-9]+$ ]]; then
+      if (( pause_annotation > row_replicas )); then
+        target_replicas="$pause_annotation"
+        set_ton_replicas "$row_ns" "$row_sts" "$target_replicas"
+        ((resumed_statefulsets+=1))
+      else
+        ((skipped+=1))
+      fi
       kubectl -n "$row_ns" patch statefulset "$row_sts" --type=merge -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
-      ((resumed_statefulsets+=1))
     else
       if (( row_replicas == 0 )); then
         ((paused_without_annotation+=1))
@@ -2686,6 +2840,8 @@ run_resume() {
       ((skipped+=1))
     fi
   done
+
+  resume_operator_after_fleet_pause
 
   echo "Resume summary: tonnodes_resumed=${resumed_tonnodes}, statefulsets_resumed=${resumed_statefulsets}, skipped=${skipped}"
   if (( paused_without_annotation > 0 )); then

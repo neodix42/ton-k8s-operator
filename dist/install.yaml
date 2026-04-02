@@ -398,6 +398,12 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector constrains TON pods to nodes with matching
+                  labels.
+                type: object
               replicas:
                 default: 1
                 description: Replicas is the desired number of TON nodes.
@@ -891,7 +897,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: ghcr.io/neodix42/ton-k8s-operator:0.1.22
+        image: ghcr.io/neodix42/ton-k8s-operator:dev-local
         livenessProbe:
           httpGet:
             path: /healthz
