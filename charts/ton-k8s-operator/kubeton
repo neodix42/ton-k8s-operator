@@ -53,6 +53,7 @@ Commands:
   start <num>          Same as start, but overrides tonNode.replicas=<num>.
   add                  Add one TON replica to the existing TON StatefulSet.
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
+  recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
@@ -1140,6 +1141,23 @@ wait_pvc_bound() {
   return 1
 }
 
+wait_pvc_gone() {
+  local ns="$1"
+  local pvc="$2"
+  local timeout_seconds="${3:-600}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+
+  while (( $(date +%s) < deadline )); do
+    if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for PVC ${ns}/${pvc} to be deleted." >&2
+  return 1
+}
+
 wait_pod_ready() {
   local ns="$1"
   local pod="$2"
@@ -1265,6 +1283,81 @@ get_single_ton_statefulset() {
     echo "  - ${ns}/${sts} replicas=${replicas:-0}" >&2
   done
   return 1
+}
+
+resolve_ton_pod_identity() {
+  local pod_ref="$1"
+  local -n out_ns="$2"
+  local -n out_pod="$3"
+  local -n out_sts="$4"
+  local -n out_ordinal="$5"
+  local ns="" pod="" sts="" ordinal=""
+  local owner_sts=""
+  local -a matches=()
+
+  out_ns=""
+  out_pod=""
+  out_sts=""
+  out_ordinal=""
+
+  if [[ "$pod_ref" == */* ]]; then
+    ns="${pod_ref%%/*}"
+    pod="${pod_ref##*/}"
+    if [[ -z "$ns" || -z "$pod" ]]; then
+      echo "Error: invalid pod reference '${pod_ref}'. Use <pod-name> or <namespace>/<pod-name>." >&2
+      return 1
+    fi
+    if ! kubectl -n "$ns" get pod "$pod" >/dev/null 2>&1; then
+      echo "Error: pod ${ns}/${pod} not found." >&2
+      return 1
+    fi
+    if ! kubectl -n "$ns" get pod "$pod" -l "$TON_POD_LABEL" --ignore-not-found -o name 2>/dev/null | grep -q '^pod/'; then
+      echo "Error: pod ${ns}/${pod} is not a TON pod (label selector: ${TON_POD_LABEL})." >&2
+      return 1
+    fi
+  else
+    mapfile -t matches < <(kubectl get pods -A -l "$TON_POD_LABEL" --field-selector "metadata.name=${pod_ref}" \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}')
+    if [[ ${#matches[@]} -eq 0 || -z "${matches[0]}" ]]; then
+      echo "Error: TON pod named '${pod_ref}' not found." >&2
+      return 1
+    fi
+    if (( ${#matches[@]} > 1 )); then
+      echo "Error: pod name '${pod_ref}' exists in multiple namespaces. Use namespace/pod format." >&2
+      printf '%s\n' "${matches[@]}" | awk 'NF{print "  - "$0}' >&2
+      return 1
+    fi
+    IFS=$'\t' read -r ns pod <<<"${matches[0]}"
+  fi
+
+  if [[ "$pod" =~ ^(.+)-([0-9]+)$ ]]; then
+    ordinal="${BASH_REMATCH[2]}"
+  else
+    echo "Error: pod ${ns}/${pod} is not a StatefulSet ordinal pod (<name>-<ordinal>)." >&2
+    return 1
+  fi
+
+  owner_sts="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .metadata.ownerReferences[?(@.kind=="StatefulSet")]}{.name}{end}' 2>/dev/null || true)"
+  owner_sts="$(trim_whitespace "$owner_sts")"
+  if [[ -z "$owner_sts" ]]; then
+    echo "Error: pod ${ns}/${pod} is not owned by a StatefulSet." >&2
+    return 1
+  fi
+  sts="$owner_sts"
+
+  if [[ "$pod" != "${sts}-${ordinal}" ]]; then
+    echo "Error: resolved StatefulSet ${sts} does not match pod name ${pod}." >&2
+    return 1
+  fi
+  if ! kubectl -n "$ns" get statefulset "$sts" >/dev/null 2>&1; then
+    echo "Error: StatefulSet ${ns}/${sts} not found." >&2
+    return 1
+  fi
+
+  out_ns="$ns"
+  out_pod="$pod"
+  out_sts="$sts"
+  out_ordinal="$ordinal"
 }
 
 get_annotation_value() {
@@ -1403,6 +1496,125 @@ run_del() {
   done
 
   echo "Replica ${ns}/${pod} deleted."
+}
+
+run_recreate() {
+  require_bin kubectl
+  require_bin sha256sum
+
+  if [[ $# -ne 2 ]]; then
+    echo "Error: usage: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>" >&2
+    exit 1
+  fi
+
+  local pod_ref="$1"
+  local input_dir="$2"
+  local ns pod sts ordinal
+  local replicas=""
+  local pvc_ton_work pvc_mytoncore pvc_keybundle
+  local item_dir bundle_dir
+  local phase=""
+  local remaining=180
+  local delete_deadline=0
+
+  if [[ ! -d "$input_dir" ]]; then
+    echo "Error: backup directory not found: $input_dir" >&2
+    exit 1
+  fi
+  input_dir="$(cd "$input_dir" && pwd)"
+
+  if should_bootstrap_baremetal; then
+    require_bin helm
+    ensure_longhorn_installed
+    ensure_longhorn_crypto_secret
+    ensure_encrypted_storage_class
+  fi
+  validate_external_key_prereqs
+
+  resolve_ton_pod_identity "$pod_ref" ns pod sts ordinal || exit 1
+
+  replicas="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+    echo "Error: cannot read replicas for StatefulSet ${ns}/${sts}." >&2
+    exit 1
+  fi
+  if (( ordinal >= replicas )); then
+    echo "Error: pod ordinal ${ordinal} is outside StatefulSet replicas=${replicas} for ${ns}/${sts}." >&2
+    exit 1
+  fi
+
+  pvc_ton_work="ton-work-${sts}-${ordinal}"
+  pvc_mytoncore="mytoncore-${sts}-${ordinal}"
+  pvc_keybundle="keybundle-${sts}-${ordinal}"
+  item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
+  bundle_dir="${item_dir}/bundle"
+
+  if [[ ! -d "$bundle_dir" ]]; then
+    echo "Error: missing backup bundle dir for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
+    exit 1
+  fi
+  if ! find "$bundle_dir" -type f -print -quit | grep -q .; then
+    echo "Error: backup bundle dir is empty for ${ns}/${sts}/${ordinal}: ${bundle_dir}" >&2
+    exit 1
+  fi
+  if [[ -f "${item_dir}/SHA256SUMS" ]]; then
+    if ! (cd "$item_dir" && sha256sum -c SHA256SUMS >/dev/null); then
+      echo "Error: SHA256SUMS verification failed for ${item_dir}." >&2
+      exit 1
+    fi
+  else
+    echo "Warning: ${item_dir}/SHA256SUMS not found; continuing without checksum verification."
+  fi
+
+  if ! kubectl -n "$ns" get pvc "$pvc_keybundle" >/dev/null 2>&1; then
+    echo "Error: required key bundle PVC ${ns}/${pvc_keybundle} not found." >&2
+    exit 1
+  fi
+
+  confirm_or_exit "This will recreate ${ns}/${pod}: delete PVCs ${pvc_ton_work} and ${pvc_mytoncore}, let pod run for 3 minutes, inject backup bundle from ${item_dir}, then restart pod. Continue?"
+
+  echo "Deleting corrupted data PVCs for ${ns}/${pod} ..."
+  delete_deadline=$(( $(date +%s) + 900 ))
+  while :; do
+    kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n "$ns" delete pvc "$pvc_ton_work" "$pvc_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+    if ! kubectl -n "$ns" get pvc "$pvc_ton_work" >/dev/null 2>&1 && ! kubectl -n "$ns" get pvc "$pvc_mytoncore" >/dev/null 2>&1; then
+      break
+    fi
+    if (( $(date +%s) >= delete_deadline )); then
+      echo "Error: timeout deleting PVCs ${ns}/${pvc_ton_work} and ${ns}/${pvc_mytoncore}." >&2
+      exit 1
+    fi
+    sleep 3
+  done
+  wait_pvc_gone "$ns" "$pvc_ton_work" 120 || true
+  wait_pvc_gone "$ns" "$pvc_mytoncore" 120 || true
+
+  echo "Waiting for fresh PVCs to become Bound ..."
+  wait_pvc_bound "$ns" "$pvc_ton_work" 1800
+  wait_pvc_bound "$ns" "$pvc_mytoncore" 1800
+
+  echo "Waiting for initial startup of ${ns}/${pod} ..."
+  wait_pod_ready "$ns" "$pod" 1800
+  echo "Initial startup complete."
+
+  while (( remaining > 0 )); do
+    phase="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [[ -z "$phase" ]] && phase="Unknown"
+    echo "[recreate] ${ns}/${pod} is running (phase=${phase}); replacing with backup in ${remaining}s ..."
+    sleep 30
+    ((remaining-=30))
+  done
+
+  echo "Injecting encrypted backup bundle into ${ns}/${pod} ..."
+  inject_bundle_into_running_pod "$ns" "$pod" "$bundle_dir"
+
+  echo "Restarting ${ns}/${pod} to restore keys and mytoncore from bundle ..."
+  kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  wait_pod_ready "$ns" "$pod" 1800
+
+  echo "Recreate completed for ${ns}/${pod}."
 }
 
 pause_operator_reconcile() {
@@ -1561,6 +1773,41 @@ EOF
   fi
   kubectl -n "$ns" exec "$helper_pod" -- sh -ec 'find /bundle -type f -exec chmod 600 {} +' >/dev/null 2>&1 || true
   kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+inject_bundle_into_running_pod() {
+  local ns="$1"
+  local pod="$2"
+  local src_bundle_dir="$3"
+  local bundle_mount=""
+  local container_names=""
+
+  if [[ ! -d "$src_bundle_dir" ]]; then
+    echo "Error: bundle source directory not found: $src_bundle_dir" >&2
+    return 1
+  fi
+  if ! find "$src_bundle_dir" -type f -print -quit | grep -q .; then
+    echo "Error: bundle source directory is empty: $src_bundle_dir" >&2
+    return 1
+  fi
+
+  container_names="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .spec.containers[*]}{.name}{" "}{end}' 2>/dev/null || true)"
+  if ! grep -qw "key-backup" <<<"$container_names"; then
+    echo "Error: pod ${ns}/${pod} has no key-backup container." >&2
+    return 1
+  fi
+
+  bundle_mount="$(kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec 'printf %s "${KEY_BUNDLE_DIR:-/var/ton-key-bundle}"' 2>/dev/null || true)"
+  bundle_mount="$(trim_whitespace "$bundle_mount")"
+  if [[ -z "$bundle_mount" ]]; then
+    bundle_mount="/var/ton-key-bundle"
+  fi
+
+  kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec \
+    "mkdir -p \"$bundle_mount\"; find \"$bundle_mount\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +" >/dev/null
+  kubectl -n "$ns" cp "${src_bundle_dir}/." "${ns}/${pod}:${bundle_mount}" -c key-backup >/dev/null
+  kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec \
+    "find \"$bundle_mount\" -type f -exec chmod 600 {} +; sync" >/dev/null 2>&1 || true
 }
 
 restore_replica_from_backup() {
@@ -2589,6 +2836,9 @@ main() {
       ;;
     del)
       run_del "$@"
+      ;;
+    recreate)
+      run_recreate "$@"
       ;;
     upgrade)
       run_upgrade "$@"

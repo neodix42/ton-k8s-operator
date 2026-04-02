@@ -229,6 +229,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # c2) scale by one replica
 ./kubeton add
 ./kubeton del   # always removes the highest ordinal (tail) replica
+./kubeton recreate tonnode-10 ./key-backups/<timestamp>  # recreates one pod data PVCs and restores its backup bundle
 
 # d) temporarily pause TON pods (keeps TonNode/STS/PVC resources)
 ./kubeton pause
