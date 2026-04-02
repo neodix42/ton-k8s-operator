@@ -58,12 +58,14 @@ Secure key workflow is available via `spec.keyManagement`:
 - plaintext key directories mounted on tmpfs (memory only)
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
-- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` safety backup
+- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton pause`/`kubeton stop` safety backup
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
-- `./kubeton stop` now triggers one encrypted backup per running TON pod before scaling TON down
-- skip stop-time backup only when needed: `SKIP_STOP_KEY_BACKUP=true ./kubeton stop`
+- `./kubeton pause` triggers one encrypted backup per running TON pod, then sets TonNode replicas to `0` (keeps TonNode/StatefulSet/PVC resources)
+- `./kubeton resume` restores all paused TON replicas using values saved by `pause`
+- `./kubeton stop` triggers one encrypted backup per running TON pod, then disables TonNode in Helm (`tonNode.enabled=false`)
+- skip stop-time backup only when needed: `SKIP_STOP_KEY_BACKUP=true ./kubeton pause` (or `./kubeton stop`)
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
 - per replica (default names):
 - `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.enc`
@@ -226,16 +228,20 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton add
 ./kubeton del   # always removes the highest ordinal (tail) replica
 
-# d) verify
+# d) temporarily pause TON pods (keeps TonNode/STS/PVC resources)
+./kubeton pause
+./kubeton resume            # resume all paused TON pods
+
+# e) verify
 ./kubeton verify
 
-# e) stop and remove all TON nodes (keep operator)
+# f) stop and remove TON manifests from Helm release (keep operator)
 ./kubeton stop
 
-# drops TON nodes and storage (PVCs)
+# g) drops TON nodes and storage (PVCs)
 ./kubeton drop
 
-# delete operator release + Longhorn + Vault (keeps TonNode CRD)
+# h) delete operator release + Longhorn + Vault (keeps TonNode CRD)
 ./kubeton uninstall
 
 # OR full destructive cleanup including TonNode CRD

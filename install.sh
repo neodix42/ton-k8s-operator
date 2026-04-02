@@ -80,17 +80,21 @@ d) Scale one replica at a time:
    ./kubeton add
    ./kubeton del   # removes highest ordinal (tail) replica
 
-e) Verify:
+e) Pause TON pods (keeps TonNode/STS/PVC resources):
+   ./kubeton pause
+   ./kubeton resume            # resume all paused TON pods
+
+f) Verify:
    kubectl -n ton-k8s-operator-system get deploy,pods
    kubectl -n default get tonnodes
    kubectl -n default get sts,pods,pvc
 
-f) Stop/remove TON nodes
+g) Stop/remove TON manifests from Helm release
    ./kubeton stop
 
-g) Drop TON nodes and storage (PVCs)
+h) Drop TON nodes and storage (PVCs)
    ./kubeton drop
 
-h) Delete operator release + namespace
+i) Delete operator release + namespace
    ./kubeton uninstall
 EOF
