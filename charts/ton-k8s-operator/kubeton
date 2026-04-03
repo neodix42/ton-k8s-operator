@@ -41,6 +41,7 @@ NAMESPACE_DELETE_PROGRESS_TIMEOUT="${NAMESPACE_DELETE_PROGRESS_TIMEOUT:-60}"
 KUBETON_PAUSE_ANNOTATION_KEY="${KUBETON_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeton-paused-replicas}"
 KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY="${KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeton-operator-paused-replicas}"
 KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
+STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 
 usage() {
   cat <<'EOF'
@@ -52,7 +53,7 @@ Commands:
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
   start                Start TON fleet (Helm upgrade with operator-values.yaml + tonnode-values.yaml).
   start <num>          Same as start, but overrides tonNode.replicas=<num>.
-  add                  Add one TON replica to the existing TON StatefulSet.
+  add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
@@ -65,7 +66,7 @@ Commands:
   uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
   purge                Full destructive cleanup: uninstall + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
   verify               Verify operator and TON resources (deploy/pods, tonnodes, sts/pods/pvc).
-  status               Run wallet/sync/db checks in each TON pod; print node/pod/wallet/sync/cell db/archive db.
+  status               Run wallet/adnl/sync/db checks in each TON pod; print node/pod/wallet/adnl/sync/cell db/archive db.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
 
 Environment overrides:
@@ -82,6 +83,7 @@ Environment overrides:
   NAMESPACE_DELETE_PROGRESS_TIMEOUT
   KUBETON_PAUSE_ANNOTATION_KEY, KUBETON_OPERATOR_PAUSE_ANNOTATION_KEY
   SKIP_STOP_KEY_BACKUP
+  STATUS_EXEC_TIMEOUT
 EOF
 }
 
@@ -100,6 +102,16 @@ sanitize_compact() {
 
 trim_whitespace() {
   printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+run_with_timeout() {
+  local timeout_value="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout_value" "$@"
+    return $?
+  fi
+  "$@"
 }
 
 yaml_quote() {
@@ -1261,6 +1273,26 @@ wait_pvc_gone() {
   return 1
 }
 
+reset_add_target_pvc_if_exists() {
+  local ns="$1"
+  local pvc="$2"
+  local pv=""
+
+  if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+  echo "Found leftover PVC ${ns}/${pvc}; deleting it for fresh replica bootstrap ..."
+  kubectl -n "$ns" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  wait_pvc_gone "$ns" "$pvc" 300 || return 1
+
+  if [[ -n "$pv" ]]; then
+    kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+}
+
 wait_pod_ready() {
   local ns="$1"
   local pod="$2"
@@ -1475,7 +1507,7 @@ run_add() {
   require_bin kubectl
   local ns="" sts="" replicas=""
   local new_ordinal new_replicas
-  local new_pod node_name
+  local new_pod node_name target_pvc
   local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
   local -a prepared_pvcs=()
   local claim_prefix pvc pv
@@ -1500,6 +1532,19 @@ run_add() {
   validate_external_key_prereqs
 
   new_ordinal="$replicas"
+  new_pod="${sts}-${new_ordinal}"
+  if kubectl -n "$ns" get pod "$new_pod" >/dev/null 2>&1; then
+    echo "Error: target pod ${ns}/${new_pod} already exists; cluster is not in expected pre-add state." >&2
+    exit 1
+  fi
+
+  for claim_prefix in "${claim_prefixes[@]}"; do
+    target_pvc="${claim_prefix}-${sts}-${new_ordinal}"
+    reset_add_target_pvc_if_exists "$ns" "$target_pvc" || {
+      echo "Error: failed to reset leftover PVC ${ns}/${target_pvc} before add." >&2
+      exit 1
+    }
+  done
 
   echo "Preparing PVCs for new replica ${ns}/${sts}-${new_ordinal} ..."
   for claim_prefix in "${claim_prefixes[@]}"; do
@@ -1536,7 +1581,6 @@ run_add() {
     set_ton_replicas "$ns" "$sts" "$new_replicas"
   fi
 
-  new_pod="${sts}-${new_ordinal}"
   echo "Waiting for ${ns}/${new_pod} to become Ready ..."
   wait_pod_ready "$ns" "$new_pod" 1200
 
@@ -2193,13 +2237,66 @@ print_aligned_table_6col() {
   done
 }
 
-bytes_to_gb() {
+print_aligned_table_7col() {
+  local h1="$1"
+  local h2="$2"
+  local h3="$3"
+  local h4="$4"
+  local h5="$5"
+  local h6="$6"
+  local h7="$7"
+  shift 7
+  local -a rows=("$@")
+  local w1=${#h1}
+  local w2=${#h2}
+  local w3=${#h3}
+  local w4=${#h4}
+  local w5=${#h5}
+  local w6=${#h6}
+  local w7=${#h7}
+  local row c1 c2 c3 c4 c5 c6 c7
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 <<<"$row"
+    (( ${#c1} > w1 )) && w1=${#c1}
+    (( ${#c2} > w2 )) && w2=${#c2}
+    (( ${#c3} > w3 )) && w3=${#c3}
+    (( ${#c4} > w4 )) && w4=${#c4}
+    (( ${#c5} > w5 )) && w5=${#c5}
+    (( ${#c6} > w6 )) && w6=${#c6}
+    (( ${#c7} > w7 )) && w7=${#c7}
+  done
+
+  printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+    "$w1" "$h1" "$w2" "$h2" "$w3" "$h3" "$w4" "$h4" "$w5" "$h5" "$w6" "$h6" "$w7" "$h7"
+  printf "|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n" \
+    "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")" "$(dash_line "$w4")" "$(dash_line "$w5")" "$(dash_line "$w6")" "$(dash_line "$w7")"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 <<<"$row"
+    printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+      "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5" "$w6" "$c6" "$w7" "$c7"
+  done
+}
+
+bytes_to_human() {
   local bytes="$1"
   if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
     echo "N/A"
     return
   fi
-  awk -v b="$bytes" 'BEGIN { printf "%.2f GB", b/1024/1024/1024 }'
+  awk -v b="$bytes" 'BEGIN {
+    if (b < 1024) {
+      printf "%.0f B", b
+    } else if (b < 1024*1024) {
+      printf "%.2f KB", b/1024
+    } else if (b < 1024*1024*1024) {
+      printf "%.2f MB", b/1024/1024
+    } else if (b < 1024*1024*1024*1024) {
+      printf "%.2f GB", b/1024/1024/1024
+    } else {
+      printf "%.2f TB", b/1024/1024/1024/1024
+    }
+  }'
 }
 
 folder_size_gb() {
@@ -2208,10 +2305,23 @@ folder_size_gb() {
   local folder="$3"
   local bytes=""
 
-  if bytes="$(kubectl -n "$ns" exec "$pod" -- bash -lc "du -s -B1 \"$folder\" 2>/dev/null | awk '{print \$1}'" 2>/dev/null)"; then
+  bytes="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc "
+    bytes=\$(du -s -B1 \"$folder\" 2>/dev/null | cut -f1 | head -n1)
+    if [[ \"\$bytes\" =~ ^[0-9]+$ ]]; then
+      printf '%s' \"\$bytes\"
+      exit 0
+    fi
+    kbytes=\$(du -sk \"$folder\" 2>/dev/null | cut -f1 | head -n1)
+    if [[ \"\$kbytes\" =~ ^[0-9]+$ ]]; then
+      printf '%s' \$((kbytes*1024))
+      exit 0
+    fi
+    exit 1
+  " 2>/dev/null || true)"
+  if [[ -n "$bytes" ]]; then
     bytes="${bytes%%$'\n'*}"
     bytes="$(printf '%s' "$bytes" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    bytes_to_gb "$bytes"
+    bytes_to_human "$bytes"
     return
   fi
 
@@ -2223,17 +2333,11 @@ sync_value() {
   local pod="$2"
   local output=""
 
-  output="$(kubectl -n "$ns" exec "$pod" -- bash -lc 'shopt -s expand_aliases; if [[ -f ~/.bashrc ]]; then source ~/.bashrc >/dev/null 2>&1; fi; sync' 2>/dev/null || true)"
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc 'shopt -s expand_aliases; if [[ -f ~/.bashrc ]]; then source ~/.bashrc >/dev/null 2>&1; fi; sync' 2>/dev/null || true)"
   output="${output//$'\r'/}"
+  output="$(printf '%s' "$output" | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g')"
   output="$(printf '%s\n' "$output" | awk 'NF{print; exit}')"
   output="$(printf '%s' "$output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-
-  if [[ -z "$output" ]]; then
-    output="$(kubectl -n "$ns" exec "$pod" -- bash -ic 'sync' 2>/dev/null || true)"
-    output="${output//$'\r'/}"
-    output="$(printf '%s\n' "$output" | awk 'NF{print; exit}')"
-    output="$(printf '%s' "$output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-  fi
 
   if [[ -z "$output" ]]; then
     echo "N/A"
@@ -2243,13 +2347,14 @@ sync_value() {
   echo "$output"
 }
 
-wallet_value() {
+wallet_adnl_values() {
   local ns="$1"
   local pod="$2"
   local output=""
   local wallet=""
+  local adnl=""
 
-  output="$(kubectl -n "$ns" exec "$pod" -- bash -lc '
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
     shopt -s expand_aliases
     if [[ -f ~/.bashrc ]]; then
       source ~/.bashrc >/dev/null 2>&1
@@ -2259,22 +2364,50 @@ wallet_value() {
     fi
   ' 2>/dev/null || true)"
   output="${output//$'\r'/}"
+  output="$(printf '%s' "$output" | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g')"
   wallet="$(printf '%s\n' "$output" | awk -F': ' '/^Local validator wallet address:/ {print $2; exit}')"
   wallet="$(trim_whitespace "$wallet")"
+  adnl="$(printf '%s\n' "$output" | awk -F': ' '/^Public ADNL address of node:/ {print $2; exit}')"
+  adnl="$(trim_whitespace "$adnl")"
 
   if [[ -z "$wallet" ]]; then
-    output="$(kubectl -n "$ns" exec "$pod" -- bash -ic 'echo status fast | mytonctrl' 2>/dev/null || true)"
-    output="${output//$'\r'/}"
-    wallet="$(printf '%s\n' "$output" | awk -F': ' '/^Local validator wallet address:/ {print $2; exit}')"
-    wallet="$(trim_whitespace "$wallet")"
+    wallet="N/A"
   fi
-
-  if [[ -z "$wallet" ]]; then
-    echo "N/A"
-    return
+  if [[ -z "$adnl" ]]; then
+    adnl="N/A"
   fi
+  printf '%s\t%s\n' "$wallet" "$adnl"
+}
 
-  echo "$wallet"
+status_collect_row() {
+  local ns="$1"
+  local pod="$2"
+  local node_name="$3"
+  local out_file="$4"
+  local wallet_adnl=""
+  local wallet_output="N/A"
+  local adnl_output="N/A"
+  local sync_output
+  local cell_db_size
+  local archive_db_size
+
+  wallet_adnl="$(wallet_adnl_values "$ns" "$pod")"
+  if [[ -n "$wallet_adnl" ]]; then
+    IFS=$'\t' read -r wallet_output adnl_output <<<"$wallet_adnl"
+  fi
+  sync_output="$(sync_value "$ns" "$pod")"
+  [[ -z "$node_name" ]] && node_name="N/A"
+  cell_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/celldb")"
+  archive_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/archive")"
+
+  wallet_output="${wallet_output//$'\t'/ }"
+  adnl_output="${adnl_output//$'\t'/ }"
+  sync_output="${sync_output//$'\t'/ }"
+  cell_db_size="${cell_db_size//$'\t'/ }"
+  archive_db_size="${archive_db_size//$'\t'/ }"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$node_name" "$pod" "$wallet_output" "$adnl_output" "$sync_output" "$cell_db_size" "$archive_db_size" >"$out_file"
 }
 
 run_install() {
@@ -2827,6 +2960,8 @@ run_resume() {
   fi
 
   local target_replicas pause_annotation
+  local tonnode_spec_replicas
+  local fallback_replicas
   local -a sts_rows=()
   local row row_ns row_sts row_replicas
   local resumed_tonnodes=0
@@ -2854,6 +2989,7 @@ run_resume() {
 
     target_replicas=""
     if kubectl -n "$row_ns" get tonnodes.ton.ton.org "$row_sts" >/dev/null 2>&1; then
+      tonnode_spec_replicas="$(kubectl -n "$row_ns" get tonnodes.ton.ton.org "$row_sts" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
       pause_annotation="$(get_annotation_value tonnodes.ton.ton.org "$row_ns" "$row_sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
       if [[ "$pause_annotation" =~ ^[0-9]+$ ]]; then
         if (( pause_annotation > row_replicas )); then
@@ -2867,10 +3003,19 @@ run_resume() {
           ((skipped+=1))
         fi
       else
-        if (( row_replicas == 0 )); then
-          ((paused_without_annotation+=1))
+        if [[ "$tonnode_spec_replicas" =~ ^[1-9][0-9]*$ ]] && (( tonnode_spec_replicas > row_replicas )); then
+          target_replicas="$tonnode_spec_replicas"
+          echo "Warning: missing ${KUBETON_PAUSE_ANNOTATION_KEY} on TonNode ${row_ns}/${row_sts}; resuming from TonNode spec.replicas=${target_replicas}."
+          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
+            -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null 2>&1 || true
+          set_ton_replicas "$row_ns" "$row_sts" "$target_replicas"
+          ((resumed_tonnodes+=1))
+        else
+          if (( row_replicas == 0 )); then
+            ((paused_without_annotation+=1))
+          fi
+          ((skipped+=1))
         fi
-        ((skipped+=1))
       fi
       continue
     fi
@@ -2886,10 +3031,21 @@ run_resume() {
       fi
       kubectl -n "$row_ns" patch statefulset "$row_sts" --type=merge -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
     else
-      if (( row_replicas == 0 )); then
-        ((paused_without_annotation+=1))
+      fallback_replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
+      if ! [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
+        fallback_replicas="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
       fi
-      ((skipped+=1))
+
+      if (( row_replicas == 0 )) && [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Warning: missing ${KUBETON_PAUSE_ANNOTATION_KEY} on StatefulSet ${row_ns}/${row_sts}; resuming using values replicas=${fallback_replicas}."
+        set_ton_replicas "$row_ns" "$row_sts" "$fallback_replicas"
+        ((resumed_statefulsets+=1))
+      else
+        if (( row_replicas == 0 )); then
+          ((paused_without_annotation+=1))
+        fi
+        ((skipped+=1))
+      fi
     fi
   done
 
@@ -3049,26 +3205,43 @@ run_status() {
     return
   fi
 
+  local status_tmp_dir=""
   local -a table_rows=()
-  local wallet_output
-  local sync_output
-  local cell_db_size
-  local archive_db_size
-  for row in "${pod_rows[@]}"; do
+  local -a result_files=()
+  local -a fallback_rows=()
+  local -a pids=()
+  local row ns pod node_name result_file
+  local i
+
+  status_tmp_dir="$(mktemp -d -t kubeton-status.XXXXXX)"
+  for i in "${!pod_rows[@]}"; do
+    row="${pod_rows[$i]}"
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pod node_name <<<"$row"
-
-    wallet_output="$(wallet_value "$ns" "$pod")"
-    wallet_output="${wallet_output//$'\t'/ }"
-    sync_output="$(sync_value "$ns" "$pod")"
-    sync_output="${sync_output//$'\t'/ }"
     [[ -z "$node_name" ]] && node_name="N/A"
-    cell_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/celldb")"
-    archive_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/archive")"
-    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$wallet_output"$'\t'"$sync_output"$'\t'"$cell_db_size"$'\t'"$archive_db_size")
+    result_file="${status_tmp_dir}/row-${i}.tsv"
+    result_files[$i]="$result_file"
+    fallback_rows[$i]="$node_name"$'\t'"$pod"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"
+    status_collect_row "$ns" "$pod" "$node_name" "$result_file" &
+    pids+=("$!")
   done
 
-  print_aligned_table_6col "server name" "pod name" "wallet" "sync" "cell db" "archive db" "${table_rows[@]}"
+  for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" || true
+  done
+
+  for i in "${!pod_rows[@]}"; do
+    result_file="${result_files[$i]:-}"
+    if [[ -n "$result_file" && -s "$result_file" ]]; then
+      table_rows+=("$(cat "$result_file")")
+    else
+      [[ -n "${fallback_rows[$i]:-}" ]] && table_rows+=("${fallback_rows[$i]}")
+    fi
+  done
+
+  rm -rf "$status_tmp_dir" >/dev/null 2>&1 || true
+
+  print_aligned_table_7col "server name" "pod name" "wallet" "ADNL address" "sync" "cell db" "archive db" "${table_rows[@]}"
 }
 
 run_exec() {
