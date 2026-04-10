@@ -1212,6 +1212,53 @@ list_ton_statefulsets() {
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
 }
 
+resolve_live_ton_replicas() {
+  local -a tonnode_rows=()
+  local -a sts_rows=()
+  local row row_ns row_name row_replicas
+  local selected_replicas=""
+  local count=0
+
+  mapfile -t tonnode_rows < <(kubectl -n "$TON_NAMESPACE" get tonnodes.ton.ton.org \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' 2>/dev/null || true)
+  for row in "${tonnode_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r row_ns row_name row_replicas <<<"$row"
+    [[ -z "$row_ns" || -z "$row_name" ]] && continue
+    [[ "$row_replicas" =~ ^[1-9][0-9]*$ ]] || continue
+    selected_replicas="$row_replicas"
+    ((count+=1))
+  done
+  if (( count == 1 )); then
+    printf '%s' "$selected_replicas"
+    return 0
+  fi
+  if (( count > 1 )); then
+    echo "Warning: found ${count} TonNode objects with valid replicas in namespace ${TON_NAMESPACE}; skipping automatic replicas override for upgrade." >&2
+    return 1
+  fi
+
+  count=0
+  selected_replicas=""
+  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+  for row in "${sts_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r row_ns row_name row_replicas <<<"$row"
+    [[ -z "$row_ns" || -z "$row_name" ]] && continue
+    [[ "$row_replicas" =~ ^[1-9][0-9]*$ ]] || continue
+    selected_replicas="$row_replicas"
+    ((count+=1))
+  done
+  if (( count == 1 )); then
+    printf '%s' "$selected_replicas"
+    return 0
+  fi
+  if (( count > 1 )); then
+    echo "Warning: found ${count} TON StatefulSets with valid replicas; skipping automatic replicas override for upgrade." >&2
+  fi
+  return 1
+}
+
 set_ton_replicas() {
   local ns="$1"
   local name="$2"
@@ -2498,9 +2545,16 @@ run_upgrade() {
     exit 1
   fi
   local tag="${1:-latest}"
+  local live_replicas=""
   if [[ "$tag" =~ [[:space:]] ]]; then
     echo "Error: image tag must not contain whitespace." >&2
     exit 1
+  fi
+
+  live_replicas="$(resolve_live_ton_replicas || true)"
+  if [[ "$live_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    KUBETON_TARGET_TON_REPLICAS="$live_replicas"
+    echo "[upgrade] Using live TON replicas=${live_replicas} (overriding values file for this upgrade)."
   fi
 
   local -a extra_overrides=()
@@ -2508,7 +2562,7 @@ run_upgrade() {
   local -a helm_cmd=()
   local helm_rc=0
   if should_bootstrap_baremetal; then
-    ensure_auto_bootstrap_stack
+    ensure_auto_bootstrap_stack_if_needed
     append_baremetal_key_overrides extra_overrides
     if ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
       ton_selector_values_file="$(build_ton_node_selector_values_file "$LONGHORN_NODE_SELECTOR")"
@@ -2529,6 +2583,9 @@ run_upgrade() {
     --wait
     --timeout 40m
   )
+  if [[ "$live_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    helm_cmd+=(--set "tonNode.replicas=${live_replicas}")
+  fi
   "${helm_cmd[@]}" || helm_rc=$?
 
   if [[ -n "$ton_selector_values_file" ]]; then
