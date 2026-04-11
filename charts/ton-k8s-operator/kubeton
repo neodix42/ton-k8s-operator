@@ -1473,7 +1473,7 @@ resolve_ton_pod_identity() {
   local -n out_pod="$3"
   local -n out_sts="$4"
   local -n out_ordinal="$5"
-  local ns="" pod="" sts="" ordinal=""
+  local resolved_ns="" resolved_pod="" resolved_sts="" resolved_ordinal=""
   local owner_sts=""
   local -a matches=()
 
@@ -1483,18 +1483,18 @@ resolve_ton_pod_identity() {
   out_ordinal=""
 
   if [[ "$pod_ref" == */* ]]; then
-    ns="${pod_ref%%/*}"
-    pod="${pod_ref##*/}"
-    if [[ -z "$ns" || -z "$pod" ]]; then
+    resolved_ns="${pod_ref%%/*}"
+    resolved_pod="${pod_ref##*/}"
+    if [[ -z "$resolved_ns" || -z "$resolved_pod" ]]; then
       echo "Error: invalid pod reference '${pod_ref}'. Use <pod-name> or <namespace>/<pod-name>." >&2
       return 1
     fi
-    if ! kubectl -n "$ns" get pod "$pod" >/dev/null 2>&1; then
-      echo "Error: pod ${ns}/${pod} not found." >&2
+    if ! kubectl -n "$resolved_ns" get pod "$resolved_pod" >/dev/null 2>&1; then
+      echo "Error: pod ${resolved_ns}/${resolved_pod} not found." >&2
       return 1
     fi
-    if ! kubectl -n "$ns" get pod "$pod" -l "$TON_POD_LABEL" --ignore-not-found -o name 2>/dev/null | grep -q '^pod/'; then
-      echo "Error: pod ${ns}/${pod} is not a TON pod (label selector: ${TON_POD_LABEL})." >&2
+    if ! kubectl -n "$resolved_ns" get pod "$resolved_pod" -l "$TON_POD_LABEL" --ignore-not-found -o name 2>/dev/null | grep -q '^pod/'; then
+      echo "Error: pod ${resolved_ns}/${resolved_pod} is not a TON pod (label selector: ${TON_POD_LABEL})." >&2
       return 1
     fi
   else
@@ -1509,37 +1509,37 @@ resolve_ton_pod_identity() {
       printf '%s\n' "${matches[@]}" | awk 'NF{print "  - "$0}' >&2
       return 1
     fi
-    IFS=$'\t' read -r ns pod <<<"${matches[0]}"
+    IFS=$'\t' read -r resolved_ns resolved_pod <<<"${matches[0]}"
   fi
 
-  if [[ "$pod" =~ ^(.+)-([0-9]+)$ ]]; then
-    ordinal="${BASH_REMATCH[2]}"
+  if [[ "$resolved_pod" =~ ^(.+)-([0-9]+)$ ]]; then
+    resolved_ordinal="${BASH_REMATCH[2]}"
   else
-    echo "Error: pod ${ns}/${pod} is not a StatefulSet ordinal pod (<name>-<ordinal>)." >&2
+    echo "Error: pod ${resolved_ns}/${resolved_pod} is not a StatefulSet ordinal pod (<name>-<ordinal>)." >&2
     return 1
   fi
 
-  owner_sts="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .metadata.ownerReferences[?(@.kind=="StatefulSet")]}{.name}{end}' 2>/dev/null || true)"
+  owner_sts="$(kubectl -n "$resolved_ns" get pod "$resolved_pod" -o jsonpath='{range .metadata.ownerReferences[?(@.kind=="StatefulSet")]}{.name}{end}' 2>/dev/null || true)"
   owner_sts="$(trim_whitespace "$owner_sts")"
   if [[ -z "$owner_sts" ]]; then
-    echo "Error: pod ${ns}/${pod} is not owned by a StatefulSet." >&2
+    echo "Error: pod ${resolved_ns}/${resolved_pod} is not owned by a StatefulSet." >&2
     return 1
   fi
-  sts="$owner_sts"
+  resolved_sts="$owner_sts"
 
-  if [[ "$pod" != "${sts}-${ordinal}" ]]; then
-    echo "Error: resolved StatefulSet ${sts} does not match pod name ${pod}." >&2
+  if [[ "$resolved_pod" != "${resolved_sts}-${resolved_ordinal}" ]]; then
+    echo "Error: resolved StatefulSet ${resolved_sts} does not match pod name ${resolved_pod}." >&2
     return 1
   fi
-  if ! kubectl -n "$ns" get statefulset "$sts" >/dev/null 2>&1; then
-    echo "Error: StatefulSet ${ns}/${sts} not found." >&2
+  if ! kubectl -n "$resolved_ns" get statefulset "$resolved_sts" >/dev/null 2>&1; then
+    echo "Error: StatefulSet ${resolved_ns}/${resolved_sts} not found." >&2
     return 1
   fi
 
-  out_ns="$ns"
-  out_pod="$pod"
-  out_sts="$sts"
-  out_ordinal="$ordinal"
+  out_ns="$resolved_ns"
+  out_pod="$resolved_pod"
+  out_sts="$resolved_sts"
+  out_ordinal="$resolved_ordinal"
 }
 
 get_annotation_value() {
@@ -1712,7 +1712,7 @@ run_recreate() {
 
   local pod_ref="$1"
   local input_dir="$2"
-  local ns pod sts ordinal
+  local ns="" pod="" sts="" ordinal=""
   local replicas=""
   local pvc_ton_work pvc_mytoncore pvc_keybundle
   local item_dir bundle_dir

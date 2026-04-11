@@ -63,6 +63,6 @@ tonNode:
     - name: MODE
       value: liteserver
     - name: DUMP
-      value: "true"
+      value: "false"
     - name: MYTONCTRL_VERSION
       value: master
