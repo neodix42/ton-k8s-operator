@@ -499,7 +499,7 @@ Prerequisites:
 Create a local k3d cluster (example with 5 agent nodes):
 
 ```bash
-k3d cluster create --agents 5
+k3d cluster create --agents 5 --api-port 127.0.0.1:6550
 kubectl config current-context
 kubectl get nodes -o wide
 ```
