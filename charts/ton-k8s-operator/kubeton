@@ -51,17 +51,17 @@ Usage:
 Commands:
   install              Install or upgrade operator only (Helm upgrade --install with operator-values.yaml).
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
-  start                Start TON fleet (Helm upgrade with operator-values.yaml + tonnode-values.yaml).
-  start <num>          Same as start, but overrides tonNode.replicas=<num>.
+  start                Start or resume TON fleet.
+  start <num>          Start TON fleet and override tonNode.replicas=<num>.
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
-  pause                Pause TON fleet after stop-time key backup (scales StatefulSets to 0; keeps TonNode/StatefulSet/PVC).
-  resume               Resume TON fleet from pause (restores paused replicas and resumes operator reconciliation).
-  stop                 Stop TON fleet after stop-time key backup (sets tonNode.enabled=false via Helm; removes TonNode/StatefulSet).
+  stop                 Stop TON fleet after stop-time key backup (scales StatefulSets to 0; keeps TonNode/StatefulSet/PVC).
+  pause                Deprecated alias for stop.
+  resume               Deprecated alias for start.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
   purge                Full destructive cleanup: uninstall + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
@@ -2465,6 +2465,36 @@ run_install() {
     -f "$OP_VALUES_FILE"
 }
 
+fleet_has_pause_annotations() {
+  local -a sts_rows=()
+  local row ns sts pause_annotation
+
+  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+  if [[ ${#sts_rows[@]} -eq 0 || -z "${sts_rows[0]}" ]]; then
+    return 1
+  fi
+
+  for row in "${sts_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts _ <<<"$row"
+    [[ -z "$ns" || -z "$sts" ]] && continue
+
+    pause_annotation="$(get_annotation_value statefulset "$ns" "$sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
+    if [[ "$pause_annotation" =~ ^[0-9]+$ ]]; then
+      return 0
+    fi
+
+    if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
+      pause_annotation="$(get_annotation_value tonnodes.ton.ton.org "$ns" "$sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
+      if [[ "$pause_annotation" =~ ^[0-9]+$ ]]; then
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
 run_bootstrap_baremetal() {
   require_bin kubectl
   require_bin helm
@@ -2480,6 +2510,11 @@ run_bootstrap_baremetal() {
 run_start() {
   require_bin helm
   require_bin kubectl
+
+  if [[ $# -gt 1 ]]; then
+    echo "Error: usage: kubeton start [num]" >&2
+    exit 1
+  fi
 
   local replicas="${1:-}"
   local desired_replicas_for_start=""
@@ -2502,6 +2537,12 @@ run_start() {
   fi
   if [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
     KUBETON_TARGET_TON_REPLICAS="$desired_replicas_for_start"
+  fi
+
+  if [[ -z "$replicas" ]] && fleet_has_pause_annotations; then
+    echo "[start] Detected paused TON fleet; resuming paused replicas."
+    run_resume
+    return
   fi
 
   if should_bootstrap_baremetal; then
@@ -2913,8 +2954,8 @@ run_stop_backup() {
   if [[ ${#failed_pods[@]} -gt 0 ]]; then
     echo "Error: stop-time key backup failed for: ${failed_pods[*]}" >&2
     echo "Refusing to stop TON pods to avoid losing in-memory keys." >&2
-    echo "If you want to force pod stop anyway, run: SKIP_STOP_KEY_BACKUP=true ./kubeton pause" >&2
-    echo "Or disable TON in Helm release directly: SKIP_STOP_KEY_BACKUP=true ./kubeton stop" >&2
+    echo "If you want to force pod stop anyway, run: SKIP_STOP_KEY_BACKUP=true ./kubeton stop" >&2
+    echo "Or disable TON via Helm directly: helm upgrade $RELEASE_NAME $CHART_DIR -n $OP_NAMESPACE -f $OP_VALUES_FILE --set tonNode.enabled=false" >&2
     return 1
   fi
 
@@ -2922,19 +2963,18 @@ run_stop_backup() {
 }
 
 run_stop() {
-  if is_true "${SKIP_STOP_KEY_BACKUP:-false}"; then
-    echo "SKIP_STOP_KEY_BACKUP=true, skipping stop-time key backup."
-  else
-    run_stop_backup
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton stop" >&2
+    exit 1
   fi
-  run_stop_without_backup
+  run_pause
 }
 
 run_pause() {
   require_bin kubectl
   if [[ $# -ne 0 ]]; then
     echo "Error: usage: kubeton pause" >&2
-    echo "Error: kubeton pause does not take a pod name. Use 'kubeton resume' to resume paused pods." >&2
+    echo "Error: kubeton pause does not take a pod name. Use 'kubeton start' to resume paused pods." >&2
     exit 1
   fi
 
@@ -3345,7 +3385,7 @@ main() {
       run_bootstrap_baremetal
       ;;
     start)
-      run_start "${1:-}"
+      run_start "$@"
       ;;
     add)
       run_add "$@"
@@ -3366,13 +3406,15 @@ main() {
       run_restore_keys "$@"
       ;;
     pause)
-      run_pause "$@"
+      echo "Warning: 'pause' is deprecated; use 'stop'." >&2
+      run_stop "$@"
       ;;
     resume)
-      run_resume "$@"
+      echo "Warning: 'resume' is deprecated; use 'start'." >&2
+      run_start "$@"
       ;;
     stop)
-      run_stop
+      run_stop "$@"
       ;;
     drop)
       run_drop

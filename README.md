@@ -58,14 +58,14 @@ Secure key workflow is available via `spec.keyManagement`:
 - plaintext key directories mounted on tmpfs (memory only)
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
-- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton pause`/`kubeton stop` safety backup
+- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` safety backup
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
-- `./kubeton pause` triggers one encrypted backup per running TON pod, then scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
-- `./kubeton resume` restores paused TON replicas using values saved by `pause` and re-enables operator reconciliation
-- `./kubeton stop` triggers one encrypted backup per running TON pod, then disables TonNode in Helm (`tonNode.enabled=false`)
-- skip stop-time backup only when needed: `SKIP_STOP_KEY_BACKUP=true ./kubeton pause` (or `./kubeton stop`)
+- `./kubeton stop` triggers one encrypted backup per running TON pod, then scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
+- `./kubeton start` resumes a paused fleet (and also performs normal start/upgrade flow when not paused)
+- `./kubeton pause` and `./kubeton resume` are deprecated aliases for `./kubeton stop` and `./kubeton start`
+- skip stop-time backup only when needed: `SKIP_STOP_KEY_BACKUP=true ./kubeton stop`
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
 - per replica (default names):
 - `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.enc`
@@ -205,7 +205,7 @@ Then follow:
 ```bash
 cd ./ton-k8s-operator
 
-# a) review defaults
+# review defaults
 ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # helper script for common fleet operations
@@ -221,31 +221,28 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton status
 ./kubeton exec "sync"
 
-# b) install TON k8s operator only
+# install TON k8s operator only
 ./kubeton install
 
-# c) start 10 TON nodes
+# start 10 TON nodes
 ./kubeton start 10
 
-# c2) scale by one replica
+# scale by one replica
 ./kubeton add
 ./kubeton del   # always removes the highest ordinal (tail) replica
 ./kubeton recreate tonnode-10 ./key-backups/<timestamp>  # recreates one pod data PVCs and restores its backup bundle
 
-# d) temporarily pause TON pods (keeps TonNode/STS/PVC resources)
-./kubeton pause
-./kubeton resume            # resume all paused TON pods
+# temporarily stop TON pods (keeps TonNode/STS/PVC resources)
+./kubeton stop
+./kubeton start             # resume all paused TON pods
 
-# e) verify
+# verify
 ./kubeton verify
 
-# f) stop and remove TON manifests from Helm release (keep operator)
-./kubeton stop
-
-# g) drops TON nodes and storage (PVCs)
+# drops TON nodes and storage (PVCs)
 ./kubeton drop
 
-# h) delete operator release + Longhorn + Vault (keeps TonNode CRD)
+# delete operator release + Longhorn + Vault (keeps TonNode CRD)
 ./kubeton uninstall
 
 # OR full destructive cleanup including TonNode CRD
