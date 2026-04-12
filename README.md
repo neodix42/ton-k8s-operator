@@ -1,6 +1,6 @@
 # TON Kubernetes Operator
 
-Kubernetes operator for `ghcr.io/ton-blockchain/ton-docker-ctrl:latest`, built with Go + Kubebuilder.
+Kubernetes operator for `ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64`, built with Go + Kubebuilder.
 
 This operator creates and manages:
 - `TonNode` custom resources (`ton.ton.org/v1alpha1`)
@@ -266,24 +266,31 @@ Cloud provider dashboards can help create the cluster and open Cloud Shell, but 
 
 ### Upgrade Workflow (When Image Changes)
 
-Use this workflow when the operator image and/or TON node image changes.
-
-Maintainer release workflow:
+Use one of the dedicated release scripts:
 
 ```bash
-# bump all project version pins
-./upgrade.sh 0.1.7
+# A) Operator release (bumps operator + chart versions; keeps ton-docker-ctrl tag unchanged)
+./upgrade-ton-operator.sh 0.1.24
+
+# B) TON image-only release (bumps chart version only; keeps operator appVersion/tag unchanged)
+./upgrade-ton-docker-ctrl-only.sh 0.1.24 v2026.05-amd64
 
 # commit + push to main
 git add .
-git commit -m "release: 0.1.7"
+git commit -m "release: 0.1.24"
 git push origin main
 ```
 
 `publish-operator.yml` will then publish:
-- operator image: `ghcr.io/neodix42/ton-k8s-operator:0.1.7`
-- chart: `oci://ghcr.io/neodix42/charts/ton-k8s-operator:0.1.7`
-- release asset: `install.sh` on GitHub Release `0.1.7`
+- operator image (for operator releases): `ghcr.io/neodix42/ton-k8s-operator:<appVersion>`
+- chart: `oci://ghcr.io/neodix42/charts/ton-k8s-operator:<chart-version>`
+- release asset: `install.sh` on GitHub Release `<chart-version>`
+
+Installer URL in docs always uses chart version:
+
+```bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/<chart-version>/install.sh" | bash
+```
 
 Cluster upgrade workflow:
 

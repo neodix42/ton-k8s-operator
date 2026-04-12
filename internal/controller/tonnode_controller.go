@@ -43,7 +43,7 @@ import (
 )
 
 const (
-	defaultImage                       = "ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
+	defaultImage                       = "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
 	defaultReplicas              int32 = 1
 	defaultTonWorkSize                 = "200Gi"
 	defaultMyTonCoreSize               = "20Gi"
@@ -56,7 +56,7 @@ const (
 	defaultLiteServerPort        int32 = 30003
 	defaultConsolePort           int32 = 30002
 	defaultKeyProvider                 = "vault"
-	defaultKeyAgentImage               = "ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
+	defaultKeyAgentImage               = "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
 	defaultKeysTmpfsSize               = "128Mi"
 	defaultWalletsTmpfsSize            = "512Mi"
 	defaultKeyBundlePVCSize            = "5Gi"

@@ -8,6 +8,7 @@ OP_VALUES_FILE="${OP_VALUES_FILE:-$CHART_DIR/operator-values.yaml}"
 TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
 TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
 TON_IMAGE_REPO="${TON_IMAGE_REPO:-ghcr.io/ton-blockchain/ton-docker-ctrl}"
+TON_IMAGE_TAG_DEFAULT="${TON_IMAGE_TAG_DEFAULT:-v2026.04-amd64}"
 TON_NAMESPACE="${TON_NAMESPACE:-default}"
 
 AUTO_BAREMETAL_BOOTSTRAP="${AUTO_BAREMETAL_BOOTSTRAP:-true}"
@@ -56,7 +57,7 @@ Commands:
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
-  upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: latest).
+  upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: v2026.04-amd64).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
@@ -71,6 +72,7 @@ Commands:
 
 Environment overrides:
   RELEASE_NAME, OP_NAMESPACE, CHART_DIR, OP_VALUES_FILE, TON_VALUES_FILE, TON_POD_LABEL, TON_IMAGE_REPO
+  TON_IMAGE_TAG_DEFAULT
   TON_NAMESPACE
   AUTO_BAREMETAL_BOOTSTRAP, FORCE_BAREMETAL_BOOTSTRAP, SKIP_KEY_PREREQ_CHECK
   LONGHORN_RELEASE_NAME, LONGHORN_NAMESPACE, LONGHORN_CHART, LONGHORN_CHART_VERSION
@@ -291,6 +293,89 @@ resolve_ton_replicas_from_values_file() {
     return 0
   fi
   return 1
+}
+
+persist_ton_images_to_values_file() {
+  local values_file="$1"
+  local ton_image="$2"
+  local tmp_file=""
+  local awk_rc=0
+
+  if [[ ! -f "$values_file" ]]; then
+    echo "Error: TON values file not found: $values_file" >&2
+    return 1
+  fi
+
+  tmp_file="$(mktemp -t kubeton-ton-values.XXXXXX.yaml)"
+  awk -v ton_image="$ton_image" '
+    BEGIN {
+      in_ton = 0
+      in_key_management = 0
+      in_agent = 0
+      updated_ton_image = 0
+      updated_agent_image = 0
+    }
+    /^[^[:space:]]/ {
+      if ($0 ~ /^tonNode:[[:space:]]*$/) {
+        in_ton = 1
+        in_key_management = 0
+        in_agent = 0
+        print
+        next
+      }
+      in_ton = 0
+      in_key_management = 0
+      in_agent = 0
+    }
+    {
+      if (in_ton && !updated_ton_image && $0 ~ /^  image:[[:space:]]*/) {
+        print "  image: " ton_image
+        updated_ton_image = 1
+        next
+      }
+      if (in_ton && $0 ~ /^  keyManagement:[[:space:]]*$/) {
+        in_key_management = 1
+        in_agent = 0
+        print
+        next
+      }
+      if (in_ton && in_key_management && $0 ~ /^    agent:[[:space:]]*$/) {
+        in_agent = 1
+        print
+        next
+      }
+      if (in_ton && in_key_management && in_agent && !updated_agent_image && $0 ~ /^      image:[[:space:]]*/) {
+        print "      image: " ton_image
+        updated_agent_image = 1
+        next
+      }
+
+      if (in_ton && in_key_management && in_agent && $0 ~ /^    [A-Za-z0-9_.-]+:[[:space:]]*$/) {
+        in_agent = 0
+      }
+      if (in_ton && in_key_management && $0 ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ && $0 !~ /^  keyManagement:[[:space:]]*$/) {
+        in_key_management = 0
+        in_agent = 0
+      }
+
+      print
+    }
+    END {
+      if (!updated_ton_image) {
+        printf("Error: could not locate tonNode.image in %s\n", FILENAME) > "/dev/stderr"
+        exit 1
+      }
+      if (!updated_agent_image) {
+        printf("Warning: could not locate tonNode.keyManagement.agent.image in %s; skipped agent image update\n", FILENAME) > "/dev/stderr"
+      }
+    }
+  ' "$values_file" >"$tmp_file" || awk_rc=$?
+
+  if (( awk_rc != 0 )); then
+    rm -f "$tmp_file" >/dev/null 2>&1 || true
+    return "$awk_rc"
+  fi
+  mv "$tmp_file" "$values_file"
 }
 
 build_longhorn_selector_values_file() {
@@ -2527,12 +2612,15 @@ run_upgrade() {
     echo "Error: usage: kubeton upgrade [tag]" >&2
     exit 1
   fi
-  local tag="${1:-latest}"
+  local tag="${1:-$TON_IMAGE_TAG_DEFAULT}"
+  local ton_image="${TON_IMAGE_REPO}:${tag}"
   local live_replicas=""
   if [[ "$tag" =~ [[:space:]] ]]; then
     echo "Error: image tag must not contain whitespace." >&2
     exit 1
   fi
+  persist_ton_images_to_values_file "$TON_VALUES_FILE" "$ton_image"
+  echo "[upgrade] Persisted tonNode.image (and keyManagement.agent.image when present) to ${ton_image} in ${TON_VALUES_FILE}."
 
   live_replicas="$(resolve_live_ton_replicas || true)"
   if [[ "$live_replicas" =~ ^[1-9][0-9]*$ ]]; then
@@ -2560,7 +2648,6 @@ run_upgrade() {
     -n "$OP_NAMESPACE"
     -f "$OP_VALUES_FILE"
     -f "$TON_VALUES_FILE"
-    --set-string "tonNode.image=${TON_IMAGE_REPO}:${tag}"
     "${extra_overrides[@]}"
     --rollback-on-failure
     --wait

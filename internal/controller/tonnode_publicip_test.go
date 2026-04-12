@@ -258,19 +258,19 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 		want  corev1.PullPolicy
 	}{
 		{
+			name:  "versioned tag uses if not present",
+			image: "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64",
+			want:  corev1.PullIfNotPresent,
+		},
+		{
 			name:  "latest tag uses pull always",
-			image: "ghcr.io/ton-blockchain/ton-docker-ctrl:latest",
+			image: "busybox:latest",
 			want:  corev1.PullAlways,
 		},
 		{
 			name:  "image without tag is treated as latest",
 			image: "ghcr.io/ton-blockchain/ton-docker-ctrl",
 			want:  corev1.PullAlways,
-		},
-		{
-			name:  "versioned tag uses if not present",
-			image: "ghcr.io/ton-blockchain/ton-docker-ctrl:0.1.7",
-			want:  corev1.PullIfNotPresent,
 		},
 		{
 			name:  "digest pin uses if not present",

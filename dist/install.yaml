@@ -194,7 +194,7 @@ spec:
                   type: object
                 type: array
               image:
-                default: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+                default: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
                 description: Image is the TON node container image.
                 type: string
               keyManagement:
@@ -206,7 +206,7 @@ spec:
                       backup encrypted bundles.
                     properties:
                       image:
-                        default: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+                        default: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
                         description: Image is the init/sidecar image used for key
                           management scripts.
                         type: string

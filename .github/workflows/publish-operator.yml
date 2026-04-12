@@ -144,8 +144,8 @@ jobs:
       - name: Create/update GitHub release and upload install.sh
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.chart.outputs.app_version }}
-          name: ${{ steps.chart.outputs.app_version }}
+          tag_name: ${{ steps.chart.outputs.chart_version }}
+          name: ${{ steps.chart.outputs.chart_version }}
           generate_release_notes: true
           make_latest: true
           files: |
@@ -158,7 +158,7 @@ jobs:
           set -euo pipefail
           image_ref="${{ steps.image.outputs.ref }}"
           chart_ref="oci://ghcr.io/${{ steps.chart.outputs.owner }}/charts/${{ steps.chart.outputs.name }}"
-          release_url="https://github.com/${{ github.repository }}/releases/tag/${{ steps.chart.outputs.app_version }}"
+          release_url="https://github.com/${{ github.repository }}/releases/tag/${{ steps.chart.outputs.chart_version }}"
 
           if [[ "${{ steps.check-image.outputs.exists }}" == "true" ]]; then
             echo "Operator image already exists: ${image_ref}. Skipped push." >> "$GITHUB_STEP_SUMMARY"

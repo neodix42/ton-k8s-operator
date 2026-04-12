@@ -27,7 +27,7 @@ import (
 // TonNodeSpec defines the desired state of TonNode.
 type TonNodeSpec struct {
 	// Image is the TON node container image.
-	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
+	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
 	Image string `json:"image,omitempty"`
 
 	// Replicas is the desired number of TON nodes.
@@ -201,7 +201,7 @@ type TonNodeEncryptedBundleSpec struct {
 // TonNodeKeyAgentSpec defines helper container settings for key restore/backup.
 type TonNodeKeyAgentSpec struct {
 	// Image is the init/sidecar image used for key management scripts.
-	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton-docker-ctrl:latest"
+	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
 	Image string `json:"image,omitempty"`
 
 	// Resources defines CPU and memory requests/limits for key helper containers.

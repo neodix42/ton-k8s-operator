@@ -91,7 +91,7 @@ spec:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
 ```
 
 Minimal KMS example:

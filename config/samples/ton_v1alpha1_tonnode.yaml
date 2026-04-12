@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: tonnode
 spec:
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
   replicas: 3
   storage:
     tonWorkSize: 200Gi
