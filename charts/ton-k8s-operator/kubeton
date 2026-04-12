@@ -1547,7 +1547,11 @@ get_annotation_value() {
   local ns="$2"
   local name="$3"
   local key="$4"
-  kubectl -n "$ns" get "$resource" "$name" -o "jsonpath={.metadata.annotations['$key']}" 2>/dev/null || true
+  local escaped_key="$key"
+  escaped_key="${escaped_key//\\/\\\\}"
+  escaped_key="${escaped_key//\"/\\\"}"
+  kubectl -n "$ns" get "$resource" "$name" \
+    -o "go-template={{if .metadata.annotations}}{{index .metadata.annotations \"${escaped_key}\"}}{{end}}" 2>/dev/null || true
 }
 
 run_add() {
@@ -2960,7 +2964,7 @@ run_pause() {
 
     if (( tonnode_exists == 1 )); then
       kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge \
-        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}},\"spec\":{\"replicas\":0}}" >/dev/null
+        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}}}" >/dev/null
       ((tonnodes_paused+=1))
       kubectl -n "$ns" patch statefulset "$sts" --type=merge \
         -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}}}" >/dev/null 2>&1 || true
@@ -3028,6 +3032,12 @@ run_resume() {
           kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
             -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null
           ((resumed_tonnodes+=1))
+        elif (( row_replicas == 0 )) && [[ "$tonnode_spec_replicas" =~ ^[1-9][0-9]*$ ]]; then
+          target_replicas="$tonnode_spec_replicas"
+          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on TonNode ${row_ns}/${row_sts}; resuming using TonNode spec.replicas=${target_replicas}."
+          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
+            -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null 2>&1 || true
+          ((resumed_tonnodes+=1))
         else
           kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
             -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
@@ -3056,6 +3066,18 @@ run_resume() {
         target_replicas="$pause_annotation"
         set_ton_replicas "$row_ns" "$row_sts" "$target_replicas"
         ((resumed_statefulsets+=1))
+      elif (( row_replicas == 0 )); then
+        fallback_replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
+        if ! [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
+          fallback_replicas="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
+        fi
+        if [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
+          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on StatefulSet ${row_ns}/${row_sts}; resuming using values replicas=${fallback_replicas}."
+          set_ton_replicas "$row_ns" "$row_sts" "$fallback_replicas"
+          ((resumed_statefulsets+=1))
+        else
+          ((skipped+=1))
+        fi
       else
         ((skipped+=1))
       fi

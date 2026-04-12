@@ -77,6 +77,10 @@ const (
 	keyBundleMountPath       = "/var/ton-key-bundle"
 
 	readyConditionType = "Ready"
+
+	// kubetonPauseReplicasAnnotationKey stores the pre-pause replica count on TonNode/StatefulSet.
+	// When present with a parseable integer value, reconciliation keeps StatefulSet replicas at 0.
+	kubetonPauseReplicasAnnotationKey = "ton.ton.org/kubeton-paused-replicas"
 )
 
 // TonNodeReconciler reconciles a TonNode object
@@ -91,7 +95,7 @@ type TonNodeReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 
@@ -106,6 +110,8 @@ func (r *TonNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	replicas := desiredReplicas(&tonNode)
+	targetStatefulSetReplicas := desiredStatefulSetReplicas(&tonNode)
+	pausedReplicas, pauseRequested := pausedReplicasAnnotation(&tonNode)
 	if tonNode.Spec.ConfigRef != nil && replicas > 1 {
 		message := "spec.configRef supports replicas=1 only to avoid sharing a single config.json across replicas"
 		if err := r.updateStatus(ctx, &tonNode, 0, "", false, "InvalidSpec", message); err != nil {
@@ -145,12 +151,23 @@ func (r *TonNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	isReady := sts.Status.ReadyReplicas >= replicas
+	isReady := false
 	reason := "Reconciling"
-	message := fmt.Sprintf("ready replicas %d/%d", sts.Status.ReadyReplicas, replicas)
-	if isReady {
-		reason = "Ready"
-		message = "all TON replicas are ready"
+	message := fmt.Sprintf("ready replicas %d/%d", sts.Status.ReadyReplicas, targetStatefulSetReplicas)
+	if pauseRequested {
+		reason = "Paused"
+		if sts.Status.ReadyReplicas == 0 {
+			isReady = true
+			message = fmt.Sprintf("pause requested (%s=%d); all TON replicas are stopped", kubetonPauseReplicasAnnotationKey, pausedReplicas)
+		} else {
+			message = fmt.Sprintf("pause requested (%s=%d); draining replicas, ready=%d", kubetonPauseReplicasAnnotationKey, pausedReplicas, sts.Status.ReadyReplicas)
+		}
+	} else {
+		isReady = sts.Status.ReadyReplicas >= targetStatefulSetReplicas
+		if isReady {
+			reason = "Ready"
+			message = "all TON replicas are ready"
+		}
 	}
 
 	if err := r.updateStatus(ctx, &tonNode, sts.Status.ReadyReplicas, serviceName, isReady, reason, message); err != nil {
@@ -228,7 +245,7 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
 		labels := labelsForTonNode(tonNode)
-		replicas := desiredReplicas(tonNode)
+		replicas := desiredStatefulSetReplicas(tonNode)
 		publicIP, err := r.desiredPublicIPEnv(ctx, tonNode)
 		if err != nil {
 			return err
@@ -687,7 +704,6 @@ TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
 DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
 SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"
-MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
@@ -702,15 +718,6 @@ need_bin() {
 read_meta_value() {
   key="$1"
   awk -F= -v wanted="$key" '$1 == wanted {print substr($0, index($0, "=") + 1); exit}' "$META_FILE"
-}
-
-systemd_units_present() {
-  [ -d "$SYSTEMD_UNITS_DIR" ] || return 1
-  find "$SYSTEMD_UNITS_DIR" -mindepth 1 -type f -print -quit | grep -q .
-}
-
-keys_present() {
-  find "$KEYS_DIR" -mindepth 1 -print -quit | grep -q .
 }
 
 vault_decrypt() {
@@ -806,15 +813,6 @@ need_bin base64
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
 if [ ! -s "$BUNDLE_FILE" ] || [ ! -s "$META_FILE" ]; then
-  if [ -f "$MTC_DONE_FILE" ]; then
-    if ! keys_present; then
-      echo "encrypted bundle missing and keys directory is empty while mtc_done exists; clearing mtc_done to force bootstrap regeneration"
-      rm -f "$MTC_DONE_FILE" || true
-    elif ! systemd_units_present; then
-      echo "systemd-units missing or empty while mtc_done exists; clearing mtc_done to force bootstrap regeneration"
-      rm -f "$MTC_DONE_FILE" || true
-    fi
-  fi
   echo "no encrypted key bundle found; continuing without key restore"
   exit 0
 fi
@@ -864,10 +862,6 @@ fi
 chmod 700 "$KEYS_DIR" "$MYTONCORE_DIR" "$WALLETS_DIR" || true
 chmod 700 "$DB_KEYRING_DIR" || true
 chmod 600 "$DB_CONFIG_FILE" || true
-if ! systemd_units_present && [ -f "$MTC_DONE_FILE" ]; then
-  echo "systemd-units missing or empty after restore while mtc_done exists; clearing mtc_done to force bootstrap regeneration"
-  rm -f "$MTC_DONE_FILE" || true
-fi
 echo "encrypted key bundle restored"
 `
 
@@ -1374,6 +1368,29 @@ func desiredReplicas(tonNode *tonv1alpha1.TonNode) int32 {
 		return defaultReplicas
 	}
 	return *tonNode.Spec.Replicas
+}
+
+func desiredStatefulSetReplicas(tonNode *tonv1alpha1.TonNode) int32 {
+	_, pauseRequested := pausedReplicasAnnotation(tonNode)
+	if pauseRequested {
+		return 0
+	}
+	return desiredReplicas(tonNode)
+}
+
+func pausedReplicasAnnotation(tonNode *tonv1alpha1.TonNode) (int32, bool) {
+	if tonNode == nil || len(tonNode.Annotations) == 0 {
+		return 0, false
+	}
+	raw := strings.TrimSpace(tonNode.Annotations[kubetonPauseReplicasAnnotationKey])
+	if raw == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || parsed < 0 {
+		return 0, false
+	}
+	return int32(parsed), true
 }
 
 func desiredGlobalConfigURL(tonNode *tonv1alpha1.TonNode) string {
