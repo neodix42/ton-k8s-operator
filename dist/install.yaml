@@ -633,12 +633,12 @@ rules:
   - ""
   resources:
   - nodes
-  - pods
   verbs:
   - get
 - apiGroups:
   - ""
   resources:
+  - pods
   - secrets
   verbs:
   - get

@@ -3,7 +3,7 @@ tonNode:
   namespace: default
   name: tonnode
   image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
-  replicas: 3
+  replicas: 1
   storage:
     tonWorkSize: 200Gi
     myTonCoreSize: 20Gi

@@ -58,14 +58,14 @@ Secure key workflow is available via `spec.keyManagement`:
 - plaintext key directories mounted on tmpfs (memory only)
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
-- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` safety backup
+- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
-- `./kubeton stop` triggers one encrypted backup per running TON pod, then scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
+- `./kubeton stop` scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
 - `./kubeton start` resumes a paused fleet (and also performs normal start/upgrade flow when not paused)
 - `./kubeton pause` and `./kubeton resume` are deprecated aliases for `./kubeton stop` and `./kubeton start`
-- skip stop-time backup only when needed: `SKIP_STOP_KEY_BACKUP=true ./kubeton stop`
+- stop-time backup is skipped by default; enable it with: `SKIP_STOP_KEY_BACKUP=false ./kubeton stop`
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
 - per replica (default names):
 - `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.enc`
