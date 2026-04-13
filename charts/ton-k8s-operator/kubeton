@@ -53,7 +53,7 @@ Usage:
 Commands:
   install              Install or upgrade operator only (Helm upgrade --install with operator-values.yaml).
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
-  start                Start or resume TON fleet.
+  start                Start TON fleet.
   start <num>          Start TON fleet and override tonNode.replicas=<num>.
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
@@ -62,8 +62,6 @@ Commands:
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
-  pause                Deprecated alias for stop.
-  resume               Deprecated alias for start.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
   purge                Full destructive cleanup: uninstall + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
@@ -84,7 +82,6 @@ Environment overrides:
   VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
   TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
   NAMESPACE_DELETE_PROGRESS_TIMEOUT
-  KUBETON_PAUSE_ANNOTATION_KEY
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
   STATUS_EXEC_TIMEOUT
   HELPER_POD_READY_TIMEOUT (default: 300s; wait timeout for backup/restore helper pods)
@@ -1980,7 +1977,7 @@ pause_operator_reconcile() {
     deploy_replicas_ref+=("$replicas")
   done
 
-  echo "Pausing operator reconciliation (scaling deployments in ${OP_NAMESPACE} to 0) ..."
+  echo "Temporarily disabling operator reconciliation (scaling deployments in ${OP_NAMESPACE} to 0) ..."
   local i
   for i in "${!deploy_names_ref[@]}"; do
     kubectl -n "$OP_NAMESPACE" scale deployment "${deploy_names_ref[$i]}" --replicas=0 >/dev/null
@@ -1994,7 +1991,7 @@ resume_operator_reconcile() {
 
   [[ ${#deploy_names_ref[@]} -eq 0 ]] && return 0
 
-  echo "Resuming operator reconciliation in ${OP_NAMESPACE} ..."
+  echo "Restoring operator reconciliation in ${OP_NAMESPACE} ..."
   for i in "${!deploy_names_ref[@]}"; do
     kubectl -n "$OP_NAMESPACE" scale deployment "${deploy_names_ref[$i]}" --replicas="${deploy_replicas_ref[$i]}" >/dev/null 2>&1 || true
   done
@@ -2550,7 +2547,7 @@ run_install() {
     -f "$OP_VALUES_FILE"
 }
 
-fleet_has_pause_annotations() {
+fleet_has_stop_annotations() {
   local -a sts_rows=()
   local row ns sts pause_annotation
 
@@ -2624,9 +2621,9 @@ run_start() {
     KUBETON_TARGET_TON_REPLICAS="$desired_replicas_for_start"
   fi
 
-  if [[ -z "$replicas" ]] && fleet_has_pause_annotations; then
-    echo "[start] Detected paused TON fleet; resuming paused replicas."
-    run_resume
+  if [[ -z "$replicas" ]] && fleet_has_stop_annotations; then
+    echo "[start] Detected stopped TON fleet metadata; restoring previous replicas."
+    run_start_stopped_fleet
     return
   fi
 
@@ -3090,14 +3087,13 @@ run_stop() {
     echo "Error: usage: kubeton stop" >&2
     exit 1
   fi
-  run_pause
+  run_stop_fleet
 }
 
-run_pause() {
+run_stop_fleet() {
   require_bin kubectl
   if [[ $# -ne 0 ]]; then
-    echo "Error: usage: kubeton pause" >&2
-    echo "Error: kubeton pause does not take a pod name. Use 'kubeton start' to resume paused pods." >&2
+    echo "Error: usage: kubeton stop" >&2
     exit 1
   fi
 
@@ -3119,7 +3115,7 @@ run_pause() {
   local tonnodes_paused=0
   local fallback_statefulsets_scaled=0
 
-  echo "Pausing TON fleet by setting TonNode replicas to 0 (operator stays running) ..."
+  echo "Stopping TON fleet by setting TonNode replicas to 0 (operator stays running) ..."
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns sts replicas <<<"$row"
@@ -3166,13 +3162,13 @@ run_pause() {
     wait_statefulset_pods_gone "$ns" "$sts"
   done
 
-  echo "Pause summary: tonnodes_paused=${tonnodes_paused}, fallback_statefulsets_scaled=${fallback_statefulsets_scaled}, operator_paused=0"
+  echo "Stop summary: tonnodes_stopped=${tonnodes_paused}, fallback_statefulsets_scaled=${fallback_statefulsets_scaled}, operator_scaled_to_zero=0"
 }
 
-run_resume() {
+run_start_stopped_fleet() {
   require_bin kubectl
   if [[ $# -ne 0 ]]; then
-    echo "Error: usage: kubeton resume" >&2
+    echo "Error: internal usage: run_start_stopped_fleet does not accept arguments" >&2
     exit 1
   fi
 
@@ -3192,7 +3188,7 @@ run_resume() {
     return
   fi
 
-  echo "Resuming TON fleet from pause annotations ..."
+  echo "Restoring TON fleet from stop annotations ..."
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r row_ns row_sts row_replicas <<<"$row"
@@ -3215,7 +3211,7 @@ run_resume() {
           ((resumed_tonnodes+=1))
         elif (( row_replicas == 0 )) && [[ "$tonnode_spec_replicas" =~ ^[1-9][0-9]*$ ]]; then
           target_replicas="$tonnode_spec_replicas"
-          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on TonNode ${row_ns}/${row_sts}; resuming using TonNode spec.replicas=${target_replicas}."
+          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on TonNode ${row_ns}/${row_sts}; restoring using TonNode spec.replicas=${target_replicas}."
           kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
             -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null 2>&1 || true
           ((resumed_tonnodes+=1))
@@ -3227,7 +3223,7 @@ run_resume() {
       else
         if [[ "$tonnode_spec_replicas" =~ ^[1-9][0-9]*$ ]] && (( tonnode_spec_replicas > row_replicas )); then
           target_replicas="$tonnode_spec_replicas"
-          echo "Warning: missing ${KUBETON_PAUSE_ANNOTATION_KEY} on TonNode ${row_ns}/${row_sts}; resuming from TonNode spec.replicas=${target_replicas}."
+          echo "Warning: missing ${KUBETON_PAUSE_ANNOTATION_KEY} on TonNode ${row_ns}/${row_sts}; restoring from TonNode spec.replicas=${target_replicas}."
           kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
             -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null 2>&1 || true
           ((resumed_tonnodes+=1))
@@ -3253,7 +3249,7 @@ run_resume() {
           fallback_replicas="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
         fi
         if [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
-          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on StatefulSet ${row_ns}/${row_sts}; resuming using values replicas=${fallback_replicas}."
+          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on StatefulSet ${row_ns}/${row_sts}; restoring using values replicas=${fallback_replicas}."
           set_ton_replicas "$row_ns" "$row_sts" "$fallback_replicas"
           ((resumed_statefulsets+=1))
         else
@@ -3270,7 +3266,7 @@ run_resume() {
       fi
 
       if (( row_replicas == 0 )) && [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
-        echo "Warning: missing ${KUBETON_PAUSE_ANNOTATION_KEY} on StatefulSet ${row_ns}/${row_sts}; resuming using values replicas=${fallback_replicas}."
+        echo "Warning: missing ${KUBETON_PAUSE_ANNOTATION_KEY} on StatefulSet ${row_ns}/${row_sts}; restoring using values replicas=${fallback_replicas}."
         set_ton_replicas "$row_ns" "$row_sts" "$fallback_replicas"
         ((resumed_statefulsets+=1))
       else
@@ -3282,9 +3278,9 @@ run_resume() {
     fi
   done
 
-  echo "Resume summary: tonnodes_resumed=${resumed_tonnodes}, statefulsets_resumed=${resumed_statefulsets}, skipped=${skipped}, operator_paused=0"
+  echo "Start summary: tonnodes_restored=${resumed_tonnodes}, statefulsets_restored=${resumed_statefulsets}, skipped=${skipped}, operator_scaled_to_zero=0"
   if (( paused_without_annotation > 0 )); then
-    echo "Warning: ${paused_without_annotation} StatefulSet(s) are at replicas=0 without ${KUBETON_PAUSE_ANNOTATION_KEY}; resume could not infer target replicas." >&2
+    echo "Warning: ${paused_without_annotation} StatefulSet(s) are at replicas=0 without ${KUBETON_PAUSE_ANNOTATION_KEY}; start could not infer target replicas." >&2
     echo "Patch TonNode replicas manually for these StatefulSets." >&2
   fi
 }
@@ -3538,14 +3534,6 @@ main() {
       ;;
     restore-keys)
       run_restore_keys "$@"
-      ;;
-    pause)
-      echo "Warning: 'pause' is deprecated; use 'stop'." >&2
-      run_stop "$@"
-      ;;
-    resume)
-      echo "Warning: 'resume' is deprecated; use 'start'." >&2
-      run_start "$@"
       ;;
     stop)
       run_stop "$@"

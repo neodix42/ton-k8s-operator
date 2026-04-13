@@ -63,8 +63,7 @@ Secure key workflow is available via `spec.keyManagement`:
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
 - `./kubeton stop` scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
-- `./kubeton start` resumes a paused fleet (and also performs normal start/upgrade flow when not paused)
-- `./kubeton pause` and `./kubeton resume` are deprecated aliases for `./kubeton stop` and `./kubeton start`
+- `./kubeton start` restores TON replicas from stop metadata (and also performs normal start/upgrade flow when no stop metadata exists)
 - stop-time backup is skipped by default; enable it with: `SKIP_STOP_KEY_BACKUP=false ./kubeton stop`
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
 - per replica (default names):
@@ -192,7 +191,7 @@ wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.24
 The script:
 - creates a local folder
 - downloads chart from `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
-- extracts chart and prints next commands
+- extracts the chart and prints next commands
 
 The extracted chart already includes:
 - `values.yaml`
@@ -234,7 +233,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # temporarily stop TON pods (keeps TonNode/STS/PVC resources)
 ./kubeton stop
-./kubeton start             # resume all paused TON pods
+./kubeton start             # restore previous TON replicas
 
 # verify
 ./kubeton verify
