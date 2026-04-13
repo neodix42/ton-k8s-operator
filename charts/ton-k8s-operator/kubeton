@@ -7,8 +7,6 @@ CHART_DIR="${CHART_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 OP_VALUES_FILE="${OP_VALUES_FILE:-$CHART_DIR/operator-values.yaml}"
 TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
 TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
-TON_IMAGE_REPO="${TON_IMAGE_REPO:-ghcr.io/ton-blockchain/ton-docker-ctrl}"
-TON_IMAGE_TAG_DEFAULT="${TON_IMAGE_TAG_DEFAULT:-v2026.04-amd64}"
 TON_NAMESPACE="${TON_NAMESPACE:-default}"
 
 AUTO_BAREMETAL_BOOTSTRAP="${AUTO_BAREMETAL_BOOTSTRAP:-true}"
@@ -44,10 +42,6 @@ KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
-UPGRADE_WAIT_FOR_READY="${UPGRADE_WAIT_FOR_READY:-false}"
-UPGRADE_WAIT_TIMEOUT="${UPGRADE_WAIT_TIMEOUT:-40m}"
-UPGRADE_FORCE_POD_RECYCLE="${UPGRADE_FORCE_POD_RECYCLE:-true}"
-UPGRADE_TEMPLATE_SYNC_TIMEOUT="${UPGRADE_TEMPLATE_SYNC_TIMEOUT:-180}"
 
 usage() {
   cat <<'EOF'
@@ -61,7 +55,6 @@ Commands:
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
-  upgrade              Upgrade TON image: kubeton upgrade [tag] (default tag: v2026.04-amd64).
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
@@ -73,8 +66,7 @@ Commands:
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
 
 Environment overrides:
-  RELEASE_NAME, OP_NAMESPACE, CHART_DIR, OP_VALUES_FILE, TON_VALUES_FILE, TON_POD_LABEL, TON_IMAGE_REPO
-  TON_IMAGE_TAG_DEFAULT
+  RELEASE_NAME, OP_NAMESPACE, CHART_DIR, OP_VALUES_FILE, TON_VALUES_FILE, TON_POD_LABEL
   TON_NAMESPACE
   AUTO_BAREMETAL_BOOTSTRAP, FORCE_BAREMETAL_BOOTSTRAP, SKIP_KEY_PREREQ_CHECK
   LONGHORN_RELEASE_NAME, LONGHORN_NAMESPACE, LONGHORN_CHART, LONGHORN_CHART_VERSION
@@ -88,10 +80,6 @@ Environment overrides:
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
   STATUS_EXEC_TIMEOUT
   HELPER_POD_READY_TIMEOUT (default: 300s; wait timeout for backup/restore helper pods)
-  UPGRADE_WAIT_FOR_READY (default: false; set true to wait for workload readiness during upgrade)
-  UPGRADE_WAIT_TIMEOUT (default: 40m; used only when UPGRADE_WAIT_FOR_READY=true)
-  UPGRADE_FORCE_POD_RECYCLE (default: true; delete/recreate TON pods after image upgrade to apply new template even if previous rollout is stuck)
-  UPGRADE_TEMPLATE_SYNC_TIMEOUT (default: 180 seconds; wait for StatefulSet template images to match requested tag before pod recycle)
 EOF
 }
 
@@ -299,89 +287,6 @@ resolve_ton_replicas_from_values_file() {
     return 0
   fi
   return 1
-}
-
-persist_ton_images_to_values_file() {
-  local values_file="$1"
-  local ton_image="$2"
-  local tmp_file=""
-  local awk_rc=0
-
-  if [[ ! -f "$values_file" ]]; then
-    echo "Error: TON values file not found: $values_file" >&2
-    return 1
-  fi
-
-  tmp_file="$(mktemp -t kubeton-ton-values.XXXXXX.yaml)"
-  awk -v ton_image="$ton_image" '
-    BEGIN {
-      in_ton = 0
-      in_key_management = 0
-      in_agent = 0
-      updated_ton_image = 0
-      updated_agent_image = 0
-    }
-    /^[^[:space:]]/ {
-      if ($0 ~ /^tonNode:[[:space:]]*$/) {
-        in_ton = 1
-        in_key_management = 0
-        in_agent = 0
-        print
-        next
-      }
-      in_ton = 0
-      in_key_management = 0
-      in_agent = 0
-    }
-    {
-      if (in_ton && !updated_ton_image && $0 ~ /^  image:[[:space:]]*/) {
-        print "  image: " ton_image
-        updated_ton_image = 1
-        next
-      }
-      if (in_ton && $0 ~ /^  keyManagement:[[:space:]]*$/) {
-        in_key_management = 1
-        in_agent = 0
-        print
-        next
-      }
-      if (in_ton && in_key_management && $0 ~ /^    agent:[[:space:]]*$/) {
-        in_agent = 1
-        print
-        next
-      }
-      if (in_ton && in_key_management && in_agent && !updated_agent_image && $0 ~ /^      image:[[:space:]]*/) {
-        print "      image: " ton_image
-        updated_agent_image = 1
-        next
-      }
-
-      if (in_ton && in_key_management && in_agent && $0 ~ /^    [A-Za-z0-9_.-]+:[[:space:]]*$/) {
-        in_agent = 0
-      }
-      if (in_ton && in_key_management && $0 ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ && $0 !~ /^  keyManagement:[[:space:]]*$/) {
-        in_key_management = 0
-        in_agent = 0
-      }
-
-      print
-    }
-    END {
-      if (!updated_ton_image) {
-        printf("Error: could not locate tonNode.image in %s\n", FILENAME) > "/dev/stderr"
-        exit 1
-      }
-      if (!updated_agent_image) {
-        printf("Warning: could not locate tonNode.keyManagement.agent.image in %s; skipped agent image update\n", FILENAME) > "/dev/stderr"
-      }
-    }
-  ' "$values_file" >"$tmp_file" || awk_rc=$?
-
-  if (( awk_rc != 0 )); then
-    rm -f "$tmp_file" >/dev/null 2>&1 || true
-    return "$awk_rc"
-  fi
-  mv "$tmp_file" "$values_file"
 }
 
 build_longhorn_selector_values_file() {
@@ -1303,53 +1208,6 @@ list_ton_statefulsets() {
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
 }
 
-resolve_live_ton_replicas() {
-  local -a tonnode_rows=()
-  local -a sts_rows=()
-  local row row_ns row_name row_replicas
-  local selected_replicas=""
-  local count=0
-
-  mapfile -t tonnode_rows < <(kubectl -n "$TON_NAMESPACE" get tonnodes.ton.ton.org \
-    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' 2>/dev/null || true)
-  for row in "${tonnode_rows[@]}"; do
-    [[ -z "$row" ]] && continue
-    IFS=$'\t' read -r row_ns row_name row_replicas <<<"$row"
-    [[ -z "$row_ns" || -z "$row_name" ]] && continue
-    [[ "$row_replicas" =~ ^[1-9][0-9]*$ ]] || continue
-    selected_replicas="$row_replicas"
-    ((count+=1))
-  done
-  if (( count == 1 )); then
-    printf '%s' "$selected_replicas"
-    return 0
-  fi
-  if (( count > 1 )); then
-    echo "Warning: found ${count} TonNode objects with valid replicas in namespace ${TON_NAMESPACE}; skipping automatic replicas override for upgrade." >&2
-    return 1
-  fi
-
-  count=0
-  selected_replicas=""
-  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
-  for row in "${sts_rows[@]}"; do
-    [[ -z "$row" ]] && continue
-    IFS=$'\t' read -r row_ns row_name row_replicas <<<"$row"
-    [[ -z "$row_ns" || -z "$row_name" ]] && continue
-    [[ "$row_replicas" =~ ^[1-9][0-9]*$ ]] || continue
-    selected_replicas="$row_replicas"
-    ((count+=1))
-  done
-  if (( count == 1 )); then
-    printf '%s' "$selected_replicas"
-    return 0
-  fi
-  if (( count > 1 )); then
-    echo "Warning: found ${count} TON StatefulSets with valid replicas; skipping automatic replicas override for upgrade." >&2
-  fi
-  return 1
-}
-
 set_ton_replicas() {
   local ns="$1"
   local name="$2"
@@ -1465,118 +1323,6 @@ wait_pod_gone() {
 
   echo "Error: timeout waiting for pod ${ns}/${pod} to be deleted." >&2
   return 1
-}
-
-wait_statefulset_template_images() {
-  local ns="$1"
-  local sts="$2"
-  local desired_image="$3"
-  local timeout_seconds="${4:-180}"
-  local deadline=$(( $(date +%s) + timeout_seconds ))
-  local ton_image=""
-  local key_restore_image=""
-  local key_backup_image=""
-
-  while (( $(date +%s) < deadline )); do
-    ton_image="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.template.spec.containers[?(@.name=="ton-node")].image}' 2>/dev/null || true)"
-    key_restore_image="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.template.spec.initContainers[?(@.name=="key-restore")].image}' 2>/dev/null || true)"
-    key_backup_image="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.template.spec.containers[?(@.name=="key-backup")].image}' 2>/dev/null || true)"
-    ton_image="$(trim_whitespace "$ton_image")"
-    key_restore_image="$(trim_whitespace "$key_restore_image")"
-    key_backup_image="$(trim_whitespace "$key_backup_image")"
-
-    if [[ "$ton_image" == "$desired_image" ]]; then
-      if [[ -n "$key_restore_image" && "$key_restore_image" != "$desired_image" ]]; then
-        sleep 2
-        continue
-      fi
-      if [[ -n "$key_backup_image" && "$key_backup_image" != "$desired_image" ]]; then
-        sleep 2
-        continue
-      fi
-      return 0
-    fi
-    sleep 2
-  done
-
-  echo "Warning: StatefulSet template did not converge to requested image for ${ns}/${sts} within ${timeout_seconds}s." >&2
-  echo "Warning: observed images: ton-node=${ton_image:-N/A}, key-restore=${key_restore_image:-N/A}, key-backup=${key_backup_image:-N/A}" >&2
-  return 1
-}
-
-recycle_statefulset_pods_for_upgrade() {
-  local ns="$1"
-  local sts="$2"
-  local wait_for_ready="$3"
-  local replicas=""
-  local ordinal pod
-  local recreate_deadline=0
-
-  replicas="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
-  if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
-    replicas=0
-  fi
-  if (( replicas == 0 )); then
-    return 0
-  fi
-
-  for ((ordinal=replicas-1; ordinal>=0; ordinal--)); do
-    pod="${sts}-${ordinal}"
-    echo "[upgrade] Recycling pod ${ns}/${pod} ..."
-    kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    wait_pod_gone "$ns" "$pod" 300 || true
-
-    recreate_deadline=$(( $(date +%s) + 300 ))
-    while (( $(date +%s) < recreate_deadline )); do
-      if kubectl -n "$ns" get pod "$pod" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 2
-    done
-    if ! kubectl -n "$ns" get pod "$pod" >/dev/null 2>&1; then
-      echo "Error: timeout waiting for recreated pod ${ns}/${pod}." >&2
-      return 1
-    fi
-
-    if is_true "$wait_for_ready"; then
-      wait_pod_ready "$ns" "$pod" 1800 || return 1
-    fi
-  done
-
-  return 0
-}
-
-post_upgrade_force_recycle_ton_pods() {
-  local desired_image="$1"
-  local wait_for_ready="$2"
-  local -a sts_rows=()
-  local row ns sts
-  local failed=0
-
-  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
-  if [[ ${#sts_rows[@]} -eq 0 || -z "${sts_rows[0]}" ]]; then
-    echo "[upgrade] No TON StatefulSets found after upgrade."
-    return 0
-  fi
-
-  for row in "${sts_rows[@]}"; do
-    [[ -z "$row" ]] && continue
-    IFS=$'\t' read -r ns sts _ <<<"$row"
-    [[ -z "$ns" || -z "$sts" ]] && continue
-
-    if ! wait_statefulset_template_images "$ns" "$sts" "$desired_image" "$UPGRADE_TEMPLATE_SYNC_TIMEOUT"; then
-      failed=1
-      continue
-    fi
-    if ! recycle_statefulset_pods_for_upgrade "$ns" "$sts" "$wait_for_ready"; then
-      failed=1
-    fi
-  done
-
-  if (( failed != 0 )); then
-    return 1
-  fi
-  return 0
 }
 
 helper_pod_node_constraints_yaml() {
@@ -2719,6 +2465,7 @@ run_start() {
   fi
 
   local desired_replicas_for_start=""
+  local restore_from_stop_metadata=0
   local -a extra_overrides=()
   local ton_selector_values_file=""
   local -a helm_cmd=()
@@ -2733,9 +2480,8 @@ run_start() {
   fi
 
   if fleet_has_stop_annotations; then
-    echo "[start] Detected stopped TON fleet metadata; restoring previous replicas."
-    run_start_stopped_fleet
-    return
+    restore_from_stop_metadata=1
+    echo "[start] Detected stopped TON fleet metadata; applying chart update before restoring previous replicas."
   fi
 
   if should_bootstrap_baremetal; then
@@ -2766,81 +2512,8 @@ run_start() {
   if (( helm_rc != 0 )); then
     return "$helm_rc"
   fi
-}
-
-run_upgrade() {
-  require_bin helm
-  require_bin kubectl
-  if [[ $# -gt 1 ]]; then
-    echo "Error: usage: kubeton upgrade [tag]" >&2
-    exit 1
-  fi
-  local tag="${1:-$TON_IMAGE_TAG_DEFAULT}"
-  local ton_image="${TON_IMAGE_REPO}:${tag}"
-  local live_replicas=""
-  if [[ "$tag" =~ [[:space:]] ]]; then
-    echo "Error: image tag must not contain whitespace." >&2
-    exit 1
-  fi
-  persist_ton_images_to_values_file "$TON_VALUES_FILE" "$ton_image"
-  echo "[upgrade] Persisted tonNode.image (and keyManagement.agent.image when present) to ${ton_image} in ${TON_VALUES_FILE}."
-
-  live_replicas="$(resolve_live_ton_replicas || true)"
-  if [[ "$live_replicas" =~ ^[1-9][0-9]*$ ]]; then
-    KUBETON_TARGET_TON_REPLICAS="$live_replicas"
-    echo "[upgrade] Using live TON replicas=${live_replicas} (overriding values file for this upgrade)."
-  fi
-
-  local -a extra_overrides=()
-  local ton_selector_values_file=""
-  local -a helm_cmd=()
-  local helm_rc=0
-  if should_bootstrap_baremetal; then
-    ensure_auto_bootstrap_stack_if_needed
-    append_baremetal_key_overrides extra_overrides
-    if ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
-      ton_selector_values_file="$(build_ton_node_selector_values_file "$LONGHORN_NODE_SELECTOR")"
-      extra_overrides+=(-f "$ton_selector_values_file")
-    fi
-  else
-    validate_external_key_prereqs
-  fi
-
-  helm_cmd=(
-    helm upgrade "$RELEASE_NAME" "$CHART_DIR"
-    -n "$OP_NAMESPACE"
-    -f "$OP_VALUES_FILE"
-    -f "$TON_VALUES_FILE"
-    "${extra_overrides[@]}"
-  )
-  if is_true "$UPGRADE_WAIT_FOR_READY"; then
-    helm_cmd+=(
-      --rollback-on-failure
-      --wait
-      --timeout "$UPGRADE_WAIT_TIMEOUT"
-    )
-    echo "[upgrade] Waiting for readiness (UPGRADE_WAIT_FOR_READY=true, timeout=${UPGRADE_WAIT_TIMEOUT})."
-  else
-    echo "[upgrade] Upgrade applied without readiness wait (UPGRADE_WAIT_FOR_READY=false)."
-  fi
-  if [[ "$live_replicas" =~ ^[1-9][0-9]*$ ]]; then
-    helm_cmd+=(--set "tonNode.replicas=${live_replicas}")
-  fi
-  "${helm_cmd[@]}" || helm_rc=$?
-
-  if [[ -n "$ton_selector_values_file" ]]; then
-    rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
-  fi
-  if (( helm_rc != 0 )); then
-    return "$helm_rc"
-  fi
-
-  if is_true "$UPGRADE_FORCE_POD_RECYCLE"; then
-    echo "[upgrade] Forcing TON pod recycle to apply new image template."
-    if ! post_upgrade_force_recycle_ton_pods "$ton_image" "$UPGRADE_WAIT_FOR_READY"; then
-      echo "Error: one or more TON StatefulSets failed post-upgrade pod recycle." >&2
-      return 1
-    fi
+  if (( restore_from_stop_metadata == 1 )); then
+    run_start_stopped_fleet
   fi
 }
 
@@ -3648,9 +3321,6 @@ main() {
       ;;
     recreate)
       run_recreate "$@"
-      ;;
-    upgrade)
-      run_upgrade "$@"
       ;;
     backup-keys)
       run_backup_keys "${1:-}"

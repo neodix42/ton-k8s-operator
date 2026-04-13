@@ -212,8 +212,6 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton install
 ./kubeton bootstrap-baremetal
 ./kubeton start
-./kubeton upgrade
-./kubeton upgrade <tag>
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton verify
