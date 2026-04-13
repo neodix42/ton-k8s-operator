@@ -1357,16 +1357,18 @@ wait_pvc_bound() {
   local timeout_seconds="${3:-300}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
   local phase=""
+  local deleting=""
 
   while (( $(date +%s) < deadline )); do
     phase="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    if [[ "$phase" == "Bound" ]]; then
+    deleting="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)"
+    if [[ "$phase" == "Bound" && -z "$deleting" ]]; then
       return 0
     fi
     sleep 2
   done
 
-  echo "Error: timeout waiting for PVC ${ns}/${pvc} to become Bound (last phase='${phase:-unknown}')." >&2
+  echo "Error: timeout waiting for PVC ${ns}/${pvc} to become Bound (last phase='${phase:-not-found}', deleting='${deleting:-no}')." >&2
   return 1
 }
 
@@ -1846,10 +1848,10 @@ run_recreate() {
   local ns="" pod="" sts="" ordinal=""
   local replicas=""
   local pvc_ton_work pvc_mytoncore pvc_keybundle
+  local pv_ton_work="" pv_mytoncore=""
   local item_dir bundle_dir
   local phase=""
   local remaining=180
-  local delete_deadline=0
 
   if [[ ! -d "$input_dir" ]]; then
     echo "Error: backup directory not found: $input_dir" >&2
@@ -1904,23 +1906,22 @@ run_recreate() {
 
   confirm_or_exit "This will recreate ${ns}/${pod}: delete PVCs ${pvc_ton_work} and ${pvc_mytoncore}, let pod run for 3 minutes, inject backup bundle from ${item_dir}, then restart pod. Continue?"
 
-  echo "Deleting corrupted data PVCs for ${ns}/${pod} ..."
-  delete_deadline=$(( $(date +%s) + 900 ))
-  while :; do
-    kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    kubectl -n "$ns" delete pvc "$pvc_ton_work" "$pvc_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  pv_ton_work="$(kubectl -n "$ns" get pvc "$pvc_ton_work" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+  pv_mytoncore="$(kubectl -n "$ns" get pvc "$pvc_mytoncore" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
 
-    if ! kubectl -n "$ns" get pvc "$pvc_ton_work" >/dev/null 2>&1 && ! kubectl -n "$ns" get pvc "$pvc_mytoncore" >/dev/null 2>&1; then
-      break
-    fi
-    if (( $(date +%s) >= delete_deadline )); then
-      echo "Error: timeout deleting PVCs ${ns}/${pvc_ton_work} and ${ns}/${pvc_mytoncore}." >&2
-      exit 1
-    fi
-    sleep 3
-  done
-  wait_pvc_gone "$ns" "$pvc_ton_work" 120 || true
-  wait_pvc_gone "$ns" "$pvc_mytoncore" 120 || true
+  echo "Deleting corrupted data PVCs for ${ns}/${pod} ..."
+  kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete pvc "$pvc_ton_work" "$pvc_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+  # Best-effort cleanup of previous backing volumes helps avoid stuck Terminating PVCs on bare-metal.
+  if [[ -n "$pv_ton_work" ]]; then
+    kubectl delete pv "$pv_ton_work" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv_ton_work" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$pv_mytoncore" ]]; then
+    kubectl delete pv "$pv_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
 
   echo "Waiting for fresh PVCs to become Bound ..."
   wait_pvc_bound "$ns" "$pvc_ton_work" 1800
