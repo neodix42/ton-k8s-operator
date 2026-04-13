@@ -44,6 +44,8 @@ KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
+UPGRADE_WAIT_FOR_READY="${UPGRADE_WAIT_FOR_READY:-false}"
+UPGRADE_WAIT_TIMEOUT="${UPGRADE_WAIT_TIMEOUT:-40m}"
 
 usage() {
   cat <<'EOF'
@@ -85,6 +87,8 @@ Environment overrides:
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
   STATUS_EXEC_TIMEOUT
   HELPER_POD_READY_TIMEOUT (default: 300s; wait timeout for backup/restore helper pods)
+  UPGRADE_WAIT_FOR_READY (default: false; set true to wait for workload readiness during upgrade)
+  UPGRADE_WAIT_TIMEOUT (default: 40m; used only when UPGRADE_WAIT_FOR_READY=true)
 EOF
 }
 
@@ -2705,10 +2709,17 @@ run_upgrade() {
     -f "$OP_VALUES_FILE"
     -f "$TON_VALUES_FILE"
     "${extra_overrides[@]}"
-    --rollback-on-failure
-    --wait
-    --timeout 40m
   )
+  if is_true "$UPGRADE_WAIT_FOR_READY"; then
+    helm_cmd+=(
+      --rollback-on-failure
+      --wait
+      --timeout "$UPGRADE_WAIT_TIMEOUT"
+    )
+    echo "[upgrade] Waiting for readiness (UPGRADE_WAIT_FOR_READY=true, timeout=${UPGRADE_WAIT_TIMEOUT})."
+  else
+    echo "[upgrade] Upgrade applied without readiness wait (UPGRADE_WAIT_FOR_READY=false)."
+  fi
   if [[ "$live_replicas" =~ ^[1-9][0-9]*$ ]]; then
     helm_cmd+=(--set "tonNode.replicas=${live_replicas}")
   fi

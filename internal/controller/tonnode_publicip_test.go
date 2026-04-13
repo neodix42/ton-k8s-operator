@@ -258,9 +258,9 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 		want  corev1.PullPolicy
 	}{
 		{
-			name:  "versioned tag uses if not present",
+			name:  "versioned tag uses pull always",
 			image: "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64",
-			want:  corev1.PullIfNotPresent,
+			want:  corev1.PullAlways,
 		},
 		{
 			name:  "latest tag uses pull always",
@@ -289,6 +289,55 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 			got := desiredImagePullPolicy(tonNode)
 			if got != tt.want {
 				t.Fatalf("desiredImagePullPolicy(%q) = %q, want %q", tt.image, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDesiredKeyAgentImagePullPolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		tonNode *tonv1alpha1.TonNode
+		want    corev1.PullPolicy
+	}{
+		{
+			name:    "default key-agent image uses pull always",
+			tonNode: &tonv1alpha1.TonNode{},
+			want:    corev1.PullAlways,
+		},
+		{
+			name: "versioned key-agent image uses pull always",
+			tonNode: &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+						Agent: tonv1alpha1.TonNodeKeyAgentSpec{
+							Image: "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64",
+						},
+					},
+				},
+			},
+			want: corev1.PullAlways,
+		},
+		{
+			name: "digest-pinned key-agent image uses if not present",
+			tonNode: &tonv1alpha1.TonNode{
+				Spec: tonv1alpha1.TonNodeSpec{
+					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+						Agent: tonv1alpha1.TonNodeKeyAgentSpec{
+							Image: "ghcr.io/ton-blockchain/ton-docker-ctrl@sha256:0123456789abcdef",
+						},
+					},
+				},
+			},
+			want: corev1.PullIfNotPresent,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := desiredKeyAgentImagePullPolicy(tt.tonNode)
+			if got != tt.want {
+				t.Fatalf("desiredKeyAgentImagePullPolicy() = %q, want %q", got, tt.want)
 			}
 		})
 	}

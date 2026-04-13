@@ -529,10 +529,10 @@ func desiredKeyAgentImage(tonNode *tonv1alpha1.TonNode) string {
 }
 
 func desiredKeyAgentImagePullPolicy(tonNode *tonv1alpha1.TonNode) corev1.PullPolicy {
-	if imageUsesLatestTag(desiredKeyAgentImage(tonNode)) {
-		return corev1.PullAlways
+	if imagePinnedByDigest(desiredKeyAgentImage(tonNode)) {
+		return corev1.PullIfNotPresent
 	}
-	return corev1.PullIfNotPresent
+	return corev1.PullAlways
 }
 
 func desiredKeyAgentResources(tonNode *tonv1alpha1.TonNode) corev1.ResourceRequirements {
@@ -1307,33 +1307,18 @@ func desiredImage(tonNode *tonv1alpha1.TonNode) string {
 }
 
 func desiredImagePullPolicy(tonNode *tonv1alpha1.TonNode) corev1.PullPolicy {
-	if imageUsesLatestTag(desiredImage(tonNode)) {
-		return corev1.PullAlways
+	if imagePinnedByDigest(desiredImage(tonNode)) {
+		return corev1.PullIfNotPresent
 	}
-	return corev1.PullIfNotPresent
+	return corev1.PullAlways
 }
 
-func imageUsesLatestTag(image string) bool {
+func imagePinnedByDigest(image string) bool {
 	image = strings.TrimSpace(image)
 	if image == "" {
 		return false
 	}
-
-	if strings.Contains(image, "@") {
-		return false
-	}
-
-	lastSegment := image
-	if idx := strings.LastIndex(image, "/"); idx >= 0 {
-		lastSegment = image[idx+1:]
-	}
-
-	if idx := strings.LastIndex(lastSegment, ":"); idx >= 0 {
-		return lastSegment[idx+1:] == "latest"
-	}
-
-	// No explicit tag defaults to "latest" in container runtimes.
-	return true
+	return strings.Contains(image, "@")
 }
 
 func desiredResources(tonNode *tonv1alpha1.TonNode) corev1.ResourceRequirements {
