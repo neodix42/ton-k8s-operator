@@ -43,6 +43,7 @@ KUBETON_PAUSE_ANNOTATION_KEY="${KUBETON_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeto
 KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
+HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
 
 usage() {
   cat <<'EOF'
@@ -86,6 +87,7 @@ Environment overrides:
   KUBETON_PAUSE_ANNOTATION_KEY
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
   STATUS_EXEC_TIMEOUT
+  HELPER_POD_READY_TIMEOUT (default: 300s; wait timeout for backup/restore helper pods)
 EOF
 }
 
@@ -1459,6 +1461,49 @@ wait_pod_gone() {
   return 1
 }
 
+helper_pod_node_constraints_yaml() {
+  local preferred_node="$1"
+  local selector="${LONGHORN_NODE_SELECTOR:-}"
+  local -a selector_pairs=()
+
+  preferred_node="$(trim_whitespace "$preferred_node")"
+  if [[ -n "$preferred_node" ]]; then
+    printf '  nodeName: %s\n' "$preferred_node"
+    return 0
+  fi
+
+  if ! parse_selector_pairs "$selector" selector_pairs >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ ${#selector_pairs[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "  nodeSelector:"
+  write_yaml_map_from_pairs selector_pairs 4
+}
+
+print_helper_pod_failure_context() {
+  local ns="$1"
+  local pod="$2"
+  local phase node_name
+
+  phase="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  node_name="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+  phase="$(trim_whitespace "$phase")"
+  node_name="$(trim_whitespace "$node_name")"
+  [[ -z "$phase" ]] && phase="unknown"
+  [[ -z "$node_name" ]] && node_name="unknown"
+
+  echo "Helper pod status: phase=${phase}, node=${node_name}" >&2
+  echo "Recent warning events for ${ns}/${pod}:" >&2
+  kubectl -n "$ns" get events \
+    --field-selector "involvedObject.kind=Pod,involvedObject.name=${pod},type=Warning" \
+    --sort-by=.lastTimestamp \
+    -o custom-columns=TIME:.lastTimestamp,REASON:.reason,MESSAGE:.message \
+    --no-headers 2>/dev/null | tail -n 5 >&2 || true
+}
+
 create_replica_pvc_from_ordinal0() {
   local ns="$1"
   local sts="$2"
@@ -2032,7 +2077,11 @@ restore_bundle_to_pvc() {
   local ns="$1"
   local pvc="$2"
   local src_bundle_dir="$3"
+  local preferred_node="${4:-}"
   local helper_pod="kubeton-restore-$RANDOM-$RANDOM"
+  local node_constraints_yaml=""
+
+  node_constraints_yaml="$(helper_pod_node_constraints_yaml "$preferred_node")"
 
   cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
@@ -2040,6 +2089,7 @@ kind: Pod
 metadata:
   name: ${helper_pod}
 spec:
+${node_constraints_yaml}
   restartPolicy: Never
   containers:
     - name: restore
@@ -2054,7 +2104,8 @@ spec:
         claimName: ${pvc}
 EOF
 
-  if ! kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout=120s >/dev/null; then
+  if ! kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout="${HELPER_POD_READY_TIMEOUT}" >/dev/null; then
+    print_helper_pod_failure_context "$ns" "$helper_pod"
     kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
     return 1
   fi
@@ -2110,6 +2161,7 @@ restore_replica_from_backup() {
   local sts="$2"
   local ordinal="$3"
   local input_dir="$4"
+  local preferred_node="${5:-}"
 
   local pvc="keybundle-${sts}-${ordinal}"
   local item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
@@ -2134,7 +2186,7 @@ restore_replica_from_backup() {
     return 11
   fi
 
-  if ! restore_bundle_to_pvc "$ns" "$pvc" "$bundle_dir"; then
+  if ! restore_bundle_to_pvc "$ns" "$pvc" "$bundle_dir" "$preferred_node"; then
     echo "Warning: failed to restore ${ns}/${pvc} from ${bundle_dir}; skipping this replica" >&2
     return 11
   fi
@@ -2147,10 +2199,14 @@ export_bundle_from_pvc() {
   local sts="$2"
   local ordinal="$3"
   local output_dir="$4"
+  local preferred_node="${5:-}"
   local pvc="keybundle-${sts}-${ordinal}"
   local item_dir="$output_dir/$ns/$sts/$ordinal"
   local bundle_dir="$item_dir/bundle"
   local helper_pod="kubeton-backup-${sts}-${ordinal}-$RANDOM-$RANDOM"
+  local node_constraints_yaml=""
+
+  node_constraints_yaml="$(helper_pod_node_constraints_yaml "$preferred_node")"
 
   if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
     echo "Warning: missing PVC ${ns}/${pvc}, skipping"
@@ -2165,6 +2221,7 @@ kind: Pod
 metadata:
   name: ${helper_pod}
 spec:
+${node_constraints_yaml}
   restartPolicy: Never
   containers:
     - name: backup
@@ -2181,7 +2238,8 @@ spec:
         readOnly: true
 EOF
 
-  if ! kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout=120s >/dev/null; then
+  if ! kubectl -n "$ns" wait --for=condition=Ready "pod/${helper_pod}" --timeout="${HELPER_POD_READY_TIMEOUT}" >/dev/null; then
+    print_helper_pod_failure_context "$ns" "$helper_pod"
     kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
     echo "Error: helper pod ${ns}/${helper_pod} did not become Ready." >&2
     return 1
@@ -2692,6 +2750,7 @@ run_backup_keys() {
   local -a ns_list=()
   local -a sts_list=()
   local -a replicas_list=()
+  local -A helper_nodes_by_replica=()
   local -a operator_deploy_names=()
   local -a operator_deploy_replicas=()
   local row ns sts replicas i ordinal pod
@@ -2734,6 +2793,13 @@ run_backup_keys() {
 
     for ordinal in $(seq 0 $((replicas - 1))); do
       pod="${sts}-${ordinal}"
+      local helper_key="${ns}/${sts}/${ordinal}"
+      local pod_node=""
+      pod_node="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+      pod_node="$(trim_whitespace "$pod_node")"
+      if [[ -n "$pod_node" ]]; then
+        helper_nodes_by_replica["$helper_key"]="$pod_node"
+      fi
       trigger_key_backup_once "$ns" "$pod" &
       trigger_pids+=("$!")
       trigger_descs+=("${ns}/${pod}")
@@ -2779,7 +2845,9 @@ run_backup_keys() {
     fi
 
     for ordinal in $(seq 0 $((replicas - 1))); do
-      export_bundle_from_pvc "$ns" "$sts" "$ordinal" "$output_dir" &
+      local helper_key="${ns}/${sts}/${ordinal}"
+      local helper_node="${helper_nodes_by_replica[$helper_key]:-}"
+      export_bundle_from_pvc "$ns" "$sts" "$ordinal" "$output_dir" "$helper_node" &
       export_pids+=("$!")
       export_descs+=("${ns}/${sts}/${ordinal}")
     done
@@ -2838,6 +2906,7 @@ run_restore_keys() {
   local -a ns_list=()
   local -a sts_list=()
   local -a replicas_list=()
+  local -A helper_nodes_by_replica=()
   local -a operator_deploy_names=()
   local -a operator_deploy_replicas=()
   local row ns sts replicas i ordinal
@@ -2849,6 +2918,29 @@ run_restore_keys() {
     ns_list+=("$ns")
     sts_list+=("$sts")
     replicas_list+=("$replicas")
+  done
+
+  for i in "${!sts_list[@]}"; do
+    ns="${ns_list[$i]}"
+    sts="${sts_list[$i]}"
+    replicas="${replicas_list[$i]}"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=0
+    fi
+    if (( replicas == 0 )); then
+      continue
+    fi
+
+    for ordinal in $(seq 0 $((replicas - 1))); do
+      local pod="${sts}-${ordinal}"
+      local helper_key="${ns}/${sts}/${ordinal}"
+      local pod_node=""
+      pod_node="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+      pod_node="$(trim_whitespace "$pod_node")"
+      if [[ -n "$pod_node" ]]; then
+        helper_nodes_by_replica["$helper_key"]="$pod_node"
+      fi
+    done
   done
 
   local restore_required=1
@@ -2893,7 +2985,9 @@ run_restore_keys() {
     fi
 
     for ordinal in $(seq 0 $((replicas - 1))); do
-      restore_replica_from_backup "$ns" "$sts" "$ordinal" "$input_dir" &
+      local helper_key="${ns}/${sts}/${ordinal}"
+      local helper_node="${helper_nodes_by_replica[$helper_key]:-}"
+      restore_replica_from_backup "$ns" "$sts" "$ordinal" "$input_dir" "$helper_node" &
       restore_pids+=("$!")
       restore_descs+=("${ns}/${sts}/${ordinal}")
     done
