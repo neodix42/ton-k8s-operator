@@ -73,8 +73,8 @@ a) Review default values files:
 b) Install operator:
    ./kubeton install
 
-c) Start 10 TON nodes:
-  ./kubeton start 10
+c) Start TON nodes (replica count is taken from tonnode-values.yaml):
+  ./kubeton start
 
 d) Scale one replica at a time:
    ./kubeton add

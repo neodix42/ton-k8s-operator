@@ -223,8 +223,8 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # install TON k8s operator only
 ./kubeton install
 
-# start 10 TON nodes
-./kubeton start 10
+# start TON nodes (replicas from tonnode-values.yaml)
+./kubeton start
 
 # scale by one replica
 ./kubeton add
@@ -542,8 +542,8 @@ cd charts/ton-k8s-operator
 # operator + TON nodes (uses tonnode-values.yaml defaults)
 ./kubeton start
 
-# operator + TON nodes with explicit replicas
-./kubeton start 10
+# operator + TON nodes (replicas from tonnode-values.yaml)
+./kubeton start
 ```
 
 On k3d, `./kubeton start` automatically bootstraps Vault and StorageClass `encrypted-sc` (local fallback) if missing.

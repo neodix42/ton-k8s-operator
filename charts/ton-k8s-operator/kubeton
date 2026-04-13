@@ -58,7 +58,6 @@ Commands:
   install              Install or upgrade operator only (Helm upgrade --install with operator-values.yaml).
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
   start                Start TON fleet.
-  start <num>          Start TON fleet and override tonNode.replicas=<num>.
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
@@ -2714,35 +2713,26 @@ run_start() {
   require_bin helm
   require_bin kubectl
 
-  if [[ $# -gt 1 ]]; then
-    echo "Error: usage: kubeton start [num]" >&2
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton start" >&2
     exit 1
   fi
 
-  local replicas="${1:-}"
   local desired_replicas_for_start=""
   local -a extra_overrides=()
   local ton_selector_values_file=""
   local -a helm_cmd=()
   local helm_rc=0
 
-  if [[ -n "$replicas" ]]; then
-    if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
-      echo "Error: replicas must be a positive integer." >&2
-      exit 1
-    fi
-    desired_replicas_for_start="$replicas"
-  else
-    desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
-    if ! [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
-      desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
-    fi
+  desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
+  if ! [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
+    desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
   fi
   if [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
     KUBETON_TARGET_TON_REPLICAS="$desired_replicas_for_start"
   fi
 
-  if [[ -z "$replicas" ]] && fleet_has_stop_annotations; then
+  if fleet_has_stop_annotations; then
     echo "[start] Detected stopped TON fleet metadata; restoring previous replicas."
     run_start_stopped_fleet
     return
@@ -2766,9 +2756,6 @@ run_start() {
     -f "$TON_VALUES_FILE"
   )
 
-  if [[ -n "$replicas" ]]; then
-    helm_cmd+=(--set "tonNode.replicas=$replicas")
-  fi
   helm_cmd+=("${extra_overrides[@]}")
 
   "${helm_cmd[@]}" || helm_rc=$?
@@ -2778,14 +2765,6 @@ run_start() {
   fi
   if (( helm_rc != 0 )); then
     return "$helm_rc"
-  fi
-
-  if is_true "$UPGRADE_FORCE_POD_RECYCLE"; then
-    echo "[upgrade] Forcing TON pod recycle to apply new image template."
-    if ! post_upgrade_force_recycle_ton_pods "$ton_image" "$UPGRADE_WAIT_FOR_READY"; then
-      echo "Error: one or more TON StatefulSets failed post-upgrade pod recycle." >&2
-      return 1
-    fi
   fi
 }
 
@@ -2854,6 +2833,14 @@ run_upgrade() {
   fi
   if (( helm_rc != 0 )); then
     return "$helm_rc"
+  fi
+
+  if is_true "$UPGRADE_FORCE_POD_RECYCLE"; then
+    echo "[upgrade] Forcing TON pod recycle to apply new image template."
+    if ! post_upgrade_force_recycle_ton_pods "$ton_image" "$UPGRADE_WAIT_FOR_READY"; then
+      echo "Error: one or more TON StatefulSets failed post-upgrade pod recycle." >&2
+      return 1
+    fi
   fi
 }
 
