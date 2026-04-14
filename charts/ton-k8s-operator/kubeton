@@ -2273,6 +2273,53 @@ print_aligned_table_7col() {
   done
 }
 
+print_aligned_table_9col() {
+  local h1="$1"
+  local h2="$2"
+  local h3="$3"
+  local h4="$4"
+  local h5="$5"
+  local h6="$6"
+  local h7="$7"
+  local h8="$8"
+  local h9="$9"
+  shift 9
+  local -a rows=("$@")
+  local w1=${#h1}
+  local w2=${#h2}
+  local w3=${#h3}
+  local w4=${#h4}
+  local w5=${#h5}
+  local w6=${#h6}
+  local w7=${#h7}
+  local w8=${#h8}
+  local w9=${#h9}
+  local row c1 c2 c3 c4 c5 c6 c7 c8 c9
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 <<<"$row"
+    (( ${#c1} > w1 )) && w1=${#c1}
+    (( ${#c2} > w2 )) && w2=${#c2}
+    (( ${#c3} > w3 )) && w3=${#c3}
+    (( ${#c4} > w4 )) && w4=${#c4}
+    (( ${#c5} > w5 )) && w5=${#c5}
+    (( ${#c6} > w6 )) && w6=${#c6}
+    (( ${#c7} > w7 )) && w7=${#c7}
+    (( ${#c8} > w8 )) && w8=${#c8}
+    (( ${#c9} > w9 )) && w9=${#c9}
+  done
+
+  printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+    "$w1" "$h1" "$w2" "$h2" "$w3" "$h3" "$w4" "$h4" "$w5" "$h5" "$w6" "$h6" "$w7" "$h7" "$w8" "$h8" "$w9" "$h9"
+  printf "|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n" \
+    "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")" "$(dash_line "$w4")" "$(dash_line "$w5")" "$(dash_line "$w6")" "$(dash_line "$w7")" "$(dash_line "$w8")" "$(dash_line "$w9")"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 <<<"$row"
+    printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+      "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5" "$w6" "$c6" "$w7" "$c7" "$w8" "$c8" "$w9" "$c9"
+  done
+}
+
 bytes_to_human() {
   local bytes="$1"
   if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
@@ -2374,12 +2421,53 @@ wallet_adnl_values() {
   printf '%s\t%s\n' "$wallet" "$adnl"
 }
 
+validator_build_values() {
+  local ns="$1"
+  local pod="$2"
+  local output=""
+  local commit=""
+  local build_date=""
+
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+    if [[ -x /usr/bin/ton/validator-engine/validator-engine ]]; then
+      /usr/bin/ton/validator-engine/validator-engine -V 2>/dev/null | head -n1
+    elif command -v validator-engine >/dev/null 2>&1; then
+      validator-engine -V 2>/dev/null | head -n1
+    else
+      true
+    fi
+  ' 2>/dev/null || true)"
+  output="${output//$'\r'/}"
+  output="$(printf '%s' "$output" | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g')"
+  output="$(trim_whitespace "$output")"
+
+  if [[ -n "$output" ]]; then
+    commit="$(printf '%s\n' "$output" | sed -n 's/.*Commit:[[:space:]]*\([0-9a-fA-F]\{7,\}\).*/\1/p' | head -n1)"
+    build_date="$(printf '%s\n' "$output" | sed -n 's/.*Date:[[:space:]]*\([^]]*\)].*/\1/p' | head -n1)"
+  fi
+
+  commit="$(trim_whitespace "$commit")"
+  build_date="$(trim_whitespace "$build_date")"
+  if [[ -z "$commit" ]]; then
+    commit="N/A"
+  else
+    commit="${commit:0:7}"
+  fi
+  if [[ -z "$build_date" ]]; then
+    build_date="N/A"
+  fi
+  printf '%s\t%s\n' "$commit" "$build_date"
+}
+
 status_collect_row() {
   local ns="$1"
   local pod="$2"
   local node_name="$3"
   local out_file="$4"
   local wallet_adnl=""
+  local validator_build=""
+  local commit_output="N/A"
+  local date_output="N/A"
   local wallet_output="N/A"
   local adnl_output="N/A"
   local sync_output
@@ -2390,19 +2478,25 @@ status_collect_row() {
   if [[ -n "$wallet_adnl" ]]; then
     IFS=$'\t' read -r wallet_output adnl_output <<<"$wallet_adnl"
   fi
+  validator_build="$(validator_build_values "$ns" "$pod")"
+  if [[ -n "$validator_build" ]]; then
+    IFS=$'\t' read -r commit_output date_output <<<"$validator_build"
+  fi
   sync_output="$(sync_value "$ns" "$pod")"
   [[ -z "$node_name" ]] && node_name="N/A"
   cell_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/celldb")"
   archive_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/archive")"
 
+  commit_output="${commit_output//$'\t'/ }"
+  date_output="${date_output//$'\t'/ }"
   wallet_output="${wallet_output//$'\t'/ }"
   adnl_output="${adnl_output//$'\t'/ }"
   sync_output="${sync_output//$'\t'/ }"
   cell_db_size="${cell_db_size//$'\t'/ }"
   archive_db_size="${archive_db_size//$'\t'/ }"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$node_name" "$pod" "$wallet_output" "$adnl_output" "$sync_output" "$cell_db_size" "$archive_db_size" >"$out_file"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$node_name" "$pod" "$commit_output" "$date_output" "$wallet_output" "$adnl_output" "$sync_output" "$cell_db_size" "$archive_db_size" >"$out_file"
 }
 
 run_install() {
@@ -3244,7 +3338,7 @@ run_status() {
     [[ -z "$node_name" ]] && node_name="N/A"
     result_file="${status_tmp_dir}/row-${i}.tsv"
     result_files[$i]="$result_file"
-    fallback_rows[$i]="$node_name"$'\t'"$pod"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"
+    fallback_rows[$i]="$node_name"$'\t'"$pod"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"
     status_collect_row "$ns" "$pod" "$node_name" "$result_file" &
     pids+=("$!")
   done
@@ -3264,7 +3358,7 @@ run_status() {
 
   rm -rf "$status_tmp_dir" >/dev/null 2>&1 || true
 
-  print_aligned_table_7col "server name" "pod name" "wallet" "ADNL address" "sync" "cell db" "archive db" "${table_rows[@]}"
+  print_aligned_table_9col "server name" "pod name" "commit" "date" "wallet" "ADNL address" "sync" "cell db" "archive db" "${table_rows[@]}"
 }
 
 run_exec() {
