@@ -2,7 +2,7 @@ tonNode:
   enabled: true
   namespace: default
   name: tonnode
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
   replicas: 1
   storage:
     tonWorkSize: 200Gi
@@ -43,7 +43,7 @@ tonNode:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
+      image: ghcr.io/ton-blockchain/ton-docker-ctrl:latest
       resources: {}
   env:
     - name: TON_BRANCH
