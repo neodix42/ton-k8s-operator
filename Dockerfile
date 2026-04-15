@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot
-ARG VERSION=0.1.33
+ARG VERSION=0.1.34
 WORKDIR /
 LABEL org.opencontainers.image.title="ton-k8s-operator"
 LABEL org.opencontainers.image.description="Kubernetes operator for TON nodes"
