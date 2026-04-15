@@ -1550,6 +1550,42 @@ list_ton_statefulsets() {
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
 }
 
+delete_ton_pvcs_for_statefulsets() {
+  local -n sts_rows_ref="$1"
+  local row ns sts
+  local -a pvc_rows=()
+  local pvc_name
+
+  if [[ ${#sts_rows_ref[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for row in "${sts_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts _ <<<"$row"
+    [[ -z "$ns" || -z "$sts" ]] && continue
+
+    while IFS= read -r pvc_name; do
+      [[ -z "$pvc_name" ]] && continue
+      pvc_rows+=("$ns"$'\t'"$pvc_name")
+    done < <(
+      kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+        | grep -E "^(ton-work|mytoncore|keybundle)-${sts}-" || true
+    )
+  done
+
+  if [[ ${#pvc_rows[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "[cleanup] Deleting TON PVCs by StatefulSet name pattern ..."
+  for row in "${pvc_rows[@]}"; do
+    IFS=$'\t' read -r ns pvc_name <<<"$row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    kubectl -n "$ns" delete pvc "$pvc_name" --ignore-not-found >/dev/null 2>&1 || true
+  done
+}
+
 set_ton_replicas() {
   local ns="$1"
   local name="$2"
@@ -3520,10 +3556,14 @@ run_start_stopped_fleet() {
 run_drop() {
   require_bin helm
   require_bin kubectl
+  local -a drop_sts_rows=()
+
+  mapfile -t drop_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
   confirm_or_exit "This will stop TON pods and DELETE TON PVC data. Continue?"
   run_stop_without_backup
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
+  delete_ton_pvcs_for_statefulsets drop_sts_rows
 }
 
 cleanup_longhorn_force() {
@@ -3630,6 +3670,10 @@ cleanup_prometheus_resources() {
 }
 
 run_uninstall_core() {
+  local -a uninstall_sts_rows=()
+
+  mapfile -t uninstall_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+
   echo "[uninstall] Step 1/9: disabling TON resources in Helm release ${RELEASE_NAME} ..."
   if ! run_stop_without_backup; then
     echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing uninstall cleanup." >&2
@@ -3640,6 +3684,7 @@ run_uninstall_core() {
 
   echo "[uninstall] Step 3/9: deleting TON PVCs ..."
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
+  delete_ton_pvcs_for_statefulsets uninstall_sts_rows
 
   echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus resources and port-forwards ..."
   cleanup_prometheus_resources

@@ -393,6 +393,7 @@ func desiredVolumeClaims(
 	tonNode *tonv1alpha1.TonNode,
 	storageClassName *string,
 ) []corev1.PersistentVolumeClaim {
+	labels := labelsForTonNode(tonNode)
 	accessModes := tonNode.Spec.Storage.AccessModes
 	if len(accessModes) == 0 {
 		accessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
@@ -403,7 +404,7 @@ func desiredVolumeClaims(
 
 	claims := []corev1.PersistentVolumeClaim{
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: tonWorkClaimName},
+			ObjectMeta: metav1.ObjectMeta{Name: tonWorkClaimName, Labels: labels},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes:      accessModes,
 				StorageClassName: storageClassName,
@@ -415,7 +416,7 @@ func desiredVolumeClaims(
 			},
 		},
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: myTonCoreClaim},
+			ObjectMeta: metav1.ObjectMeta{Name: myTonCoreClaim, Labels: labels},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes:      accessModes,
 				StorageClassName: storageClassName,
@@ -436,7 +437,7 @@ func desiredVolumeClaims(
 	keyStorageClassName := desiredKeyBundleStorageClassName(tonNode, storageClassName)
 	keyBundleSize := parseQuantityOrDefault(desiredKeyBundlePVCSize(tonNode), defaultKeyBundlePVCSize)
 	claims = append(claims, corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: keyBundleClaim},
+		ObjectMeta: metav1.ObjectMeta{Name: keyBundleClaim, Labels: labels},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      keyAccessModes,
 			StorageClassName: keyStorageClassName,
