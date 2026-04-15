@@ -42,6 +42,7 @@ KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
+HELM_UNINSTALL_CMD_TIMEOUT="${HELM_UNINSTALL_CMD_TIMEOUT:-900s}"
 PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-prom/prometheus:v2.53.4}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
 PROMETHEUS_LOCAL_PORT_BASE="${PROMETHEUS_LOCAL_PORT_BASE:-9090}"
@@ -86,6 +87,7 @@ Environment overrides:
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
   STATUS_EXEC_TIMEOUT
   HELPER_POD_READY_TIMEOUT (default: 300s; wait timeout for backup/restore helper pods)
+  HELM_UNINSTALL_CMD_TIMEOUT (default: 900s; hard timeout wrapper for helm uninstall commands)
   PROMETHEUS_IMAGE (default: prom/prometheus:v2.53.4)
   PROMETHEUS_PORT (default: 9090)
   PROMETHEUS_LOCAL_PORT_BASE (default: 9090)
@@ -3608,35 +3610,57 @@ cleanup_longhorn_force() {
 }
 
 uninstall_longhorn() {
+  local rc=0
   if ! helm status "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
     return 0
   fi
   echo "[uninstall] Running Helm uninstall for Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   kubectl -n "$LONGHORN_NAMESPACE" patch settings.longhorn.io deleting-confirmation-flag --type=merge -p '{"value":"true"}' >/dev/null 2>&1 || true
-  if helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE"; then
+  if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE"; then
     return 0
   fi
-  echo "Warning: Longhorn Helm uninstall failed; retrying with --no-hooks." >&2
-  if helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" --no-hooks >/dev/null 2>&1; then
+  rc=$?
+  if [[ "$rc" -eq 124 ]]; then
+    echo "Warning: Longhorn Helm uninstall timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; retrying with --no-hooks." >&2
+  else
+    echo "Warning: Longhorn Helm uninstall failed (exit ${rc}); retrying with --no-hooks." >&2
+  fi
+  if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" --no-hooks >/dev/null 2>&1; then
     return 0
   fi
-  echo "Warning: Longhorn Helm uninstall --no-hooks failed; running forced cleanup fallback." >&2
+  rc=$?
+  if [[ "$rc" -eq 124 ]]; then
+    echo "Warning: Longhorn Helm uninstall --no-hooks timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; running forced cleanup fallback." >&2
+  else
+    echo "Warning: Longhorn Helm uninstall --no-hooks failed (exit ${rc}); running forced cleanup fallback." >&2
+  fi
   cleanup_longhorn_force
 }
 
 uninstall_vault() {
+  local rc=0
   if ! helm status "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" >/dev/null 2>&1; then
     return 0
   fi
   echo "[uninstall] Running Helm uninstall for Vault release ${VAULT_RELEASE_NAME} ..."
-  if helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE"; then
+  if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE"; then
     return 0
   fi
-  echo "Warning: Vault Helm uninstall failed; retrying with --no-hooks." >&2
-  if helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" --no-hooks >/dev/null 2>&1; then
+  rc=$?
+  if [[ "$rc" -eq 124 ]]; then
+    echo "Warning: Vault Helm uninstall timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; retrying with --no-hooks." >&2
+  else
+    echo "Warning: Vault Helm uninstall failed (exit ${rc}); retrying with --no-hooks." >&2
+  fi
+  if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" --no-hooks >/dev/null 2>&1; then
     return 0
   fi
-  echo "Warning: Vault Helm uninstall --no-hooks failed; running forced cleanup fallback." >&2
+  rc=$?
+  if [[ "$rc" -eq 124 ]]; then
+    echo "Warning: Vault Helm uninstall --no-hooks timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; running forced cleanup fallback." >&2
+  else
+    echo "Warning: Vault Helm uninstall --no-hooks failed (exit ${rc}); running forced cleanup fallback." >&2
+  fi
   cleanup_vault_force
 }
 
