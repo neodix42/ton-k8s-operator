@@ -54,6 +54,7 @@ const (
 	defaultGlobalConfigURL             = "https://ton.org/global.config.json"
 	defaultValidatorPort         int32 = 30001
 	defaultLiteServerPort        int32 = 30003
+	defaultQuicPort              int32 = 31001
 	defaultConsolePort           int32 = 30002
 	defaultKeyProvider                 = "vault"
 	defaultKeyAgentImage               = "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
@@ -213,6 +214,12 @@ func (r *TonNodeReconciler) reconcileHeadlessService(
 				TargetPort: intstr.FromInt32(desiredValidatorPort(tonNode)),
 			},
 			{
+				Name:       "quic-udp",
+				Port:       desiredQuicPort(tonNode),
+				Protocol:   corev1.ProtocolUDP,
+				TargetPort: intstr.FromInt32(desiredQuicPort(tonNode)),
+			},
+			{
 				Name:       "liteserver-tcp",
 				Port:       desiredLiteServerPort(tonNode),
 				Protocol:   corev1.ProtocolTCP,
@@ -280,6 +287,11 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		{
 			Name:          "validator-udp",
 			ContainerPort: desiredValidatorPort(tonNode),
+			Protocol:      corev1.ProtocolUDP,
+		},
+		{
+			Name:          "quic-udp",
+			ContainerPort: desiredQuicPort(tonNode),
 			Protocol:      corev1.ProtocolUDP,
 		},
 		{
@@ -1398,6 +1410,13 @@ func desiredLiteServerPort(tonNode *tonv1alpha1.TonNode) int32 {
 		return tonNode.Spec.Network.LiteServerPort
 	}
 	return defaultLiteServerPort
+}
+
+func desiredQuicPort(tonNode *tonv1alpha1.TonNode) int32 {
+	if tonNode.Spec.Network.QuicPort > 0 {
+		return tonNode.Spec.Network.QuicPort
+	}
+	return defaultQuicPort
 }
 
 func desiredConsolePort(tonNode *tonv1alpha1.TonNode) int32 {

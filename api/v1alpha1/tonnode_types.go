@@ -103,6 +103,12 @@ type TonNodeNetworkSpec struct {
 	// +kubebuilder:default:=30003
 	LiteServerPort int32 `json:"liteServerPort,omitempty"`
 
+	// QuicPort is the validator QUIC UDP port.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +kubebuilder:default:=31001
+	QuicPort int32 `json:"quicPort,omitempty"`
+
 	// ValidatorConsolePort is the validator console TCP port.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
@@ -115,7 +121,7 @@ type TonNodeNetworkSpec struct {
 	// +optional
 	PublicIP string `json:"publicIP,omitempty"`
 
-	// HostPortsEnabled exposes validator/lite-server ports via hostPort on the node.
+	// HostPortsEnabled exposes validator/lite-server/quic ports via hostPort on the node.
 	// Enabled by default for external TON reachability.
 	// +kubebuilder:default:=true
 	// +optional

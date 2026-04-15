@@ -14,8 +14,9 @@ This operator creates and manages:
 
 - Uses StatefulSet for TON replicas.
 - Uses headless Service (`clusterIP: None`) for stable DNS.
-- Exposes TON validator/lite-server ports on worker nodes with `hostPort` by default:
+- Exposes TON validator/quic/lite-server ports on worker nodes with `hostPort` by default:
   - UDP `30001` (`validatorPort`)
+  - UDP `31001` (`quicPort`)
   - TCP `30003` (`liteServerPort`)
   - can be disabled via `spec.network.hostPortsEnabled: false`
 - Enforces anti-affinity (`kubernetes.io/hostname`) so replicas of the same `TonNode` are not scheduled on the same worker.
@@ -468,7 +469,7 @@ Run them from repo root:
 ## Production TON Notes
 
 - `PUBLIC_IP`: by default, for `replicas=1`, operator tries node `ExternalIP`, then falls back to node host IP. For multi-replica or private/NAT workers, set `spec.network.publicIP`.
-- `hostPortsEnabled`: default is `true`. This is required for direct TON reachability on bare-metal/public-node setups.
+- `hostPortsEnabled`: default is `true`. This is required for direct TON reachability on bare-metal/public-node setups (`validatorPort`, `quicPort`, `liteServerPort`).
 - Private cloud workers (no public node IP): provide per-node/per-replica public forwarding; one shared LB endpoint/port pair is not sufficient for many TON replicas.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
 - Bare metal: if Longhorn exists, the operator prefers it automatically.

@@ -33,6 +33,7 @@ spec:
   network:
     globalConfigURL: {{ .Values.tonNode.network.globalConfigURL }}
     validatorPort: {{ .Values.tonNode.network.validatorPort }}
+    quicPort: {{ .Values.tonNode.network.quicPort }}
     liteServerPort: {{ .Values.tonNode.network.liteServerPort }}
     validatorConsolePort: {{ .Values.tonNode.network.validatorConsolePort }}
     hostPortsEnabled: {{ .Values.tonNode.network.hostPortsEnabled }}

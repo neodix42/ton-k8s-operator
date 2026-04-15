@@ -154,11 +154,15 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 		ports := tpl.Spec.Containers[0].Ports
 
 		validator := containerPortByName(t, ports, "validator-udp")
+		quic := containerPortByName(t, ports, "quic-udp")
 		liteserver := containerPortByName(t, ports, "liteserver-tcp")
 		console := containerPortByName(t, ports, "console-tcp")
 
 		if validator.HostPort != defaultValidatorPort {
 			t.Fatalf("validator hostPort = %d, want %d", validator.HostPort, defaultValidatorPort)
+		}
+		if quic.HostPort != defaultQuicPort {
+			t.Fatalf("quic hostPort = %d, want %d", quic.HostPort, defaultQuicPort)
 		}
 		if liteserver.HostPort != defaultLiteServerPort {
 			t.Fatalf("liteserver hostPort = %d, want %d", liteserver.HostPort, defaultLiteServerPort)
@@ -180,11 +184,12 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 		ports := tpl.Spec.Containers[0].Ports
 
 		validator := containerPortByName(t, ports, "validator-udp")
+		quic := containerPortByName(t, ports, "quic-udp")
 		liteserver := containerPortByName(t, ports, "liteserver-tcp")
 		console := containerPortByName(t, ports, "console-tcp")
 
-		if validator.HostPort != 0 || liteserver.HostPort != 0 || console.HostPort != 0 {
-			t.Fatalf("all hostPorts should be disabled, got validator=%d liteserver=%d console=%d", validator.HostPort, liteserver.HostPort, console.HostPort)
+		if validator.HostPort != 0 || quic.HostPort != 0 || liteserver.HostPort != 0 || console.HostPort != 0 {
+			t.Fatalf("all hostPorts should be disabled, got validator=%d quic=%d liteserver=%d console=%d", validator.HostPort, quic.HostPort, liteserver.HostPort, console.HostPort)
 		}
 	})
 
@@ -193,6 +198,7 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 			Spec: tonv1alpha1.TonNodeSpec{
 				Network: tonv1alpha1.TonNodeNetworkSpec{
 					ValidatorPort:        32001,
+					QuicPort:             32011,
 					LiteServerPort:       32003,
 					ValidatorConsolePort: 32002,
 					HostPortsEnabled:     ptr.To(true),
@@ -203,11 +209,15 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 		ports := tpl.Spec.Containers[0].Ports
 
 		validator := containerPortByName(t, ports, "validator-udp")
+		quic := containerPortByName(t, ports, "quic-udp")
 		liteserver := containerPortByName(t, ports, "liteserver-tcp")
 		console := containerPortByName(t, ports, "console-tcp")
 
 		if validator.ContainerPort != 32001 || validator.HostPort != 32001 {
 			t.Fatalf("validator ports = container:%d host:%d, want 32001/32001", validator.ContainerPort, validator.HostPort)
+		}
+		if quic.ContainerPort != 32011 || quic.HostPort != 32011 {
+			t.Fatalf("quic ports = container:%d host:%d, want 32011/32011", quic.ContainerPort, quic.HostPort)
 		}
 		if liteserver.ContainerPort != 32003 || liteserver.HostPort != 32003 {
 			t.Fatalf("liteserver ports = container:%d host:%d, want 32003/32003", liteserver.ContainerPort, liteserver.HostPort)

@@ -366,12 +366,19 @@ spec:
                   hostPortsEnabled:
                     default: true
                     description: |-
-                      HostPortsEnabled exposes validator/lite-server ports via hostPort on the node.
+                      HostPortsEnabled exposes validator/lite-server/quic ports via hostPort on the node.
                       Enabled by default for external TON reachability.
                     type: boolean
                   liteServerPort:
                     default: 30003
                     description: LiteServerPort is the lite-server TCP port.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  quicPort:
+                    default: 31001
+                    description: QuicPort is the validator QUIC UDP port.
                     format: int32
                     maximum: 65535
                     minimum: 1

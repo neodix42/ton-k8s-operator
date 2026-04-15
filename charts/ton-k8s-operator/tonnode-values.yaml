@@ -21,6 +21,7 @@ tonNode:
   network:
     globalConfigURL: https://ton.org/global.config.json
     validatorPort: 30001
+    quicPort: 31001
     liteServerPort: 30003
     validatorConsolePort: 30002
     hostPortsEnabled: true
