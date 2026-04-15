@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+CHART_VERSION="${CHART_VERSION:-0.1.35}"
 CHART_REF="${CHART_REF:-oci://ghcr.io/neodix42/charts/ton-k8s-operator}"
-INSTALL_DIR="${INSTALL_DIR:-$PWD/ton-k8s-operator}"
-CHART_VERSION="0.1.35"
+INSTALL_DIR="${INSTALL_DIR:-$PWD/ton-k8s-operator-$CHART_VERSION}"
 
 require_bin() {
   local bin="$1"

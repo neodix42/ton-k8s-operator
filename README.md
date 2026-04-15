@@ -189,7 +189,7 @@ wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.35
 ```
 
 The script:
-- creates a local folder
+- creates a local folder named `ton-k8s-operator-<chart-version>` by default
 - downloads chart from `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
 - extracts the chart and prints next commands
 
@@ -202,7 +202,7 @@ The extracted chart already includes:
 Then follow:
 
 ```bash
-cd ./ton-k8s-operator
+cd ./ton-k8s-operator-0.1.35
 
 # review defaults
 ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
@@ -299,7 +299,7 @@ Cluster upgrade workflow:
 ```bash
 # fetch new release installer and chart
 wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.35/install.sh" | bash
-cd ./ton-k8s-operator
+cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade
 cat operator-values.yaml
