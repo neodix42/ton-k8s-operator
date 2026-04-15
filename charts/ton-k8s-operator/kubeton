@@ -42,6 +42,11 @@ KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
+PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-prom/prometheus:v2.53.4}"
+PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
+PROMETHEUS_LOCAL_PORT_BASE="${PROMETHEUS_LOCAL_PORT_BASE:-9090}"
+PROMETHEUS_PORT_FORWARD_DIR="${PROMETHEUS_PORT_FORWARD_DIR:-${TMPDIR:-/tmp}/kubeton-prometheus-port-forward}"
+PROMETHEUS_PORT_FORWARD_WAIT_SECONDS="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS:-5}"
 
 usage() {
   cat <<'EOF'
@@ -52,6 +57,7 @@ Commands:
   install              Install or upgrade operator only (Helm upgrade --install with operator-values.yaml).
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
   start                Start TON fleet.
+  prometheus           Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
@@ -80,6 +86,11 @@ Environment overrides:
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
   STATUS_EXEC_TIMEOUT
   HELPER_POD_READY_TIMEOUT (default: 300s; wait timeout for backup/restore helper pods)
+  PROMETHEUS_IMAGE (default: prom/prometheus:v2.53.4)
+  PROMETHEUS_PORT (default: 9090)
+  PROMETHEUS_LOCAL_PORT_BASE (default: 9090)
+  PROMETHEUS_PORT_FORWARD_DIR (default: ${TMPDIR:-/tmp}/kubeton-prometheus-port-forward)
+  PROMETHEUS_PORT_FORWARD_WAIT_SECONDS (default: 5)
 EOF
 }
 
@@ -287,6 +298,337 @@ resolve_ton_replicas_from_values_file() {
     return 0
   fi
   return 1
+}
+
+resolve_tonnode_custom_parameters_rows() {
+  kubectl get tonnodes.ton.ton.org -A \
+    -o go-template='{{range .items}}{{ $ns := .metadata.namespace }}{{ $name := .metadata.name }}{{range .spec.env}}{{if eq .name "CUSTOM_PARAMETERS"}}{{$ns}}{{"\t"}}{{$name}}{{"\t"}}{{.value}}{{"\n"}}{{end}}{{end}}{{end}}'
+}
+
+extract_exporter_address() {
+  local custom_parameters="$1"
+  local exporter_address=""
+
+  custom_parameters="$(trim_whitespace "$custom_parameters")"
+  if [[ -z "$custom_parameters" ]]; then
+    return 0
+  fi
+
+  if [[ "$custom_parameters" =~ (^|[[:space:]])--exporter-address=([^[:space:]]+) ]]; then
+    exporter_address="${BASH_REMATCH[2]}"
+  elif [[ "$custom_parameters" =~ (^|[[:space:]])--exporter-address[[:space:]]+([^[:space:]]+) ]]; then
+    exporter_address="${BASH_REMATCH[2]}"
+  fi
+
+  exporter_address="$(trim_whitespace "$exporter_address")"
+  exporter_address="${exporter_address#\"}"
+  exporter_address="${exporter_address%\"}"
+  exporter_address="${exporter_address#\'}"
+  exporter_address="${exporter_address%\'}"
+  printf '%s' "$exporter_address"
+}
+
+extract_exporter_port() {
+  local exporter_address="$1"
+  local port=""
+
+  exporter_address="$(trim_whitespace "$exporter_address")"
+  if [[ "$exporter_address" =~ :([0-9]{1,5})$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+    printf '%s' "$port"
+  fi
+}
+
+list_tonnode_running_pod_ips() {
+  local ns="$1"
+  local tonnode_name="$2"
+
+  kubectl -n "$ns" get pods \
+    -l "app.kubernetes.io/name=ton-node,app.kubernetes.io/instance=${tonnode_name}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.status.podIP}{"\n"}{end}' 2>/dev/null \
+    | awk 'NF' \
+    | sort -u
+}
+
+build_prometheus_static_targets_yaml() {
+  local target
+
+  for target in "$@"; do
+    target="$(trim_whitespace "$target")"
+    [[ -z "$target" ]] && continue
+    printf '            - %s\n' "$(yaml_quote "$target")"
+  done
+}
+
+sanitize_k8s_name_fragment() {
+  local raw="${1:-}"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//')"
+  if [[ -z "$raw" ]]; then
+    raw="tonnode"
+  fi
+  printf '%s' "${raw:0:30}"
+}
+
+ensure_exporter_prometheus_stack() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local exporter_address="$3"
+  local targets_yaml="$4"
+  local name_suffix deploy_name service_name configmap_name
+
+  name_suffix="$(sanitize_k8s_name_fragment "$tonnode_name")"
+  deploy_name="kubeton-prometheus-${name_suffix}"
+  service_name="${deploy_name}"
+  configmap_name="${deploy_name}-config"
+
+  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${configmap_name}
+  labels:
+    app.kubernetes.io/name: kubeton-prometheus
+    app.kubernetes.io/instance: ${deploy_name}
+    app.kubernetes.io/managed-by: kubeton
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+      - job_name: "ton-exporter-${name_suffix}"
+        static_configs:
+          - targets:
+${targets_yaml}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${deploy_name}
+  labels:
+    app.kubernetes.io/name: kubeton-prometheus
+    app.kubernetes.io/instance: ${deploy_name}
+    app.kubernetes.io/managed-by: kubeton
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubeton-prometheus
+      app.kubernetes.io/instance: ${deploy_name}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubeton-prometheus
+        app.kubernetes.io/instance: ${deploy_name}
+      annotations:
+        ton.ton.org/exporter-address: ${exporter_address}
+    spec:
+      containers:
+        - name: prometheus
+          image: ${PROMETHEUS_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --web.listen-address=:${PROMETHEUS_PORT}
+          ports:
+            - name: http
+              containerPort: ${PROMETHEUS_PORT}
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: ${configmap_name}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_name}
+  labels:
+    app.kubernetes.io/name: kubeton-prometheus
+    app.kubernetes.io/instance: ${deploy_name}
+    app.kubernetes.io/managed-by: kubeton
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubeton-prometheus
+    app.kubernetes.io/instance: ${deploy_name}
+  ports:
+    - name: http
+      protocol: TCP
+      port: ${PROMETHEUS_PORT}
+      targetPort: http
+EOF
+
+  if ! kubectl -n "$ns" rollout status "deployment/${deploy_name}" --timeout=180s >/dev/null 2>&1; then
+    echo "Warning: Prometheus deployment ${ns}/${deploy_name} is not Ready yet." >&2
+  fi
+
+  printf '%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$deploy_name" "$exporter_address"
+}
+
+configure_prometheus_for_exporter_targets() {
+  local output_rows_array_name="${1:-}"
+  local -a custom_rows=()
+  local -a configured_rows=()
+  local row ns tonnode_name custom_parameters exporter_address exporter_port access_row service_name deploy_name
+  local -a pod_ips=()
+  local -a scrape_targets=()
+  local scrape_targets_yaml=""
+  local matched_count=0
+  local i local_port
+
+  mapfile -t custom_rows < <(resolve_tonnode_custom_parameters_rows 2>/dev/null || true)
+
+  for row in "${custom_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns tonnode_name custom_parameters <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    tonnode_name="$(trim_whitespace "$tonnode_name")"
+    custom_parameters="$(trim_whitespace "$custom_parameters")"
+    if [[ -z "$ns" || -z "$tonnode_name" || -z "$custom_parameters" || "$custom_parameters" == "<no value>" ]]; then
+      continue
+    fi
+
+    exporter_address="$(extract_exporter_address "$custom_parameters")"
+    if [[ -z "$exporter_address" ]]; then
+      continue
+    fi
+    ((matched_count+=1))
+
+    exporter_port="$(extract_exporter_port "$exporter_address")"
+    if ! [[ "$exporter_port" =~ ^[0-9]+$ ]]; then
+      echo "Warning: ignoring invalid --exporter-address '${exporter_address}' from TonNode ${ns}/${tonnode_name}." >&2
+      continue
+    fi
+
+    mapfile -t pod_ips < <(list_tonnode_running_pod_ips "$ns" "$tonnode_name")
+    if [[ ${#pod_ips[@]} -eq 0 || -z "${pod_ips[0]}" ]]; then
+      echo "Warning: no Running TON pods found for ${ns}/${tonnode_name}; Prometheus stack will not be created yet." >&2
+      continue
+    fi
+
+    scrape_targets=()
+    for i in "${!pod_ips[@]}"; do
+      scrape_targets+=("${pod_ips[$i]}:${exporter_port}")
+    done
+    scrape_targets_yaml="$(build_prometheus_static_targets_yaml "${scrape_targets[@]}")"
+    if [[ -z "$scrape_targets_yaml" ]]; then
+      echo "Warning: failed to resolve scrape targets for ${ns}/${tonnode_name}." >&2
+      continue
+    fi
+
+    if access_row="$(ensure_exporter_prometheus_stack "$ns" "$tonnode_name" "$exporter_address" "$scrape_targets_yaml")"; then
+      configured_rows+=("$access_row")
+    else
+      echo "Error: failed to create Prometheus stack for TonNode ${ns}/${tonnode_name}." >&2
+    fi
+  done
+
+  if [[ -n "$output_rows_array_name" ]]; then
+    local -n output_rows_ref="$output_rows_array_name"
+    output_rows_ref=("${configured_rows[@]}")
+  fi
+
+  if [[ ${#configured_rows[@]} -gt 0 ]]; then
+    echo "[metrics] Prometheus stack is configured from CUSTOM_PARAMETERS exporter target(s)."
+    for i in "${!configured_rows[@]}"; do
+      row="${configured_rows[$i]}"
+      IFS=$'\t' read -r ns service_name deploy_name exporter_address <<<"$row"
+      local_port="$PROMETHEUS_LOCAL_PORT_BASE"
+      if [[ "$PROMETHEUS_LOCAL_PORT_BASE" =~ ^[0-9]+$ ]]; then
+        local_port="$((PROMETHEUS_LOCAL_PORT_BASE + i))"
+      fi
+      echo "[metrics] ${ns}/${deploy_name} configured from --exporter-address ${exporter_address} using TON pod IP targets."
+    done
+    return 0
+  fi
+
+  if (( matched_count == 0 )); then
+    echo "No TonNode exporter targets found. Set TonNode env CUSTOM_PARAMETERS with --exporter-address <addr:port> first." >&2
+  else
+    echo "No Prometheus stacks were created. Ensure TON pods are Running and --exporter-address port is valid." >&2
+  fi
+  return 1
+}
+
+sanitize_file_name_fragment() {
+  local raw="${1:-}"
+  raw="$(printf '%s' "$raw" | sed -E 's/[^A-Za-z0-9._-]+/_/g')"
+  if [[ -z "$raw" ]]; then
+    raw="item"
+  fi
+  printf '%s' "$raw"
+}
+
+ensure_prometheus_port_forward() {
+  local ns="$1"
+  local service_name="$2"
+  local local_port="$3"
+  local remote_port="$4"
+  local quiet="${5:-false}"
+  local state_dir="${PROMETHEUS_PORT_FORWARD_DIR}"
+  local wait_seconds="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS}"
+  local key pid_file log_file existing_pid pf_pid deadline now
+
+  if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]]; then
+    wait_seconds=5
+  fi
+
+  mkdir -p "$state_dir"
+  key="$(sanitize_file_name_fragment "${ns}__${service_name}__${local_port}")"
+  pid_file="${state_dir}/${key}.pid"
+  log_file="${state_dir}/${key}.log"
+
+  if [[ -f "$pid_file" ]]; then
+    existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" >/dev/null 2>&1; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$existing_pid" "$log_file"
+      return 0
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+  fi
+
+  nohup kubectl -n "$ns" port-forward "svc/${service_name}" "${local_port}:${remote_port}" >"$log_file" 2>&1 &
+  pf_pid="$!"
+  echo "$pf_pid" >"$pid_file"
+
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    if ! kill -0 "$pf_pid" >/dev/null 2>&1; then
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+        echo "Warning: failed to start background port-forward for ${ns}/${service_name} on localhost:${local_port}." >&2
+        echo "Warning: see ${log_file}" >&2
+      fi
+      return 1
+    fi
+    if grep -q "Forwarding from" "$log_file" 2>/dev/null; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$pf_pid" "$log_file"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$pf_pid" "$log_file"
+      return 0
+    fi
+    sleep 1
+  done
 }
 
 build_longhorn_selector_values_file() {
@@ -3258,49 +3600,81 @@ uninstall_vault() {
   cleanup_vault_force
 }
 
+cleanup_prometheus_port_forwards() {
+  local state_dir="${PROMETHEUS_PORT_FORWARD_DIR}"
+  local pid_file pid
+
+  if [[ ! -d "$state_dir" ]]; then
+    return 0
+  fi
+
+  for pid_file in "$state_dir"/*.pid; do
+    [[ -f "$pid_file" ]] || continue
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+  done
+
+  rm -rf "$state_dir" >/dev/null 2>&1 || true
+}
+
+cleanup_prometheus_resources() {
+  local selector='app.kubernetes.io/name=kubeton-prometheus,app.kubernetes.io/managed-by=kubeton'
+
+  echo "[uninstall] Deleting kubeton-managed Prometheus resources ..."
+  kubectl delete deployment,service,configmap -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete pod -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
+  cleanup_prometheus_port_forwards
+}
+
 run_uninstall_core() {
-  echo "[uninstall] Step 1/8: disabling TON resources in Helm release ${RELEASE_NAME} ..."
+  echo "[uninstall] Step 1/9: disabling TON resources in Helm release ${RELEASE_NAME} ..."
   if ! run_stop_without_backup; then
     echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing uninstall cleanup." >&2
   fi
 
-  echo "[uninstall] Step 2/8: deleting TonNode custom resources ..."
+  echo "[uninstall] Step 2/9: deleting TonNode custom resources ..."
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
 
-  echo "[uninstall] Step 3/8: deleting TON PVCs ..."
+  echo "[uninstall] Step 3/9: deleting TON PVCs ..."
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
 
-  echo "[uninstall] Step 4/8: uninstalling operator Helm release ${RELEASE_NAME} ..."
+  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus resources and port-forwards ..."
+  cleanup_prometheus_resources
+
+  echo "[uninstall] Step 5/9: uninstalling operator Helm release ${RELEASE_NAME} ..."
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
   delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 5/8: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
+  echo "[uninstall] Step 6/9: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
   kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
 
-  echo "[uninstall] Step 6/8: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
+  echo "[uninstall] Step 7/9: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   uninstall_longhorn || true
   cleanup_longhorn_force || true
   delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 7/8: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
+  echo "[uninstall] Step 8/9: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
   uninstall_vault || true
   cleanup_vault_force || true
   delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 8/8: uninstall core complete."
+  echo "[uninstall] Step 9/9: uninstall core complete."
 }
 
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, delete kubeton-managed Prometheus resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
   run_uninstall_core
 }
 
 run_purge() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "DANGER: purge runs full uninstall (operator + Longhorn + Vault + StorageClass cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
+  confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
   run_uninstall_core
   echo "[purge] Deleting CRD tonnodes.ton.ton.org ..."
   kubectl delete crd tonnodes.ton.ton.org --ignore-not-found
@@ -3361,6 +3735,64 @@ run_status() {
   print_aligned_table_9col "server name" "pod name" "commit" "date" "wallet" "ADNL address" "sync" "cell db" "archive db" "${table_rows[@]}"
 }
 
+run_prometheus() {
+  require_bin kubectl
+  require_bin nohup
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton prometheus" >&2
+    exit 1
+  fi
+  local -a access_rows=()
+  local -a forwarded_rows=()
+  local row ns service_name deploy_name exporter_address forward_row log_file
+  local base_port local_port remote_port
+  local i attempt quiet_attempt
+
+  configure_prometheus_for_exporter_targets access_rows || true
+  if [[ ${#access_rows[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  remote_port="$PROMETHEUS_PORT"
+  if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    remote_port=9090
+  fi
+  base_port="$PROMETHEUS_LOCAL_PORT_BASE"
+  if ! [[ "$base_port" =~ ^[0-9]+$ ]]; then
+    base_port=9090
+  fi
+
+  echo "[metrics] Starting background local port-forward(s) ..."
+  for i in "${!access_rows[@]}"; do
+    row="${access_rows[$i]}"
+    IFS=$'\t' read -r ns service_name deploy_name exporter_address <<<"$row"
+    local_port="$((base_port + i))"
+    for ((attempt=0; attempt<25; attempt++)); do
+      quiet_attempt="true"
+      if (( attempt == 24 )); then
+        quiet_attempt="false"
+      fi
+      if forward_row="$(ensure_prometheus_port_forward "$ns" "$service_name" "$((local_port + attempt))" "$remote_port" "$quiet_attempt")"; then
+        forwarded_rows+=("$forward_row")
+        break
+      fi
+    done
+  done
+
+  if [[ ${#forwarded_rows[@]} -eq 0 ]]; then
+    echo "Error: failed to start any background port-forward for Prometheus services." >&2
+    return 1
+  fi
+
+  for row in "${forwarded_rows[@]}"; do
+    IFS=$'\t' read -r ns service_name local_port _pid log_file <<<"$row"
+    echo "[metrics] Background access: http://127.0.0.1:${local_port}/targets (service ${ns}/${service_name})"
+    echo "[metrics] Port-forward log: ${log_file}"
+  done
+
+  return 0
+}
+
 run_exec() {
   require_bin kubectl
   local cmd="${*:-}"
@@ -3406,6 +3838,9 @@ main() {
       ;;
     start)
       run_start "$@"
+      ;;
+    prometheus)
+      run_prometheus "$@"
       ;;
     add)
       run_add "$@"

@@ -125,3 +125,5 @@ tonNode:
       value: "true"
     - name: MYTONCTRL_VERSION
       value: master
+    - name: CUSTOM_PARAMETERS
+      value: ""

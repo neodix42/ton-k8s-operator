@@ -66,3 +66,5 @@ tonNode:
       value: "true"
     - name: MYTONCTRL_VERSION
       value: master
+    - name: CUSTOM_PARAMETERS
+      value: "--exporter-address 0.0.0.0:9777"

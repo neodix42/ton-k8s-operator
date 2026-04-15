@@ -212,6 +212,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton install
 ./kubeton bootstrap-baremetal
 ./kubeton start
+./kubeton prometheus
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton verify
@@ -223,6 +224,10 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # start TON nodes (replicas from tonnode-values.yaml)
 ./kubeton start
+
+# create/update Prometheus scrapers from TonNode CUSTOM_PARAMETERS --exporter-address
+# and start background local port-forward(s)
+./kubeton prometheus
 
 # scale by one replica
 ./kubeton add
