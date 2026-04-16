@@ -826,6 +826,19 @@ unwrap_data_key() {
   esac
 }
 
+fix_validator_ownership() {
+  if ! command -v id >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! id -u validator >/dev/null 2>&1; then
+    return 0
+  fi
+
+  chown -R validator:validator "$KEYS_DIR" "$WALLETS_DIR" || true
+  chown validator:validator "$DB_CONFIG_FILE" "$MTC_DONE_FILE" || true
+  chown -R validator:validator "$DB_KEYRING_DIR" "$SYSTEMD_UNITS_DIR" || true
+}
+
 need_bin tar
 need_bin openssl
 need_bin base64
@@ -891,6 +904,8 @@ chmod 700 "$DB_KEYRING_DIR" || true
 chmod 700 "$SYSTEMD_UNITS_DIR" || true
 chmod 600 "$DB_CONFIG_FILE" || true
 chmod 600 "$MTC_DONE_FILE" || true
+chmod 600 "$KEYS_DIR/client" "$KEYS_DIR/client.pub" "$KEYS_DIR/server.pub" "$KEYS_DIR/liteserver.pub" 2>/dev/null || true
+fix_validator_ownership
 echo "encrypted key bundle restored"
 `
 
@@ -1030,13 +1045,16 @@ bundle_present() {
 }
 
 auto_backup_ready() {
-  if ! key_material_present; then
-    return 1
-  fi
-  if [ -s "$DB_CONFIG_FILE" ] || [ -f "$MTC_DONE_FILE" ]; then
-    return 0
-  fi
-  return 1
+  [ -f "$MTC_DONE_FILE" ] || return 1
+  [ -s "$DB_CONFIG_FILE" ] || return 1
+  [ -d "$DB_KEYRING_DIR" ] || return 1
+  dir_has_payload "$DB_KEYRING_DIR" || return 1
+
+  [ -s "$KEYS_DIR/client" ] || return 1
+  [ -s "$KEYS_DIR/client.pub" ] || return 1
+  [ -s "$KEYS_DIR/server.pub" ] || return 1
+  [ -s "$KEYS_DIR/liteserver.pub" ] || return 1
+  [ "$(wc -c < "$KEYS_DIR/client")" -gt 128 ] || return 1
 }
 
 backup_sources_present() {
@@ -1121,6 +1139,8 @@ while true; do
       else
         echo "automatic bootstrap backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ); retrying" >&2
       fi
+    else
+      echo "key material not ready yet; automatic bootstrap backup retrying"
     fi
   fi
 

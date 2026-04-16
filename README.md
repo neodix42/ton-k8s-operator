@@ -61,6 +61,7 @@ Secure key workflow is available via `spec.keyManagement`:
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
 - sidecar performs one automatic encrypted bootstrap backup after initial key material appears, and also writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
+- automatic bootstrap backup waits for completed first init (`mtc_done`, DB config/keyring, required key files) to avoid persisting partial/placeholder key state
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
