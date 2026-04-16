@@ -5,7 +5,7 @@ tonNode:
   image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
   replicas: 1
   storage:
-    tonWorkSize: 200Gi
+    tonWorkSize: 400Gi
     myTonCoreSize: 20Gi
     storageClassName: ""
     accessModes:

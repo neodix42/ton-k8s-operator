@@ -146,7 +146,7 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 
 	t.Run("enabled by default", func(t *testing.T) {
 		tonNode := &tonv1alpha1.TonNode{}
-		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP)
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
 
 		if len(tpl.Spec.Containers) != 1 {
 			t.Fatalf("expected one container, got %d", len(tpl.Spec.Containers))
@@ -180,7 +180,7 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 				},
 			},
 		}
-		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP)
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
 		ports := tpl.Spec.Containers[0].Ports
 
 		validator := containerPortByName(t, ports, "validator-udp")
@@ -205,7 +205,7 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 				},
 			},
 		}
-		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP)
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
 		ports := tpl.Spec.Containers[0].Ports
 
 		validator := containerPortByName(t, ports, "validator-udp")
@@ -224,6 +224,30 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 		}
 		if console.ContainerPort != 32002 || console.HostPort != 0 {
 			t.Fatalf("console ports = container:%d host:%d, want 32002/0", console.ContainerPort, console.HostPort)
+		}
+	})
+
+	t.Run("adds sticky hostname node affinity", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{}
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, []string{"devnet-09", "devnet-15"})
+
+		affinity := tpl.Spec.Affinity
+		if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+			t.Fatalf("expected required node affinity for sticky hostnames")
+		}
+		terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		if len(terms) != 1 || len(terms[0].MatchExpressions) != 1 {
+			t.Fatalf("unexpected node affinity terms: %#v", terms)
+		}
+		req := terms[0].MatchExpressions[0]
+		if req.Key != "kubernetes.io/hostname" {
+			t.Fatalf("node affinity key = %q, want kubernetes.io/hostname", req.Key)
+		}
+		if req.Operator != corev1.NodeSelectorOpIn {
+			t.Fatalf("node affinity operator = %q, want In", req.Operator)
+		}
+		if len(req.Values) != 2 || req.Values[0] != "devnet-09" || req.Values[1] != "devnet-15" {
+			t.Fatalf("node affinity values = %#v, want [devnet-09 devnet-15]", req.Values)
 		}
 	})
 }
@@ -474,7 +498,7 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 		},
 	}
 
-	tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP)
+	tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
 
 	if len(tpl.Spec.Containers) != 2 {
 		t.Fatalf("expected two containers (ton + sidecar), got %d", len(tpl.Spec.Containers))
@@ -514,6 +538,109 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	if len(sidecar.EnvFrom) != 1 || sidecar.EnvFrom[0].SecretRef == nil || sidecar.EnvFrom[0].SecretRef.Name != "vault-creds" {
 		t.Fatalf("sidecar must consume credentials secret vault-creds")
 	}
+}
+
+func TestDesiredStickyNodeHostnames(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	if err := tonv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add ton scheme: %v", err)
+	}
+
+	t.Run("keeps existing sticky hostnames from affinity", func(t *testing.T) {
+		reconciler := &TonNodeReconciler{}
+		tonNode := &tonv1alpha1.TonNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+			Spec: tonv1alpha1.TonNodeSpec{
+				Replicas: ptr.To[int32](2),
+			},
+		}
+		existingAffinity := &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "kubernetes.io/hostname",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"devnet-03", "devnet-01"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, existingAffinity, labelsForTonNode(tonNode))
+		if err != nil {
+			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
+		}
+		if len(got) != 2 || got[0] != "devnet-01" || got[1] != "devnet-03" {
+			t.Fatalf("sticky hostnames = %#v, want [devnet-01 devnet-03]", got)
+		}
+	})
+
+	t.Run("discovers sticky hostnames from running pods", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+			Spec: tonv1alpha1.TonNodeSpec{
+				Replicas: ptr.To[int32](2),
+			},
+		}
+		labels := labelsForTonNode(tonNode)
+		pod0 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "tonnode-0",
+				Namespace: "default",
+				Labels:    labels,
+			},
+			Spec: corev1.PodSpec{NodeName: "devnet-09"},
+		}
+		pod1 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "tonnode-1",
+				Namespace: "default",
+				Labels:    labels,
+			},
+			Spec: corev1.PodSpec{NodeName: "devnet-11"},
+		}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pod0, pod1).
+			Build()
+		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
+
+		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, nil, labels)
+		if err != nil {
+			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
+		}
+		if len(got) != 2 || got[0] != "devnet-09" || got[1] != "devnet-11" {
+			t.Fatalf("sticky hostnames = %#v, want [devnet-09 devnet-11]", got)
+		}
+	})
+
+	t.Run("disables sticky hostnames when explicit public ip is set", func(t *testing.T) {
+		reconciler := &TonNodeReconciler{}
+		tonNode := &tonv1alpha1.TonNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+			Spec: tonv1alpha1.TonNodeSpec{
+				Replicas: ptr.To[int32](1),
+				Network:  tonv1alpha1.TonNodeNetworkSpec{PublicIP: "1.2.3.4"},
+			},
+		}
+
+		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, nil, labelsForTonNode(tonNode))
+		if err != nil {
+			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Fatalf("sticky hostnames = %#v, want nil", got)
+		}
+	})
 }
 
 func TestDesiredVolumeClaimsWithKeyManagement(t *testing.T) {

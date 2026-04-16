@@ -257,13 +257,17 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 		if err != nil {
 			return err
 		}
+		stickyNodeHostnames, err := r.desiredStickyNodeHostnames(ctx, tonNode, sts.Spec.Template.Spec.Affinity, labels)
+		if err != nil {
+			return err
+		}
 		sts.Labels = labels
 		sts.Spec.Replicas = ptr.To(replicas)
 		sts.Spec.ServiceName = serviceName
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 		sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType}
-		sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP)
+		sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP, stickyNodeHostnames)
 		sts.Spec.VolumeClaimTemplates = desiredVolumeClaims(tonNode, storageClassName)
 		return controllerutil.SetControllerReference(tonNode, sts, r.Scheme)
 	})
@@ -281,6 +285,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	tonNode *tonv1alpha1.TonNode,
 	labels map[string]string,
 	publicIP corev1.EnvVar,
+	stickyNodeHostnames []string,
 ) corev1.PodTemplateSpec {
 	env := mergeEnvVars(defaultTonEnv(tonNode, publicIP), tonNode.Spec.Env)
 	containerPorts := []corev1.ContainerPort{
@@ -338,7 +343,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 
 	podSpec := corev1.PodSpec{
 		NodeSelector: desiredNodeSelector(tonNode),
-		Affinity:     requiredPodAntiAffinity(labels),
+		Affinity:     requiredPodAntiAffinity(labels, stickyNodeHostnames),
 		Containers:   []corev1.Container{container},
 	}
 	if keyManagementEnabled(tonNode) {
@@ -1074,8 +1079,8 @@ while true; do
 done
 `
 
-func requiredPodAntiAffinity(labels map[string]string) *corev1.Affinity {
-	return &corev1.Affinity{
+func requiredPodAntiAffinity(labels map[string]string, stickyNodeHostnames []string) *corev1.Affinity {
+	affinity := &corev1.Affinity{
 		PodAntiAffinity: &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
 				{
@@ -1089,6 +1094,117 @@ func requiredPodAntiAffinity(labels map[string]string) *corev1.Affinity {
 			},
 		},
 	}
+	if len(stickyNodeHostnames) > 0 {
+		affinity.NodeAffinity = &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      "kubernetes.io/hostname",
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   stickyNodeHostnames,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+	return affinity
+}
+
+func (r *TonNodeReconciler) desiredStickyNodeHostnames(
+	ctx context.Context,
+	tonNode *tonv1alpha1.TonNode,
+	existingAffinity *corev1.Affinity,
+	labels map[string]string,
+) ([]string, error) {
+	// Keep replica placement stable when PUBLIC_IP is auto-derived from host node IP.
+	// This avoids drifting to another worker (and public IP) after a restart.
+	if !hostPortsEnabled(tonNode) || strings.TrimSpace(tonNode.Spec.Network.PublicIP) != "" {
+		return nil, nil
+	}
+
+	targetReplicas := int(desiredStatefulSetReplicas(tonNode))
+	existing := stickyNodeHostnamesFromAffinity(existingAffinity)
+	if len(existing) > 0 {
+		// Allow scale-up to discover a larger stable node set.
+		if targetReplicas > len(existing) {
+			return nil, nil
+		}
+		return existing, nil
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(tonNode.Namespace), client.MatchingLabels(labels)); err != nil {
+		return nil, err
+	}
+
+	hostnames := make([]string, 0, len(pods.Items))
+	for i := range pods.Items {
+		pod := pods.Items[i]
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		hostname := strings.TrimSpace(pod.Spec.NodeName)
+		if hostname == "" {
+			continue
+		}
+		hostnames = append(hostnames, hostname)
+	}
+	hostnames = uniqueSortedStrings(hostnames)
+	if len(hostnames) == 0 {
+		return nil, nil
+	}
+	if targetReplicas > len(hostnames) {
+		return nil, nil
+	}
+	return hostnames, nil
+}
+
+func stickyNodeHostnamesFromAffinity(affinity *corev1.Affinity) []string {
+	if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return nil
+	}
+	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	for i := range terms {
+		requirements := terms[i].MatchExpressions
+		for j := range requirements {
+			requirement := requirements[j]
+			if requirement.Key != "kubernetes.io/hostname" {
+				continue
+			}
+			if requirement.Operator != corev1.NodeSelectorOpIn {
+				continue
+			}
+			return uniqueSortedStrings(requirement.Values)
+		}
+	}
+	return nil
+}
+
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	uniq := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		item := strings.TrimSpace(value)
+		if item == "" {
+			continue
+		}
+		uniq[item] = struct{}{}
+	}
+	if len(uniq) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(uniq))
+	for item := range uniq {
+		out = append(out, item)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func desiredNodeSelector(tonNode *tonv1alpha1.TonNode) map[string]string {
