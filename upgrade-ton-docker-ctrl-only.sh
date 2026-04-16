@@ -9,6 +9,10 @@ Usage:
 Example:
   ./upgrade-ton-docker-ctrl-only.sh 0.1.24 v2026.05-amd64
   ./upgrade-ton-docker-ctrl-only.sh v0.1.24 v2026.05-amd64
+
+Note:
+  TON_BRANCH is derived from ton-docker-ctrl tag by dropping arch suffix:
+  v2026.05-amd64 -> v2026.05
 EOF
 }
 
@@ -27,6 +31,11 @@ fi
 if [[ -z "$TARGET_TON_TAG" || "$TARGET_TON_TAG" =~ [[:space:]] ]]; then
   echo "Error: invalid TON image tag '$TARGET_TON_TAG'." >&2
   exit 1
+fi
+
+TARGET_TON_BRANCH="$TARGET_TON_TAG"
+if [[ "$TARGET_TON_TAG" =~ ^(.+)-(amd64|arm64)$ ]]; then
+  TARGET_TON_BRANCH="${BASH_REMATCH[1]}"
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +67,8 @@ sed -E -i "s|^  image: ghcr\\.io/ton-blockchain/ton-docker-ctrl:.*$|  image: ${T
 sed -E -i "s|^      image: ghcr\\.io/ton-blockchain/ton-docker-ctrl:.*$|      image: ${TON_IMAGE}|" "$VALUES_FILE"
 sed -E -i "s|^  image: ghcr\\.io/ton-blockchain/ton-docker-ctrl:.*$|  image: ${TON_IMAGE}|" "$TON_VALUES_FILE"
 sed -E -i "s|^      image: ghcr\\.io/ton-blockchain/ton-docker-ctrl:.*$|      image: ${TON_IMAGE}|" "$TON_VALUES_FILE"
+sed -E -i '/^[[:space:]]*- name: TON_BRANCH[[:space:]]*$/ { n; s|^([[:space:]]*value:).*$|\1 '"${TARGET_TON_BRANCH}"'|; }' "$VALUES_FILE"
+sed -E -i '/^[[:space:]]*- name: TON_BRANCH[[:space:]]*$/ { n; s|^([[:space:]]*value:).*$|\1 '"${TARGET_TON_BRANCH}"'|; }' "$TON_VALUES_FILE"
 sed -E -i "s|^TON_IMAGE_TAG_DEFAULT=.*$|TON_IMAGE_TAG_DEFAULT=\"\${TON_IMAGE_TAG_DEFAULT:-${TARGET_TON_TAG}}\"|" "$KUBETON_FILE"
 
 # Installer artifacts are always chart-versioned.
@@ -70,6 +81,8 @@ grep -q "^  image: ${TON_IMAGE}$" "$VALUES_FILE"
 grep -q "^      image: ${TON_IMAGE}$" "$VALUES_FILE"
 grep -q "^  image: ${TON_IMAGE}$" "$TON_VALUES_FILE"
 grep -q "^      image: ${TON_IMAGE}$" "$TON_VALUES_FILE"
+[[ "$(awk '/- name: TON_BRANCH/{getline; gsub(/^[[:space:]]*value:[[:space:]]*/,""); print; exit}' "$VALUES_FILE")" == "$TARGET_TON_BRANCH" ]]
+[[ "$(awk '/- name: TON_BRANCH/{getline; gsub(/^[[:space:]]*value:[[:space:]]*/,""); print; exit}' "$TON_VALUES_FILE")" == "$TARGET_TON_BRANCH" ]]
 grep -q "^TON_IMAGE_TAG_DEFAULT=\"\\\${TON_IMAGE_TAG_DEFAULT:-${TARGET_TON_TAG}}\"$" "$KUBETON_FILE"
 grep -q "releases/download/${TARGET_CHART_VERSION}/install.sh" "$README"
 grep -q "^CHART_VERSION=\"${TARGET_CHART_VERSION}\"$" "$INSTALL_SH"
@@ -78,6 +91,7 @@ echo "Updated TON image-only release:"
 echo "- chart version: ${CURRENT_CHART_VERSION} -> ${TARGET_CHART_VERSION}"
 echo "- appVersion:    ${CURRENT_APP_VERSION} (unchanged)"
 echo "- ton image:     ${TON_IMAGE}"
+echo "- TON_BRANCH:    ${TARGET_TON_BRANCH}"
 echo
 echo "Changed files:"
 echo "- charts/ton-k8s-operator/Chart.yaml"

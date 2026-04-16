@@ -368,6 +368,12 @@ spec:
                     maximum: 65535
                     minimum: 1
                     type: integer
+                  publicIP:
+                    description: |-
+                      PublicIP explicitly sets PUBLIC_IP for TON.
+                      If omitted and replicas=1, operator prefers the scheduled node ExternalIP.
+                      If not available, it falls back to the Pod's host IP.
+                    type: string
                   quicPort:
                     default: 31001
                     description: QuicPort is the validator QUIC UDP port.
@@ -375,12 +381,6 @@ spec:
                     maximum: 65535
                     minimum: 1
                     type: integer
-                  publicIP:
-                    description: |-
-                      PublicIP explicitly sets PUBLIC_IP for TON.
-                      If omitted and replicas=1, operator prefers the scheduled node ExternalIP.
-                      If not available, it falls back to the Pod's host IP.
-                    type: string
                   validatorConsolePort:
                     default: 30002
                     description: ValidatorConsolePort is the validator console TCP

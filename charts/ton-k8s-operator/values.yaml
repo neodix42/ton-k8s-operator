@@ -6,7 +6,7 @@ namespace:
 
 image:
   repository: ghcr.io/neodix42/ton-k8s-operator
-  tag: 0.1.38
+  tag: 0.1.39
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -107,7 +107,7 @@ tonNode:
       resources: {}
   env:
     - name: TON_BRANCH
-      value: latest
+      value: v2026.04
     - name: ARCHIVE_TTL
       value: "86400"
     - name: STATE_TTL
