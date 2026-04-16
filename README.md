@@ -60,7 +60,7 @@ Secure key workflow is available via `spec.keyManagement`:
 - plaintext key directories mounted on tmpfs (memory only)
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
-- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
+- sidecar performs one automatic encrypted bootstrap backup after initial key material appears, and also writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
@@ -84,7 +84,7 @@ Manual encrypted bundle backup is available with:
 - if `spec.keyManagement.encryptedBundle.fileName` or `metaFileName` is customized, exported filenames follow those values.
 
 Manual backup is still required for external/exported copies and destructive workflows:
-- run `./kubeton backup-keys` immediately after first key generation/initial setup
+- run `./kubeton backup-keys` immediately after first key generation/initial setup when you need an external/off-cluster copy
 - run it again after any key change/rotation before maintenance, upgrade, or cluster-level operations
 
 Restore prerequisites:

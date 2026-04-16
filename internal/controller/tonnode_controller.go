@@ -911,6 +911,7 @@ META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
 REQUEST_FILE="/tmp/key-backup.request"
 DONE_FILE="/tmp/key-backup.done"
 FAIL_FILE="/tmp/key-backup.failed"
+AUTO_DONE_FILE="${BUNDLE_DIR}/.bootstrap-auto-backup.done"
 
 need_bin() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -1006,26 +1007,40 @@ wrap_data_key() {
   esac
 }
 
-backup_sources_present() {
-  if find "$KEYS_DIR" -mindepth 1 -print -quit | grep -q .; then
+dir_has_payload() {
+  dir="$1"
+  if [ ! -d "$dir" ]; then
+    return 1
+  fi
+  find "$dir" -mindepth 1 ! -name 'lost+found' -print -quit | grep -q .
+}
+
+key_material_present() {
+  if dir_has_payload "$KEYS_DIR"; then
     return 0
   fi
-  if find "$MYTONCORE_DIR" -mindepth 1 -print -quit | grep -q .; then
-    return 0
-  fi
-  if [ -s "$DB_CONFIG_FILE" ]; then
-    return 0
-  fi
-  if [ -d "$DB_KEYRING_DIR" ] && find "$DB_KEYRING_DIR" -mindepth 1 -print -quit | grep -q .; then
-    return 0
-  fi
-  if [ -d "$SYSTEMD_UNITS_DIR" ] && find "$SYSTEMD_UNITS_DIR" -mindepth 1 -print -quit | grep -q .; then
-    return 0
-  fi
-  if [ -f "$MTC_DONE_FILE" ]; then
+  if dir_has_payload "$DB_KEYRING_DIR"; then
     return 0
   fi
   return 1
+}
+
+bundle_present() {
+  [ -s "$BUNDLE_FILE" ] && [ -s "$META_FILE" ]
+}
+
+auto_backup_ready() {
+  if ! key_material_present; then
+    return 1
+  fi
+  if [ -s "$DB_CONFIG_FILE" ] || [ -f "$MTC_DONE_FILE" ]; then
+    return 0
+  fi
+  return 1
+}
+
+backup_sources_present() {
+  key_material_present
 }
 
 perform_backup() {
@@ -1035,8 +1050,8 @@ perform_backup() {
   mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
   if ! backup_sources_present; then
-    echo "key material not present yet; backup skipped"
-    return 0
+    echo "key material not present yet; backup skipped" >&2
+    return 1
   fi
 
   work_dir="$(mktemp -d)"
@@ -1089,12 +1104,31 @@ perform_backup() {
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
 echo "manual backup mode enabled"
+echo "automatic bootstrap backup mode enabled"
 
 while true; do
+  if [ -f "$AUTO_DONE_FILE" ] && ! bundle_present; then
+    rm -f "$AUTO_DONE_FILE"
+  fi
+
+  if [ ! -f "$AUTO_DONE_FILE" ]; then
+    if bundle_present; then
+      date -u +%Y-%m-%dT%H:%M:%SZ >"$AUTO_DONE_FILE"
+    elif auto_backup_ready; then
+      if perform_backup; then
+        date -u +%Y-%m-%dT%H:%M:%SZ >"$AUTO_DONE_FILE"
+        echo "automatic bootstrap backup completed"
+      else
+        echo "automatic bootstrap backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ); retrying" >&2
+      fi
+    fi
+  fi
+
   if [ -f "$REQUEST_FILE" ]; then
     rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
     if perform_backup; then
       date -u +%Y-%m-%dT%H:%M:%SZ >"$DONE_FILE"
+      date -u +%Y-%m-%dT%H:%M:%SZ >"$AUTO_DONE_FILE" || true
     else
       echo "backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$FAIL_FILE"
     fi

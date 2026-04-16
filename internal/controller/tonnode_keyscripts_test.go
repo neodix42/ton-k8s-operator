@@ -26,10 +26,18 @@ func TestKeyBackupScriptIncludesBootstrapArtifacts(t *testing.T) {
 	required := []string{
 		`SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"`,
 		`MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"`,
-		`if [ -d "$SYSTEMD_UNITS_DIR" ] && find "$SYSTEMD_UNITS_DIR" -mindepth 1 -print -quit | grep -q .; then`,
+		`AUTO_DONE_FILE="${BUNDLE_DIR}/.bootstrap-auto-backup.done"`,
+		`dir_has_payload() {`,
+		`key_material_present() {`,
+		`bundle_present() {`,
+		`auto_backup_ready() {`,
+		`key_material_present`,
 		`if [ -f "$MTC_DONE_FILE" ]; then`,
 		`cp -a "$SYSTEMD_UNITS_DIR" "$work_dir/stage/tondb/systemd-units"`,
 		`cp -a "$MTC_DONE_FILE" "$work_dir/stage/tondb/mtc_done"`,
+		`echo "automatic bootstrap backup mode enabled"`,
+		`if [ ! -f "$AUTO_DONE_FILE" ]; then`,
+		`automatic bootstrap backup completed`,
 	}
 	for _, fragment := range required {
 		if !strings.Contains(keyBackupScript, fragment) {
