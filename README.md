@@ -76,6 +76,8 @@ Manual encrypted bundle backup is available with:
 - `/var/ton-work/keys/**` (for example: `client.pub`, `liteserver.pub`, `client`, `server.pub`)
 - `/var/ton-work/db/config.json`
 - `/var/ton-work/db/keyring/**`
+- `/var/ton-work/db/systemd-units/**`
+- `/var/ton-work/db/mtc_done`
 - `/usr/local/bin/mytoncore/**` (entire folder, including wallets and mytoncore state files)
 - `keys.bundle.meta` contains bundle metadata: `provider`, `wrapped_key`, `algorithm`, `created_at`
 - TON DB data outside this set (for example `/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`) is not part of this key bundle backup.

@@ -722,6 +722,7 @@ TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
 DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
 SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"
+MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
@@ -863,6 +864,8 @@ find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
 find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
 rm -f "$DB_CONFIG_FILE" || true
 rm -rf "$DB_KEYRING_DIR" || true
+rm -rf "$SYSTEMD_UNITS_DIR" || true
+rm -f "$MTC_DONE_FILE" || true
 
 if [ -d "$work_dir/unpacked/keys" ]; then
   cp -a "$work_dir/unpacked/keys/." "$KEYS_DIR/"
@@ -876,10 +879,18 @@ fi
 if [ -d "$work_dir/unpacked/tondb/keyring" ]; then
   cp -a "$work_dir/unpacked/tondb/keyring" "$DB_KEYRING_DIR"
 fi
+if [ -d "$work_dir/unpacked/tondb/systemd-units" ]; then
+  cp -a "$work_dir/unpacked/tondb/systemd-units" "$SYSTEMD_UNITS_DIR"
+fi
+if [ -f "$work_dir/unpacked/tondb/mtc_done" ]; then
+  cp -a "$work_dir/unpacked/tondb/mtc_done" "$MTC_DONE_FILE"
+fi
 
 chmod 700 "$KEYS_DIR" "$MYTONCORE_DIR" "$WALLETS_DIR" || true
 chmod 700 "$DB_KEYRING_DIR" || true
+chmod 700 "$SYSTEMD_UNITS_DIR" || true
 chmod 600 "$DB_CONFIG_FILE" || true
+chmod 600 "$MTC_DONE_FILE" || true
 echo "encrypted key bundle restored"
 `
 
@@ -892,6 +903,8 @@ WALLETS_DIR="${MYTONCORE_DIR}/wallets"
 TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
 DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
+SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"
+MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
@@ -1006,6 +1019,12 @@ backup_sources_present() {
   if [ -d "$DB_KEYRING_DIR" ] && find "$DB_KEYRING_DIR" -mindepth 1 -print -quit | grep -q .; then
     return 0
   fi
+  if [ -d "$SYSTEMD_UNITS_DIR" ] && find "$SYSTEMD_UNITS_DIR" -mindepth 1 -print -quit | grep -q .; then
+    return 0
+  fi
+  if [ -f "$MTC_DONE_FILE" ]; then
+    return 0
+  fi
   return 1
 }
 
@@ -1030,6 +1049,12 @@ perform_backup() {
   fi
   if [ -d "$DB_KEYRING_DIR" ]; then
     cp -a "$DB_KEYRING_DIR" "$work_dir/stage/tondb/keyring"
+  fi
+  if [ -d "$SYSTEMD_UNITS_DIR" ]; then
+    cp -a "$SYSTEMD_UNITS_DIR" "$work_dir/stage/tondb/systemd-units"
+  fi
+  if [ -f "$MTC_DONE_FILE" ]; then
+    cp -a "$MTC_DONE_FILE" "$work_dir/stage/tondb/mtc_done"
   fi
   tar -czf "$work_dir/bundle.tar.gz" -C "$work_dir/stage" .
 
