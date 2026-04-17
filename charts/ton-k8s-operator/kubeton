@@ -39,6 +39,7 @@ VAULT_ADDR_INTERNAL="${VAULT_ADDR_INTERNAL:-http://${VAULT_RELEASE_NAME}.${VAULT
 VAULT_TOKEN_PERIOD="${VAULT_TOKEN_PERIOD:-720h}"
 NAMESPACE_DELETE_PROGRESS_TIMEOUT="${NAMESPACE_DELETE_PROGRESS_TIMEOUT:-60}"
 KUBETON_PAUSE_ANNOTATION_KEY="${KUBETON_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeton-paused-replicas}"
+KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY="${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY:-ton.ton.org/kubeton-paused-nodemap}"
 KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
@@ -86,6 +87,7 @@ Environment overrides:
   VAULT_LOCALDEV_NODE_SELECTOR
   TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
   NAMESPACE_DELETE_PROGRESS_TIMEOUT
+  KUBETON_PAUSE_ANNOTATION_KEY, KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
   STATUS_EXEC_TIMEOUT
   HELPER_POD_READY_TIMEOUT (default: 300s; wait timeout for backup/restore helper pods)
@@ -1955,6 +1957,321 @@ get_annotation_value() {
     -o "go-template={{if .metadata.annotations}}{{index .metadata.annotations \"${escaped_key}\"}}{{end}}" 2>/dev/null || true
 }
 
+json_escape_string() {
+  local value="${1:-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/}"
+  value="${value//$'\r'/}"
+  printf '%s' "$value"
+}
+
+json_array_from_values() {
+  local -n values_ref="$1"
+  local out="" value escaped
+  for value in "${values_ref[@]}"; do
+    escaped="$(json_escape_string "$value")"
+    [[ -n "$out" ]] && out+=","
+    out+="\"${escaped}\""
+  done
+  printf '[%s]' "$out"
+}
+
+append_unique_item() {
+  local item="$1"
+  local -n values_ref="$2"
+  local existing
+  for existing in "${values_ref[@]}"; do
+    if [[ "$existing" == "$item" ]]; then
+      return 0
+    fi
+  done
+  values_ref+=("$item")
+}
+
+build_sts_ordinal_node_map() {
+  local ns="$1"
+  local sts="$2"
+  local replicas="$3"
+  local -a pairs=()
+  local ordinal pod node_name
+
+  if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    return 0
+  fi
+
+  for ordinal in $(seq 0 $((replicas - 1))); do
+    pod="${sts}-${ordinal}"
+    node_name="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+    node_name="$(trim_whitespace "$node_name")"
+    if [[ -z "$node_name" ]]; then
+      continue
+    fi
+    pairs+=("${ordinal}=${node_name}")
+  done
+
+  if [[ ${#pairs[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  local IFS=,
+  printf '%s' "${pairs[*]}"
+}
+
+parse_ordinal_node_map() {
+  local mapping="$1"
+  local -n out_nodes_ref="$2"
+  local -A ordinal_to_node=()
+  local -a pairs=()
+  local pair ordinal node_name max_ordinal=-1 i
+
+  out_nodes_ref=()
+  mapping="$(trim_whitespace "$mapping")"
+  [[ -z "$mapping" ]] && return 1
+
+  IFS=',' read -r -a pairs <<<"$mapping"
+  for pair in "${pairs[@]}"; do
+    pair="$(trim_whitespace "$pair")"
+    [[ -z "$pair" ]] && continue
+    if [[ "$pair" != *=* ]]; then
+      return 1
+    fi
+    ordinal="$(trim_whitespace "${pair%%=*}")"
+    node_name="$(trim_whitespace "${pair#*=}")"
+    if ! [[ "$ordinal" =~ ^[0-9]+$ ]]; then
+      return 1
+    fi
+    if [[ -z "$node_name" ]]; then
+      return 1
+    fi
+    ordinal_to_node["$ordinal"]="$node_name"
+    if (( ordinal > max_ordinal )); then
+      max_ordinal="$ordinal"
+    fi
+  done
+
+  if (( max_ordinal < 0 )); then
+    return 1
+  fi
+
+  for i in $(seq 0 "$max_ordinal"); do
+    if [[ -z "${ordinal_to_node[$i]:-}" ]]; then
+      return 1
+    fi
+    out_nodes_ref+=("${ordinal_to_node[$i]}")
+  done
+  return 0
+}
+
+set_statefulset_update_strategy() {
+  local ns="$1"
+  local sts="$2"
+  local strategy_type="$3"
+  local escaped_strategy
+  escaped_strategy="$(json_escape_string "$strategy_type")"
+
+  kubectl -n "$ns" patch statefulset "$sts" --type=merge \
+    -p "{\"spec\":{\"updateStrategy\":{\"type\":\"${escaped_strategy}\"}}}" >/dev/null
+}
+
+patch_statefulset_hostname_affinity() {
+  local ns="$1"
+  local sts="$2"
+  shift 2
+  local -a hostnames=("$@")
+  local hostnames_json
+
+  if [[ ${#hostnames[@]} -eq 0 ]]; then
+    kubectl -n "$ns" patch statefulset "$sts" --type=merge \
+      -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":null}}}}}' >/dev/null
+    return 0
+  fi
+
+  hostnames_json="$(json_array_from_values hostnames)"
+  kubectl -n "$ns" patch statefulset "$sts" --type=merge \
+    -p "{\"spec\":{\"template\":{\"spec\":{\"affinity\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchExpressions\":[{\"key\":\"kubernetes.io/hostname\",\"operator\":\"In\",\"values\":${hostnames_json}}]}]}}}}}}}" >/dev/null
+}
+
+get_stopped_node_map_annotation() {
+  local ns="$1"
+  local sts="$2"
+  local value=""
+
+  if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
+    value="$(get_annotation_value tonnodes.ton.ton.org "$ns" "$sts" "$KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY")"
+    value="$(trim_whitespace "$value")"
+    if [[ -n "$value" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  fi
+
+  value="$(get_annotation_value statefulset "$ns" "$sts" "$KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY")"
+  value="$(trim_whitespace "$value")"
+  printf '%s' "$value"
+}
+
+clear_stopped_node_map_annotation() {
+  local ns="$1"
+  local sts="$2"
+  if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge \
+      -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+  fi
+  kubectl -n "$ns" patch statefulset "$sts" --type=merge \
+    -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+}
+
+statefulset_matches_expected_nodes() {
+  local ns="$1"
+  local sts="$2"
+  local -n expected_nodes_ref="$3"
+  local ordinal pod current_node
+
+  if [[ ${#expected_nodes_ref[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  for ordinal in "${!expected_nodes_ref[@]}"; do
+    pod="${sts}-${ordinal}"
+    current_node="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+    current_node="$(trim_whitespace "$current_node")"
+    if [[ "$current_node" != "${expected_nodes_ref[$ordinal]}" ]]; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+restore_statefulset_with_expected_nodes() {
+  local ns="$1"
+  local sts="$2"
+  local target_replicas="$3"
+  local -n expected_nodes_ref="$4"
+  local -a allowed_nodes=()
+  local -a final_nodes=()
+  local -a unique_expected_nodes=()
+  local ordinal pod expected_node current_node
+
+  if ! [[ "$target_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  if (( ${#expected_nodes_ref[@]} < target_replicas )); then
+    return 1
+  fi
+
+  for ordinal in $(seq 0 $((target_replicas - 1))); do
+    append_unique_item "${expected_nodes_ref[$ordinal]}" unique_expected_nodes
+  done
+  if (( ${#unique_expected_nodes[@]} != target_replicas )); then
+    echo "Error: strict node map for ${ns}/${sts} contains duplicate nodes for ${target_replicas} replicas." >&2
+    return 1
+  fi
+
+  set_statefulset_update_strategy "$ns" "$sts" "OnDelete" || return 1
+  set_ton_replicas "$ns" "$sts" 0 || return 1
+  wait_statefulset_pods_gone "$ns" "$sts" || return 1
+
+  for ordinal in $(seq 0 $((target_replicas - 1))); do
+    expected_node="${expected_nodes_ref[$ordinal]}"
+    append_unique_item "$expected_node" allowed_nodes
+    patch_statefulset_hostname_affinity "$ns" "$sts" "${allowed_nodes[@]}" || return 1
+    set_ton_replicas "$ns" "$sts" $((ordinal + 1)) || return 1
+    pod="${sts}-${ordinal}"
+    wait_pod_ready "$ns" "$pod" 1800 || return 1
+    current_node="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+    current_node="$(trim_whitespace "$current_node")"
+    if [[ "$current_node" != "$expected_node" ]]; then
+      echo "Error: ${ns}/${pod} expected node ${expected_node} but landed on ${current_node:-unknown}." >&2
+      return 1
+    fi
+  done
+
+  mapfile -t final_nodes < <(printf '%s\n' "${expected_nodes_ref[@]:0:$target_replicas}" | awk 'NF' | sort -u)
+  patch_statefulset_hostname_affinity "$ns" "$sts" "${final_nodes[@]}" || true
+  set_statefulset_update_strategy "$ns" "$sts" "RollingUpdate" || true
+  return 0
+}
+
+enforce_stopped_node_mappings_after_start() {
+  local -a sts_rows=()
+  local -a operator_deploy_names=()
+  local -a operator_deploy_replicas=()
+  local operator_paused=0
+  local row ns sts replicas node_map
+  local remapped=0
+  local unchanged=0
+  local skipped=0
+  local failed=0
+
+  mapfile -t sts_rows < <(list_ton_statefulsets)
+  if [[ ${#sts_rows[@]} -eq 0 || -z "${sts_rows[0]}" ]]; then
+    return 0
+  fi
+
+  for row in "${sts_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts replicas <<<"$row"
+    if [[ -z "$ns" || -z "$sts" ]]; then
+      continue
+    fi
+    if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+      clear_stopped_node_map_annotation "$ns" "$sts"
+      continue
+    fi
+
+    node_map="$(get_stopped_node_map_annotation "$ns" "$sts")"
+    node_map="$(trim_whitespace "$node_map")"
+    if [[ -z "$node_map" ]]; then
+      continue
+    fi
+
+    local -a expected_nodes=()
+    if ! parse_ordinal_node_map "$node_map" expected_nodes; then
+      echo "Warning: invalid ${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY} on ${ns}/${sts}; skipping strict node restore." >&2
+      ((skipped+=1))
+      clear_stopped_node_map_annotation "$ns" "$sts"
+      continue
+    fi
+    if (( ${#expected_nodes[@]} < replicas )); then
+      echo "Warning: ${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY} has ${#expected_nodes[@]} entries but replicas=${replicas} on ${ns}/${sts}; skipping strict node restore." >&2
+      ((skipped+=1))
+      clear_stopped_node_map_annotation "$ns" "$sts"
+      continue
+    fi
+
+    if statefulset_matches_expected_nodes "$ns" "$sts" expected_nodes; then
+      ((unchanged+=1))
+      clear_stopped_node_map_annotation "$ns" "$sts"
+      continue
+    fi
+
+    if (( operator_paused == 0 )); then
+      pause_operator_reconcile operator_deploy_names operator_deploy_replicas
+      operator_paused=1
+    fi
+
+    echo "Restoring strict ordinal->node placement for ${ns}/${sts} ..."
+    if restore_statefulset_with_expected_nodes "$ns" "$sts" "$replicas" expected_nodes; then
+      ((remapped+=1))
+      clear_stopped_node_map_annotation "$ns" "$sts"
+    else
+      echo "Error: failed strict node restore for ${ns}/${sts}." >&2
+      ((failed+=1))
+    fi
+  done
+
+  if (( operator_paused == 1 )); then
+    resume_operator_reconcile operator_deploy_names operator_deploy_replicas
+  fi
+
+  if (( remapped > 0 || unchanged > 0 || skipped > 0 || failed > 0 )); then
+    echo "Start node placement summary: remapped=${remapped}, already_matched=${unchanged}, skipped=${skipped}, failed=${failed}"
+  fi
+  return 0
+}
+
 run_add() {
   require_bin kubectl
   local ns="" sts="" replicas=""
@@ -3409,6 +3726,7 @@ run_stop_fleet() {
 
   local row ns sts replicas
   local pause_annotation existing_pause_annotation tonnode_exists
+  local node_map_annotation node_map_patch
   local tonnodes_paused=0
   local fallback_statefulsets_scaled=0
 
@@ -3423,6 +3741,13 @@ run_stop_fleet() {
     if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
       replicas=0
     fi
+    node_map_annotation="$(build_sts_ordinal_node_map "$ns" "$sts" "$replicas" || true)"
+    node_map_annotation="$(trim_whitespace "$node_map_annotation")"
+    node_map_patch="\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":null"
+    if [[ -n "$node_map_annotation" ]]; then
+      node_map_patch="\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":\"${node_map_annotation}\""
+    fi
+
     tonnode_exists=0
     if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
       tonnode_exists=1
@@ -3438,14 +3763,14 @@ run_stop_fleet() {
 
     if (( tonnode_exists == 1 )); then
       kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge \
-        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}}}" >/dev/null
+        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\",${node_map_patch}}}}" >/dev/null
       ((tonnodes_paused+=1))
       kubectl -n "$ns" patch statefulset "$sts" --type=merge \
-        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}}}" >/dev/null 2>&1 || true
+        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\",${node_map_patch}}}}" >/dev/null 2>&1 || true
     else
       echo "Warning: TonNode ${ns}/${sts} not found; using StatefulSet scale fallback." >&2
       kubectl -n "$ns" patch statefulset "$sts" --type=merge \
-        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\"}}}" >/dev/null 2>&1 || true
+        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\",${node_map_patch}}}}" >/dev/null 2>&1 || true
       set_ton_replicas "$ns" "$sts" 0
       ((fallback_statefulsets_scaled+=1))
     fi
@@ -3574,6 +3899,8 @@ run_start_stopped_fleet() {
       fi
     fi
   done
+
+  enforce_stopped_node_mappings_after_start || true
 
   echo "Start summary: tonnodes_restored=${resumed_tonnodes}, statefulsets_restored=${resumed_statefulsets}, skipped=${skipped}, operator_scaled_to_zero=0"
   if (( paused_without_annotation > 0 )); then
