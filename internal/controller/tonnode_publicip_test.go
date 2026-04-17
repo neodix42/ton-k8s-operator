@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	tonv1alpha1 "github.com/neodix/ton-k8s-operator/api/v1alpha1"
@@ -12,6 +13,18 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+)
+
+const (
+	testK8sNodeName0 = "k8s-node-0"
+	testK8sNodeName1 = "k8s-node-1"
+	testK8sNodeName2 = "k8s-node-2"
+	testK8sNodeName3 = "k8s-node-3"
+
+	testHostName0 = "node-host-00"
+	testHostName1 = "node-host-01"
+	testHostName2 = "node-host-02"
+	testHostName3 = "node-host-03"
 )
 
 func TestDesiredPublicIPEnv(t *testing.T) {
@@ -52,10 +65,10 @@ func TestDesiredPublicIPEnv(t *testing.T) {
 			objects: []client.Object{
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{Name: "tonnode-0", Namespace: "default"},
-					Spec:       corev1.PodSpec{NodeName: "devnet-15"},
+					Spec:       corev1.PodSpec{NodeName: testK8sNodeName3},
 				},
 				&corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{Name: "devnet-15"},
+					ObjectMeta: metav1.ObjectMeta{Name: testK8sNodeName3},
 					Status: corev1.NodeStatus{
 						Addresses: []corev1.NodeAddress{
 							{Type: corev1.NodeInternalIP, Address: "10.0.0.10"},
@@ -77,10 +90,10 @@ func TestDesiredPublicIPEnv(t *testing.T) {
 			objects: []client.Object{
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{Name: "tonnode-0", Namespace: "default"},
-					Spec:       corev1.PodSpec{NodeName: "devnet-15"},
+					Spec:       corev1.PodSpec{NodeName: testK8sNodeName3},
 				},
 				&corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{Name: "devnet-15"},
+					ObjectMeta: metav1.ObjectMeta{Name: testK8sNodeName3},
 					Status: corev1.NodeStatus{
 						Addresses: []corev1.NodeAddress{
 							{Type: corev1.NodeInternalIP, Address: "10.0.0.10"},
@@ -229,7 +242,7 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 
 	t.Run("adds sticky hostname node affinity", func(t *testing.T) {
 		tonNode := &tonv1alpha1.TonNode{}
-		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, []string{"devnet-09", "devnet-15"})
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, []string{testHostName0, testHostName3})
 
 		affinity := tpl.Spec.Affinity
 		if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
@@ -246,8 +259,8 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 		if req.Operator != corev1.NodeSelectorOpIn {
 			t.Fatalf("node affinity operator = %q, want In", req.Operator)
 		}
-		if len(req.Values) != 2 || req.Values[0] != "devnet-09" || req.Values[1] != "devnet-15" {
-			t.Fatalf("node affinity values = %#v, want [devnet-09 devnet-15]", req.Values)
+		if len(req.Values) != 2 || req.Values[0] != testHostName0 || req.Values[1] != testHostName3 {
+			t.Fatalf("node affinity values = %#v, want [%s %s]", req.Values, testHostName0, testHostName3)
 		}
 	})
 }
@@ -566,7 +579,7 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 								{
 									Key:      "kubernetes.io/hostname",
 									Operator: corev1.NodeSelectorOpIn,
-									Values:   []string{"devnet-03", "devnet-01"},
+									Values:   []string{testHostName2, testHostName1},
 								},
 							},
 						},
@@ -586,8 +599,8 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
-		if len(got) != 2 || got[0] != "devnet-01" || got[1] != "devnet-03" {
-			t.Fatalf("sticky hostnames = %#v, want [devnet-01 devnet-03]", got)
+		if len(got) != 2 || got[0] != testHostName1 || got[1] != testHostName2 {
+			t.Fatalf("sticky hostnames = %#v, want [%s %s]", got, testHostName1, testHostName2)
 		}
 	})
 
@@ -600,9 +613,9 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		}
 		node0 := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "worker-a",
+				Name: testK8sNodeName0,
 				Labels: map[string]string{
-					corev1.LabelHostname: "devnet-09",
+					corev1.LabelHostname: testHostName0,
 				},
 			},
 			Status: corev1.NodeStatus{
@@ -613,9 +626,9 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		}
 		node1 := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "worker-b",
+				Name: testK8sNodeName1,
 				Labels: map[string]string{
-					corev1.LabelHostname: "devnet-11",
+					corev1.LabelHostname: testHostName1,
 				},
 			},
 			Status: corev1.NodeStatus{
@@ -626,9 +639,9 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		}
 		node2 := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "worker-c",
+				Name: testK8sNodeName2,
 				Labels: map[string]string{
-					corev1.LabelHostname: "devnet-13",
+					corev1.LabelHostname: testHostName2,
 				},
 			},
 			Status: corev1.NodeStatus{
@@ -655,8 +668,8 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
-		if len(got) != 2 || got[0] != "devnet-09" || got[1] != "devnet-11" {
-			t.Fatalf("sticky hostnames = %#v, want [devnet-09 devnet-11]", got)
+		if len(got) != 2 || got[0] != testHostName0 || got[1] != testHostName1 {
+			t.Fatalf("sticky hostnames = %#v, want [%s %s]", got, testHostName0, testHostName1)
 		}
 	})
 
@@ -670,9 +683,9 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 			},
 		}
 		ordinalNodeMap := map[int]string{
-			0: "devnet-09",
-			1: "devnet-11",
-			2: "devnet-15",
+			0: testHostName0,
+			1: testHostName1,
+			2: testHostName3,
 		}
 
 		got, err := reconciler.desiredStickyNodeHostnames(
@@ -686,8 +699,8 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
-		if len(got) != 3 || got[0] != "devnet-09" || got[1] != "devnet-11" || got[2] != "devnet-15" {
-			t.Fatalf("sticky hostnames = %#v, want [devnet-09 devnet-11 devnet-15]", got)
+		if len(got) != 3 || got[0] != testHostName0 || got[1] != testHostName1 || got[2] != testHostName3 {
+			t.Fatalf("sticky hostnames = %#v, want [%s %s %s]", got, testHostName0, testHostName1, testHostName3)
 		}
 	})
 
@@ -701,9 +714,9 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		labels := labelsForTonNode(tonNode)
 		node0 := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "worker-a",
+				Name: testK8sNodeName0,
 				Labels: map[string]string{
-					corev1.LabelHostname: "devnet-09",
+					corev1.LabelHostname: testHostName0,
 				},
 			},
 			Status: corev1.NodeStatus{
@@ -714,9 +727,9 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		}
 		node1 := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "worker-b",
+				Name: testK8sNodeName1,
 				Labels: map[string]string{
-					corev1.LabelHostname: "devnet-11",
+					corev1.LabelHostname: testHostName1,
 				},
 			},
 			Status: corev1.NodeStatus{
@@ -731,7 +744,7 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 				Namespace: "default",
 				Labels:    labels,
 			},
-			Spec: corev1.PodSpec{NodeName: "devnet-09"},
+			Spec: corev1.PodSpec{NodeName: testK8sNodeName0},
 		}
 		pod1 := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -739,7 +752,7 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 				Namespace: "default",
 				Labels:    labels,
 			},
-			Spec: corev1.PodSpec{NodeName: "devnet-11"},
+			Spec: corev1.PodSpec{NodeName: testK8sNodeName1},
 		}
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
@@ -792,34 +805,35 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 
 func TestOrdinalNodeMapAnnotationHelpers(t *testing.T) {
 	t.Run("parses and formats stable ordinal map", func(t *testing.T) {
-		parsed, ok := parseOrdinalNodeMapAnnotation("0=devnet-02,1=devnet-01,2=devnet-03")
+		mapRaw := fmt.Sprintf("0=%s,1=%s,2=%s", testHostName2, testHostName1, testHostName3)
+		parsed, ok := parseOrdinalNodeMapAnnotation(mapRaw)
 		if !ok {
 			t.Fatalf("expected map to parse")
 		}
-		if parsed[0] != "devnet-02" || parsed[1] != "devnet-01" || parsed[2] != "devnet-03" {
+		if parsed[0] != testHostName2 || parsed[1] != testHostName1 || parsed[2] != testHostName3 {
 			t.Fatalf("unexpected parsed map: %#v", parsed)
 		}
 
 		formatted := formatOrdinalNodeMapAnnotation(parsed, 3)
-		if formatted != "0=devnet-02,1=devnet-01,2=devnet-03" {
-			t.Fatalf("formatted map = %q, want %q", formatted, "0=devnet-02,1=devnet-01,2=devnet-03")
+		if formatted != mapRaw {
+			t.Fatalf("formatted map = %q, want %q", formatted, mapRaw)
 		}
 	})
 
 	t.Run("merge keeps stored ordinal assignments", func(t *testing.T) {
 		existing := map[int]string{
-			0: "devnet-02",
-			1: "devnet-01",
-			2: "devnet-03",
+			0: testHostName2,
+			1: testHostName1,
+			2: testHostName3,
 		}
 		current := map[int]string{
-			0: "devnet-01",
-			1: "devnet-03",
-			2: "devnet-02",
+			0: testHostName1,
+			1: testHostName3,
+			2: testHostName2,
 		}
 
 		merged := mergeOrdinalNodeMaps(existing, current, 3)
-		if merged[0] != "devnet-02" || merged[1] != "devnet-01" || merged[2] != "devnet-03" {
+		if merged[0] != testHostName2 || merged[1] != testHostName1 || merged[2] != testHostName3 {
 			t.Fatalf("merged map drifted from stored assignments: %#v", merged)
 		}
 	})
