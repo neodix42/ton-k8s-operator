@@ -642,6 +642,8 @@ rules:
   - nodes
   verbs:
   - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
@@ -904,7 +906,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: ghcr.io/neodix42/ton-k8s-operator:0.1.40
+        image: ghcr.io/neodix42/ton-k8s-operator:dev-local
         livenessProbe:
           httpGet:
             path: /healthz

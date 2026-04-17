@@ -33,6 +33,7 @@ VAULT_TON_POLICY_NAME="${VAULT_TON_POLICY_NAME:-tonnode-transit}"
 VAULT_BOOTSTRAP_SECRET="${VAULT_BOOTSTRAP_SECRET:-ton-vault-bootstrap}"
 VAULT_BOOTSTRAP_UNSEAL_KEY="${VAULT_BOOTSTRAP_UNSEAL_KEY:-}"
 VAULT_BOOTSTRAP_ROOT_TOKEN="${VAULT_BOOTSTRAP_ROOT_TOKEN:-}"
+VAULT_LOCALDEV_NODE_SELECTOR="${VAULT_LOCALDEV_NODE_SELECTOR:-node-role.kubernetes.io/control-plane=true}"
 TON_VAULT_CREDS_SECRET="${TON_VAULT_CREDS_SECRET:-ton-vault-creds}"
 VAULT_ADDR_INTERNAL="${VAULT_ADDR_INTERNAL:-http://${VAULT_RELEASE_NAME}.${VAULT_NAMESPACE}.svc:8200}"
 VAULT_TOKEN_PERIOD="${VAULT_TOKEN_PERIOD:-720h}"
@@ -82,6 +83,7 @@ Environment overrides:
   VAULT_RELEASE_NAME, VAULT_NAMESPACE, VAULT_CHART, VAULT_CHART_VERSION
   VAULT_TRANSIT_KEY, VAULT_TON_POLICY_NAME, VAULT_BOOTSTRAP_SECRET
   VAULT_BOOTSTRAP_UNSEAL_KEY, VAULT_BOOTSTRAP_ROOT_TOKEN
+  VAULT_LOCALDEV_NODE_SELECTOR
   TON_VAULT_CREDS_SECRET, VAULT_ADDR_INTERNAL, VAULT_TOKEN_PERIOD
   NAMESPACE_DELETE_PROGRESS_TIMEOUT
   SKIP_STOP_KEY_BACKUP (default: true; set false to run stop-time backup)
@@ -1231,11 +1233,29 @@ EOF
 ensure_vault_installed() {
   local vault_storage_class="${1:-longhorn}"
   local vault_selector_values_file=""
+  local -a vault_selector_values_files=()
   local -a vault_extra_args=()
+  local k3d_selector=""
+  local k3d_matched_nodes=0
   require_bin helm
   ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240
   ensure_helm_repo "hashicorp" "https://helm.releases.hashicorp.com"
   helm repo update hashicorp >/dev/null
+
+  if cluster_is_k3d; then
+    k3d_selector="$(trim_whitespace "${VAULT_LOCALDEV_NODE_SELECTOR:-}")"
+    if [[ -n "$k3d_selector" ]]; then
+      k3d_matched_nodes="$(kubectl get nodes -l "$k3d_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+      if [[ "${k3d_matched_nodes:-0}" == "0" ]]; then
+        echo "Warning: VAULT_LOCALDEV_NODE_SELECTOR='${k3d_selector}' matched 0 nodes; continuing without Vault node selector." >&2
+      else
+        vault_selector_values_file="$(build_vault_selector_values_file "$k3d_selector")"
+        vault_selector_values_files+=("$vault_selector_values_file")
+        vault_extra_args+=(-f "$vault_selector_values_file")
+        echo "[localdev] Restricting Vault server to nodes: ${k3d_selector} (matched ${k3d_matched_nodes} node(s))"
+      fi
+    fi
+  fi
 
   if ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
     local -a selector_pairs=()
@@ -1257,6 +1277,7 @@ ensure_vault_installed() {
     fi
 
     vault_selector_values_file="$(build_vault_selector_values_file "$LONGHORN_NODE_SELECTOR")"
+    vault_selector_values_files+=("$vault_selector_values_file")
     vault_extra_args+=(-f "$vault_selector_values_file")
     echo "[baremetal] Restricting Vault server to Longhorn nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
   fi
@@ -1278,9 +1299,10 @@ ensure_vault_installed() {
     --wait \
     --timeout 30m || install_rc=$?
 
-  if [[ -n "$vault_selector_values_file" ]]; then
+  for vault_selector_values_file in "${vault_selector_values_files[@]}"; do
+    [[ -n "$vault_selector_values_file" ]] || continue
     rm -f "$vault_selector_values_file" >/dev/null 2>&1 || true
-  fi
+  done
   if (( install_rc != 0 )); then
     return "$install_rc"
   fi
@@ -1301,7 +1323,7 @@ vault_status_with_retry() {
   local deadline=$(( $(date +%s) + 180 ))
   local status initialized
   while (( $(date +%s) < deadline )); do
-    status="$(vault_exec vault status 2>/dev/null || true)"
+    status="$(vault_exec vault status 2>&1 || true)"
     initialized="$(printf '%s\n' "$status" | awk '/^Initialized[[:space:]]+/ {print tolower($2); exit}')"
     if [[ "$initialized" == "true" || "$initialized" == "false" ]]; then
       printf '%s' "$status"
@@ -1353,7 +1375,12 @@ initialize_and_unseal_vault() {
 
   if ! status="$(vault_status_with_retry)"; then
     echo "Error: failed to get parseable Vault status from ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0." >&2
+    if [[ -n "${status:-}" ]]; then
+      echo "Last vault status output:" >&2
+      printf '%s\n' "$status" >&2
+    fi
     echo "Check pod logs: kubectl -n ${VAULT_NAMESPACE} logs ${VAULT_RELEASE_NAME}-0" >&2
+    echo "Check pod events: kubectl -n ${VAULT_NAMESPACE} describe pod ${VAULT_RELEASE_NAME}-0" >&2
     exit 1
   fi
   initialized="$(printf '%s\n' "$status" | awk '/^Initialized[[:space:]]+/ {print tolower($2); exit}')"

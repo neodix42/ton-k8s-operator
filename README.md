@@ -31,7 +31,7 @@ This operator creates and manages:
   - `VALIDATOR_PORT`
   - `LITESERVER_PORT`
   - `VALIDATOR_CONSOLE_PORT`
-- For `hostPortsEnabled=true` with auto `PUBLIC_IP` (empty `spec.network.publicIP`), keeps TON replica placement sticky to already used worker hostnames to prevent node/IP drift on restarts.
+- For `hostPortsEnabled=true` with auto `PUBLIC_IP` (empty `spec.network.publicIP`), operator preselects sticky worker hostnames before first pod launch (Ready/schedulable nodes matching `spec.nodeSelector`) to prevent node/IP drift on restarts without a post-launch rollout.
 - Sets `IGNORE_MINIMAL_REQS=true` by default (can be overridden through `spec.env`).
 - Applies default pod resources (overridable via `spec.resources`):
   - requests: `cpu=16000m`, `memory=64Gi`
@@ -474,7 +474,7 @@ Run them from repo root:
 
 - `PUBLIC_IP`: by default, for `replicas=1`, operator tries node `ExternalIP`, then falls back to node host IP. For multi-replica or private/NAT workers, set `spec.network.publicIP`.
 - `hostPortsEnabled`: default is `true`. This is required for direct TON reachability on bare-metal/public-node setups (`validatorPort`, `quicPort`, `liteServerPort`).
-- When `spec.network.publicIP` is empty, operator keeps replicas on the same worker hostname set after initial placement to avoid advertised-IP drift after pod restarts.
+- When `spec.network.publicIP` is empty, operator pins replicas to a preselected worker hostname set before first launch to avoid advertised-IP drift after pod restarts.
 - Private cloud workers (no public node IP): provide per-node/per-replica public forwarding; one shared LB endpoint/port pair is not sufficient for many TON replicas.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
 - Bare metal: if Longhorn exists, the operator prefers it automatically.

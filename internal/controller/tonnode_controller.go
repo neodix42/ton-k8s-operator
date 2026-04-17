@@ -97,7 +97,7 @@ type TonNodeReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -1206,11 +1206,24 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 	}
 
 	targetReplicas := int(desiredStatefulSetReplicas(tonNode))
+	if targetReplicas < 1 {
+		return nil, nil
+	}
+
 	existing := stickyNodeHostnamesFromAffinity(existingAffinity)
 	if len(existing) > 0 {
-		// Allow scale-up to discover a larger stable node set.
-		if targetReplicas > len(existing) {
-			return nil, nil
+		// Keep existing host affinity stable to avoid automatic rollouts.
+		if targetReplicas <= len(existing) {
+			return existing, nil
+		}
+
+		eligibleHostnames, err := r.eligibleStickyNodeHostnames(ctx, tonNode)
+		if err != nil {
+			return nil, err
+		}
+		expanded := appendMissingHostnames(existing, eligibleHostnames, targetReplicas)
+		if len(expanded) >= targetReplicas {
+			return expanded, nil
 		}
 		return existing, nil
 	}
@@ -1219,27 +1232,120 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 	if err := r.List(ctx, &pods, client.InNamespace(tonNode.Namespace), client.MatchingLabels(labels)); err != nil {
 		return nil, err
 	}
+	if hasActivePods(pods.Items) {
+		// Do not retrofit sticky affinity after initial launch; that would update the
+		// StatefulSet template and trigger a rollout of already-running TON pods.
+		return nil, nil
+	}
 
-	hostnames := make([]string, 0, len(pods.Items))
-	for i := range pods.Items {
-		pod := pods.Items[i]
-		if pod.DeletionTimestamp != nil {
+	eligibleHostnames, err := r.eligibleStickyNodeHostnames(ctx, tonNode)
+	if err != nil {
+		return nil, err
+	}
+	if len(eligibleHostnames) < targetReplicas {
+		return nil, nil
+	}
+	return append([]string(nil), eligibleHostnames[:targetReplicas]...), nil
+}
+
+func (r *TonNodeReconciler) eligibleStickyNodeHostnames(
+	ctx context.Context,
+	tonNode *tonv1alpha1.TonNode,
+) ([]string, error) {
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		return nil, err
+	}
+
+	hostnames := make([]string, 0, len(nodes.Items))
+	for i := range nodes.Items {
+		node := nodes.Items[i]
+		if node.Spec.Unschedulable {
 			continue
 		}
-		hostname := strings.TrimSpace(pod.Spec.NodeName)
+		if !nodeReady(&node) {
+			continue
+		}
+		if nodeHasHardScheduleTaint(&node) {
+			continue
+		}
+		if !labelsMatch(node.Labels, tonNode.Spec.NodeSelector) {
+			continue
+		}
+		hostname := strings.TrimSpace(node.Labels[corev1.LabelHostname])
+		if hostname == "" {
+			hostname = strings.TrimSpace(node.Name)
+		}
 		if hostname == "" {
 			continue
 		}
 		hostnames = append(hostnames, hostname)
 	}
-	hostnames = uniqueSortedStrings(hostnames)
-	if len(hostnames) == 0 {
-		return nil, nil
+	return uniqueSortedStrings(hostnames), nil
+}
+
+func hasActivePods(pods []corev1.Pod) bool {
+	for i := range pods {
+		if pods[i].DeletionTimestamp == nil {
+			return true
+		}
 	}
-	if targetReplicas > len(hostnames) {
-		return nil, nil
+	return false
+}
+
+func labelsMatch(labels map[string]string, selector map[string]string) bool {
+	if len(selector) == 0 {
+		return true
 	}
-	return hostnames, nil
+	for key, value := range selector {
+		if labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeReady(node *corev1.Node) bool {
+	for i := range node.Status.Conditions {
+		condition := node.Status.Conditions[i]
+		if condition.Type != corev1.NodeReady {
+			continue
+		}
+		return condition.Status == corev1.ConditionTrue
+	}
+	return false
+}
+
+func nodeHasHardScheduleTaint(node *corev1.Node) bool {
+	for i := range node.Spec.Taints {
+		effect := node.Spec.Taints[i].Effect
+		if effect == corev1.TaintEffectNoSchedule || effect == corev1.TaintEffectNoExecute {
+			return true
+		}
+	}
+	return false
+}
+
+func appendMissingHostnames(existing []string, candidates []string, target int) []string {
+	if len(existing) == 0 {
+		return nil
+	}
+	out := append([]string(nil), existing...)
+	seen := make(map[string]struct{}, len(out))
+	for _, hostname := range out {
+		seen[hostname] = struct{}{}
+	}
+	for _, hostname := range candidates {
+		if len(out) >= target {
+			break
+		}
+		if _, ok := seen[hostname]; ok {
+			continue
+		}
+		out = append(out, hostname)
+		seen[hostname] = struct{}{}
+	}
+	return out
 }
 
 func stickyNodeHostnamesFromAffinity(affinity *corev1.Affinity) []string {

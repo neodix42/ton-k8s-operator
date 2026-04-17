@@ -3,7 +3,7 @@ tonNode:
   namespace: default
   name: tonnode
   image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
-  replicas: 1
+  replicas: 3
   storage:
     tonWorkSize: 400Gi
     myTonCoreSize: 20Gi
@@ -56,7 +56,7 @@ tonNode:
     - name: SYNC_BEFORE
       value: "60"
     - name: VERBOSITY
-      value: "3"
+      value: "1"
     - name: IGNORE_MINIMAL_REQS
       value: "false"
     - name: TELEMETRY
@@ -64,7 +64,7 @@ tonNode:
     - name: MODE
       value: liteserver
     - name: DUMP
-      value: "true"
+      value: "false"
     - name: MYTONCTRL_VERSION
       value: master
     - name: CUSTOM_PARAMETERS

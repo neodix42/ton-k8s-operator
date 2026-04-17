@@ -584,7 +584,69 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		}
 	})
 
-	t.Run("discovers sticky hostnames from running pods", func(t *testing.T) {
+	t.Run("preselects sticky hostnames from eligible nodes before first launch", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+			Spec: tonv1alpha1.TonNodeSpec{
+				Replicas: ptr.To[int32](2),
+			},
+		}
+		node0 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "worker-a",
+				Labels: map[string]string{
+					corev1.LabelHostname: "devnet-09",
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		node1 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "worker-b",
+				Labels: map[string]string{
+					corev1.LabelHostname: "devnet-11",
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		node2 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "worker-c",
+				Labels: map[string]string{
+					corev1.LabelHostname: "devnet-13",
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+				},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(node0, node1, node2).
+			Build()
+		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
+		labels := labelsForTonNode(tonNode)
+
+		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, nil, labels)
+		if err != nil {
+			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
+		}
+		if len(got) != 2 || got[0] != "devnet-09" || got[1] != "devnet-11" {
+			t.Fatalf("sticky hostnames = %#v, want [devnet-09 devnet-11]", got)
+		}
+	})
+
+	t.Run("does not retrofit sticky hostnames from running pods", func(t *testing.T) {
 		tonNode := &tonv1alpha1.TonNode{
 			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
 			Spec: tonv1alpha1.TonNodeSpec{
@@ -592,6 +654,32 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 			},
 		}
 		labels := labelsForTonNode(tonNode)
+		node0 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "worker-a",
+				Labels: map[string]string{
+					corev1.LabelHostname: "devnet-09",
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		node1 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "worker-b",
+				Labels: map[string]string{
+					corev1.LabelHostname: "devnet-11",
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
 		pod0 := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "tonnode-0",
@@ -610,7 +698,7 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		}
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(pod0, pod1).
+			WithObjects(node0, node1, pod0, pod1).
 			Build()
 		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
 
@@ -618,8 +706,8 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
-		if len(got) != 2 || got[0] != "devnet-09" || got[1] != "devnet-11" {
-			t.Fatalf("sticky hostnames = %#v, want [devnet-09 devnet-11]", got)
+		if got != nil {
+			t.Fatalf("sticky hostnames = %#v, want nil", got)
 		}
 	})
 
