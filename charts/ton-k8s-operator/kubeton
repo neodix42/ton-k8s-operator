@@ -69,7 +69,7 @@ Commands:
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
   purge                Full destructive cleanup: uninstall + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
-  verify               Verify operator and TON resources (deploy/pods, tonnodes, sts/pods/pvc).
+  verify               Verify operator and TON resources (deploy, pods with node/server, tonnodes, sts, pvc).
   status               Run wallet/adnl/sync/db checks in each TON pod; print node/pod/wallet/adnl/sync/cell db/archive db.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
 
@@ -3779,9 +3779,15 @@ run_purge() {
 
 run_verify() {
   require_bin kubectl
-  kubectl -n "$OP_NAMESPACE" get deploy,pods
+  echo "[verify] Operator resources (${OP_NAMESPACE})"
+  kubectl -n "$OP_NAMESPACE" get deploy
+  kubectl -n "$OP_NAMESPACE" get pods -o wide
+  echo
+  echo "[verify] TON resources (${TON_NAMESPACE})"
   kubectl -n "$TON_NAMESPACE" get tonnodes
-  kubectl -n "$TON_NAMESPACE" get sts,pods,pvc
+  kubectl -n "$TON_NAMESPACE" get sts
+  kubectl -n "$TON_NAMESPACE" get pods -o wide
+  kubectl -n "$TON_NAMESPACE" get pvc
 }
 
 run_status() {
