@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -82,6 +83,12 @@ const (
 	// kubetonPauseReplicasAnnotationKey stores the pre-pause replica count on TonNode/StatefulSet.
 	// When present with a parseable integer value, reconciliation keeps StatefulSet replicas at 0.
 	kubetonPauseReplicasAnnotationKey = "ton.ton.org/kubeton-paused-replicas"
+	// stickyOrdinalNodeMapAnnotationKey persists the stable StatefulSet ordinal->node assignment.
+	stickyOrdinalNodeMapAnnotationKey = "ton.ton.org/sticky-ordinal-node-map"
+
+	stickyRemapPodGoneTimeout   = 10 * time.Minute
+	stickyRemapPodAssignTimeout = 15 * time.Minute
+	stickyRemapPollInterval     = 2 * time.Second
 )
 
 // TonNodeReconciler reconciles a TonNode object
@@ -150,6 +157,15 @@ func (r *TonNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	sts, err := r.reconcileStatefulSet(ctx, &tonNode, serviceName, storageClassName)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	remapped, err := r.enforceStickyOrdinalPlacement(ctx, &tonNode, sts)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if remapped {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	isReady := false
@@ -253,15 +269,37 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
 		labels := labelsForTonNode(tonNode)
 		replicas := desiredStatefulSetReplicas(tonNode)
+		mapReplicas := int(desiredReplicas(tonNode))
 		publicIP, err := r.desiredPublicIPEnv(ctx, tonNode)
 		if err != nil {
 			return err
 		}
-		stickyNodeHostnames, err := r.desiredStickyNodeHostnames(ctx, tonNode, sts.Spec.Template.Spec.Affinity, labels)
+
+		currentOrdinalNodeMap, err := r.currentOrdinalNodeMap(ctx, tonNode.Namespace, tonNode.Name, labels)
 		if err != nil {
 			return err
 		}
+		existingOrdinalNodeMap, _ := parseOrdinalNodeMapAnnotation(annotationValue(sts.Annotations, stickyOrdinalNodeMapAnnotationKey))
+		effectiveOrdinalNodeMap := mergeOrdinalNodeMaps(existingOrdinalNodeMap, currentOrdinalNodeMap, mapReplicas)
+
+		stickyNodeHostnames, err := r.desiredStickyNodeHostnames(
+			ctx,
+			tonNode,
+			sts.Spec.Template.Spec.Affinity,
+			labels,
+			effectiveOrdinalNodeMap,
+			mapReplicas,
+		)
+		if err != nil {
+			return err
+		}
+
 		sts.Labels = labels
+		sts.Annotations = setAnnotationValue(
+			sts.Annotations,
+			stickyOrdinalNodeMapAnnotationKey,
+			formatOrdinalNodeMapAnnotation(effectiveOrdinalNodeMap, mapReplicas),
+		)
 		sts.Spec.Replicas = ptr.To(replicas)
 		sts.Spec.ServiceName = serviceName
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
@@ -279,6 +317,237 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 		return nil, err
 	}
 	return sts, nil
+}
+
+func (r *TonNodeReconciler) enforceStickyOrdinalPlacement(
+	ctx context.Context,
+	tonNode *tonv1alpha1.TonNode,
+	sts *appsv1.StatefulSet,
+) (bool, error) {
+	if tonNode == nil || sts == nil {
+		return false, nil
+	}
+	if !stickyPlacementEnabled(tonNode) {
+		return false, nil
+	}
+
+	targetReplicas := int(desiredStatefulSetReplicas(tonNode))
+	if targetReplicas < 1 {
+		return false, nil
+	}
+
+	expectedMap, valid := parseOrdinalNodeMapAnnotation(annotationValue(sts.Annotations, stickyOrdinalNodeMapAnnotationKey))
+	if !valid || !ordinalNodeMapComplete(expectedMap, targetReplicas) {
+		return false, nil
+	}
+	expectedNodes, complete := orderedOrdinalNodes(expectedMap, targetReplicas)
+	if !complete {
+		return false, nil
+	}
+	if len(uniqueSortedStrings(expectedNodes)) != len(expectedNodes) {
+		return false, nil
+	}
+
+	eligibleHostnames, err := r.eligibleStickyNodeHostnames(ctx, tonNode)
+	if err != nil {
+		return false, err
+	}
+	if !allExpectedNodesEligible(expectedNodes, eligibleHostnames) {
+		return false, nil
+	}
+
+	labels := labelsForTonNode(tonNode)
+	currentMap, err := r.currentOrdinalNodeMap(ctx, tonNode.Namespace, tonNode.Name, labels)
+	if err != nil {
+		return false, err
+	}
+	if !ordinalNodeMapComplete(currentMap, targetReplicas) {
+		return false, nil
+	}
+	if ordinalNodeMapMatches(expectedMap, currentMap, targetReplicas) {
+		return false, nil
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("Detected StatefulSet ordinal->node drift; restoring sticky placement", "namespace", tonNode.Namespace, "statefulSet", sts.Name)
+	if err := r.restoreOrdinalNodePlacement(ctx, tonNode, sts.Name, labels, expectedNodes); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *TonNodeReconciler) restoreOrdinalNodePlacement(
+	ctx context.Context,
+	tonNode *tonv1alpha1.TonNode,
+	stsName string,
+	labels map[string]string,
+	expectedNodes []string,
+) error {
+	if len(expectedNodes) == 0 {
+		return nil
+	}
+
+	publicIP, err := r.desiredPublicIPEnv(ctx, tonNode)
+	if err != nil {
+		return err
+	}
+
+	fullStickyHostnames := uniqueSortedStrings(expectedNodes)
+	if err := r.updateStatefulSetStickyStep(
+		ctx,
+		tonNode,
+		stsName,
+		labels,
+		publicIP,
+		fullStickyHostnames,
+		0,
+		appsv1.OnDeleteStatefulSetStrategyType,
+	); err != nil {
+		return err
+	}
+	if err := r.waitStatefulSetPodsGone(ctx, tonNode.Namespace, stsName, labels, stickyRemapPodGoneTimeout); err != nil {
+		return err
+	}
+
+	seenNodes := make(map[string]struct{}, len(expectedNodes))
+	allowedNodes := make([]string, 0, len(expectedNodes))
+	for ordinal := range expectedNodes {
+		expectedNode := expectedNodes[ordinal]
+		if _, seen := seenNodes[expectedNode]; !seen {
+			allowedNodes = append(allowedNodes, expectedNode)
+			seenNodes[expectedNode] = struct{}{}
+			allowedNodes = uniqueSortedStrings(allowedNodes)
+		}
+
+		if err := r.updateStatefulSetStickyStep(
+			ctx,
+			tonNode,
+			stsName,
+			labels,
+			publicIP,
+			allowedNodes,
+			int32(ordinal+1),
+			appsv1.OnDeleteStatefulSetStrategyType,
+		); err != nil {
+			return err
+		}
+
+		podName := fmt.Sprintf("%s-%d", stsName, ordinal)
+		if err := r.waitPodScheduledOnExpectedNode(
+			ctx,
+			tonNode.Namespace,
+			podName,
+			expectedNode,
+			stickyRemapPodAssignTimeout,
+		); err != nil {
+			return err
+		}
+	}
+
+	return r.updateStatefulSetStickyStep(
+		ctx,
+		tonNode,
+		stsName,
+		labels,
+		publicIP,
+		fullStickyHostnames,
+		int32(len(expectedNodes)),
+		appsv1.RollingUpdateStatefulSetStrategyType,
+	)
+}
+
+func (r *TonNodeReconciler) updateStatefulSetStickyStep(
+	ctx context.Context,
+	tonNode *tonv1alpha1.TonNode,
+	stsName string,
+	labels map[string]string,
+	publicIP corev1.EnvVar,
+	stickyHostnames []string,
+	replicas int32,
+	strategy appsv1.StatefulSetUpdateStrategyType,
+) error {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: stsName, Namespace: tonNode.Namespace}, sts); err != nil {
+		return err
+	}
+
+	sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: strategy}
+	sts.Spec.Replicas = ptr.To(replicas)
+	sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP, stickyHostnames)
+	return r.Update(ctx, sts)
+}
+
+func (r *TonNodeReconciler) waitStatefulSetPodsGone(
+	ctx context.Context,
+	namespace string,
+	stsName string,
+	labels map[string]string,
+	timeout time.Duration,
+) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		pods, err := r.listStatefulSetPods(ctx, namespace, stsName, labels)
+		if err != nil {
+			return err
+		}
+		if len(pods) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for pods of %s/%s to terminate", namespace, stsName)
+		}
+		if err := sleepWithContext(ctx, stickyRemapPollInterval); err != nil {
+			return err
+		}
+	}
+}
+
+func (r *TonNodeReconciler) waitPodScheduledOnExpectedNode(
+	ctx context.Context,
+	namespace string,
+	podName string,
+	expectedNode string,
+	timeout time.Duration,
+) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		pod := &corev1.Pod{}
+		err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: podName}, pod)
+		if err == nil {
+			if pod.DeletionTimestamp == nil {
+				nodeName := strings.TrimSpace(pod.Spec.NodeName)
+				if nodeName == expectedNode {
+					return nil
+				}
+				if nodeName != "" {
+					return fmt.Errorf("pod %s/%s scheduled on %s, expected %s", namespace, podName, nodeName, expectedNode)
+				}
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for pod %s/%s to schedule on %s", namespace, podName, expectedNode)
+		}
+		if err := sleepWithContext(ctx, stickyRemapPollInterval); err != nil {
+			return err
+		}
+	}
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (r *TonNodeReconciler) desiredPodTemplate(
@@ -1159,6 +1428,8 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 	tonNode *tonv1alpha1.TonNode,
 	existingAffinity *corev1.Affinity,
 	labels map[string]string,
+	ordinalNodeMap map[int]string,
+	mapTargetReplicas int,
 ) ([]string, error) {
 	// Keep replica placement stable when PUBLIC_IP is auto-derived from host node IP.
 	// This avoids drifting to another worker (and public IP) after a restart.
@@ -1166,7 +1437,7 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 		return nil, nil
 	}
 
-	targetReplicas := int(desiredStatefulSetReplicas(tonNode))
+	targetReplicas := mapTargetReplicas
 	if targetReplicas < 1 {
 		return nil, nil
 	}
@@ -1178,11 +1449,17 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 			return existing, nil
 		}
 
+		ordinalCandidates := stickyHostnamesFromOrdinalMap(ordinalNodeMap, targetReplicas)
+		expanded := appendMissingHostnames(existing, ordinalCandidates, targetReplicas)
+		if len(expanded) >= targetReplicas {
+			return expanded, nil
+		}
+
 		eligibleHostnames, err := r.eligibleStickyNodeHostnames(ctx, tonNode)
 		if err != nil {
 			return nil, err
 		}
-		expanded := appendMissingHostnames(existing, eligibleHostnames, targetReplicas)
+		expanded = appendMissingHostnames(expanded, eligibleHostnames, targetReplicas)
 		if len(expanded) >= targetReplicas {
 			return expanded, nil
 		}
@@ -1199,14 +1476,26 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 		return nil, nil
 	}
 
+	ordinalCandidates := stickyHostnamesFromOrdinalMap(ordinalNodeMap, targetReplicas)
+	if len(ordinalCandidates) >= targetReplicas {
+		return ordinalCandidates[:targetReplicas], nil
+	}
+
 	eligibleHostnames, err := r.eligibleStickyNodeHostnames(ctx, tonNode)
 	if err != nil {
 		return nil, err
 	}
-	if len(eligibleHostnames) < targetReplicas {
-		return nil, nil
+	if len(ordinalCandidates) == 0 {
+		if len(eligibleHostnames) < targetReplicas {
+			return nil, nil
+		}
+		return append([]string(nil), eligibleHostnames[:targetReplicas]...), nil
 	}
-	return append([]string(nil), eligibleHostnames[:targetReplicas]...), nil
+	expanded := appendMissingHostnames(ordinalCandidates, eligibleHostnames, targetReplicas)
+	if len(expanded) < targetReplicas {
+		return ordinalCandidates, nil
+	}
+	return append([]string(nil), expanded[:targetReplicas]...), nil
 }
 
 func (r *TonNodeReconciler) eligibleStickyNodeHostnames(
@@ -1252,6 +1541,71 @@ func hasActivePods(pods []corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func (r *TonNodeReconciler) listStatefulSetPods(
+	ctx context.Context,
+	namespace string,
+	stsName string,
+	labels map[string]string,
+) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.InNamespace(namespace), client.MatchingLabels(labels)); err != nil {
+		return nil, err
+	}
+	out := make([]corev1.Pod, 0, len(podList.Items))
+	for i := range podList.Items {
+		pod := podList.Items[i]
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if _, ok := podOrdinalForStatefulSet(stsName, pod.Name); !ok {
+			continue
+		}
+		out = append(out, pod)
+	}
+	return out, nil
+}
+
+func (r *TonNodeReconciler) currentOrdinalNodeMap(
+	ctx context.Context,
+	namespace string,
+	stsName string,
+	labels map[string]string,
+) (map[int]string, error) {
+	pods, err := r.listStatefulSetPods(ctx, namespace, stsName, labels)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int]string, len(pods))
+	for i := range pods {
+		ordinal, ok := podOrdinalForStatefulSet(stsName, pods[i].Name)
+		if !ok {
+			continue
+		}
+		nodeName := strings.TrimSpace(pods[i].Spec.NodeName)
+		if nodeName == "" {
+			continue
+		}
+		out[ordinal] = nodeName
+	}
+	return out, nil
+}
+
+func podOrdinalForStatefulSet(stsName string, podName string) (int, bool) {
+	prefix := strings.TrimSpace(stsName) + "-"
+	if !strings.HasPrefix(podName, prefix) {
+		return 0, false
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(podName, prefix))
+	if raw == "" {
+		return 0, false
+	}
+	ordinal, err := strconv.Atoi(raw)
+	if err != nil || ordinal < 0 {
+		return 0, false
+	}
+	return ordinal, true
 }
 
 func labelsMatch(labels map[string]string, selector map[string]string) bool {
@@ -1307,6 +1661,167 @@ func appendMissingHostnames(existing []string, candidates []string, target int) 
 		seen[hostname] = struct{}{}
 	}
 	return out
+}
+
+func stickyHostnamesFromOrdinalMap(ordinalNodeMap map[int]string, targetReplicas int) []string {
+	if targetReplicas < 1 {
+		return nil
+	}
+	nodes, ok := orderedOrdinalNodes(ordinalNodeMap, targetReplicas)
+	if !ok {
+		return nil
+	}
+	return uniqueSortedStrings(nodes)
+}
+
+func orderedOrdinalNodes(ordinalNodeMap map[int]string, targetReplicas int) ([]string, bool) {
+	if targetReplicas < 1 {
+		return nil, false
+	}
+	out := make([]string, 0, targetReplicas)
+	for ordinal := 0; ordinal < targetReplicas; ordinal++ {
+		nodeName := strings.TrimSpace(ordinalNodeMap[ordinal])
+		if nodeName == "" {
+			return nil, false
+		}
+		out = append(out, nodeName)
+	}
+	return out, true
+}
+
+func ordinalNodeMapComplete(ordinalNodeMap map[int]string, targetReplicas int) bool {
+	_, ok := orderedOrdinalNodes(ordinalNodeMap, targetReplicas)
+	return ok
+}
+
+func ordinalNodeMapMatches(expected map[int]string, current map[int]string, targetReplicas int) bool {
+	if targetReplicas < 1 {
+		return true
+	}
+	for ordinal := 0; ordinal < targetReplicas; ordinal++ {
+		if strings.TrimSpace(expected[ordinal]) != strings.TrimSpace(current[ordinal]) {
+			return false
+		}
+	}
+	return true
+}
+
+func allExpectedNodesEligible(expectedNodes []string, eligibleHostnames []string) bool {
+	if len(expectedNodes) == 0 {
+		return true
+	}
+	eligible := make(map[string]struct{}, len(eligibleHostnames))
+	for _, hostname := range eligibleHostnames {
+		name := strings.TrimSpace(hostname)
+		if name == "" {
+			continue
+		}
+		eligible[name] = struct{}{}
+	}
+	for _, hostname := range expectedNodes {
+		name := strings.TrimSpace(hostname)
+		if name == "" {
+			return false
+		}
+		if _, ok := eligible[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeOrdinalNodeMaps(existing map[int]string, current map[int]string, targetReplicas int) map[int]string {
+	if targetReplicas < 1 {
+		return nil
+	}
+	out := make(map[int]string, targetReplicas)
+	for ordinal := 0; ordinal < targetReplicas; ordinal++ {
+		if nodeName := strings.TrimSpace(existing[ordinal]); nodeName != "" {
+			out[ordinal] = nodeName
+			continue
+		}
+		if nodeName := strings.TrimSpace(current[ordinal]); nodeName != "" {
+			out[ordinal] = nodeName
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func formatOrdinalNodeMapAnnotation(ordinalNodeMap map[int]string, targetReplicas int) string {
+	if len(ordinalNodeMap) == 0 {
+		return ""
+	}
+	if targetReplicas < 1 {
+		return ""
+	}
+	pairs := make([]string, 0, targetReplicas)
+	for ordinal := 0; ordinal < targetReplicas; ordinal++ {
+		nodeName := strings.TrimSpace(ordinalNodeMap[ordinal])
+		if nodeName == "" {
+			continue
+		}
+		pairs = append(pairs, fmt.Sprintf("%d=%s", ordinal, nodeName))
+	}
+	return strings.Join(pairs, ",")
+}
+
+func parseOrdinalNodeMapAnnotation(raw string) (map[int]string, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil, false
+	}
+	parts := strings.Split(value, ",")
+	out := make(map[int]string, len(parts))
+	for _, part := range parts {
+		pair := strings.TrimSpace(part)
+		if pair == "" {
+			continue
+		}
+		sides := strings.SplitN(pair, "=", 2)
+		if len(sides) != 2 {
+			return nil, false
+		}
+		ordinalRaw := strings.TrimSpace(sides[0])
+		nodeName := strings.TrimSpace(sides[1])
+		ordinal, err := strconv.Atoi(ordinalRaw)
+		if err != nil || ordinal < 0 || nodeName == "" {
+			return nil, false
+		}
+		out[ordinal] = nodeName
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func annotationValue(annotations map[string]string, key string) string {
+	if len(annotations) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(annotations[key])
+}
+
+func setAnnotationValue(annotations map[string]string, key string, value string) map[string]string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		if len(annotations) == 0 {
+			return nil
+		}
+		delete(annotations, key)
+		if len(annotations) == 0 {
+			return nil
+		}
+		return annotations
+	}
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[key] = trimmed
+	return annotations
 }
 
 func stickyNodeHostnamesFromAffinity(affinity *corev1.Affinity) []string {
@@ -1530,6 +2045,16 @@ func hostPortsEnabled(tonNode *tonv1alpha1.TonNode) bool {
 		return true
 	}
 	return *tonNode.Spec.Network.HostPortsEnabled
+}
+
+func stickyPlacementEnabled(tonNode *tonv1alpha1.TonNode) bool {
+	if tonNode == nil {
+		return false
+	}
+	if !hostPortsEnabled(tonNode) {
+		return false
+	}
+	return strings.TrimSpace(tonNode.Spec.Network.PublicIP) == ""
 }
 
 func defaultTonEnv(tonNode *tonv1alpha1.TonNode, publicIP corev1.EnvVar) []corev1.EnvVar {

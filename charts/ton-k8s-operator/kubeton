@@ -2151,21 +2151,12 @@ restore_statefulset_with_expected_nodes() {
   local -n expected_nodes_ref="$4"
   local -a allowed_nodes=()
   local -a final_nodes=()
-  local -a unique_expected_nodes=()
   local ordinal pod expected_node current_node
 
   if ! [[ "$target_replicas" =~ ^[1-9][0-9]*$ ]]; then
     return 1
   fi
   if (( ${#expected_nodes_ref[@]} < target_replicas )); then
-    return 1
-  fi
-
-  for ordinal in $(seq 0 $((target_replicas - 1))); do
-    append_unique_item "${expected_nodes_ref[$ordinal]}" unique_expected_nodes
-  done
-  if (( ${#unique_expected_nodes[@]} != target_replicas )); then
-    echo "Error: strict node map for ${ns}/${sts} contains duplicate nodes for ${target_replicas} replicas." >&2
     return 1
   fi
 
@@ -3361,26 +3352,53 @@ run_backup_keys() {
   local -a ns_list=()
   local -a sts_list=()
   local -a replicas_list=()
+  local -A ordinal_node_maps=()
   local -A helper_nodes_by_replica=()
   local -a operator_deploy_names=()
   local -a operator_deploy_replicas=()
-  local row ns sts replicas i ordinal pod
+  local row ns sts replicas i ordinal pod node_map_key node_map
   local operator_paused=0
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns sts replicas <<<"$row"
-    replicas="${replicas:-0}"
+    replicas="$(trim_whitespace "${replicas:-0}")"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=0
+    fi
     ns_list+=("$ns")
     sts_list+=("$sts")
     replicas_list+=("$replicas")
+    if (( replicas > 0 )); then
+      node_map_key="${ns}/${sts}"
+      node_map="$(build_sts_ordinal_node_map "$ns" "$sts" "$replicas" || true)"
+      node_map="$(trim_whitespace "$node_map")"
+      if [[ -n "$node_map" ]]; then
+        ordinal_node_maps["$node_map_key"]="$node_map"
+      fi
+    fi
   done
 
   local restore_required=1
   cleanup_restore() {
     [[ "${restore_required:-0}" -ne 1 ]] && return 0
-    local i
+    local i ns sts replicas node_map_key node_map
+    local -a expected_nodes=()
     for i in "${!sts_list[@]}"; do
-      set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}" >/dev/null 2>&1 || true
+      ns="${ns_list[$i]}"
+      sts="${sts_list[$i]}"
+      replicas="${replicas_list[$i]}"
+      if [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+        node_map_key="${ns}/${sts}"
+        node_map="${ordinal_node_maps[$node_map_key]:-}"
+        expected_nodes=()
+        if [[ -n "$node_map" ]] \
+          && parse_ordinal_node_map "$node_map" expected_nodes \
+          && (( ${#expected_nodes[@]} >= replicas )) \
+          && restore_statefulset_with_expected_nodes "$ns" "$sts" "$replicas" expected_nodes >/dev/null 2>&1; then
+          continue
+        fi
+      fi
+      set_ton_replicas "$ns" "$sts" "$replicas" >/dev/null 2>&1 || true
     done
     if [[ "${operator_paused:-0}" -eq 1 ]]; then
       resume_operator_reconcile operator_deploy_names operator_deploy_replicas || true
@@ -3476,10 +3494,52 @@ run_backup_keys() {
     return 1
   fi
 
-  echo "Restoring TON StatefulSets replicas ..."
+  echo "Restoring TON StatefulSets replicas with sticky node placement ..."
+  local sticky_restore_count=0
+  local sticky_restore_failed=0
+  local -a expected_nodes=()
   for i in "${!sts_list[@]}"; do
-    set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}"
+    ns="${ns_list[$i]}"
+    sts="${sts_list[$i]}"
+    replicas="${replicas_list[$i]}"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=0
+    fi
+    if (( replicas == 0 )); then
+      set_ton_replicas "$ns" "$sts" 0
+      continue
+    fi
+
+    node_map_key="${ns}/${sts}"
+    node_map="${ordinal_node_maps[$node_map_key]:-}"
+    if [[ -z "$node_map" ]]; then
+      echo "Error: missing pre-backup ordinal->node map for ${ns}/${sts}; refusing non-sticky restore." >&2
+      ((sticky_restore_failed+=1))
+      continue
+    fi
+
+    expected_nodes=()
+    if ! parse_ordinal_node_map "$node_map" expected_nodes; then
+      echo "Error: invalid pre-backup ordinal->node map for ${ns}/${sts}; refusing non-sticky restore." >&2
+      ((sticky_restore_failed+=1))
+      continue
+    fi
+    if (( ${#expected_nodes[@]} < replicas )); then
+      echo "Error: incomplete pre-backup ordinal->node map for ${ns}/${sts} (have ${#expected_nodes[@]}, need ${replicas})." >&2
+      ((sticky_restore_failed+=1))
+      continue
+    fi
+    if restore_statefulset_with_expected_nodes "$ns" "$sts" "$replicas" expected_nodes; then
+      ((sticky_restore_count+=1))
+    else
+      echo "Error: failed sticky-node restore for ${ns}/${sts} after backup." >&2
+      ((sticky_restore_failed+=1))
+    fi
   done
+  echo "Backup node placement summary: restored=${sticky_restore_count}, failed=${sticky_restore_failed}"
+  if (( sticky_restore_failed > 0 )); then
+    return 1
+  fi
   if [[ "$operator_paused" -eq 1 ]]; then
     resume_operator_reconcile operator_deploy_names operator_deploy_replicas
     operator_paused=0
@@ -3517,18 +3577,30 @@ run_restore_keys() {
   local -a ns_list=()
   local -a sts_list=()
   local -a replicas_list=()
+  local -A ordinal_node_maps=()
   local -A helper_nodes_by_replica=()
   local -a operator_deploy_names=()
   local -a operator_deploy_replicas=()
-  local row ns sts replicas i ordinal
+  local row ns sts replicas i ordinal node_map_key node_map
   local operator_paused=0
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns sts replicas <<<"$row"
-    replicas="${replicas:-0}"
+    replicas="$(trim_whitespace "${replicas:-0}")"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=0
+    fi
     ns_list+=("$ns")
     sts_list+=("$sts")
     replicas_list+=("$replicas")
+    if (( replicas > 0 )); then
+      node_map_key="${ns}/${sts}"
+      node_map="$(build_sts_ordinal_node_map "$ns" "$sts" "$replicas" || true)"
+      node_map="$(trim_whitespace "$node_map")"
+      if [[ -n "$node_map" ]]; then
+        ordinal_node_maps["$node_map_key"]="$node_map"
+      fi
+    fi
   done
 
   for i in "${!sts_list[@]}"; do
@@ -3557,9 +3629,24 @@ run_restore_keys() {
   local restore_required=1
   cleanup_restore() {
     [[ "${restore_required:-0}" -ne 1 ]] && return 0
-    local i
+    local i ns sts replicas node_map_key node_map
+    local -a expected_nodes=()
     for i in "${!sts_list[@]}"; do
-      set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}" >/dev/null 2>&1 || true
+      ns="${ns_list[$i]}"
+      sts="${sts_list[$i]}"
+      replicas="${replicas_list[$i]}"
+      if [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+        node_map_key="${ns}/${sts}"
+        node_map="${ordinal_node_maps[$node_map_key]:-}"
+        expected_nodes=()
+        if [[ -n "$node_map" ]] \
+          && parse_ordinal_node_map "$node_map" expected_nodes \
+          && (( ${#expected_nodes[@]} >= replicas )) \
+          && restore_statefulset_with_expected_nodes "$ns" "$sts" "$replicas" expected_nodes >/dev/null 2>&1; then
+          continue
+        fi
+      fi
+      set_ton_replicas "$ns" "$sts" "$replicas" >/dev/null 2>&1 || true
     done
     if [[ "${operator_paused:-0}" -eq 1 ]]; then
       resume_operator_reconcile operator_deploy_names operator_deploy_replicas || true
@@ -3625,10 +3712,52 @@ run_restore_keys() {
     esac
   done
 
-  echo "Restoring TON StatefulSets replicas ..."
+  echo "Restoring TON StatefulSets replicas with sticky node placement ..."
+  local sticky_restore_count=0
+  local sticky_restore_failed=0
+  local -a expected_nodes=()
   for i in "${!sts_list[@]}"; do
-    set_ton_replicas "${ns_list[$i]}" "${sts_list[$i]}" "${replicas_list[$i]}"
+    ns="${ns_list[$i]}"
+    sts="${sts_list[$i]}"
+    replicas="${replicas_list[$i]}"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      replicas=0
+    fi
+    if (( replicas == 0 )); then
+      set_ton_replicas "$ns" "$sts" 0
+      continue
+    fi
+
+    node_map_key="${ns}/${sts}"
+    node_map="${ordinal_node_maps[$node_map_key]:-}"
+    if [[ -z "$node_map" ]]; then
+      echo "Error: missing pre-restore ordinal->node map for ${ns}/${sts}; refusing non-sticky restore." >&2
+      ((sticky_restore_failed+=1))
+      continue
+    fi
+
+    expected_nodes=()
+    if ! parse_ordinal_node_map "$node_map" expected_nodes; then
+      echo "Error: invalid pre-restore ordinal->node map for ${ns}/${sts}; refusing non-sticky restore." >&2
+      ((sticky_restore_failed+=1))
+      continue
+    fi
+    if (( ${#expected_nodes[@]} < replicas )); then
+      echo "Error: incomplete pre-restore ordinal->node map for ${ns}/${sts} (have ${#expected_nodes[@]}, need ${replicas})." >&2
+      ((sticky_restore_failed+=1))
+      continue
+    fi
+    if restore_statefulset_with_expected_nodes "$ns" "$sts" "$replicas" expected_nodes; then
+      ((sticky_restore_count+=1))
+    else
+      echo "Error: failed sticky-node restore for ${ns}/${sts} after restore-keys." >&2
+      ((sticky_restore_failed+=1))
+    fi
   done
+  echo "Restore node placement summary: restored=${sticky_restore_count}, failed=${sticky_restore_failed}"
+  if (( sticky_restore_failed > 0 )); then
+    return 1
+  fi
   if [[ "$operator_paused" -eq 1 ]]; then
     resume_operator_reconcile operator_deploy_names operator_deploy_replicas
     operator_paused=0

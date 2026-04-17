@@ -575,7 +575,14 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 			},
 		}
 
-		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, existingAffinity, labelsForTonNode(tonNode))
+		got, err := reconciler.desiredStickyNodeHostnames(
+			context.Background(),
+			tonNode,
+			existingAffinity,
+			labelsForTonNode(tonNode),
+			nil,
+			int(desiredReplicas(tonNode)),
+		)
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
@@ -637,12 +644,50 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
 		labels := labelsForTonNode(tonNode)
 
-		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, nil, labels)
+		got, err := reconciler.desiredStickyNodeHostnames(
+			context.Background(),
+			tonNode,
+			nil,
+			labels,
+			nil,
+			int(desiredReplicas(tonNode)),
+		)
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
 		if len(got) != 2 || got[0] != "devnet-09" || got[1] != "devnet-11" {
 			t.Fatalf("sticky hostnames = %#v, want [devnet-09 devnet-11]", got)
+		}
+	})
+
+	t.Run("prefers stored ordinal map before first launch", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
+		tonNode := &tonv1alpha1.TonNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+			Spec: tonv1alpha1.TonNodeSpec{
+				Replicas: ptr.To[int32](3),
+			},
+		}
+		ordinalNodeMap := map[int]string{
+			0: "devnet-09",
+			1: "devnet-11",
+			2: "devnet-15",
+		}
+
+		got, err := reconciler.desiredStickyNodeHostnames(
+			context.Background(),
+			tonNode,
+			nil,
+			labelsForTonNode(tonNode),
+			ordinalNodeMap,
+			int(desiredReplicas(tonNode)),
+		)
+		if err != nil {
+			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
+		}
+		if len(got) != 3 || got[0] != "devnet-09" || got[1] != "devnet-11" || got[2] != "devnet-15" {
+			t.Fatalf("sticky hostnames = %#v, want [devnet-09 devnet-11 devnet-15]", got)
 		}
 	})
 
@@ -702,7 +747,14 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 			Build()
 		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
 
-		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, nil, labels)
+		got, err := reconciler.desiredStickyNodeHostnames(
+			context.Background(),
+			tonNode,
+			nil,
+			labels,
+			nil,
+			int(desiredReplicas(tonNode)),
+		)
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
@@ -721,12 +773,54 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 			},
 		}
 
-		got, err := reconciler.desiredStickyNodeHostnames(context.Background(), tonNode, nil, labelsForTonNode(tonNode))
+		got, err := reconciler.desiredStickyNodeHostnames(
+			context.Background(),
+			tonNode,
+			nil,
+			labelsForTonNode(tonNode),
+			nil,
+			int(desiredReplicas(tonNode)),
+		)
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
 		if got != nil {
 			t.Fatalf("sticky hostnames = %#v, want nil", got)
+		}
+	})
+}
+
+func TestOrdinalNodeMapAnnotationHelpers(t *testing.T) {
+	t.Run("parses and formats stable ordinal map", func(t *testing.T) {
+		parsed, ok := parseOrdinalNodeMapAnnotation("0=devnet-02,1=devnet-01,2=devnet-03")
+		if !ok {
+			t.Fatalf("expected map to parse")
+		}
+		if parsed[0] != "devnet-02" || parsed[1] != "devnet-01" || parsed[2] != "devnet-03" {
+			t.Fatalf("unexpected parsed map: %#v", parsed)
+		}
+
+		formatted := formatOrdinalNodeMapAnnotation(parsed, 3)
+		if formatted != "0=devnet-02,1=devnet-01,2=devnet-03" {
+			t.Fatalf("formatted map = %q, want %q", formatted, "0=devnet-02,1=devnet-01,2=devnet-03")
+		}
+	})
+
+	t.Run("merge keeps stored ordinal assignments", func(t *testing.T) {
+		existing := map[int]string{
+			0: "devnet-02",
+			1: "devnet-01",
+			2: "devnet-03",
+		}
+		current := map[int]string{
+			0: "devnet-01",
+			1: "devnet-03",
+			2: "devnet-02",
+		}
+
+		merged := mergeOrdinalNodeMaps(existing, current, 3)
+		if merged[0] != "devnet-02" || merged[1] != "devnet-01" || merged[2] != "devnet-03" {
+			t.Fatalf("merged map drifted from stored assignments: %#v", merged)
 		}
 	})
 }
