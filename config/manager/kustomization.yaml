@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: ghcr.io/neodix42/ton-k8s-operator
-  newTag: 0.1.42
+  newTag: 0.1.43
