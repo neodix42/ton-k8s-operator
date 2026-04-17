@@ -50,6 +50,8 @@ PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
 PROMETHEUS_LOCAL_PORT_BASE="${PROMETHEUS_LOCAL_PORT_BASE:-9090}"
 PROMETHEUS_PORT_FORWARD_DIR="${PROMETHEUS_PORT_FORWARD_DIR:-${TMPDIR:-/tmp}/kubeton-prometheus-port-forward}"
 PROMETHEUS_PORT_FORWARD_WAIT_SECONDS="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS:-5}"
+PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS="${PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS:-20}"
+PROMETHEUS_PORT_FORWARD_ADDRESS="${PROMETHEUS_PORT_FORWARD_ADDRESS:-}"
 
 usage() {
   cat <<'EOF'
@@ -60,7 +62,8 @@ Commands:
   install              Install or upgrade operator only (Helm upgrade --install with operator-values.yaml).
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
   start                Start TON fleet.
-  prometheus           Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
+  prometheus start     Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
+  prometheus stop      Stop/drop kubeton-managed Prometheus resources and local background port-forward(s).
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
@@ -97,6 +100,8 @@ Environment overrides:
   PROMETHEUS_LOCAL_PORT_BASE (default: 9090)
   PROMETHEUS_PORT_FORWARD_DIR (default: ${TMPDIR:-/tmp}/kubeton-prometheus-port-forward)
   PROMETHEUS_PORT_FORWARD_WAIT_SECONDS (default: 5)
+  PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS (default: 20)
+  PROMETHEUS_PORT_FORWARD_ADDRESS (default: auto; bare-metal=0.0.0.0, k3d/cloud=127.0.0.1)
 EOF
 }
 
@@ -579,14 +584,169 @@ sanitize_file_name_fragment() {
   printf '%s' "$raw"
 }
 
+prometheus_port_forward_address() {
+  local configured
+  configured="$(trim_whitespace "${PROMETHEUS_PORT_FORWARD_ADDRESS:-}")"
+  if [[ -n "$configured" ]]; then
+    printf '%s' "$configured"
+    return 0
+  fi
+
+  if cluster_is_baremetal && ! cluster_is_k3d; then
+    printf '%s' "0.0.0.0"
+    return 0
+  fi
+
+  printf '%s' "127.0.0.1"
+}
+
+is_loopback_host() {
+  case "$(trim_whitespace "${1:-}")" in
+    "" ) return 1 ;;
+    localhost|127.0.0.1|::1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+address_list_exposes_non_loopback() {
+  local raw="${1:-}"
+  local token
+  local -a addr_tokens=()
+  IFS=',' read -r -a addr_tokens <<<"$raw"
+  for token in "${addr_tokens[@]}"; do
+    token="$(trim_whitespace "$token")"
+    [[ -z "$token" ]] && continue
+    if [[ "$token" == "0.0.0.0" || "$token" == "::" ]]; then
+      return 0
+    fi
+    if ! is_loopback_host "$token"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+address_list_allows_loopback() {
+  local raw="${1:-}"
+  local token
+  local -a addr_tokens=()
+  IFS=',' read -r -a addr_tokens <<<"$raw"
+  for token in "${addr_tokens[@]}"; do
+    token="$(trim_whitespace "$token")"
+    [[ -z "$token" ]] && continue
+    if [[ "$token" == "0.0.0.0" || "$token" == "::" ]]; then
+      return 0
+    fi
+    if is_loopback_host "$token"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+first_non_loopback_bind_address() {
+  local raw="${1:-}"
+  local token
+  local -a addr_tokens=()
+  IFS=',' read -r -a addr_tokens <<<"$raw"
+  for token in "${addr_tokens[@]}"; do
+    token="$(trim_whitespace "$token")"
+    [[ -z "$token" ]] && continue
+    if [[ "$token" == "0.0.0.0" || "$token" == "::" ]]; then
+      continue
+    fi
+    if ! is_loopback_host "$token"; then
+      printf '%s' "$token"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_primary_host_address() {
+  local candidate=""
+
+  if command -v hostname >/dev/null 2>&1; then
+    candidate="$(hostname -I 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9.]+$/) {print $i; exit}}' || true)"
+    candidate="$(trim_whitespace "$candidate")"
+    if [[ -n "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+
+    candidate="$(hostname -f 2>/dev/null || true)"
+    candidate="$(trim_whitespace "$candidate")"
+    if [[ -n "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+port_forward_process_matches() {
+  local pid="$1"
+  local ns="$2"
+  local service_name="$3"
+  local local_port="$4"
+  local remote_port="$5"
+  local bind_address="$6"
+  local cmdline
+
+  cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  [[ -z "$cmdline" ]] && return 1
+  [[ "$cmdline" == *"kubectl"* ]] || return 1
+  [[ "$cmdline" == *"port-forward"* ]] || return 1
+  [[ "$cmdline" == *"svc/${service_name}"* ]] || return 1
+  [[ "$cmdline" == *"${local_port}:${remote_port}"* ]] || return 1
+  if [[ -n "$bind_address" && "$cmdline" != *"--address"* ]]; then
+    return 1
+  fi
+  [[ "$cmdline" == *"-n ${ns}"* || "$cmdline" == *"--namespace ${ns}"* || "$cmdline" == *"--namespace=${ns}"* ]] || return 1
+  return 0
+}
+
+wait_prometheus_http_ready() {
+  local local_port="$1"
+  local verify_seconds="$2"
+  local deadline now
+
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
+    verify_seconds=20
+  fi
+  if (( verify_seconds <= 0 )); then
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  deadline=$(( $(date +%s) + verify_seconds ))
+  while :; do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/-/ready" >/dev/null 2>&1 \
+      || curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/targets" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 ensure_prometheus_port_forward() {
   local ns="$1"
   local service_name="$2"
   local local_port="$3"
   local remote_port="$4"
-  local quiet="${5:-false}"
+  local bind_address="${5:-127.0.0.1}"
+  local quiet="${6:-false}"
   local state_dir="${PROMETHEUS_PORT_FORWARD_DIR}"
   local wait_seconds="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS}"
+  local verify_seconds="${PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS}"
   local key pid_file log_file existing_pid pf_pid deadline now
 
   if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
@@ -594,6 +754,9 @@ ensure_prometheus_port_forward() {
   fi
   if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]]; then
     wait_seconds=5
+  fi
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
+    verify_seconds=20
   fi
 
   mkdir -p "$state_dir"
@@ -604,13 +767,18 @@ ensure_prometheus_port_forward() {
   if [[ -f "$pid_file" ]]; then
     existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" >/dev/null 2>&1; then
-      printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$existing_pid" "$log_file"
-      return 0
+      if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" "$bind_address"; then
+        if wait_prometheus_http_ready "$local_port" 2; then
+          printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$existing_pid" "$log_file"
+          return 0
+        fi
+      fi
+      kill "$existing_pid" >/dev/null 2>&1 || true
     fi
     rm -f "$pid_file" >/dev/null 2>&1 || true
   fi
 
-  nohup kubectl -n "$ns" port-forward "svc/${service_name}" "${local_port}:${remote_port}" >"$log_file" 2>&1 &
+  nohup kubectl -n "$ns" port-forward --address "$bind_address" "svc/${service_name}" "${local_port}:${remote_port}" >"$log_file" 2>&1 &
   pf_pid="$!"
   echo "$pf_pid" >"$pid_file"
 
@@ -625,13 +793,27 @@ ensure_prometheus_port_forward() {
       return 1
     fi
     if grep -q "Forwarding from" "$log_file" 2>/dev/null; then
+      if ! wait_prometheus_http_ready "$local_port" "$verify_seconds"; then
+        kill "$pf_pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file" >/dev/null 2>&1 || true
+        if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+          echo "Warning: port-forward for ${ns}/${service_name} started on localhost:${local_port}, but Prometheus HTTP endpoint is not ready." >&2
+          echo "Warning: see ${log_file}" >&2
+        fi
+        return 1
+      fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$pf_pid" "$log_file"
       return 0
     fi
     now="$(date +%s)"
     if (( now >= deadline )); then
-      printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$pf_pid" "$log_file"
-      return 0
+      kill "$pf_pid" >/dev/null 2>&1 || true
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+        echo "Warning: timed out waiting for port-forward readiness for ${ns}/${service_name} on localhost:${local_port}." >&2
+        echo "Warning: see ${log_file}" >&2
+      fi
+      return 1
     fi
     sleep 1
   done
@@ -4293,17 +4475,17 @@ run_status() {
   print_aligned_table_9col "server name" "pod name" "commit" "date" "wallet" "ADNL address" "sync" "cell db" "archive db" "${table_rows[@]}"
 }
 
-run_prometheus() {
+run_prometheus_start() {
   require_bin kubectl
   require_bin nohup
   if [[ $# -ne 0 ]]; then
-    echo "Error: usage: kubeton prometheus" >&2
+    echo "Error: usage: kubeton prometheus start" >&2
     exit 1
   fi
   local -a access_rows=()
   local -a forwarded_rows=()
   local row ns service_name deploy_name exporter_address forward_row log_file
-  local base_port local_port remote_port
+  local base_port local_port remote_port bind_address remote_access_host
   local i attempt quiet_attempt
 
   configure_prometheus_for_exporter_targets access_rows || true
@@ -4319,8 +4501,14 @@ run_prometheus() {
   if ! [[ "$base_port" =~ ^[0-9]+$ ]]; then
     base_port=9090
   fi
+  bind_address="$(prometheus_port_forward_address)"
+  bind_address="$(trim_whitespace "$bind_address")"
+  if [[ -z "$bind_address" ]]; then
+    bind_address="127.0.0.1"
+  fi
 
   echo "[metrics] Starting background local port-forward(s) ..."
+  echo "[metrics] Port-forward bind address: ${bind_address}"
   for i in "${!access_rows[@]}"; do
     row="${access_rows[$i]}"
     IFS=$'\t' read -r ns service_name deploy_name exporter_address <<<"$row"
@@ -4330,7 +4518,7 @@ run_prometheus() {
       if (( attempt == 24 )); then
         quiet_attempt="false"
       fi
-      if forward_row="$(ensure_prometheus_port_forward "$ns" "$service_name" "$((local_port + attempt))" "$remote_port" "$quiet_attempt")"; then
+      if forward_row="$(ensure_prometheus_port_forward "$ns" "$service_name" "$((local_port + attempt))" "$remote_port" "$bind_address" "$quiet_attempt")"; then
         forwarded_rows+=("$forward_row")
         break
       fi
@@ -4344,11 +4532,58 @@ run_prometheus() {
 
   for row in "${forwarded_rows[@]}"; do
     IFS=$'\t' read -r ns service_name local_port _pid log_file <<<"$row"
-    echo "[metrics] Background access: http://127.0.0.1:${local_port}/targets (service ${ns}/${service_name})"
+    if address_list_allows_loopback "$bind_address"; then
+      echo "[metrics] Background access: http://127.0.0.1:${local_port}/targets (service ${ns}/${service_name})"
+    fi
+    if address_list_exposes_non_loopback "$bind_address"; then
+      remote_access_host="$(first_non_loopback_bind_address "$bind_address" || true)"
+      remote_access_host="$(trim_whitespace "$remote_access_host")"
+      if [[ -z "$remote_access_host" ]]; then
+        remote_access_host="$(resolve_primary_host_address || true)"
+        remote_access_host="$(trim_whitespace "$remote_access_host")"
+      fi
+      if [[ -n "$remote_access_host" ]]; then
+        echo "[metrics] Remote access: http://${remote_access_host}:${local_port}/targets"
+      fi
+    fi
     echo "[metrics] Port-forward log: ${log_file}"
   done
 
   return 0
+}
+
+run_prometheus_stop() {
+  require_bin kubectl
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton prometheus stop" >&2
+    exit 1
+  fi
+
+  cleanup_prometheus_resources
+  echo "[metrics] kubeton-managed Prometheus resources and local port-forward(s) removed."
+}
+
+run_prometheus() {
+  local subcommand="${1:-}"
+  case "$subcommand" in
+    start)
+      shift
+      run_prometheus_start "$@"
+      ;;
+    stop)
+      shift
+      run_prometheus_stop "$@"
+      ;;
+    "")
+      echo "Error: usage: kubeton prometheus <start|stop>" >&2
+      exit 1
+      ;;
+    *)
+      echo "Error: unknown prometheus subcommand '$subcommand'." >&2
+      echo "Usage: kubeton prometheus <start|stop>" >&2
+      exit 1
+      ;;
+  esac
 }
 
 run_exec() {
