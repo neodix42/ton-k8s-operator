@@ -926,7 +926,6 @@ META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
 REQUEST_FILE="/tmp/key-backup.request"
 DONE_FILE="/tmp/key-backup.done"
 FAIL_FILE="/tmp/key-backup.failed"
-AUTO_DONE_FILE="${BUNDLE_DIR}/.bootstrap-auto-backup.done"
 
 need_bin() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -1040,23 +1039,6 @@ key_material_present() {
   return 1
 }
 
-bundle_present() {
-  [ -s "$BUNDLE_FILE" ] && [ -s "$META_FILE" ]
-}
-
-auto_backup_ready() {
-  [ -f "$MTC_DONE_FILE" ] || return 1
-  [ -s "$DB_CONFIG_FILE" ] || return 1
-  [ -d "$DB_KEYRING_DIR" ] || return 1
-  dir_has_payload "$DB_KEYRING_DIR" || return 1
-
-  [ -s "$KEYS_DIR/client" ] || return 1
-  [ -s "$KEYS_DIR/client.pub" ] || return 1
-  [ -s "$KEYS_DIR/server.pub" ] || return 1
-  [ -s "$KEYS_DIR/liteserver.pub" ] || return 1
-  [ "$(wc -c < "$KEYS_DIR/client")" -gt 128 ] || return 1
-}
-
 backup_sources_present() {
   key_material_present
 }
@@ -1122,33 +1104,12 @@ perform_backup() {
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
 echo "manual backup mode enabled"
-echo "automatic bootstrap backup mode enabled"
 
 while true; do
-  if [ -f "$AUTO_DONE_FILE" ] && ! bundle_present; then
-    rm -f "$AUTO_DONE_FILE"
-  fi
-
-  if [ ! -f "$AUTO_DONE_FILE" ]; then
-    if bundle_present; then
-      date -u +%Y-%m-%dT%H:%M:%SZ >"$AUTO_DONE_FILE"
-    elif auto_backup_ready; then
-      if perform_backup; then
-        date -u +%Y-%m-%dT%H:%M:%SZ >"$AUTO_DONE_FILE"
-        echo "automatic bootstrap backup completed"
-      else
-        echo "automatic bootstrap backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ); retrying" >&2
-      fi
-    else
-      echo "key material not ready yet; automatic bootstrap backup retrying"
-    fi
-  fi
-
   if [ -f "$REQUEST_FILE" ]; then
     rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
     if perform_backup; then
       date -u +%Y-%m-%dT%H:%M:%SZ >"$DONE_FILE"
-      date -u +%Y-%m-%dT%H:%M:%SZ >"$AUTO_DONE_FILE" || true
     else
       echo "backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$FAIL_FILE"
     fi
