@@ -68,6 +68,8 @@ GRAFANA_PORT_FORWARD_ADDRESS="${GRAFANA_PORT_FORWARD_ADDRESS:-}"
 GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER:-admin}"
 GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-}"
 GRAFANA_ADMIN_SECRET_NAME="${GRAFANA_ADMIN_SECRET_NAME:-kubeton-grafana-admin}"
+GRAFANA_DASHBOARD_UID="${GRAFANA_DASHBOARD_UID:-kubeton-ton-overview}"
+GRAFANA_DASHBOARD_TITLE="${GRAFANA_DASHBOARD_TITLE:-TON Exporter Overview}"
 
 usage() {
   cat <<'EOF'
@@ -80,7 +82,7 @@ Commands:
   start                Start TON fleet.
   prometheus start     Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
   prometheus stop      Stop/drop kubeton-managed Prometheus resources and local background port-forward(s).
-  grafana start        Create/update Grafana, provision kubeton Prometheus datasource(s), and start local background port-forward.
+  grafana start        Create/update Grafana, provision kubeton Prometheus datasource(s) and starter dashboard(s), and start local background port-forward.
   grafana stop         Stop/drop kubeton-managed Grafana resources and local background port-forward(s).
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
@@ -136,6 +138,8 @@ Environment overrides:
   GRAFANA_ADMIN_USER (default: admin)
   GRAFANA_ADMIN_PASSWORD (default: auto-generated and persisted in secret)
   GRAFANA_ADMIN_SECRET_NAME (default: kubeton-grafana-admin)
+  GRAFANA_DASHBOARD_UID (default: kubeton-ton-overview)
+  GRAFANA_DASHBOARD_TITLE (default: TON Exporter Overview)
 EOF
 }
 
@@ -170,6 +174,16 @@ yaml_quote() {
   local value="${1:-}"
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+json_quote() {
+  local value="${1:-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/}"
+  value="${value//$'\t'/\\t}"
   printf '"%s"' "$value"
 }
 
@@ -1505,32 +1519,187 @@ build_grafana_datasources_yaml() {
   done
 }
 
+grafana_datasource_name_for_service() {
+  local ns="$1"
+  local service_name="$2"
+
+  ns="$(trim_whitespace "$ns")"
+  service_name="$(trim_whitespace "$service_name")"
+  printf '%s' "kubeton-prometheus-${ns}-${service_name}"
+}
+
+first_grafana_datasource_name_from_prometheus_rows() {
+  local row ns service_name _deploy_name _exporter_address
+
+  for row in "$@"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns service_name _deploy_name _exporter_address <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    service_name="$(trim_whitespace "$service_name")"
+    if [[ -n "$ns" && -n "$service_name" ]]; then
+      grafana_datasource_name_for_service "$ns" "$service_name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+build_grafana_dashboards_provisioning_yaml() {
+  cat <<'EOF'
+apiVersion: 1
+providers:
+  - name: "kubeton"
+    orgId: 1
+    folder: "Kubeton"
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards/kubeton
+EOF
+}
+
+build_grafana_ton_overview_dashboard_json() {
+  local datasource_name="$1"
+  local dashboard_uid dashboard_title
+
+  dashboard_uid="$(trim_whitespace "${GRAFANA_DASHBOARD_UID:-kubeton-ton-overview}")"
+  dashboard_title="$(trim_whitespace "${GRAFANA_DASHBOARD_TITLE:-TON Exporter Overview}")"
+  [[ -z "$dashboard_uid" ]] && dashboard_uid="kubeton-ton-overview"
+  [[ -z "$dashboard_title" ]] && dashboard_title="TON Exporter Overview"
+
+  cat <<EOF
+{
+  "uid": $(json_quote "$dashboard_uid"),
+  "title": $(json_quote "$dashboard_title"),
+  "tags": ["kubeton", "ton", "exporter"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "editable": true,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Exporter Up",
+      "datasource": $(json_quote "$datasource_name"),
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=~\"ton-exporter-.*\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scrape Duration (s)",
+      "datasource": $(json_quote "$datasource_name"),
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "scrape_duration_seconds{job=~\"ton-exporter-.*\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Samples Scraped",
+      "datasource": $(json_quote "$datasource_name"),
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "scrape_samples_scraped{job=~\"ton-exporter-.*\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    }
+  ]
+}
+EOF
+}
+
 ensure_grafana_stack() {
   local ns="$1"
   local datasources_yaml="$2"
+  local dashboards_yaml="$3"
+  local dashboard_json="$4"
   local deploy_name="kubeton-grafana"
   local service_name="${deploy_name}"
-  local configmap_name="${deploy_name}-datasources"
+  local datasources_configmap_name="${deploy_name}-datasources"
+  local dashboards_provider_configmap_name="${deploy_name}-dashboards-provider"
+  local dashboards_configmap_name="${deploy_name}-dashboards"
   local admin_secret_name="${GRAFANA_ADMIN_SECRET_NAME}"
   local admin_row admin_user admin_password
+  local datasources_hash dashboards_hash
 
   ensure_namespace "$ns"
   admin_row="$(ensure_grafana_admin_secret "$ns" "$admin_secret_name")" || return 1
   IFS=$'\t' read -r admin_user admin_password <<<"$admin_row"
   admin_user="$(trim_whitespace "$admin_user")"
   admin_password="$(trim_whitespace "$admin_password")"
+  datasources_hash="$(printf '%s' "$datasources_yaml" | cksum | awk '{print $1}')"
+  dashboards_hash="$(printf '%s' "$dashboards_yaml"$'\n'"$dashboard_json" | cksum | awk '{print $1}')"
 
   cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: ${configmap_name}
+  name: ${datasources_configmap_name}
   labels:
     app.kubernetes.io/name: kubeton-grafana
     app.kubernetes.io/managed-by: kubeton
 data:
   datasources.yaml: |
 $(printf '%s\n' "$datasources_yaml" | sed 's/^/    /')
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${dashboards_provider_configmap_name}
+  labels:
+    app.kubernetes.io/name: kubeton-grafana
+    app.kubernetes.io/managed-by: kubeton
+data:
+  dashboards.yaml: |
+$(printf '%s\n' "$dashboards_yaml" | sed 's/^/    /')
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${dashboards_configmap_name}
+  labels:
+    app.kubernetes.io/name: kubeton-grafana
+    app.kubernetes.io/managed-by: kubeton
+data:
+  ton-overview.json: |
+$(printf '%s\n' "$dashboard_json" | sed 's/^/    /')
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1550,6 +1719,8 @@ spec:
         app.kubernetes.io/name: kubeton-grafana
       annotations:
         ton.ton.org/provisioned-by: kubeton
+        ton.ton.org/datasources-checksum: $(yaml_quote "$datasources_hash")
+        ton.ton.org/dashboards-checksum: $(yaml_quote "$dashboards_hash")
     spec:
       containers:
         - name: grafana
@@ -1588,6 +1759,12 @@ spec:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
               readOnly: true
+            - name: dashboards-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards/kubeton
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -1598,7 +1775,13 @@ spec:
       volumes:
         - name: datasources
           configMap:
-            name: ${configmap_name}
+            name: ${datasources_configmap_name}
+        - name: dashboards-provider
+          configMap:
+            name: ${dashboards_provider_configmap_name}
+        - name: dashboards
+          configMap:
+            name: ${dashboards_configmap_name}
 ---
 apiVersion: v1
 kind: Service
@@ -5453,6 +5636,9 @@ run_grafana_start() {
 
   local -a prometheus_rows=()
   local datasources_yaml=""
+  local dashboards_yaml=""
+  local dashboard_json=""
+  local default_datasource_name=""
   local grafana_row ns service_name deploy_name admin_user admin_password
   local -a forwarded_rows=()
   local forward_row log_file
@@ -5470,8 +5656,20 @@ run_grafana_start() {
     echo "Error: failed to build Grafana datasources provisioning config." >&2
     return 1
   fi
+  dashboards_yaml="$(build_grafana_dashboards_provisioning_yaml)"
+  default_datasource_name="$(first_grafana_datasource_name_from_prometheus_rows "${prometheus_rows[@]}" || true)"
+  default_datasource_name="$(trim_whitespace "$default_datasource_name")"
+  if [[ -z "$default_datasource_name" ]]; then
+    echo "Error: failed to resolve default Grafana datasource name." >&2
+    return 1
+  fi
+  dashboard_json="$(build_grafana_ton_overview_dashboard_json "$default_datasource_name")"
+  if [[ -z "$dashboard_json" || "$dashboard_json" != *"\"panels\""* ]]; then
+    echo "Error: failed to build Grafana dashboard JSON." >&2
+    return 1
+  fi
 
-  if ! grafana_row="$(ensure_grafana_stack "$GRAFANA_NAMESPACE" "$datasources_yaml")"; then
+  if ! grafana_row="$(ensure_grafana_stack "$GRAFANA_NAMESPACE" "$datasources_yaml" "$dashboards_yaml" "$dashboard_json")"; then
     echo "Error: failed to create/update Grafana stack." >&2
     return 1
   fi
@@ -5528,6 +5726,7 @@ run_grafana_start() {
   echo "[grafana] Admin user: ${admin_user}"
   echo "[grafana] Admin password: ${admin_password}"
   echo "[grafana] Datasource: kubeton-managed Prometheus service(s) provisioned."
+  echo "[grafana] Dashboard: starter TON overview provisioned (folder: Kubeton)."
   echo "[grafana] Port-forward log: ${log_file}"
   return 0
 }
@@ -5547,11 +5746,15 @@ run_grafana() {
   local subcommand="${1:-start}"
   case "$subcommand" in
     start)
-      shift
+      if [[ $# -gt 0 ]]; then
+        shift
+      fi
       run_grafana_start "$@"
       ;;
     stop)
-      shift
+      if [[ $# -gt 0 ]]; then
+        shift
+      fi
       run_grafana_stop "$@"
       ;;
     *)

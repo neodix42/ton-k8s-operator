@@ -313,12 +313,13 @@ Auto-remediation controls:
 
 ### kubeton grafana
 
-`kubeton grafana start` automates Grafana installation/start and wires datasource provisioning to kubeton-managed Prometheus service(s).
+`kubeton grafana start` automates Grafana installation/start and wires datasource/dashboard provisioning to kubeton-managed Prometheus service(s).
 
 Behavior:
 - ensures kubeton-managed Prometheus stack exists (from TonNode `CUSTOM_PARAMETERS --exporter-address`)
 - deploys `kubeton-grafana` (`grafana/grafana`)
 - provisions datasource file in Grafana (`/etc/grafana/provisioning/datasources/datasources.yaml`)
+- provisions dashboard provider + starter TON dashboard
 - starts background `kubectl port-forward` and prints local/remote URL
 - prints Grafana admin credentials (stored in secret, reused across restarts)
 
@@ -331,6 +332,8 @@ Main environment overrides:
 - `GRAFANA_ADMIN_USER`
 - `GRAFANA_ADMIN_PASSWORD`
 - `GRAFANA_ADMIN_SECRET_NAME`
+- `GRAFANA_DASHBOARD_UID`
+- `GRAFANA_DASHBOARD_TITLE`
 
 ### Cloud Install Options
 
