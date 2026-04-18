@@ -53,6 +53,8 @@ PROMETHEUS_PORT_FORWARD_WAIT_SECONDS="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS:-5}
 PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS="${PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS:-20}"
 PROMETHEUS_PORT_FORWARD_ADDRESS="${PROMETHEUS_PORT_FORWARD_ADDRESS:-}"
 PROMETHEUS_TARGET_MODE="${PROMETHEUS_TARGET_MODE:-auto}"
+PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX:-true}"
+PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS:-420}"
 
 usage() {
   cat <<'EOF'
@@ -104,6 +106,8 @@ Environment overrides:
   PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS (default: 20)
   PROMETHEUS_PORT_FORWARD_ADDRESS (default: auto; bare-metal=0.0.0.0, k3d/cloud=127.0.0.1)
   PROMETHEUS_TARGET_MODE (default: auto; auto=external-nodeip on bare-metal, else pod-ip)
+  PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX (default: true; in external-nodeip mode, auto-enable hostPorts and roll StatefulSet if exporter hostPort is missing)
+  PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS (default: 420)
 EOF
 }
 
@@ -434,6 +438,170 @@ host_port_list_contains() {
   return 1
 }
 
+tonnode_host_ports_enabled() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local value=""
+
+  value="$(kubectl -n "$ns" get tonnodes.ton.ton.org "$tonnode_name" -o jsonpath='{.spec.network.hostPortsEnabled}' 2>/dev/null || true)"
+  value="$(trim_whitespace "$value")"
+  if [[ -z "$value" || "$value" == "<no value>" ]]; then
+    return 0
+  fi
+  is_true "$value"
+}
+
+enable_tonnode_host_ports() {
+  local ns="$1"
+  local tonnode_name="$2"
+
+  if tonnode_host_ports_enabled "$ns" "$tonnode_name"; then
+    return 1
+  fi
+  if ! kubectl -n "$ns" patch tonnodes.ton.ton.org "$tonnode_name" --type=merge \
+    -p '{"spec":{"network":{"hostPortsEnabled":true}}}' >/dev/null 2>&1; then
+    echo "Warning: failed to patch ${ns}/${tonnode_name} spec.network.hostPortsEnabled=true." >&2
+    return 2
+  fi
+  echo "[metrics] Enabled spec.network.hostPortsEnabled=true for ${ns}/${tonnode_name} (required for external-nodeip targets)."
+  return 0
+}
+
+list_statefulset_ton_container_port_rows() {
+  local ns="$1"
+  local tonnode_name="$2"
+
+  kubectl -n "$ns" get statefulset "$tonnode_name" \
+    -o jsonpath='{range .spec.template.spec.containers[?(@.name=="ton-node")].ports[*]}{.containerPort}{"\t"}{.hostPort}{"\n"}{end}' 2>/dev/null \
+    | awk 'NF'
+}
+
+statefulset_exposes_exporter_hostport() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local exporter_port="$3"
+  local row container_port host_port
+  local -a port_rows=()
+
+  mapfile -t port_rows < <(list_statefulset_ton_container_port_rows "$ns" "$tonnode_name")
+  if [[ ${#port_rows[@]} -eq 0 || -z "${port_rows[0]}" ]]; then
+    return 1
+  fi
+
+  for row in "${port_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r container_port host_port <<<"$row"
+    container_port="$(trim_whitespace "$container_port")"
+    host_port="$(trim_whitespace "$host_port")"
+    if [[ "$container_port" == "$exporter_port" && "$host_port" == "$exporter_port" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+all_tonnode_running_pods_expose_hostport() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local exporter_port="$3"
+  local row pod_name _pod_ip _pod_node host_ports_csv
+  local -a pod_rows=()
+
+  mapfile -t pod_rows < <(list_tonnode_running_pod_rows "$ns" "$tonnode_name")
+  if [[ ${#pod_rows[@]} -eq 0 || -z "${pod_rows[0]}" ]]; then
+    return 1
+  fi
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r pod_name _pod_ip _pod_node host_ports_csv <<<"$row"
+    if ! host_port_list_contains "$host_ports_csv" "$exporter_port"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+wait_statefulset_exporter_hostport() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local exporter_port="$3"
+  local timeout_seconds="${4:-120}"
+  local deadline now
+
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]]; then
+    timeout_seconds=120
+  fi
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while :; do
+    if statefulset_exposes_exporter_hostport "$ns" "$tonnode_name" "$exporter_port"; then
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+ensure_external_nodeip_scrape_prereqs() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local exporter_port="$3"
+  local timeout_seconds="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS}"
+  local wait_seconds
+  local patch_status=1
+
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 30 )); then
+    timeout_seconds=420
+  fi
+  wait_seconds=$((timeout_seconds / 2))
+  if (( wait_seconds < 30 )); then
+    wait_seconds=30
+  fi
+
+  if all_tonnode_running_pods_expose_hostport "$ns" "$tonnode_name" "$exporter_port"; then
+    return 0
+  fi
+
+  if enable_tonnode_host_ports "$ns" "$tonnode_name"; then
+    patch_status=0
+  else
+    patch_status=$?
+  fi
+  if (( patch_status == 2 )); then
+    return 1
+  fi
+
+  if ! statefulset_exposes_exporter_hostport "$ns" "$tonnode_name" "$exporter_port"; then
+    echo "[metrics] Waiting for StatefulSet ${ns}/${tonnode_name} template to expose exporter hostPort ${exporter_port} ..."
+    if ! wait_statefulset_exporter_hostport "$ns" "$tonnode_name" "$exporter_port" "$wait_seconds"; then
+      echo "Warning: StatefulSet ${ns}/${tonnode_name} template still does not expose exporter hostPort ${exporter_port}. Ensure ton-k8s-operator controller is upgraded." >&2
+      return 1
+    fi
+  fi
+
+  if all_tonnode_running_pods_expose_hostport "$ns" "$tonnode_name" "$exporter_port"; then
+    return 0
+  fi
+
+  echo "[metrics] Rolling restart StatefulSet ${ns}/${tonnode_name} to apply exporter hostPort ${exporter_port} ..."
+  if ! kubectl -n "$ns" rollout restart "statefulset/${tonnode_name}" >/dev/null 2>&1; then
+    echo "Warning: failed to rollout restart StatefulSet ${ns}/${tonnode_name}." >&2
+    return 1
+  fi
+  if ! kubectl -n "$ns" rollout status "statefulset/${tonnode_name}" --timeout="${timeout_seconds}s" >/dev/null 2>&1; then
+    echo "Warning: timeout waiting for StatefulSet ${ns}/${tonnode_name} rollout to complete." >&2
+    return 1
+  fi
+
+  if ! all_tonnode_running_pods_expose_hostport "$ns" "$tonnode_name" "$exporter_port"; then
+    echo "Warning: TON pods for ${ns}/${tonnode_name} are still missing hostPort ${exporter_port} after rollout." >&2
+    return 1
+  fi
+  return 0
+}
+
 build_prometheus_static_targets_yaml() {
   local target
 
@@ -618,6 +786,10 @@ configure_prometheus_for_exporter_targets() {
     if ! [[ "$exporter_port" =~ ^[0-9]+$ ]]; then
       echo "Warning: ignoring invalid --exporter-address '${exporter_address}' from TonNode ${ns}/${tonnode_name}." >&2
       continue
+    fi
+
+    if [[ "$target_mode" == "external-nodeip" ]] && is_true "$PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX"; then
+      ensure_external_nodeip_scrape_prereqs "$ns" "$tonnode_name" "$exporter_port" || true
     fi
 
     mapfile -t pod_rows < <(list_tonnode_running_pod_rows "$ns" "$tonnode_name")

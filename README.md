@@ -288,6 +288,15 @@ PROMETHEUS_TARGET_MODE=external-nodeip ./kubeton prometheus start
 
 If prerequisites for `external-nodeip` are missing, `kubeton` prints warnings and skips Prometheus stack creation for that TonNode until fixed.
 
+In `external-nodeip` mode, `kubeton prometheus start` auto-remediates by default:
+- patches `spec.network.hostPortsEnabled=true` on the TonNode when it is disabled
+- waits for StatefulSet template to expose exporter `hostPort`
+- performs one StatefulSet rollout restart so running pods pick up the exporter `hostPort`
+
+Auto-remediation controls:
+- `PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX=true|false` (default `true`)
+- `PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS` (default `420`)
+
 `operator-values.yaml` keeps `tonNode.enabled=false` (operator only).
 `tonnode-values.yaml` enables TON nodes, enables key-management by default (`vault`, `ton-vault-creds`, `encrypted-sc`), and includes common `ton-docker-ctrl` env parameters.
 
