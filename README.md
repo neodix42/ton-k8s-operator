@@ -217,6 +217,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton bootstrap-baremetal
 ./kubeton start
 ./kubeton prometheus start
+./kubeton grafana start
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton verify
@@ -235,6 +236,13 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # remove kubeton-managed Prometheus resources and background port-forward(s)
 ./kubeton prometheus stop
+
+# create/update Grafana with kubeton-managed Prometheus datasource(s)
+# and start background local/public port-forward
+./kubeton grafana start
+
+# remove kubeton-managed Grafana resources and background port-forward(s)
+./kubeton grafana stop
 
 # scale by one replica
 ./kubeton add
@@ -302,6 +310,27 @@ Auto-remediation controls:
 
 `operator-values.yaml` is operator-focused (image/resources/metrics); `kubeton install` preserves existing TonNode chart values on upgrade (`--reuse-values`) and does not delete active TON resources.
 `tonnode-values.yaml` enables TON nodes, enables key-management by default (`vault`, `ton-vault-creds`, `encrypted-sc`), and includes common `ton-docker-ctrl` env parameters.
+
+### kubeton grafana
+
+`kubeton grafana start` automates Grafana installation/start and wires datasource provisioning to kubeton-managed Prometheus service(s).
+
+Behavior:
+- ensures kubeton-managed Prometheus stack exists (from TonNode `CUSTOM_PARAMETERS --exporter-address`)
+- deploys `kubeton-grafana` (`grafana/grafana`)
+- provisions datasource file in Grafana (`/etc/grafana/provisioning/datasources/datasources.yaml`)
+- starts background `kubectl port-forward` and prints local/remote URL
+- prints Grafana admin credentials (stored in secret, reused across restarts)
+
+Main environment overrides:
+- `GRAFANA_IMAGE`
+- `GRAFANA_NAMESPACE`
+- `GRAFANA_PORT`
+- `GRAFANA_LOCAL_PORT_BASE`
+- `GRAFANA_PORT_FORWARD_ADDRESS`
+- `GRAFANA_ADMIN_USER`
+- `GRAFANA_ADMIN_PASSWORD`
+- `GRAFANA_ADMIN_SECRET_NAME`
 
 ### Cloud Install Options
 

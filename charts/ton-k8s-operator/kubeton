@@ -57,6 +57,17 @@ PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX:-true}"
 PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS:-420}"
 PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX="${PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX:-true}"
 OP_CONTROLLER_DEPLOYMENT="${OP_CONTROLLER_DEPLOYMENT:-ton-k8s-operator-controller-manager}"
+GRAFANA_IMAGE="${GRAFANA_IMAGE:-grafana/grafana:11.2.2}"
+GRAFANA_NAMESPACE="${GRAFANA_NAMESPACE:-default}"
+GRAFANA_PORT="${GRAFANA_PORT:-3000}"
+GRAFANA_LOCAL_PORT_BASE="${GRAFANA_LOCAL_PORT_BASE:-3000}"
+GRAFANA_PORT_FORWARD_DIR="${GRAFANA_PORT_FORWARD_DIR:-${TMPDIR:-/tmp}/kubeton-grafana-port-forward}"
+GRAFANA_PORT_FORWARD_WAIT_SECONDS="${GRAFANA_PORT_FORWARD_WAIT_SECONDS:-5}"
+GRAFANA_PORT_FORWARD_VERIFY_SECONDS="${GRAFANA_PORT_FORWARD_VERIFY_SECONDS:-20}"
+GRAFANA_PORT_FORWARD_ADDRESS="${GRAFANA_PORT_FORWARD_ADDRESS:-}"
+GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER:-admin}"
+GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-}"
+GRAFANA_ADMIN_SECRET_NAME="${GRAFANA_ADMIN_SECRET_NAME:-kubeton-grafana-admin}"
 
 usage() {
   cat <<'EOF'
@@ -69,6 +80,8 @@ Commands:
   start                Start TON fleet.
   prometheus start     Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
   prometheus stop      Stop/drop kubeton-managed Prometheus resources and local background port-forward(s).
+  grafana start        Create/update Grafana, provision kubeton Prometheus datasource(s), and start local background port-forward.
+  grafana stop         Stop/drop kubeton-managed Grafana resources and local background port-forward(s).
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
@@ -112,6 +125,17 @@ Environment overrides:
   PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS (default: 420)
   PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX (default: true; in external-nodeip mode, auto-upgrade operator when exporter hostPort wiring is not available yet)
   OP_CONTROLLER_DEPLOYMENT (default: ton-k8s-operator-controller-manager)
+  GRAFANA_IMAGE (default: grafana/grafana:11.2.2)
+  GRAFANA_NAMESPACE (default: default)
+  GRAFANA_PORT (default: 3000)
+  GRAFANA_LOCAL_PORT_BASE (default: 3000)
+  GRAFANA_PORT_FORWARD_DIR (default: ${TMPDIR:-/tmp}/kubeton-grafana-port-forward)
+  GRAFANA_PORT_FORWARD_WAIT_SECONDS (default: 5)
+  GRAFANA_PORT_FORWARD_VERIFY_SECONDS (default: 20)
+  GRAFANA_PORT_FORWARD_ADDRESS (default: auto; bare-metal=0.0.0.0, k3d/cloud=127.0.0.1)
+  GRAFANA_ADMIN_USER (default: admin)
+  GRAFANA_ADMIN_PASSWORD (default: auto-generated and persisted in secret)
+  GRAFANA_ADMIN_SECRET_NAME (default: kubeton-grafana-admin)
 EOF
 }
 
@@ -1267,6 +1291,338 @@ ensure_prometheus_port_forward() {
     fi
     sleep 1
   done
+}
+
+grafana_port_forward_address() {
+  local configured
+  configured="$(trim_whitespace "${GRAFANA_PORT_FORWARD_ADDRESS:-}")"
+  if [[ -n "$configured" ]]; then
+    printf '%s' "$configured"
+    return 0
+  fi
+
+  if cluster_is_baremetal && ! cluster_is_k3d; then
+    printf '%s' "0.0.0.0"
+    return 0
+  fi
+
+  printf '%s' "127.0.0.1"
+}
+
+wait_grafana_http_ready() {
+  local local_port="$1"
+  local verify_seconds="$2"
+  local deadline now
+
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
+    verify_seconds=20
+  fi
+  if (( verify_seconds <= 0 )); then
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  deadline=$(( $(date +%s) + verify_seconds ))
+  while :; do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/api/health" >/dev/null 2>&1 \
+      || curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/login" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+ensure_grafana_port_forward() {
+  local ns="$1"
+  local service_name="$2"
+  local local_port="$3"
+  local remote_port="$4"
+  local bind_address="${5:-127.0.0.1}"
+  local quiet="${6:-false}"
+  local state_dir="${GRAFANA_PORT_FORWARD_DIR}"
+  local wait_seconds="${GRAFANA_PORT_FORWARD_WAIT_SECONDS}"
+  local verify_seconds="${GRAFANA_PORT_FORWARD_VERIFY_SECONDS}"
+  local key pid_file log_file existing_pid pf_pid deadline now
+
+  if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]]; then
+    wait_seconds=5
+  fi
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
+    verify_seconds=20
+  fi
+
+  mkdir -p "$state_dir"
+  key="$(sanitize_file_name_fragment "${ns}__${service_name}__${local_port}")"
+  pid_file="${state_dir}/${key}.pid"
+  log_file="${state_dir}/${key}.log"
+
+  if [[ -f "$pid_file" ]]; then
+    existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" >/dev/null 2>&1; then
+      if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" "$bind_address"; then
+        if wait_grafana_http_ready "$local_port" 2; then
+          printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$existing_pid" "$log_file"
+          return 0
+        fi
+      fi
+      kill "$existing_pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+  fi
+
+  nohup kubectl -n "$ns" port-forward --address "$bind_address" "svc/${service_name}" "${local_port}:${remote_port}" >"$log_file" 2>&1 &
+  pf_pid="$!"
+  echo "$pf_pid" >"$pid_file"
+
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    if ! kill -0 "$pf_pid" >/dev/null 2>&1; then
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+        echo "Warning: failed to start background port-forward for ${ns}/${service_name} on localhost:${local_port}." >&2
+        echo "Warning: see ${log_file}" >&2
+      fi
+      return 1
+    fi
+    if grep -q "Forwarding from" "$log_file" 2>/dev/null; then
+      if ! wait_grafana_http_ready "$local_port" "$verify_seconds"; then
+        kill "$pf_pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file" >/dev/null 2>&1 || true
+        if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+          echo "Warning: port-forward for ${ns}/${service_name} started on localhost:${local_port}, but Grafana HTTP endpoint is not ready." >&2
+          echo "Warning: see ${log_file}" >&2
+        fi
+        return 1
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$pf_pid" "$log_file"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      kill "$pf_pid" >/dev/null 2>&1 || true
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+        echo "Warning: timed out waiting for port-forward readiness for ${ns}/${service_name} on localhost:${local_port}." >&2
+        echo "Warning: see ${log_file}" >&2
+      fi
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+generate_random_password() {
+  LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+}
+
+ensure_grafana_admin_secret() {
+  local ns="$1"
+  local secret_name="$2"
+  local admin_user="${GRAFANA_ADMIN_USER:-admin}"
+  local admin_password="${GRAFANA_ADMIN_PASSWORD:-}"
+  local existing_user existing_password
+
+  admin_user="$(trim_whitespace "$admin_user")"
+  if [[ -z "$admin_user" ]]; then
+    admin_user="admin"
+  fi
+
+  if [[ -z "$admin_password" ]] && kubectl -n "$ns" get secret "$secret_name" >/dev/null 2>&1; then
+    existing_user="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.admin-user}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    existing_password="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    existing_user="$(trim_whitespace "$existing_user")"
+    existing_password="$(trim_whitespace "$existing_password")"
+    if [[ -n "$existing_user" && -n "$existing_password" ]]; then
+      printf '%s\t%s\n' "$existing_user" "$existing_password"
+      return 0
+    fi
+  fi
+
+  if [[ -z "$admin_password" ]]; then
+    admin_password="$(generate_random_password)"
+  fi
+  admin_password="$(trim_whitespace "$admin_password")"
+  if [[ -z "$admin_password" ]]; then
+    echo "Error: failed to resolve Grafana admin password." >&2
+    return 1
+  fi
+
+  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret_name}
+  labels:
+    app.kubernetes.io/name: kubeton-grafana
+    app.kubernetes.io/managed-by: kubeton
+type: Opaque
+stringData:
+  admin-user: $(yaml_quote "$admin_user")
+  admin-password: $(yaml_quote "$admin_password")
+EOF
+
+  printf '%s\t%s\n' "$admin_user" "$admin_password"
+}
+
+build_grafana_datasources_yaml() {
+  local row ns service_name deploy_name exporter_address
+  local index=0
+  local url datasource_name is_default
+
+  echo "apiVersion: 1"
+  echo "datasources:"
+  for row in "$@"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns service_name deploy_name exporter_address <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    service_name="$(trim_whitespace "$service_name")"
+    if [[ -z "$ns" || -z "$service_name" ]]; then
+      continue
+    fi
+    url="http://${service_name}.${ns}.svc:${PROMETHEUS_PORT}"
+    datasource_name="kubeton-prometheus-${ns}-${service_name}"
+    is_default="false"
+    if (( index == 0 )); then
+      is_default="true"
+    fi
+    echo "  - name: $(yaml_quote "$datasource_name")"
+    echo "    type: prometheus"
+    echo "    access: proxy"
+    echo "    url: $(yaml_quote "$url")"
+    echo "    isDefault: ${is_default}"
+    echo "    editable: false"
+    ((index+=1))
+  done
+}
+
+ensure_grafana_stack() {
+  local ns="$1"
+  local datasources_yaml="$2"
+  local deploy_name="kubeton-grafana"
+  local service_name="${deploy_name}"
+  local configmap_name="${deploy_name}-datasources"
+  local admin_secret_name="${GRAFANA_ADMIN_SECRET_NAME}"
+  local admin_row admin_user admin_password
+
+  ensure_namespace "$ns"
+  admin_row="$(ensure_grafana_admin_secret "$ns" "$admin_secret_name")" || return 1
+  IFS=$'\t' read -r admin_user admin_password <<<"$admin_row"
+  admin_user="$(trim_whitespace "$admin_user")"
+  admin_password="$(trim_whitespace "$admin_password")"
+
+  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${configmap_name}
+  labels:
+    app.kubernetes.io/name: kubeton-grafana
+    app.kubernetes.io/managed-by: kubeton
+data:
+  datasources.yaml: |
+$(printf '%s\n' "$datasources_yaml" | sed 's/^/    /')
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${deploy_name}
+  labels:
+    app.kubernetes.io/name: kubeton-grafana
+    app.kubernetes.io/managed-by: kubeton
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubeton-grafana
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubeton-grafana
+      annotations:
+        ton.ton.org/provisioned-by: kubeton
+    spec:
+      containers:
+        - name: grafana
+          image: ${GRAFANA_IMAGE}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ${admin_secret_name}
+                  key: admin-user
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ${admin_secret_name}
+                  key: admin-password
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+          ports:
+            - name: http
+              containerPort: ${GRAFANA_PORT}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+      volumes:
+        - name: datasources
+          configMap:
+            name: ${configmap_name}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_name}
+  labels:
+    app.kubernetes.io/name: kubeton-grafana
+    app.kubernetes.io/managed-by: kubeton
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubeton-grafana
+  ports:
+    - name: http
+      protocol: TCP
+      port: ${GRAFANA_PORT}
+      targetPort: http
+EOF
+
+  if ! kubectl -n "$ns" rollout status "deployment/${deploy_name}" --timeout=180s >/dev/null 2>&1; then
+    echo "Warning: Grafana deployment ${ns}/${deploy_name} is not Ready yet." >&2
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$deploy_name" "$admin_user" "$admin_password"
 }
 
 build_longhorn_selector_values_file() {
@@ -4820,6 +5176,26 @@ cleanup_prometheus_port_forwards() {
   rm -rf "$state_dir" >/dev/null 2>&1 || true
 }
 
+cleanup_grafana_port_forwards() {
+  local state_dir="${GRAFANA_PORT_FORWARD_DIR}"
+  local pid_file pid
+
+  if [[ ! -d "$state_dir" ]]; then
+    return 0
+  fi
+
+  for pid_file in "$state_dir"/*.pid; do
+    [[ -f "$pid_file" ]] || continue
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+  done
+
+  rm -rf "$state_dir" >/dev/null 2>&1 || true
+}
+
 cleanup_prometheus_resources() {
   local selector='app.kubernetes.io/name=kubeton-prometheus,app.kubernetes.io/managed-by=kubeton'
 
@@ -4827,6 +5203,15 @@ cleanup_prometheus_resources() {
   kubectl delete deployment,service,configmap -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete pod -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
   cleanup_prometheus_port_forwards
+}
+
+cleanup_grafana_resources() {
+  local selector='app.kubernetes.io/name=kubeton-grafana,app.kubernetes.io/managed-by=kubeton'
+
+  echo "[uninstall] Deleting kubeton-managed Grafana resources ..."
+  kubectl delete deployment,service,configmap,secret -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete pod -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
+  cleanup_grafana_port_forwards
 }
 
 run_uninstall_core() {
@@ -4846,8 +5231,9 @@ run_uninstall_core() {
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
   delete_ton_pvcs_for_statefulsets uninstall_sts_rows
 
-  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus resources and port-forwards ..."
+  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus/Grafana resources and port-forwards ..."
   cleanup_prometheus_resources
+  cleanup_grafana_resources
 
   echo "[uninstall] Step 5/9: uninstalling operator Helm release ${RELEASE_NAME} ..."
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
@@ -4872,14 +5258,14 @@ run_uninstall_core() {
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, delete kubeton-managed Prometheus resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, delete kubeton-managed Prometheus/Grafana resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
   run_uninstall_core
 }
 
 run_purge() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
+  confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus/Grafana cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
   run_uninstall_core
   echo "[purge] Deleting CRD tonnodes.ton.ton.org ..."
   kubectl delete crd tonnodes.ton.ton.org --ignore-not-found
@@ -5057,6 +5443,125 @@ run_prometheus() {
   esac
 }
 
+run_grafana_start() {
+  require_bin kubectl
+  require_bin nohup
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton grafana start" >&2
+    exit 1
+  fi
+
+  local -a prometheus_rows=()
+  local datasources_yaml=""
+  local grafana_row ns service_name deploy_name admin_user admin_password
+  local -a forwarded_rows=()
+  local forward_row log_file
+  local base_port local_port remote_port bind_address remote_access_host
+  local attempt quiet_attempt
+
+  configure_prometheus_for_exporter_targets prometheus_rows || true
+  if [[ ${#prometheus_rows[@]} -eq 0 ]]; then
+    echo "Error: no kubeton-managed Prometheus service found/configured. Run 'kubeton prometheus start' first." >&2
+    return 1
+  fi
+
+  datasources_yaml="$(build_grafana_datasources_yaml "${prometheus_rows[@]}")"
+  if [[ -z "$datasources_yaml" || "$datasources_yaml" != *"datasources:"* ]]; then
+    echo "Error: failed to build Grafana datasources provisioning config." >&2
+    return 1
+  fi
+
+  if ! grafana_row="$(ensure_grafana_stack "$GRAFANA_NAMESPACE" "$datasources_yaml")"; then
+    echo "Error: failed to create/update Grafana stack." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r ns service_name deploy_name admin_user admin_password <<<"$grafana_row"
+
+  remote_port="$GRAFANA_PORT"
+  if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    remote_port=3000
+  fi
+  base_port="$GRAFANA_LOCAL_PORT_BASE"
+  if ! [[ "$base_port" =~ ^[0-9]+$ ]]; then
+    base_port=3000
+  fi
+  bind_address="$(grafana_port_forward_address)"
+  bind_address="$(trim_whitespace "$bind_address")"
+  if [[ -z "$bind_address" ]]; then
+    bind_address="127.0.0.1"
+  fi
+
+  echo "[grafana] Starting background local port-forward(s) ..."
+  echo "[grafana] Port-forward bind address: ${bind_address}"
+  local_port="$base_port"
+  for ((attempt=0; attempt<25; attempt++)); do
+    quiet_attempt="true"
+    if (( attempt == 24 )); then
+      quiet_attempt="false"
+    fi
+    if forward_row="$(ensure_grafana_port_forward "$ns" "$service_name" "$((local_port + attempt))" "$remote_port" "$bind_address" "$quiet_attempt")"; then
+      forwarded_rows+=("$forward_row")
+      break
+    fi
+  done
+
+  if [[ ${#forwarded_rows[@]} -eq 0 ]]; then
+    echo "Error: failed to start background port-forward for Grafana service." >&2
+    return 1
+  fi
+
+  IFS=$'\t' read -r ns service_name local_port _pid log_file <<<"${forwarded_rows[0]}"
+  if address_list_allows_loopback "$bind_address"; then
+    echo "[grafana] Background access: http://127.0.0.1:${local_port}/ (service ${ns}/${service_name})"
+  fi
+  if address_list_exposes_non_loopback "$bind_address"; then
+    remote_access_host="$(first_non_loopback_bind_address "$bind_address" || true)"
+    remote_access_host="$(trim_whitespace "$remote_access_host")"
+    if [[ -z "$remote_access_host" ]]; then
+      remote_access_host="$(resolve_primary_host_address || true)"
+      remote_access_host="$(trim_whitespace "$remote_access_host")"
+    fi
+    if [[ -n "$remote_access_host" ]]; then
+      echo "[grafana] Remote access: http://${remote_access_host}:${local_port}/"
+    fi
+  fi
+  echo "[grafana] Admin user: ${admin_user}"
+  echo "[grafana] Admin password: ${admin_password}"
+  echo "[grafana] Datasource: kubeton-managed Prometheus service(s) provisioned."
+  echo "[grafana] Port-forward log: ${log_file}"
+  return 0
+}
+
+run_grafana_stop() {
+  require_bin kubectl
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton grafana stop" >&2
+    exit 1
+  fi
+
+  cleanup_grafana_resources
+  echo "[grafana] kubeton-managed Grafana resources and local port-forward(s) removed."
+}
+
+run_grafana() {
+  local subcommand="${1:-start}"
+  case "$subcommand" in
+    start)
+      shift
+      run_grafana_start "$@"
+      ;;
+    stop)
+      shift
+      run_grafana_stop "$@"
+      ;;
+    *)
+      echo "Error: unknown grafana subcommand '$subcommand'." >&2
+      echo "Usage: kubeton grafana [start|stop]" >&2
+      exit 1
+      ;;
+  esac
+}
+
 run_exec() {
   require_bin kubectl
   local cmd="${*:-}"
@@ -5105,6 +5610,9 @@ main() {
       ;;
     prometheus)
       run_prometheus "$@"
+      ;;
+    grafana)
+      run_grafana "$@"
       ;;
     add)
       run_add "$@"
