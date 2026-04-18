@@ -416,15 +416,20 @@ list_tonnode_running_pod_ips() {
 
 list_node_external_ip_rows() {
   kubectl get nodes \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.addresses[?(@.type=="ExternalIP")]}{.address}{" "}{end}{"\n"}{end}' 2>/dev/null \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.addresses[?(@.type=="ExternalIP")]}{.address}{" "}{end}{"\t"}{range .status.addresses[?(@.type=="InternalIP")]}{.address}{" "}{end}{"\n"}{end}' 2>/dev/null \
     | awk -F'\t' '
       NF {
         node=$1
-        ip=$2
-        sub(/^[[:space:]]+/, "", ip)
-        sub(/[[:space:]].*$/, "", ip)
-        if (node != "" && ip != "") {
-          print node "\t" ip
+        ext_ip=$2
+        int_ip=$3
+        sub(/^[[:space:]]+/, "", ext_ip)
+        sub(/[[:space:]].*$/, "", ext_ip)
+        sub(/^[[:space:]]+/, "", int_ip)
+        sub(/[[:space:]].*$/, "", int_ip)
+        if (node != "" && ext_ip != "") {
+          print node "\t" ext_ip "\tExternalIP"
+        } else if (node != "" && int_ip != "") {
+          print node "\t" int_ip "\tInternalIP"
         }
       }
     '
@@ -879,23 +884,29 @@ configure_prometheus_for_exporter_targets() {
   local scrape_targets_yaml=""
   local matched_count=0
   local i local_port
-  local pod_row pod_name pod_ip pod_node_name host_ports_csv node_external_ip
+  local pod_row pod_name pod_ip pod_node_name host_ports_csv node_external_ip node_ip_source
   local target_resolution_failed
   local -A node_external_ip_by_name=()
+  local -A node_ip_source_by_name=()
 
   if ! target_mode="$(normalize_prometheus_target_mode)"; then
     return 1
   fi
   if [[ "$target_mode" == "external-nodeip" ]]; then
-    target_mode_desc="node ExternalIP targets"
+    target_mode_desc="node ExternalIP/InternalIP targets"
     mapfile -t node_external_ip_rows < <(list_node_external_ip_rows)
     for row in "${node_external_ip_rows[@]}"; do
       [[ -z "$row" ]] && continue
-      IFS=$'\t' read -r pod_node_name node_external_ip <<<"$row"
+      IFS=$'\t' read -r pod_node_name node_external_ip node_ip_source <<<"$row"
       pod_node_name="$(trim_whitespace "$pod_node_name")"
       node_external_ip="$(trim_whitespace "$node_external_ip")"
+      node_ip_source="$(trim_whitespace "$node_ip_source")"
       [[ -z "$pod_node_name" || -z "$node_external_ip" ]] && continue
       node_external_ip_by_name["$pod_node_name"]="$node_external_ip"
+      node_ip_source_by_name["$pod_node_name"]="$node_ip_source"
+      if [[ "$node_ip_source" == "InternalIP" ]]; then
+        echo "[metrics] Node ${pod_node_name} has no ExternalIP; using InternalIP ${node_external_ip} for scrape targets."
+      fi
     done
   else
     target_mode_desc="TON pod IP targets"
@@ -954,11 +965,13 @@ configure_prometheus_for_exporter_targets() {
           continue
         fi
         node_external_ip="$(trim_whitespace "${node_external_ip_by_name[$pod_node_name]:-}")"
+        node_ip_source="$(trim_whitespace "${node_ip_source_by_name[$pod_node_name]:-}")"
         if [[ -z "$node_external_ip" ]]; then
-          echo "Warning: node ${pod_node_name} has no ExternalIP; cannot use PROMETHEUS_TARGET_MODE=external-nodeip for pod ${ns}/${pod_name}." >&2
+          echo "Warning: node ${pod_node_name} has neither ExternalIP nor InternalIP; cannot use PROMETHEUS_TARGET_MODE=external-nodeip for pod ${ns}/${pod_name}." >&2
           target_resolution_failed=1
           continue
         fi
+        [[ -z "$node_ip_source" ]] && node_ip_source="ExternalIP"
         scrape_targets+=("${node_external_ip}:${exporter_port}")
       done
       if (( target_resolution_failed != 0 )); then

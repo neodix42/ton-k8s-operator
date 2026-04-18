@@ -268,12 +268,13 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
   - k3d/cloud: uses `pod-ip`
 - `pod-ip`: Prometheus targets pod addresses (`<podIP>:<port>`). This is cluster-internal and does not require node-level exporter exposure.
 - `external-nodeip`: Prometheus targets node external addresses (`<nodeExternalIP>:<port>`). Use this when you want exporter endpoints reachable via server IP.
+  - when `ExternalIP` is absent on a node, `kubeton` falls back to that node `InternalIP`.
 
 `external-nodeip` prerequisites:
 - TON pods are `Running`
 - exporter port from `--exporter-address` is valid
 - TON pod template exposes matching `hostPort` (requires `hostPortsEnabled=true`)
-- worker nodes have `ExternalIP`
+- worker nodes have `ExternalIP` or `InternalIP`
 - firewall/security-group allows inbound traffic to exporter port (for example `9777/tcp`)
 
 Examples:
