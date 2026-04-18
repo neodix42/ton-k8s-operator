@@ -300,30 +300,34 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 			t.Fatalf("unexpected %s container port for invalid exporter address", exporterContainerPortName)
 		}
 	})
+}
 
-	t.Run("adds sticky hostname node affinity", func(t *testing.T) {
-		tonNode := &tonv1alpha1.TonNode{}
-		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, []string{testHostName0, testHostName3})
+func TestDesiredPodTemplateStickyNodeAffinity(t *testing.T) {
+	reconciler := &TonNodeReconciler{}
+	labels := map[string]string{"app.kubernetes.io/instance": "tonnode"}
+	publicIP := corev1.EnvVar{Name: "PUBLIC_IP", Value: "95.217.73.161"}
+	tonNode := &tonv1alpha1.TonNode{}
 
-		affinity := tpl.Spec.Affinity
-		if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
-			t.Fatalf("expected required node affinity for sticky hostnames")
-		}
-		terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
-		if len(terms) != 1 || len(terms[0].MatchExpressions) != 1 {
-			t.Fatalf("unexpected node affinity terms: %#v", terms)
-		}
-		req := terms[0].MatchExpressions[0]
-		if req.Key != "kubernetes.io/hostname" {
-			t.Fatalf("node affinity key = %q, want kubernetes.io/hostname", req.Key)
-		}
-		if req.Operator != corev1.NodeSelectorOpIn {
-			t.Fatalf("node affinity operator = %q, want In", req.Operator)
-		}
-		if len(req.Values) != 2 || req.Values[0] != testHostName0 || req.Values[1] != testHostName3 {
-			t.Fatalf("node affinity values = %#v, want [%s %s]", req.Values, testHostName0, testHostName3)
-		}
-	})
+	tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, []string{testHostName0, testHostName3})
+
+	affinity := tpl.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		t.Fatalf("expected required node affinity for sticky hostnames")
+	}
+	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) != 1 || len(terms[0].MatchExpressions) != 1 {
+		t.Fatalf("unexpected node affinity terms: %#v", terms)
+	}
+	req := terms[0].MatchExpressions[0]
+	if req.Key != "kubernetes.io/hostname" {
+		t.Fatalf("node affinity key = %q, want kubernetes.io/hostname", req.Key)
+	}
+	if req.Operator != corev1.NodeSelectorOpIn {
+		t.Fatalf("node affinity operator = %q, want In", req.Operator)
+	}
+	if len(req.Values) != 2 || req.Values[0] != testHostName0 || req.Values[1] != testHostName3 {
+		t.Fatalf("node affinity values = %#v, want [%s %s]", req.Values, testHostName0, testHostName3)
+	}
 }
 
 func TestDesiredResources(t *testing.T) {
