@@ -240,6 +240,67 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 		}
 	})
 
+	t.Run("exposes exporter hostPort from custom parameters", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			Spec: tonv1alpha1.TonNodeSpec{
+				Env: []corev1.EnvVar{
+					{
+						Name:  customParametersEnvName,
+						Value: "--exporter-address 0.0.0.0:9777",
+					},
+				},
+			},
+		}
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
+		ports := tpl.Spec.Containers[0].Ports
+
+		exporter := containerPortByName(t, ports, exporterContainerPortName)
+		if exporter.ContainerPort != 9777 || exporter.HostPort != 9777 {
+			t.Fatalf("exporter ports = container:%d host:%d, want 9777/9777", exporter.ContainerPort, exporter.HostPort)
+		}
+	})
+
+	t.Run("keeps exporter hostPort disabled when host ports are disabled", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			Spec: tonv1alpha1.TonNodeSpec{
+				Network: tonv1alpha1.TonNodeNetworkSpec{
+					HostPortsEnabled: ptr.To(false),
+				},
+				Env: []corev1.EnvVar{
+					{
+						Name:  customParametersEnvName,
+						Value: "--exporter-address=0.0.0.0:9777",
+					},
+				},
+			},
+		}
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
+		ports := tpl.Spec.Containers[0].Ports
+
+		exporter := containerPortByName(t, ports, exporterContainerPortName)
+		if exporter.ContainerPort != 9777 || exporter.HostPort != 0 {
+			t.Fatalf("exporter ports = container:%d host:%d, want 9777/0", exporter.ContainerPort, exporter.HostPort)
+		}
+	})
+
+	t.Run("ignores invalid exporter address", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			Spec: tonv1alpha1.TonNodeSpec{
+				Env: []corev1.EnvVar{
+					{
+						Name:  customParametersEnvName,
+						Value: "--exporter-address=not-a-port",
+					},
+				},
+			},
+		}
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
+		ports := tpl.Spec.Containers[0].Ports
+		if hasContainerPortNamed(ports, exporterContainerPortName) {
+			t.Fatalf("unexpected %s container port for invalid exporter address", exporterContainerPortName)
+		}
+	})
+
 	t.Run("adds sticky hostname node affinity", func(t *testing.T) {
 		tonNode := &tonv1alpha1.TonNode{}
 		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, []string{testHostName0, testHostName3})
@@ -887,6 +948,15 @@ func containerPortByName(t *testing.T, ports []corev1.ContainerPort, name string
 	}
 	t.Fatalf("port %q not found", name)
 	return corev1.ContainerPort{}
+}
+
+func hasContainerPortNamed(ports []corev1.ContainerPort, name string) bool {
+	for _, port := range ports {
+		if port.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func assertQuantityEqual(t *testing.T, actual resource.Quantity, expected string, field string) {

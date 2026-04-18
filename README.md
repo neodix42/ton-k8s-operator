@@ -216,7 +216,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton install
 ./kubeton bootstrap-baremetal
 ./kubeton start
-./kubeton prometheus
+./kubeton prometheus start
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton verify
@@ -231,7 +231,10 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # create/update Prometheus scrapers from TonNode CUSTOM_PARAMETERS --exporter-address
 # and start background local port-forward(s)
-./kubeton prometheus
+./kubeton prometheus start
+
+# remove kubeton-managed Prometheus resources and background port-forward(s)
+./kubeton prometheus stop
 
 # scale by one replica
 ./kubeton add
@@ -255,6 +258,35 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # kept separate from uninstall because CRD deletion is cluster-scoped
 ./kubeton purge
 ```
+
+### PROMETHEUS_TARGET_MODE
+
+`PROMETHEUS_TARGET_MODE` controls how `kubeton prometheus start` builds scrape targets from TonNode `CUSTOM_PARAMETERS` (`--exporter-address`).
+
+- `auto` (default):
+  - bare-metal (non-k3d): uses `external-nodeip`
+  - k3d/cloud: uses `pod-ip`
+- `pod-ip`: Prometheus targets pod addresses (`<podIP>:<port>`). This is cluster-internal and does not require node-level exporter exposure.
+- `external-nodeip`: Prometheus targets node external addresses (`<nodeExternalIP>:<port>`). Use this when you want exporter endpoints reachable via server IP.
+
+`external-nodeip` prerequisites:
+- TON pods are `Running`
+- exporter port from `--exporter-address` is valid
+- TON pod template exposes matching `hostPort` (requires `hostPortsEnabled=true`)
+- worker nodes have `ExternalIP`
+- firewall/security-group allows inbound traffic to exporter port (for example `9777/tcp`)
+
+Examples:
+
+```bash
+# force cluster-internal pod IP targets
+PROMETHEUS_TARGET_MODE=pod-ip ./kubeton prometheus start
+
+# force server/node external IP targets
+PROMETHEUS_TARGET_MODE=external-nodeip ./kubeton prometheus start
+```
+
+If prerequisites for `external-nodeip` are missing, `kubeton` prints warnings and skips Prometheus stack creation for that TonNode until fixed.
 
 `operator-values.yaml` keeps `tonNode.enabled=false` (operator only).
 `tonnode-values.yaml` enables TON nodes, enables key-management by default (`vault`, `ton-vault-creds`, `encrypted-sc`), and includes common `ton-docker-ctrl` env parameters.

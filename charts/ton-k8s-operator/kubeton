@@ -52,6 +52,7 @@ PROMETHEUS_PORT_FORWARD_DIR="${PROMETHEUS_PORT_FORWARD_DIR:-${TMPDIR:-/tmp}/kube
 PROMETHEUS_PORT_FORWARD_WAIT_SECONDS="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS:-5}"
 PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS="${PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS:-20}"
 PROMETHEUS_PORT_FORWARD_ADDRESS="${PROMETHEUS_PORT_FORWARD_ADDRESS:-}"
+PROMETHEUS_TARGET_MODE="${PROMETHEUS_TARGET_MODE:-auto}"
 
 usage() {
   cat <<'EOF'
@@ -102,6 +103,7 @@ Environment overrides:
   PROMETHEUS_PORT_FORWARD_WAIT_SECONDS (default: 5)
   PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS (default: 20)
   PROMETHEUS_PORT_FORWARD_ADDRESS (default: auto; bare-metal=0.0.0.0, k3d/cloud=127.0.0.1)
+  PROMETHEUS_TARGET_MODE (default: auto; auto=external-nodeip on bare-metal, else pod-ip)
 EOF
 }
 
@@ -352,6 +354,42 @@ extract_exporter_port() {
   fi
 }
 
+normalize_prometheus_target_mode() {
+  local raw mode
+  raw="$(trim_whitespace "${PROMETHEUS_TARGET_MODE:-}")"
+  mode="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ -z "$mode" || "$mode" == "auto" ]]; then
+    if cluster_is_baremetal && ! cluster_is_k3d; then
+      printf '%s' "external-nodeip"
+    else
+      printf '%s' "pod-ip"
+    fi
+    return 0
+  fi
+
+  case "$mode" in
+    pod-ip|external-nodeip)
+      printf '%s' "$mode"
+      return 0
+      ;;
+    *)
+      echo "Error: invalid PROMETHEUS_TARGET_MODE='${raw}'. Use one of: auto, pod-ip, external-nodeip." >&2
+      return 1
+      ;;
+  esac
+}
+
+list_tonnode_running_pod_rows() {
+  local ns="$1"
+  local tonnode_name="$2"
+
+  kubectl -n "$ns" get pods \
+    -l "app.kubernetes.io/name=ton-node,app.kubernetes.io/instance=${tonnode_name}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\t"}{.status.podIP}{"\t"}{.spec.nodeName}{"\t"}{range .spec.containers[*]}{range .ports[*]}{.hostPort}{","}{end}{end}{"\n"}{end}' 2>/dev/null \
+    | awk 'NF'
+}
+
 list_tonnode_running_pod_ips() {
   local ns="$1"
   local tonnode_name="$2"
@@ -361,6 +399,39 @@ list_tonnode_running_pod_ips() {
     -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.status.podIP}{"\n"}{end}' 2>/dev/null \
     | awk 'NF' \
     | sort -u
+}
+
+list_node_external_ip_rows() {
+  kubectl get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.addresses[?(@.type=="ExternalIP")]}{.address}{" "}{end}{"\n"}{end}' 2>/dev/null \
+    | awk -F'\t' '
+      NF {
+        node=$1
+        ip=$2
+        sub(/^[[:space:]]+/, "", ip)
+        sub(/[[:space:]].*$/, "", ip)
+        if (node != "" && ip != "") {
+          print node "\t" ip
+        }
+      }
+    '
+}
+
+host_port_list_contains() {
+  local host_ports_csv="$1"
+  local expected_port="$2"
+  local token
+  local -a host_ports=()
+
+  IFS=',' read -r -a host_ports <<<"$host_ports_csv"
+  for token in "${host_ports[@]}"; do
+    token="$(trim_whitespace "$token")"
+    [[ -z "$token" ]] && continue
+    if [[ "$token" == "$expected_port" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 build_prometheus_static_targets_yaml() {
@@ -495,11 +566,35 @@ configure_prometheus_for_exporter_targets() {
   local -a custom_rows=()
   local -a configured_rows=()
   local row ns tonnode_name custom_parameters exporter_address exporter_port access_row service_name deploy_name
+  local target_mode target_mode_desc
   local -a pod_ips=()
+  local -a pod_rows=()
+  local -a node_external_ip_rows=()
   local -a scrape_targets=()
   local scrape_targets_yaml=""
   local matched_count=0
   local i local_port
+  local pod_row pod_name pod_ip pod_node_name host_ports_csv node_external_ip
+  local target_resolution_failed
+  local -A node_external_ip_by_name=()
+
+  if ! target_mode="$(normalize_prometheus_target_mode)"; then
+    return 1
+  fi
+  if [[ "$target_mode" == "external-nodeip" ]]; then
+    target_mode_desc="node ExternalIP targets"
+    mapfile -t node_external_ip_rows < <(list_node_external_ip_rows)
+    for row in "${node_external_ip_rows[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r pod_node_name node_external_ip <<<"$row"
+      pod_node_name="$(trim_whitespace "$pod_node_name")"
+      node_external_ip="$(trim_whitespace "$node_external_ip")"
+      [[ -z "$pod_node_name" || -z "$node_external_ip" ]] && continue
+      node_external_ip_by_name["$pod_node_name"]="$node_external_ip"
+    done
+  else
+    target_mode_desc="TON pod IP targets"
+  fi
 
   mapfile -t custom_rows < <(resolve_tonnode_custom_parameters_rows 2>/dev/null || true)
 
@@ -525,16 +620,49 @@ configure_prometheus_for_exporter_targets() {
       continue
     fi
 
-    mapfile -t pod_ips < <(list_tonnode_running_pod_ips "$ns" "$tonnode_name")
-    if [[ ${#pod_ips[@]} -eq 0 || -z "${pod_ips[0]}" ]]; then
+    mapfile -t pod_rows < <(list_tonnode_running_pod_rows "$ns" "$tonnode_name")
+    if [[ ${#pod_rows[@]} -eq 0 || -z "${pod_rows[0]}" ]]; then
       echo "Warning: no Running TON pods found for ${ns}/${tonnode_name}; Prometheus stack will not be created yet." >&2
       continue
     fi
 
     scrape_targets=()
-    for i in "${!pod_ips[@]}"; do
-      scrape_targets+=("${pod_ips[$i]}:${exporter_port}")
-    done
+    if [[ "$target_mode" == "external-nodeip" ]]; then
+      target_resolution_failed=0
+      for pod_row in "${pod_rows[@]}"; do
+        [[ -z "$pod_row" ]] && continue
+        IFS=$'\t' read -r pod_name pod_ip pod_node_name host_ports_csv <<<"$pod_row"
+        pod_name="$(trim_whitespace "$pod_name")"
+        pod_node_name="$(trim_whitespace "$pod_node_name")"
+        if [[ -z "$pod_node_name" ]]; then
+          echo "Warning: pod ${ns}/${pod_name} has no assigned node; cannot resolve node ExternalIP target." >&2
+          target_resolution_failed=1
+          continue
+        fi
+        if ! host_port_list_contains "$host_ports_csv" "$exporter_port"; then
+          echo "Warning: pod ${ns}/${pod_name} does not expose hostPort ${exporter_port}; cannot use PROMETHEUS_TARGET_MODE=external-nodeip." >&2
+          target_resolution_failed=1
+          continue
+        fi
+        node_external_ip="$(trim_whitespace "${node_external_ip_by_name[$pod_node_name]:-}")"
+        if [[ -z "$node_external_ip" ]]; then
+          echo "Warning: node ${pod_node_name} has no ExternalIP; cannot use PROMETHEUS_TARGET_MODE=external-nodeip for pod ${ns}/${pod_name}." >&2
+          target_resolution_failed=1
+          continue
+        fi
+        scrape_targets+=("${node_external_ip}:${exporter_port}")
+      done
+      if (( target_resolution_failed != 0 )); then
+        echo "Warning: failed to resolve external-nodeip scrape targets for ${ns}/${tonnode_name}; fix warnings above and retry." >&2
+        continue
+      fi
+    else
+      mapfile -t pod_ips < <(list_tonnode_running_pod_ips "$ns" "$tonnode_name")
+      for i in "${!pod_ips[@]}"; do
+        scrape_targets+=("${pod_ips[$i]}:${exporter_port}")
+      done
+    fi
+    mapfile -t scrape_targets < <(printf '%s\n' "${scrape_targets[@]}" | awk 'NF' | sort -u)
     scrape_targets_yaml="$(build_prometheus_static_targets_yaml "${scrape_targets[@]}")"
     if [[ -z "$scrape_targets_yaml" ]]; then
       echo "Warning: failed to resolve scrape targets for ${ns}/${tonnode_name}." >&2
@@ -562,7 +690,7 @@ configure_prometheus_for_exporter_targets() {
       if [[ "$PROMETHEUS_LOCAL_PORT_BASE" =~ ^[0-9]+$ ]]; then
         local_port="$((PROMETHEUS_LOCAL_PORT_BASE + i))"
       fi
-      echo "[metrics] ${ns}/${deploy_name} configured from --exporter-address ${exporter_address} using TON pod IP targets."
+      echo "[metrics] ${ns}/${deploy_name} configured from --exporter-address ${exporter_address} using ${target_mode_desc}."
     done
     return 0
   fi

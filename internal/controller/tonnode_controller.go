@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,6 +90,14 @@ const (
 	stickyRemapPodGoneTimeout   = 10 * time.Minute
 	stickyRemapPodAssignTimeout = 15 * time.Minute
 	stickyRemapPollInterval     = 2 * time.Second
+
+	customParametersEnvName   = "CUSTOM_PARAMETERS"
+	exporterContainerPortName = "exporter-tcp"
+)
+
+var (
+	exporterAddressEqualsPattern = regexp.MustCompile(`(^|\s)--exporter-address=([^\s]+)`)
+	exporterAddressSpacedPattern = regexp.MustCompile(`(^|\s)--exporter-address\s+([^\s]+)`)
 )
 
 // TonNodeReconciler reconciles a TonNode object
@@ -578,6 +587,9 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 			ContainerPort: desiredConsolePort(tonNode),
 			Protocol:      corev1.ProtocolTCP,
 		},
+	}
+	if exporterPort, ok := desiredExporterPortFromEnv(env); ok {
+		containerPorts = appendExporterContainerPort(containerPorts, exporterPort)
 	}
 	if hostPortsEnabled(tonNode) {
 		for i := range containerPorts {
@@ -2088,6 +2100,93 @@ func mergeEnvVars(base []corev1.EnvVar, extra []corev1.EnvVar) []corev1.EnvVar {
 		merged = append(merged, item)
 	}
 	return merged
+}
+
+func envVarValueByName(envVars []corev1.EnvVar, name string) string {
+	for _, item := range envVars {
+		if item.Name != name {
+			continue
+		}
+		return strings.TrimSpace(item.Value)
+	}
+	return ""
+}
+
+func desiredExporterPortFromEnv(envVars []corev1.EnvVar) (int32, bool) {
+	customParameters := envVarValueByName(envVars, customParametersEnvName)
+	if customParameters == "" {
+		return 0, false
+	}
+	exporterAddress := extractExporterAddressFromCustomParameters(customParameters)
+	if exporterAddress == "" {
+		return 0, false
+	}
+	return extractExporterPort(exporterAddress)
+}
+
+func appendExporterContainerPort(containerPorts []corev1.ContainerPort, exporterPort int32) []corev1.ContainerPort {
+	for _, containerPort := range containerPorts {
+		if containerPort.Protocol == corev1.ProtocolTCP && containerPort.ContainerPort == exporterPort {
+			return containerPorts
+		}
+	}
+
+	return append(containerPorts, corev1.ContainerPort{
+		Name:          exporterContainerPortName,
+		ContainerPort: exporterPort,
+		Protocol:      corev1.ProtocolTCP,
+	})
+}
+
+func extractExporterAddressFromCustomParameters(customParameters string) string {
+	customParameters = strings.TrimSpace(customParameters)
+	if customParameters == "" {
+		return ""
+	}
+
+	matches := exporterAddressEqualsPattern.FindStringSubmatch(customParameters)
+	if len(matches) >= 3 {
+		return trimWrappedQuotes(strings.TrimSpace(matches[2]))
+	}
+	matches = exporterAddressSpacedPattern.FindStringSubmatch(customParameters)
+	if len(matches) >= 3 {
+		return trimWrappedQuotes(strings.TrimSpace(matches[2]))
+	}
+
+	return ""
+}
+
+func trimWrappedQuotes(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 {
+		return value
+	}
+
+	first := value[0]
+	last := value[len(value)-1]
+	if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+		return strings.TrimSpace(value[1 : len(value)-1])
+	}
+	return value
+}
+
+func extractExporterPort(exporterAddress string) (int32, bool) {
+	exporterAddress = strings.TrimSpace(exporterAddress)
+	if exporterAddress == "" {
+		return 0, false
+	}
+
+	lastColon := strings.LastIndex(exporterAddress, ":")
+	if lastColon < 0 || lastColon >= len(exporterAddress)-1 {
+		return 0, false
+	}
+
+	rawPort := strings.TrimSpace(exporterAddress[lastColon+1:])
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return int32(port), true
 }
 
 func labelsForTonNode(tonNode *tonv1alpha1.TonNode) map[string]string {
