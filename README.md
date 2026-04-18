@@ -296,8 +296,10 @@ In `external-nodeip` mode, `kubeton prometheus start` auto-remediates by default
 Auto-remediation controls:
 - `PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX=true|false` (default `true`)
 - `PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS` (default `420`)
+- `PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX=true|false` (default `true`, auto-upgrades operator to chart version when needed)
+- `OP_CONTROLLER_DEPLOYMENT` (default `ton-k8s-operator-controller-manager`)
 
-`operator-values.yaml` keeps `tonNode.enabled=false` (operator only).
+`operator-values.yaml` is operator-focused (image/resources/metrics); `kubeton install` preserves existing TonNode chart values on upgrade (`--reuse-values`) and does not delete active TON resources.
 `tonnode-values.yaml` enables TON nodes, enables key-management by default (`vault`, `ton-vault-creds`, `encrypted-sc`), and includes common `ton-docker-ctrl` env parameters.
 
 ### Cloud Install Options

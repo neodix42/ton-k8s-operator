@@ -55,6 +55,8 @@ PROMETHEUS_PORT_FORWARD_ADDRESS="${PROMETHEUS_PORT_FORWARD_ADDRESS:-}"
 PROMETHEUS_TARGET_MODE="${PROMETHEUS_TARGET_MODE:-auto}"
 PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX:-true}"
 PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS:-420}"
+PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX="${PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX:-true}"
+OP_CONTROLLER_DEPLOYMENT="${OP_CONTROLLER_DEPLOYMENT:-ton-k8s-operator-controller-manager}"
 
 usage() {
   cat <<'EOF'
@@ -108,6 +110,8 @@ Environment overrides:
   PROMETHEUS_TARGET_MODE (default: auto; auto=external-nodeip on bare-metal, else pod-ip)
   PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX (default: true; in external-nodeip mode, auto-enable hostPorts and roll StatefulSet if exporter hostPort is missing)
   PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS (default: 420)
+  PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX (default: true; in external-nodeip mode, auto-upgrade operator when exporter hostPort wiring is not available yet)
+  OP_CONTROLLER_DEPLOYMENT (default: ton-k8s-operator-controller-manager)
 EOF
 }
 
@@ -317,6 +321,11 @@ resolve_ton_replicas_from_values_file() {
   return 1
 }
 
+cluster_has_tonnodes() {
+  kubectl get tonnodes.ton.ton.org -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+    | awk 'NF {found=1; exit} END {exit(found ? 0 : 1)}'
+}
+
 resolve_tonnode_custom_parameters_rows() {
   kubectl get tonnodes.ton.ton.org -A \
     -o go-template='{{range .items}}{{ $ns := .metadata.namespace }}{{ $name := .metadata.name }}{{range .spec.env}}{{if eq .name "CUSTOM_PARAMETERS"}}{{$ns}}{{"\t"}}{{$name}}{{"\t"}}{{.value}}{{"\n"}}{{end}}{{end}}{{end}}'
@@ -436,6 +445,125 @@ host_port_list_contains() {
     fi
   done
   return 1
+}
+
+trim_wrapped_quotes() {
+  local value
+  value="$(trim_whitespace "${1:-}")"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  printf '%s' "$value"
+}
+
+resolve_operator_image_from_values_file() {
+  local values_file="$1"
+  local repo=""
+  local tag=""
+  local in_image=0
+  local line value
+
+  [[ -f "$values_file" ]] || return 1
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^image:[[:space:]]*$ ]]; then
+      in_image=1
+      continue
+    fi
+    if (( in_image != 0 )) && [[ "$line" =~ ^[^[:space:]] ]]; then
+      break
+    fi
+    if (( in_image == 0 )); then
+      continue
+    fi
+
+    if [[ "$line" =~ ^[[:space:]]*repository:[[:space:]]*(.+)$ ]]; then
+      value="${BASH_REMATCH[1]}"
+      value="${value%%#*}"
+      repo="$(trim_wrapped_quotes "$value")"
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*tag:[[:space:]]*(.+)$ ]]; then
+      value="${BASH_REMATCH[1]}"
+      value="${value%%#*}"
+      tag="$(trim_wrapped_quotes "$value")"
+      continue
+    fi
+  done < "$values_file"
+
+  repo="$(trim_whitespace "$repo")"
+  tag="$(trim_whitespace "$tag")"
+  [[ -z "$repo" ]] && return 1
+  if [[ -n "$tag" ]]; then
+    printf '%s:%s' "$repo" "$tag"
+  else
+    printf '%s' "$repo"
+  fi
+}
+
+desired_operator_image() {
+  local image
+  image="$(resolve_operator_image_from_values_file "$OP_VALUES_FILE" || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  image="$(resolve_operator_image_from_values_file "$CHART_DIR/values.yaml" || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+  return 1
+}
+
+current_operator_image() {
+  kubectl -n "$OP_NAMESPACE" get deploy "$OP_CONTROLLER_DEPLOYMENT" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null \
+    | awk 'NF {print; exit}'
+}
+
+ensure_external_nodeip_operator_support() {
+  local timeout_seconds="${1:-420}"
+  local desired_image current_image
+
+  if ! is_true "$PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX"; then
+    return 0
+  fi
+
+  desired_image="$(desired_operator_image || true)"
+  desired_image="$(trim_whitespace "$desired_image")"
+  current_image="$(current_operator_image || true)"
+  current_image="$(trim_whitespace "$current_image")"
+
+  if [[ -z "$desired_image" || -z "$current_image" || "$desired_image" == "$current_image" ]]; then
+    return 0
+  fi
+  if ! command -v helm >/dev/null 2>&1; then
+    echo "Warning: operator image is ${current_image}, chart expects ${desired_image}, but helm is not available for auto-upgrade." >&2
+    return 1
+  fi
+
+  echo "[metrics] Detected operator image ${current_image}; upgrading to ${desired_image} ..."
+  if ! run_install; then
+    echo "Warning: failed to auto-upgrade operator release ${RELEASE_NAME}." >&2
+    return 1
+  fi
+  if ! kubectl -n "$OP_NAMESPACE" rollout status "deployment/${OP_CONTROLLER_DEPLOYMENT}" --timeout="${timeout_seconds}s" >/dev/null 2>&1; then
+    echo "Warning: operator deployment ${OP_NAMESPACE}/${OP_CONTROLLER_DEPLOYMENT} did not become Ready after auto-upgrade." >&2
+    return 1
+  fi
+
+  current_image="$(current_operator_image || true)"
+  current_image="$(trim_whitespace "$current_image")"
+  if [[ -z "$current_image" || "$current_image" != "$desired_image" ]]; then
+    echo "Warning: operator image is still '${current_image}' after auto-upgrade, expected '${desired_image}'." >&2
+    return 1
+  fi
+  return 0
 }
 
 tonnode_host_ports_enabled() {
@@ -570,6 +698,15 @@ ensure_external_nodeip_scrape_prereqs() {
     patch_status=$?
   fi
   if (( patch_status == 2 )); then
+    return 1
+  fi
+
+  if ! statefulset_exposes_exporter_hostport "$ns" "$tonnode_name" "$exporter_port"; then
+    ensure_external_nodeip_operator_support "$timeout_seconds" || true
+  fi
+  if (( patch_status == 1 )) && ! statefulset_exposes_exporter_hostport "$ns" "$tonnode_name" "$exporter_port"; then
+    echo "Warning: ${ns}/${tonnode_name} already has hostPortsEnabled=true but StatefulSet template still lacks exporter hostPort ${exporter_port}." >&2
+    echo "Warning: this usually means the running ton-k8s-operator controller does not support exporter hostPort wiring yet; upgrade operator or use PROMETHEUS_TARGET_MODE=pod-ip." >&2
     return 1
   fi
 
@@ -3698,10 +3835,31 @@ status_collect_row() {
 
 run_install() {
   require_bin helm
-  helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
-    -n "$OP_NAMESPACE" \
-    --create-namespace \
+  local release_exists=0
+  local -a helm_cmd=()
+
+  if helm -n "$OP_NAMESPACE" status "$RELEASE_NAME" >/dev/null 2>&1; then
+    release_exists=1
+  fi
+
+  helm_cmd=(
+    helm upgrade --install "$RELEASE_NAME" "$CHART_DIR"
+    -n "$OP_NAMESPACE"
+    --create-namespace
     -f "$OP_VALUES_FILE"
+  )
+
+  if (( release_exists == 1 )); then
+    # Preserve current TonNode chart values during operator-only upgrades.
+    helm_cmd+=(--reuse-values)
+    # If no TonNode CRs exist, keep operator-only behavior and avoid accidental TonNode recreation
+    # from reused values.
+    if ! cluster_has_tonnodes; then
+      helm_cmd+=(--set tonNode.enabled=false)
+    fi
+  fi
+
+  "${helm_cmd[@]}"
 }
 
 fleet_has_stop_annotations() {
