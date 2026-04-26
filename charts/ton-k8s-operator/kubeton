@@ -87,6 +87,25 @@ VICTORIA_METRICS_PORT_FORWARD_WAIT_SECONDS="${VICTORIA_METRICS_PORT_FORWARD_WAIT
 VICTORIA_METRICS_PORT_FORWARD_VERIFY_SECONDS="${VICTORIA_METRICS_PORT_FORWARD_VERIFY_SECONDS:-20}"
 VICTORIA_METRICS_PORT_FORWARD_ADDRESS="${VICTORIA_METRICS_PORT_FORWARD_ADDRESS:-}"
 VICTORIA_METRICS_STATE_CONFIGMAP="${VICTORIA_METRICS_STATE_CONFIGMAP:-kubeton-victoria-metrics-state}"
+VICTORIA_LOGS_ENABLED="${VICTORIA_LOGS_ENABLED:-true}"
+VICTORIA_LOGS_NAMESPACE="${VICTORIA_LOGS_NAMESPACE:-${VICTORIA_METRICS_NAMESPACE:-vm}}"
+VICTORIA_LOGS_RELEASE_NAME="${VICTORIA_LOGS_RELEASE_NAME:-kubeton-vlogs}"
+VICTORIA_LOGS_COLLECTOR_RELEASE_NAME="${VICTORIA_LOGS_COLLECTOR_RELEASE_NAME:-kubeton-vlogs-collector}"
+VICTORIA_LOGS_HELM_REPO_NAME="${VICTORIA_LOGS_HELM_REPO_NAME:-vm}"
+VICTORIA_LOGS_HELM_REPO_URL="${VICTORIA_LOGS_HELM_REPO_URL:-https://victoriametrics.github.io/helm-charts}"
+VICTORIA_LOGS_SINGLE_CHART_VERSION="${VICTORIA_LOGS_SINGLE_CHART_VERSION:-}"
+VICTORIA_LOGS_COLLECTOR_CHART_VERSION="${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}"
+VICTORIA_LOGS_RETENTION_PERIOD="${VICTORIA_LOGS_RETENTION_PERIOD:-30d}"
+VICTORIA_LOGS_PVC_SIZE="${VICTORIA_LOGS_PVC_SIZE:-10Gi}"
+VICTORIA_LOGS_PORT="${VICTORIA_LOGS_PORT:-9428}"
+VICTORIA_LOGS_LOCAL_PORT_BASE="${VICTORIA_LOGS_LOCAL_PORT_BASE:-9428}"
+VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE="${VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE:-19428}"
+VICTORIA_LOGS_PORT_FORWARD_DIR="${VICTORIA_LOGS_PORT_FORWARD_DIR:-${TMPDIR:-/tmp}/kubeton-victoria-logs-port-forward}"
+VICTORIA_LOGS_PORT_FORWARD_WAIT_SECONDS="${VICTORIA_LOGS_PORT_FORWARD_WAIT_SECONDS:-5}"
+VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS="${VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS:-20}"
+VICTORIA_LOGS_PORT_FORWARD_ADDRESS="${VICTORIA_LOGS_PORT_FORWARD_ADDRESS:-}"
+VICTORIA_LOGS_STATE_CONFIGMAP="${VICTORIA_LOGS_STATE_CONFIGMAP:-kubeton-victoria-logs-state}"
+VICTORIA_LOGS_HELM_TIMEOUT_SECONDS="${VICTORIA_LOGS_HELM_TIMEOUT_SECONDS:-600}"
 
 usage() {
   cat <<'EOF'
@@ -101,8 +120,8 @@ Commands:
   prometheus stop      Stop/drop kubeton-managed Prometheus resources and local background port-forward(s).
   grafana start        Create/update Grafana, provision kubeton Prometheus datasource(s) and starter dashboard(s), and start local background port-forward.
   grafana stop         Stop/drop kubeton-managed Grafana resources and local background port-forward(s).
-  victoria-metrics install    Install VictoriaMetrics operator + VMSingle/VMAgent/VMAuth stack, configure TonNode scraping, and start local background port-forward.
-  victoria-metrics uninstall  Remove kubeton-managed VictoriaMetrics stack resources and local background port-forward(s).
+  victoria-metrics install    Install VictoriaMetrics operator + VMSingle/VMAgent/VMAuth stack, configure TonNode scraping, enable VictoriaLogs collector, and start local background port-forward(s).
+  victoria-metrics uninstall  Remove kubeton-managed VictoriaMetrics/VictoriaLogs resources and local background port-forward(s).
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
@@ -176,6 +195,25 @@ Environment overrides:
   VICTORIA_METRICS_PORT_FORWARD_VERIFY_SECONDS (default: 20)
   VICTORIA_METRICS_PORT_FORWARD_ADDRESS (default: auto; bare-metal=0.0.0.0, k3d/cloud=127.0.0.1)
   VICTORIA_METRICS_STATE_CONFIGMAP (default: kubeton-victoria-metrics-state)
+  VICTORIA_LOGS_ENABLED (default: true; install victoria-logs-single + victoria-logs-collector during victoria-metrics install)
+  VICTORIA_LOGS_NAMESPACE (default: vm)
+  VICTORIA_LOGS_RELEASE_NAME (default: kubeton-vlogs)
+  VICTORIA_LOGS_COLLECTOR_RELEASE_NAME (default: kubeton-vlogs-collector)
+  VICTORIA_LOGS_HELM_REPO_NAME (default: vm)
+  VICTORIA_LOGS_HELM_REPO_URL (default: https://victoriametrics.github.io/helm-charts)
+  VICTORIA_LOGS_SINGLE_CHART_VERSION (default: latest from repo)
+  VICTORIA_LOGS_COLLECTOR_CHART_VERSION (default: latest from repo)
+  VICTORIA_LOGS_RETENTION_PERIOD (default: 30d)
+  VICTORIA_LOGS_PVC_SIZE (default: 10Gi)
+  VICTORIA_LOGS_PORT (default: 9428)
+  VICTORIA_LOGS_LOCAL_PORT_BASE (default: 9428)
+  VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE (default: 19428; local fallback kubectl proxy port base when port-forward is unavailable)
+  VICTORIA_LOGS_PORT_FORWARD_DIR (default: ${TMPDIR:-/tmp}/kubeton-victoria-logs-port-forward)
+  VICTORIA_LOGS_PORT_FORWARD_WAIT_SECONDS (default: 5)
+  VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS (default: 20)
+  VICTORIA_LOGS_PORT_FORWARD_ADDRESS (default: auto; bare-metal=0.0.0.0, k3d/cloud=127.0.0.1)
+  VICTORIA_LOGS_STATE_CONFIGMAP (default: kubeton-victoria-logs-state)
+  VICTORIA_LOGS_HELM_TIMEOUT_SECONDS (default: 600)
 EOF
 }
 
@@ -1854,6 +1892,90 @@ victoria_metrics_stack_name() {
   printf '%s' "$stack_name"
 }
 
+victoria_logs_namespace() {
+  local ns
+  ns="$(trim_whitespace "${VICTORIA_LOGS_NAMESPACE:-${VICTORIA_METRICS_NAMESPACE:-vm}}")"
+  if [[ -z "$ns" ]]; then
+    ns="vm"
+  fi
+  printf '%s' "$ns"
+}
+
+victoria_logs_release_name() {
+  local release_name
+  release_name="$(sanitize_k8s_name_fragment "${VICTORIA_LOGS_RELEASE_NAME:-kubeton-vlogs}")"
+  release_name="$(trim_whitespace "$release_name")"
+  if [[ -z "$release_name" ]]; then
+    release_name="kubeton-vlogs"
+  fi
+  printf '%s' "$release_name"
+}
+
+victoria_logs_collector_release_name() {
+  local release_name
+  release_name="$(sanitize_k8s_name_fragment "${VICTORIA_LOGS_COLLECTOR_RELEASE_NAME:-kubeton-vlogs-collector}")"
+  release_name="$(trim_whitespace "$release_name")"
+  if [[ -z "$release_name" ]]; then
+    release_name="kubeton-vlogs-collector"
+  fi
+  printf '%s' "$release_name"
+}
+
+victoria_logs_service_name() {
+  local release_name="$1"
+  printf '%s' "${release_name}-victoria-logs-single-server"
+}
+
+victoria_logs_collector_daemonset_name() {
+  local release_name="$1"
+  printf '%s' "${release_name}-victoria-logs-collector"
+}
+
+resolve_victoria_logs_helm_timeout_seconds() {
+  local timeout_seconds
+  timeout_seconds="$(trim_whitespace "${VICTORIA_LOGS_HELM_TIMEOUT_SECONDS:-600}")"
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 60 )); then
+    timeout_seconds=600
+  fi
+  printf '%s' "$timeout_seconds"
+}
+
+read_victoria_logs_state_value() {
+  local ns="$1"
+  local key="$2"
+
+  kubectl -n "$ns" get configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" \
+    -o jsonpath="{.data.${key}}" 2>/dev/null \
+    || true
+}
+
+write_victoria_logs_state() {
+  local state_ns="$1"
+  local logs_namespace="$2"
+  local release_name="$3"
+  local collector_release_name="$4"
+  local service_name="$5"
+  local collector_daemonset="$6"
+
+  ensure_namespace "$state_ns"
+  cat <<EOF | kubectl -n "$state_ns" apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${VICTORIA_LOGS_STATE_CONFIGMAP}
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-logs
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-logs
+data:
+  namespace: $(yaml_quote "$logs_namespace")
+  releaseName: $(yaml_quote "$release_name")
+  collectorReleaseName: $(yaml_quote "$collector_release_name")
+  serviceName: $(yaml_quote "$service_name")
+  collectorDaemonSet: $(yaml_quote "$collector_daemonset")
+EOF
+}
+
 resolve_victoria_metrics_rollout_timeout_seconds() {
   local timeout_seconds
   timeout_seconds="$(trim_whitespace "${VICTORIA_METRICS_ROLLOUT_TIMEOUT_SECONDS:-300}")"
@@ -2331,6 +2453,15 @@ ensure_victoria_metrics_port_forward() {
         fi
         return 1
       fi
+      if ! kill -0 "$pf_pid" >/dev/null 2>&1 || ! wait_victoria_metrics_http_ready "$local_port" 2; then
+        kill "$pf_pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file" >/dev/null 2>&1 || true
+        if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+          echo "Warning: port-forward for ${ns}/${service_name} became unavailable immediately after startup on localhost:${local_port}." >&2
+          echo "Warning: see ${log_file}" >&2
+        fi
+        return 1
+      fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$pf_pid" "$log_file"
       return 0
     fi
@@ -2532,6 +2663,436 @@ EOF
   if (( printed == 0 )); then
     echo "[victoria-metrics] NodePort VMUI access: <node-ip>:${node_port}/vmui/"
     echo "[victoria-metrics] NodePort targets access: <node-ip>:${node_port}/targets"
+  fi
+}
+
+ensure_victoria_logs_access_service() {
+  local ns="$1"
+  local release_name="$2"
+  local remote_port="$3"
+  local service_name="kubeton-vlogs-access-${release_name}"
+
+  if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    remote_port=9428
+  fi
+
+  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_name}
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-logs-access
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-logs
+spec:
+  type: ClusterIP
+  selector:
+    app: server
+    app.kubernetes.io/instance: ${release_name}
+    app.kubernetes.io/name: victoria-logs-single
+  ports:
+    - name: http
+      protocol: TCP
+      port: ${remote_port}
+      targetPort: http
+EOF
+  printf '%s' "$service_name"
+}
+
+ensure_victoria_logs_stack() {
+  local ns="$1"
+  local release_name="$2"
+  local collector_release_name="$3"
+  local remote_port="$4"
+  local retention_period="$5"
+  local pvc_size="$6"
+  local rollout_timeout_seconds="$7"
+  local helm_timeout_seconds="$8"
+  local repo_name repo_url single_chart collector_chart
+  local single_chart_version collector_chart_version
+  local service_name collector_daemonset access_service_name remote_write_url
+  local ds_desired ds_ready
+  local -a vls_cmd=()
+  local -a vlc_cmd=()
+
+  repo_name="$(trim_whitespace "${VICTORIA_LOGS_HELM_REPO_NAME:-vm}")"
+  if [[ -z "$repo_name" ]]; then
+    repo_name="vm"
+  fi
+  repo_url="$(trim_whitespace "${VICTORIA_LOGS_HELM_REPO_URL:-https://victoriametrics.github.io/helm-charts}")"
+  if [[ -z "$repo_url" ]]; then
+    repo_url="https://victoriametrics.github.io/helm-charts"
+  fi
+  single_chart="${repo_name}/victoria-logs-single"
+  collector_chart="${repo_name}/victoria-logs-collector"
+  single_chart_version="$(trim_whitespace "${VICTORIA_LOGS_SINGLE_CHART_VERSION:-}")"
+  collector_chart_version="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}")"
+
+  if ! [[ "$rollout_timeout_seconds" =~ ^[0-9]+$ ]] || (( rollout_timeout_seconds < 60 )); then
+    rollout_timeout_seconds=300
+  fi
+  if ! [[ "$helm_timeout_seconds" =~ ^[0-9]+$ ]] || (( helm_timeout_seconds < 60 )); then
+    helm_timeout_seconds=600
+  fi
+  if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    remote_port=9428
+  fi
+
+  ensure_namespace "$ns"
+  ensure_helm_repo "$repo_name" "$repo_url"
+  helm repo update "$repo_name" >/dev/null
+
+  service_name="$(victoria_logs_service_name "$release_name")"
+  collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
+
+  vls_cmd=(helm upgrade --install "$release_name" "$single_chart" -n "$ns" --create-namespace --wait --timeout "${helm_timeout_seconds}s" \
+    --set-string "server.retentionPeriod=${retention_period}" \
+    --set-string "server.persistentVolume.size=${pvc_size}")
+  if [[ -n "$single_chart_version" ]]; then
+    vls_cmd+=(--version "$single_chart_version")
+  fi
+
+  echo "[victoria-metrics] Installing/updating VictoriaLogs single (${release_name}) ..." >&2
+  if ! run_with_timeout "${helm_timeout_seconds}s" "${vls_cmd[@]}" >/dev/null; then
+    echo "Error: failed to install/upgrade VictoriaLogs single release ${release_name} in namespace ${ns}." >&2
+    return 1
+  fi
+
+  access_service_name="$(ensure_victoria_logs_access_service "$ns" "$release_name" "$remote_port")"
+  remote_write_url="http://${access_service_name}:${remote_port}"
+
+  vlc_cmd=(helm upgrade --install "$collector_release_name" "$collector_chart" -n "$ns" --create-namespace --wait --timeout "${helm_timeout_seconds}s" \
+    --set-string "remoteWrite[0].url=${remote_write_url}" \
+    --set-string "collector.excludeFilter=kubernetes.pod_name:=%{HOSTNAME}")
+  if [[ -n "$collector_chart_version" ]]; then
+    vlc_cmd+=(--version "$collector_chart_version")
+  fi
+
+  echo "[victoria-metrics] Installing/updating VictoriaLogs collector (${collector_release_name}) ..." >&2
+  if ! run_with_timeout "${helm_timeout_seconds}s" "${vlc_cmd[@]}" >/dev/null; then
+    echo "Error: failed to install/upgrade VictoriaLogs collector release ${collector_release_name} in namespace ${ns}." >&2
+    return 1
+  fi
+
+  if ! kubectl -n "$ns" rollout status "statefulset/${service_name}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
+    echo "Warning: VictoriaLogs StatefulSet ${ns}/${service_name} is not Ready yet." >&2
+  fi
+  if ! kubectl -n "$ns" rollout status "daemonset/${collector_daemonset}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
+    echo "Warning: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} is not fully Ready yet." >&2
+  fi
+
+  ds_desired="$(kubectl -n "$ns" get daemonset "$collector_daemonset" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+  ds_ready="$(kubectl -n "$ns" get daemonset "$collector_daemonset" -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+  ds_desired="$(trim_whitespace "$ds_desired")"
+  ds_ready="$(trim_whitespace "$ds_ready")"
+  if [[ "$ds_desired" =~ ^[0-9]+$ && "$ds_ready" =~ ^[0-9]+$ ]]; then
+    if (( ds_desired > 0 && ds_ready == 0 )); then
+      echo "Error: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} has 0 ready pods out of ${ds_desired}; log collection is not active." >&2
+      return 1
+    fi
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$access_service_name" "$service_name" "$collector_daemonset" "$remote_write_url" "$ds_ready" "$ds_desired"
+}
+
+victoria_logs_port_forward_address() {
+  local configured
+  configured="$(trim_whitespace "${VICTORIA_LOGS_PORT_FORWARD_ADDRESS:-}")"
+  if [[ -n "$configured" ]]; then
+    printf '%s' "$configured"
+    return 0
+  fi
+
+  if cluster_is_baremetal && ! cluster_is_k3d; then
+    printf '%s' "0.0.0.0"
+    return 0
+  fi
+
+  printf '%s' "127.0.0.1"
+}
+
+wait_victoria_logs_http_ready() {
+  local local_port="$1"
+  local verify_seconds="$2"
+  local deadline now status_code
+
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
+    verify_seconds=20
+  fi
+  if (( verify_seconds <= 0 )); then
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  deadline=$(( $(date +%s) + verify_seconds ))
+  while :; do
+    status_code="$(curl -sS -o /dev/null --max-time 3 -w '%{http_code}' "http://127.0.0.1:${local_port}/health" || true)"
+    if [[ "$status_code" == "200" || "$status_code" == "401" || "$status_code" == "403" || "$status_code" == "404" ]]; then
+      return 0
+    fi
+    status_code="$(curl -sS -o /dev/null --max-time 3 -w '%{http_code}' "http://127.0.0.1:${local_port}/select/vmui/" || true)"
+    if [[ "$status_code" == "200" || "$status_code" == "401" || "$status_code" == "403" || "$status_code" == "404" ]]; then
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+ensure_victoria_logs_port_forward() {
+  local ns="$1"
+  local service_name="$2"
+  local local_port="$3"
+  local remote_port="$4"
+  local bind_address="${5:-127.0.0.1}"
+  local quiet="${6:-false}"
+  local state_dir="${VICTORIA_LOGS_PORT_FORWARD_DIR}"
+  local wait_seconds="${VICTORIA_LOGS_PORT_FORWARD_WAIT_SECONDS}"
+  local verify_seconds="${VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS}"
+  local key pid_file log_file existing_pid pf_pid deadline now
+
+  if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]]; then
+    wait_seconds=5
+  fi
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
+    verify_seconds=20
+  fi
+
+  mkdir -p "$state_dir"
+  key="$(sanitize_file_name_fragment "${ns}__${service_name}__${local_port}")"
+  pid_file="${state_dir}/${key}.pid"
+  log_file="${state_dir}/${key}.log"
+
+  if [[ -f "$pid_file" ]]; then
+    existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" >/dev/null 2>&1; then
+      if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" "$bind_address"; then
+        if wait_victoria_logs_http_ready "$local_port" 2; then
+          printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$existing_pid" "$log_file"
+          return 0
+        fi
+      fi
+      kill "$existing_pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+  fi
+
+  nohup kubectl -n "$ns" port-forward --address "$bind_address" "svc/${service_name}" "${local_port}:${remote_port}" >"$log_file" 2>&1 &
+  pf_pid="$!"
+  echo "$pf_pid" >"$pid_file"
+
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    if ! kill -0 "$pf_pid" >/dev/null 2>&1; then
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+        echo "Warning: failed to start background port-forward for ${ns}/${service_name} on localhost:${local_port}." >&2
+        echo "Warning: see ${log_file}" >&2
+      fi
+      return 1
+    fi
+    if grep -q "Forwarding from" "$log_file" 2>/dev/null; then
+      if ! wait_victoria_logs_http_ready "$local_port" "$verify_seconds"; then
+        kill "$pf_pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file" >/dev/null 2>&1 || true
+        if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+          echo "Warning: port-forward for ${ns}/${service_name} started on localhost:${local_port}, but VictoriaLogs endpoint is not ready." >&2
+          echo "Warning: see ${log_file}" >&2
+        fi
+        return 1
+      fi
+      if ! kill -0 "$pf_pid" >/dev/null 2>&1 || ! wait_victoria_logs_http_ready "$local_port" 2; then
+        kill "$pf_pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file" >/dev/null 2>&1 || true
+        if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+          echo "Warning: port-forward for ${ns}/${service_name} became unavailable immediately after startup on localhost:${local_port}." >&2
+          echo "Warning: see ${log_file}" >&2
+        fi
+        return 1
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$pf_pid" "$log_file"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      kill "$pf_pid" >/dev/null 2>&1 || true
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+        echo "Warning: timed out waiting for port-forward readiness for ${ns}/${service_name} on localhost:${local_port}." >&2
+        echo "Warning: see ${log_file}" >&2
+      fi
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+start_victoria_logs_port_forward() {
+  local ns="$1"
+  local service_name="$2"
+  local base_port="$3"
+  local remote_port="$4"
+  local bind_address="$5"
+  local forward_row attempt quiet_attempt
+
+  if ! [[ "$base_port" =~ ^[0-9]+$ ]]; then
+    base_port=9428
+  fi
+
+  for ((attempt=0; attempt<25; attempt++)); do
+    quiet_attempt="true"
+    if (( attempt == 24 )); then
+      quiet_attempt="false"
+    fi
+    if forward_row="$(ensure_victoria_logs_port_forward "$ns" "$service_name" "$((base_port + attempt))" "$remote_port" "$bind_address" "$quiet_attempt")"; then
+      printf '%s' "$forward_row"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_victoria_logs_api_proxy() {
+  local local_port="$1"
+  local state_dir="${VICTORIA_LOGS_PORT_FORWARD_DIR}"
+  local wait_seconds="${VICTORIA_LOGS_PORT_FORWARD_WAIT_SECONDS}"
+  local verify_seconds="${VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS}"
+  local pid_file log_file proxy_pid deadline now
+
+  if ! [[ "$local_port" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]]; then
+    wait_seconds=5
+  fi
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
+    verify_seconds=20
+  fi
+
+  mkdir -p "$state_dir"
+  pid_file="${state_dir}/proxy-${local_port}.pid"
+  log_file="${state_dir}/proxy-${local_port}.log"
+
+  if [[ -f "$pid_file" ]]; then
+    proxy_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ "$proxy_pid" =~ ^[0-9]+$ ]] && kill -0 "$proxy_pid" >/dev/null 2>&1; then
+      if wait_kubectl_proxy_ready "$local_port" 2; then
+        printf '%s\t%s\t%s\n' "$local_port" "$proxy_pid" "$log_file"
+        return 0
+      fi
+      kill "$proxy_pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+  fi
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid kubectl proxy --disable-filter --address 127.0.0.1 --port "$local_port" >"$log_file" 2>&1 < /dev/null &
+  else
+    nohup kubectl proxy --disable-filter --address 127.0.0.1 --port "$local_port" >"$log_file" 2>&1 &
+  fi
+  proxy_pid="$!"
+  echo "$proxy_pid" >"$pid_file"
+
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    if ! kill -0 "$proxy_pid" >/dev/null 2>&1; then
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      return 1
+    fi
+    if wait_kubectl_proxy_ready "$local_port" 1; then
+      if ! wait_kubectl_proxy_ready "$local_port" "$verify_seconds"; then
+        kill "$proxy_pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file" >/dev/null 2>&1 || true
+        return 1
+      fi
+      printf '%s\t%s\t%s\n' "$local_port" "$proxy_pid" "$log_file"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      kill "$proxy_pid" >/dev/null 2>&1 || true
+      rm -f "$pid_file" >/dev/null 2>&1 || true
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+ensure_victoria_logs_nodeport_access() {
+  local ns="$1"
+  local release_name="$2"
+  local remote_port="$3"
+  local service_name="kubeton-vlogs-nodeport-${release_name}"
+  local node_port
+  local -a node_ip_rows=()
+  local row node_name node_ip ip_source
+  local printed=0
+  local -A seen_ip=()
+
+  if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+    remote_port=9428
+  fi
+
+  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_name}
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-logs-access
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-logs
+spec:
+  type: NodePort
+  selector:
+    app: server
+    app.kubernetes.io/instance: ${release_name}
+    app.kubernetes.io/name: victoria-logs-single
+  ports:
+    - name: http
+      protocol: TCP
+      port: ${remote_port}
+      targetPort: http
+EOF
+
+  node_port="$(kubectl -n "$ns" get service "$service_name" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
+  node_port="$(trim_whitespace "$node_port")"
+  if ! [[ "$node_port" =~ ^[0-9]+$ ]]; then
+    echo "Warning: failed to resolve NodePort for VictoriaLogs access service ${ns}/${service_name}." >&2
+    return 1
+  fi
+  echo "[victoria-metrics] VictoriaLogs NodePort service: ${ns}/${service_name} (${node_port})"
+
+  mapfile -t node_ip_rows < <(list_node_external_ip_rows)
+  for row in "${node_ip_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r node_name node_ip ip_source <<<"$row"
+    node_name="$(trim_whitespace "$node_name")"
+    node_ip="$(trim_whitespace "$node_ip")"
+    ip_source="$(trim_whitespace "$ip_source")"
+    [[ -z "$node_ip" ]] && continue
+    if [[ -n "${seen_ip[$node_ip]:-}" ]]; then
+      continue
+    fi
+    seen_ip["$node_ip"]=1
+    ((printed+=1))
+    echo "[victoria-metrics] VictoriaLogs NodePort VMUI (${ip_source} ${node_name}): http://${node_ip}:${node_port}/select/vmui/"
+    echo "[victoria-metrics] VictoriaLogs NodePort query API (${ip_source} ${node_name}): http://${node_ip}:${node_port}/select/logsql/query"
+  done
+
+  if (( printed == 0 )); then
+    echo "[victoria-metrics] VictoriaLogs NodePort VMUI: <node-ip>:${node_port}/select/vmui/"
+    echo "[victoria-metrics] VictoriaLogs NodePort query API: <node-ip>:${node_port}/select/logsql/query"
   fi
 }
 
@@ -6126,6 +6687,26 @@ cleanup_victoria_metrics_port_forwards() {
   rm -rf "$state_dir" >/dev/null 2>&1 || true
 }
 
+cleanup_victoria_logs_port_forwards() {
+  local state_dir="${VICTORIA_LOGS_PORT_FORWARD_DIR}"
+  local pid_file pid
+
+  if [[ ! -d "$state_dir" ]]; then
+    return 0
+  fi
+
+  for pid_file in "$state_dir"/*.pid; do
+    [[ -f "$pid_file" ]] || continue
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+  done
+
+  rm -rf "$state_dir" >/dev/null 2>&1 || true
+}
+
 cleanup_prometheus_resources() {
   local selector='app.kubernetes.io/name=kubeton-prometheus,app.kubernetes.io/managed-by=kubeton'
 
@@ -6152,6 +6733,64 @@ cleanup_victoria_metrics_operator() {
   kubectl -n "$ns" delete deployment,service,serviceaccount,role,rolebinding,configmap,secret -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete clusterrole,clusterrolebinding -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete validatingwebhookconfiguration,mutatingwebhookconfiguration -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+cleanup_victoria_logs_resources() {
+  local ns state_ns release_name collector_release_name
+  local state_value
+  local access_selector='app.kubernetes.io/part-of=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton'
+  local service_name
+
+  ns="$(victoria_logs_namespace)"
+  state_ns="$ns"
+  if kubectl -n "$state_ns" get configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" >/dev/null 2>&1; then
+    :
+  elif [[ -n "${VICTORIA_METRICS_OPERATOR_NAMESPACE:-}" ]] && kubectl -n "$VICTORIA_METRICS_OPERATOR_NAMESPACE" get configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" >/dev/null 2>&1; then
+    state_ns="$VICTORIA_METRICS_OPERATOR_NAMESPACE"
+  fi
+
+  state_value="$(read_victoria_logs_state_value "$state_ns" "namespace")"
+  state_value="$(trim_whitespace "$state_value")"
+  if [[ -n "$state_value" ]]; then
+    ns="$state_value"
+  fi
+
+  release_name="$(read_victoria_logs_state_value "$state_ns" "releaseName")"
+  release_name="$(trim_whitespace "$release_name")"
+  if [[ -z "$release_name" ]]; then
+    release_name="$(victoria_logs_release_name)"
+  fi
+
+  collector_release_name="$(read_victoria_logs_state_value "$state_ns" "collectorReleaseName")"
+  collector_release_name="$(trim_whitespace "$collector_release_name")"
+  if [[ -z "$collector_release_name" ]]; then
+    collector_release_name="$(victoria_logs_collector_release_name)"
+  fi
+  service_name="$(victoria_logs_service_name "$release_name")"
+
+  echo "[uninstall] Deleting kubeton-managed VictoriaLogs access resources ..."
+  kubectl delete service -A -l "$access_selector" --ignore-not-found >/dev/null 2>&1 || true
+
+  echo "[uninstall] Uninstalling VictoriaLogs releases (${release_name}, ${collector_release_name}) ..."
+  if command -v helm >/dev/null 2>&1; then
+    helm uninstall "$collector_release_name" -n "$ns" >/dev/null 2>&1 || true
+    helm uninstall "$release_name" -n "$ns" >/dev/null 2>&1 || true
+  else
+    echo "Warning: helm is not installed; attempting best-effort kubectl cleanup for VictoriaLogs resources." >&2
+  fi
+
+  kubectl -n "$ns" delete daemonset,serviceaccount -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete clusterrole,clusterrolebinding -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete statefulset,service -l "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$ns" get pvc -o name 2>/dev/null \
+    | awk -v prefix="persistentvolumeclaim/server-volume-${service_name}-" 'index($0, prefix) == 1 {print $0}' \
+    | xargs -r kubectl -n "$ns" delete --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+  kubectl -n "$state_ns" delete configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
+  if [[ "$state_ns" != "$ns" ]]; then
+    kubectl -n "$ns" delete configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
+  fi
+  cleanup_victoria_logs_port_forwards
 }
 
 cleanup_victoria_metrics_resources() {
@@ -6186,6 +6825,7 @@ cleanup_victoria_metrics_resources() {
   kubectl -n "$ns" delete secret "vmuser-${stack_name}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "$operator_ns" delete configmap "$VICTORIA_METRICS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
   cleanup_victoria_metrics_port_forwards
+  cleanup_victoria_logs_resources
   cleanup_victoria_metrics_operator "$operator_ns"
 }
 
@@ -6206,7 +6846,7 @@ run_uninstall_core() {
   kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
   delete_ton_pvcs_for_statefulsets uninstall_sts_rows
 
-  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics resources and port-forwards ..."
+  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
   cleanup_prometheus_resources
   cleanup_grafana_resources
   cleanup_victoria_metrics_resources
@@ -6234,14 +6874,14 @@ run_uninstall_core() {
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, delete kubeton-managed Prometheus/Grafana/VictoriaMetrics resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, delete kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
   run_uninstall_core
 }
 
 run_purge() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus/Grafana/VictoriaMetrics cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
+  confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
   run_uninstall_core
   echo "[purge] Deleting CRD tonnodes.ton.ton.org ..."
   kubectl delete crd tonnodes.ton.ton.org --ignore-not-found
@@ -6576,6 +7216,17 @@ run_victoria_metrics_install() {
   local vmsingle_service vmagent_service
   local forward_row log_file pf_ns pf_service
   local -a forwarded_rows=()
+  local metrics_port_forward_ok=0
+  local logs_enabled_raw logs_enabled="false"
+  local logs_ns logs_release_name logs_collector_release_name
+  local logs_retention_period logs_pvc_size logs_remote_port logs_base_port logs_api_proxy_base_port
+  local logs_bind_address logs_remote_access_host logs_stack_row logs_helm_timeout_seconds
+  local logs_access_service logs_backend_service logs_collector_daemonset logs_remote_write_url
+  local logs_ds_ready logs_ds_desired
+  local logs_forward_row logs_log_file logs_pf_ns logs_pf_service logs_local_port
+  local logs_api_proxy_row logs_api_proxy_port logs_api_proxy_log
+  local -a logs_forwarded_rows=()
+  local logs_port_forward_ok=0
 
   ns="$(trim_whitespace "${VICTORIA_METRICS_NAMESPACE:-vm}")"
   if [[ -z "$ns" ]]; then
@@ -6592,6 +7243,23 @@ run_victoria_metrics_install() {
   fi
   auth_password="$(trim_whitespace "${VICTORIA_METRICS_AUTH_PASSWORD:-}")"
   timeout_seconds="$(resolve_victoria_metrics_rollout_timeout_seconds)"
+  logs_enabled_raw="$(trim_whitespace "${VICTORIA_LOGS_ENABLED:-true}")"
+  if is_true "$logs_enabled_raw"; then
+    logs_enabled="true"
+    require_bin helm
+  fi
+  logs_ns="$(victoria_logs_namespace)"
+  logs_release_name="$(victoria_logs_release_name)"
+  logs_collector_release_name="$(victoria_logs_collector_release_name)"
+  logs_retention_period="$(trim_whitespace "${VICTORIA_LOGS_RETENTION_PERIOD:-30d}")"
+  if [[ -z "$logs_retention_period" ]]; then
+    logs_retention_period="30d"
+  fi
+  logs_pvc_size="$(trim_whitespace "${VICTORIA_LOGS_PVC_SIZE:-10Gi}")"
+  if [[ -z "$logs_pvc_size" ]]; then
+    logs_pvc_size="10Gi"
+  fi
+  logs_helm_timeout_seconds="$(resolve_victoria_logs_helm_timeout_seconds)"
 
   if ! operator_row="$(ensure_victoria_metrics_operator "$operator_ns" "$stack_name")"; then
     return 1
@@ -6604,6 +7272,33 @@ run_victoria_metrics_install() {
   ensure_victoria_metrics_stack "$ns" "$stack_name" "$auth_username" "$auth_password" "$timeout_seconds"
   ensure_victoria_metrics_scrape_resources scrape_rows
   write_victoria_metrics_state "$operator_ns" "$stack_name" "$ns" "$operator_ns" "$operator_version" "$operator_manifest_url"
+
+  logs_remote_port="$(trim_whitespace "${VICTORIA_LOGS_PORT:-9428}")"
+  if ! [[ "$logs_remote_port" =~ ^[0-9]+$ ]]; then
+    logs_remote_port=9428
+  fi
+  logs_base_port="$(trim_whitespace "${VICTORIA_LOGS_LOCAL_PORT_BASE:-9428}")"
+  if ! [[ "$logs_base_port" =~ ^[0-9]+$ ]]; then
+    logs_base_port=9428
+  fi
+  logs_api_proxy_base_port="$(trim_whitespace "${VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE:-19428}")"
+  if ! [[ "$logs_api_proxy_base_port" =~ ^[0-9]+$ ]]; then
+    logs_api_proxy_base_port=19428
+  fi
+
+  if [[ "$logs_enabled" == "true" ]]; then
+    if ! logs_stack_row="$(ensure_victoria_logs_stack "$logs_ns" "$logs_release_name" "$logs_collector_release_name" "$logs_remote_port" "$logs_retention_period" "$logs_pvc_size" "$timeout_seconds" "$logs_helm_timeout_seconds")"; then
+      return 1
+    fi
+    IFS=$'\t' read -r logs_access_service logs_backend_service logs_collector_daemonset logs_remote_write_url logs_ds_ready logs_ds_desired <<<"$logs_stack_row"
+    logs_access_service="$(trim_whitespace "$logs_access_service")"
+    logs_backend_service="$(trim_whitespace "$logs_backend_service")"
+    logs_collector_daemonset="$(trim_whitespace "$logs_collector_daemonset")"
+    logs_remote_write_url="$(trim_whitespace "$logs_remote_write_url")"
+    logs_ds_ready="$(trim_whitespace "$logs_ds_ready")"
+    logs_ds_desired="$(trim_whitespace "$logs_ds_desired")"
+    write_victoria_logs_state "$operator_ns" "$logs_ns" "$logs_release_name" "$logs_collector_release_name" "$logs_access_service" "$logs_collector_daemonset"
+  fi
 
   auth_service_name="$(resolve_victoria_metrics_auth_service_name "$ns" "$stack_name" || true)"
   auth_service_name="$(trim_whitespace "$auth_service_name")"
@@ -6660,6 +7355,7 @@ run_victoria_metrics_install() {
   fi
 
   if [[ ${#forwarded_rows[@]} -eq 0 ]]; then
+    metrics_port_forward_ok=0
     echo "Warning: failed to start background port-forward for VictoriaMetrics auth service ${ns}/${auth_service_name}." >&2
     echo "Warning: VictoriaMetrics stack is installed, but local VMAuth access is unavailable (kubelet proxy likely returned 502)." >&2
     echo "Warning: check node/kubelet reachability (kubectl get nodes -o wide) and retry: ./kubeton victoria-metrics install" >&2
@@ -6682,43 +7378,118 @@ run_victoria_metrics_install() {
       fi
     fi
     ensure_victoria_metrics_nodeport_access "$ns" "$stack_name" "$remote_port" || true
-    echo "[victoria-metrics] Username: ${username}"
-    echo "[victoria-metrics] Password: ${password}"
-    echo "[victoria-metrics] Credentials secret: ${ns}/${credentials_secret}"
-    echo "[victoria-metrics] In-cluster VMAuth URL (pod/cluster only): http://${auth_service_name}.${ns}.svc:${remote_port}/"
-    echo "[victoria-metrics] In-cluster query endpoint (pod/cluster only): http://${auth_service_name}.${ns}.svc:${remote_port}/api/v1/query"
-    echo "[victoria-metrics] Operator namespace: ${operator_ns}"
-    echo "[victoria-metrics] Operator version: ${operator_version}"
-    echo "[victoria-metrics] Operator manifest: ${operator_manifest_url}"
-    echo "[victoria-metrics] TonNode scrape resources configured: ${#scrape_rows[@]}"
-    return 0
+  else
+    metrics_port_forward_ok=1
+    IFS=$'\t' read -r pf_ns pf_service local_port _pid log_file <<<"${forwarded_rows[0]}"
+    if address_list_allows_loopback "$bind_address"; then
+      echo "[victoria-metrics] Background VMUI access: http://127.0.0.1:${local_port}/vmui/"
+      echo "[victoria-metrics] Background targets access: http://127.0.0.1:${local_port}/targets"
+    fi
+    if address_list_exposes_non_loopback "$bind_address"; then
+      remote_access_host="$(first_non_loopback_bind_address "$bind_address" || true)"
+      remote_access_host="$(trim_whitespace "$remote_access_host")"
+      if [[ -z "$remote_access_host" ]]; then
+        remote_access_host="$(resolve_primary_host_address || true)"
+        remote_access_host="$(trim_whitespace "$remote_access_host")"
+      fi
+      if [[ -n "$remote_access_host" ]]; then
+        echo "[victoria-metrics] Remote VMUI access: http://${remote_access_host}:${local_port}/vmui/"
+        echo "[victoria-metrics] Remote targets access: http://${remote_access_host}:${local_port}/targets"
+      fi
+    fi
+    echo "[victoria-metrics] Query endpoint: http://127.0.0.1:${local_port}/api/v1/query"
+    echo "[victoria-metrics] Port-forward log: ${log_file}"
   fi
 
-  IFS=$'\t' read -r pf_ns pf_service local_port _pid log_file <<<"${forwarded_rows[0]}"
-  if address_list_allows_loopback "$bind_address"; then
-    echo "[victoria-metrics] Background VMUI access: http://127.0.0.1:${local_port}/vmui/"
-    echo "[victoria-metrics] Background targets access: http://127.0.0.1:${local_port}/targets"
-  fi
-  if address_list_exposes_non_loopback "$bind_address"; then
-    remote_access_host="$(first_non_loopback_bind_address "$bind_address" || true)"
-    remote_access_host="$(trim_whitespace "$remote_access_host")"
-    if [[ -z "$remote_access_host" ]]; then
-      remote_access_host="$(resolve_primary_host_address || true)"
-      remote_access_host="$(trim_whitespace "$remote_access_host")"
+  if [[ "$logs_enabled" == "true" ]]; then
+    logs_bind_address="$(victoria_logs_port_forward_address)"
+    logs_bind_address="$(trim_whitespace "$logs_bind_address")"
+    if [[ -z "$logs_bind_address" ]]; then
+      logs_bind_address="127.0.0.1"
     fi
-    if [[ -n "$remote_access_host" ]]; then
-      echo "[victoria-metrics] Remote VMUI access: http://${remote_access_host}:${local_port}/vmui/"
-      echo "[victoria-metrics] Remote targets access: http://${remote_access_host}:${local_port}/targets"
+
+    echo "[victoria-metrics] Starting background VictoriaLogs port-forward ..."
+    echo "[victoria-metrics] VictoriaLogs port-forward bind address: ${logs_bind_address}"
+    if logs_forward_row="$(start_victoria_logs_port_forward "$logs_ns" "$logs_access_service" "$logs_base_port" "$logs_remote_port" "$logs_bind_address" || true)"; then
+      logs_forward_row="$(trim_whitespace "$logs_forward_row")"
+      if [[ -n "$logs_forward_row" ]]; then
+        logs_forwarded_rows+=("$logs_forward_row")
+      fi
+    fi
+
+    if [[ ${#logs_forwarded_rows[@]} -eq 0 ]]; then
+      logs_port_forward_ok=0
+      echo "Warning: failed to start background port-forward for VictoriaLogs service ${logs_ns}/${logs_access_service}." >&2
+      echo "Warning: VictoriaLogs is installed, but local direct access is unavailable (kubelet proxy may return 502)." >&2
+      if logs_api_proxy_row="$(ensure_victoria_logs_api_proxy "$logs_api_proxy_base_port" || true)"; then
+        logs_api_proxy_row="$(trim_whitespace "$logs_api_proxy_row")"
+        if [[ -n "$logs_api_proxy_row" ]]; then
+          IFS=$'\t' read -r logs_api_proxy_port _logs_api_proxy_pid logs_api_proxy_log <<<"$logs_api_proxy_row"
+          logs_api_proxy_port="$(trim_whitespace "$logs_api_proxy_port")"
+          logs_api_proxy_log="$(trim_whitespace "$logs_api_proxy_log")"
+          if [[ -n "$logs_api_proxy_port" ]]; then
+            echo "[victoria-metrics] VictoriaLogs local fallback VMUI (kubectl proxy): http://127.0.0.1:${logs_api_proxy_port}/api/v1/namespaces/${logs_ns}/services/http:${logs_access_service}:${logs_remote_port}/proxy/select/vmui/"
+            echo "[victoria-metrics] VictoriaLogs local fallback query API (kubectl proxy): http://127.0.0.1:${logs_api_proxy_port}/api/v1/namespaces/${logs_ns}/services/http:${logs_access_service}:${logs_remote_port}/proxy/select/logsql/query"
+            if [[ -n "$logs_api_proxy_log" ]]; then
+              echo "[victoria-metrics] VictoriaLogs local fallback proxy log: ${logs_api_proxy_log}"
+            fi
+          fi
+        fi
+      fi
+      ensure_victoria_logs_nodeport_access "$logs_ns" "$logs_release_name" "$logs_remote_port" || true
+    else
+      logs_port_forward_ok=1
+      IFS=$'\t' read -r logs_pf_ns logs_pf_service logs_local_port _logs_pid logs_log_file <<<"${logs_forwarded_rows[0]}"
+      if address_list_allows_loopback "$logs_bind_address"; then
+        echo "[victoria-metrics] VictoriaLogs VMUI access: http://127.0.0.1:${logs_local_port}/select/vmui/"
+        echo "[victoria-metrics] VictoriaLogs query API: http://127.0.0.1:${logs_local_port}/select/logsql/query"
+      fi
+      if address_list_exposes_non_loopback "$logs_bind_address"; then
+        logs_remote_access_host="$(first_non_loopback_bind_address "$logs_bind_address" || true)"
+        logs_remote_access_host="$(trim_whitespace "$logs_remote_access_host")"
+        if [[ -z "$logs_remote_access_host" ]]; then
+          logs_remote_access_host="$(resolve_primary_host_address || true)"
+          logs_remote_access_host="$(trim_whitespace "$logs_remote_access_host")"
+        fi
+        if [[ -n "$logs_remote_access_host" ]]; then
+          echo "[victoria-metrics] VictoriaLogs remote VMUI access: http://${logs_remote_access_host}:${logs_local_port}/select/vmui/"
+          echo "[victoria-metrics] VictoriaLogs remote query API: http://${logs_remote_access_host}:${logs_local_port}/select/logsql/query"
+        fi
+      fi
+      echo "[victoria-metrics] VictoriaLogs port-forward log: ${logs_log_file}"
     fi
   fi
+
   echo "[victoria-metrics] Username: ${username}"
   echo "[victoria-metrics] Password: ${password}"
   echo "[victoria-metrics] Credentials secret: ${ns}/${credentials_secret}"
+  echo "[victoria-metrics] In-cluster VMAuth URL (pod/cluster only): http://${auth_service_name}.${ns}.svc:${remote_port}/"
+  echo "[victoria-metrics] In-cluster query endpoint (pod/cluster only): http://${auth_service_name}.${ns}.svc:${remote_port}/api/v1/query"
   echo "[victoria-metrics] Operator namespace: ${operator_ns}"
   echo "[victoria-metrics] Operator version: ${operator_version}"
   echo "[victoria-metrics] Operator manifest: ${operator_manifest_url}"
-  echo "[victoria-metrics] Query endpoint: http://127.0.0.1:${local_port}/api/v1/query"
-  echo "[victoria-metrics] Port-forward log: ${log_file}"
+  if [[ "$logs_enabled" == "true" ]]; then
+    echo "[victoria-metrics] VictoriaLogs enabled: true"
+    echo "[victoria-metrics] VictoriaLogs namespace: ${logs_ns}"
+    echo "[victoria-metrics] VictoriaLogs release: ${logs_release_name}"
+    echo "[victoria-metrics] VictoriaLogs collector release: ${logs_collector_release_name}"
+    echo "[victoria-metrics] VictoriaLogs in-cluster URL (pod/cluster only): http://${logs_access_service}.${logs_ns}.svc:${logs_remote_port}/select/vmui/"
+    echo "[victoria-metrics] VictoriaLogs in-cluster query API (pod/cluster only): http://${logs_access_service}.${logs_ns}.svc:${logs_remote_port}/select/logsql/query"
+    if [[ "$logs_ds_ready" =~ ^[0-9]+$ && "$logs_ds_desired" =~ ^[0-9]+$ ]]; then
+      echo "[victoria-metrics] VictoriaLogs collector readiness: ${logs_ds_ready}/${logs_ds_desired}"
+    fi
+    if [[ -n "$logs_remote_write_url" ]]; then
+      echo "[victoria-metrics] VictoriaLogs collector remoteWrite URL: ${logs_remote_write_url}"
+    fi
+  else
+    echo "[victoria-metrics] VictoriaLogs enabled: false (set VICTORIA_LOGS_ENABLED=true to enable)"
+  fi
+  if (( metrics_port_forward_ok == 0 )); then
+    echo "[victoria-metrics] Query endpoint: unavailable via direct port-forward; use fallback URLs above."
+  fi
+  if [[ "$logs_enabled" == "true" && "$logs_port_forward_ok" -eq 0 ]]; then
+    echo "[victoria-metrics] VictoriaLogs direct local access: unavailable; use fallback URLs above."
+  fi
   echo "[victoria-metrics] TonNode scrape resources configured: ${#scrape_rows[@]}"
 }
 
@@ -6730,7 +7501,7 @@ run_victoria_metrics_uninstall() {
   fi
 
   cleanup_victoria_metrics_resources
-  echo "[victoria-metrics] kubeton-managed VictoriaMetrics resources and local port-forward(s) removed."
+  echo "[victoria-metrics] kubeton-managed VictoriaMetrics/VictoriaLogs resources and local port-forward(s) removed."
 }
 
 run_victoria_metrics() {
