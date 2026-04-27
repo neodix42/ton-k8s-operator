@@ -97,6 +97,8 @@ VICTORIA_LOGS_SINGLE_CHART_VERSION="${VICTORIA_LOGS_SINGLE_CHART_VERSION:-}"
 VICTORIA_LOGS_COLLECTOR_CHART_VERSION="${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}"
 VICTORIA_LOGS_RETENTION_PERIOD="${VICTORIA_LOGS_RETENTION_PERIOD:-30d}"
 VICTORIA_LOGS_PVC_SIZE="${VICTORIA_LOGS_PVC_SIZE:-10Gi}"
+VICTORIA_LOGS_STORAGE_CLASS="${VICTORIA_LOGS_STORAGE_CLASS:-}"
+VICTORIA_LOGS_NODE_SELECTOR="${VICTORIA_LOGS_NODE_SELECTOR:-}"
 VICTORIA_LOGS_PORT="${VICTORIA_LOGS_PORT:-9428}"
 VICTORIA_LOGS_LOCAL_PORT_BASE="${VICTORIA_LOGS_LOCAL_PORT_BASE:-9428}"
 VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE="${VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE:-19428}"
@@ -205,6 +207,8 @@ Environment overrides:
   VICTORIA_LOGS_COLLECTOR_CHART_VERSION (default: latest from repo)
   VICTORIA_LOGS_RETENTION_PERIOD (default: 30d)
   VICTORIA_LOGS_PVC_SIZE (default: 10Gi)
+  VICTORIA_LOGS_STORAGE_CLASS (default: auto; uses longhorn when present, otherwise chart/default StorageClass)
+  VICTORIA_LOGS_NODE_SELECTOR (default: bare-metal auto uses LONGHORN_NODE_SELECTOR; set empty to disable pinning)
   VICTORIA_LOGS_PORT (default: 9428)
   VICTORIA_LOGS_LOCAL_PORT_BASE (default: 9428)
   VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE (default: 19428; local fallback kubectl proxy port base when port-forward is unavailable)
@@ -2711,6 +2715,7 @@ ensure_victoria_logs_stack() {
   local helm_timeout_seconds="$8"
   local repo_name repo_url single_chart collector_chart
   local single_chart_version collector_chart_version
+  local logs_storage_class logs_node_selector vls_selector_values_file=""
   local service_name collector_daemonset access_service_name remote_write_url
   local ds_desired ds_ready
   local -a vls_cmd=()
@@ -2728,6 +2733,11 @@ ensure_victoria_logs_stack() {
   collector_chart="${repo_name}/victoria-logs-collector"
   single_chart_version="$(trim_whitespace "${VICTORIA_LOGS_SINGLE_CHART_VERSION:-}")"
   collector_chart_version="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}")"
+  logs_storage_class="$(trim_whitespace "${VICTORIA_LOGS_STORAGE_CLASS:-}")"
+  logs_node_selector="$(trim_whitespace "${VICTORIA_LOGS_NODE_SELECTOR:-}")"
+  if [[ -z "$logs_node_selector" && ! cluster_is_k3d ]]; then
+    logs_node_selector="$(trim_whitespace "${LONGHORN_NODE_SELECTOR:-}")"
+  fi
 
   if ! [[ "$rollout_timeout_seconds" =~ ^[0-9]+$ ]] || (( rollout_timeout_seconds < 60 )); then
     rollout_timeout_seconds=300
@@ -2738,6 +2748,9 @@ ensure_victoria_logs_stack() {
   if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
     remote_port=9428
   fi
+  if [[ -z "$logs_storage_class" ]] && kubectl get storageclass longhorn >/dev/null 2>&1; then
+    logs_storage_class="longhorn"
+  fi
 
   ensure_namespace "$ns"
   ensure_helm_repo "$repo_name" "$repo_url"
@@ -2745,18 +2758,48 @@ ensure_victoria_logs_stack() {
 
   service_name="$(victoria_logs_service_name "$release_name")"
   collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
+  if [[ -n "$logs_node_selector" ]]; then
+    vls_selector_values_file="$(build_victoria_logs_single_selector_values_file "$logs_node_selector")" || return 1
+  fi
 
   vls_cmd=(helm upgrade --install "$release_name" "$single_chart" -n "$ns" --create-namespace --wait --timeout "${helm_timeout_seconds}s" \
     --set-string "server.retentionPeriod=${retention_period}" \
     --set-string "server.persistentVolume.size=${pvc_size}")
+  if [[ -n "$logs_storage_class" ]]; then
+    vls_cmd+=(--set-string "server.persistentVolume.storageClassName=${logs_storage_class}")
+  fi
+  if [[ -n "$vls_selector_values_file" ]]; then
+    vls_cmd+=(-f "$vls_selector_values_file")
+  fi
   if [[ -n "$single_chart_version" ]]; then
     vls_cmd+=(--version "$single_chart_version")
   fi
 
   echo "[victoria-metrics] Installing/updating VictoriaLogs single (${release_name}) ..." >&2
   if ! run_with_timeout "${helm_timeout_seconds}s" "${vls_cmd[@]}" >/dev/null; then
+    if [[ -n "$vls_selector_values_file" ]]; then
+      rm -f "$vls_selector_values_file" >/dev/null 2>&1 || true
+    fi
     echo "Error: failed to install/upgrade VictoriaLogs single release ${release_name} in namespace ${ns}." >&2
+    if [[ -n "$logs_storage_class" ]]; then
+      echo "Warning: VictoriaLogs storageClassName in use: ${logs_storage_class}" >&2
+    fi
+    if [[ -n "$logs_node_selector" ]]; then
+      echo "Warning: VictoriaLogs nodeSelector in use: ${logs_node_selector}" >&2
+    fi
+    echo "Warning: recent VictoriaLogs pod/PVC diagnostics:" >&2
+    kubectl -n "$ns" get pod "${service_name}-0" -o wide >/dev/null 2>&1 && kubectl -n "$ns" get pod "${service_name}-0" -o wide >&2 || true
+    kubectl -n "$ns" get pvc 2>/dev/null | awk -v prefix="server-volume-${service_name}-" 'NR==1 || index($1, prefix)==1 {print}' >&2 || true
+    kubectl -n "$ns" get events --field-selector "involvedObject.name=${service_name}-0" --sort-by=.lastTimestamp 2>/dev/null | tail -n 8 >&2 || true
+    if [[ -z "$logs_node_selector" ]]; then
+      echo "Warning: if Longhorn CSI runs only on selected nodes, set VICTORIA_LOGS_NODE_SELECTOR (for example: ${LONGHORN_NODE_SELECTOR})." >&2
+    else
+      echo "Warning: verify that nodes matching VICTORIA_LOGS_NODE_SELECTOR run Longhorn CSI driver." >&2
+    fi
     return 1
+  fi
+  if [[ -n "$vls_selector_values_file" ]]; then
+    rm -f "$vls_selector_values_file" >/dev/null 2>&1 || true
   fi
 
   access_service_name="$(ensure_victoria_logs_access_service "$ns" "$release_name" "$remote_port")"
@@ -3141,6 +3184,27 @@ build_vault_selector_values_file() {
   fi
 
   values_file="$(mktemp -t kubeton-vault-selector.XXXXXX.yaml)"
+  {
+    echo "server:"
+    echo "  nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 4
+  } >"$values_file"
+
+  printf '%s' "$values_file"
+}
+
+build_victoria_logs_single_selector_values_file() {
+  local selector="$1"
+  local -a selector_pairs=()
+  local values_file
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  if [[ ${#selector_pairs[@]} -eq 0 ]]; then
+    echo "Error: VICTORIA_LOGS_NODE_SELECTOR is set but has no valid key=value pairs." >&2
+    return 1
+  fi
+
+  values_file="$(mktemp -t kubeton-victoria-logs-single-selector.XXXXXX.yaml)"
   {
     echo "server:"
     echo "  nodeSelector:"

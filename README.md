@@ -189,7 +189,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.49/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.50/install.sh" | bash
 ```
 
 The script:
@@ -353,6 +353,7 @@ Behavior:
 - deploys kubeton-managed VM stack resources with generated or user-provided auth credentials
 - creates/updates TonNode scrape resources so `VMAgent` starts scraping TonNode exporters
 - installs/updates VictoriaLogs backend (`victoria-logs-single`) and cluster-wide collector (`victoria-logs-collector` DaemonSet) with `remoteWrite[0].url` pointed at VictoriaLogs
+- on bare-metal, pins VictoriaLogs single to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
 - starts background `kubectl port-forward` to `VMAuth` and prints VMUI/targets URLs + credentials
 - starts background `kubectl port-forward` to VictoriaLogs and prints log UI/query URLs (`/select/vmui/`, `/select/logsql/query`)
 - if `port-forward` is unavailable, starts a local `kubectl proxy` fallback and prints localhost VMUI/targets/query URLs via API proxy
@@ -377,6 +378,8 @@ Main environment overrides:
 - `VICTORIA_LOGS_COLLECTOR_RELEASE_NAME`
 - `VICTORIA_LOGS_RETENTION_PERIOD`
 - `VICTORIA_LOGS_PVC_SIZE`
+- `VICTORIA_LOGS_STORAGE_CLASS` (default auto; uses `longhorn` when available)
+- `VICTORIA_LOGS_NODE_SELECTOR` (default on bare-metal: `LONGHORN_NODE_SELECTOR`)
 - `VICTORIA_LOGS_PORT`
 - `VICTORIA_LOGS_LOCAL_PORT_BASE`
 - `VICTORIA_LOGS_PORT_FORWARD_ADDRESS`
@@ -424,7 +427,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.49/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.50/install.sh" | bash
 cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade
