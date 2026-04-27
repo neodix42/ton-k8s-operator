@@ -247,7 +247,8 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # install VictoriaMetrics operator stack, auto-create TonNode scrape resources,
 # install VictoriaLogs single + collector (enabled by default),
-# start background VMAuth/VictoriaLogs port-forward(s), and print endpoints/credentials
+# start background VMAuth port-forward, expose VictoriaLogs via VMAuth auth routes,
+# and print endpoints/credentials
 ./kubeton victoria-metrics install
 
 # remove kubeton-managed VictoriaMetrics/VictoriaLogs resources and background port-forward(s)
@@ -274,6 +275,125 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # OR full destructive cleanup including TonNode CRD
 # kept separate from uninstall because CRD deletion is cluster-scoped
 ./kubeton purge
+```
+
+### Environment overrides
+
+`kubeton` reads these environment variables:
+
+```bash
+RELEASE_NAME
+OP_NAMESPACE
+CHART_DIR
+OP_VALUES_FILE
+TON_VALUES_FILE
+TON_POD_LABEL
+TON_NAMESPACE
+
+AUTO_BAREMETAL_BOOTSTRAP
+FORCE_BAREMETAL_BOOTSTRAP
+SKIP_KEY_PREREQ_CHECK
+
+LONGHORN_RELEASE_NAME
+LONGHORN_NAMESPACE
+LONGHORN_CHART
+LONGHORN_CHART_VERSION
+LONGHORN_DEFAULT_REPLICA_COUNT
+ENCRYPTED_SC_NAME
+LONGHORN_CRYPTO_SECRET_NAME
+LOCALDEV_BASE_SC
+ALLOW_DESTRUCTIVE_LONGHORN_REPAIR
+LONGHORN_NODE_SELECTOR
+
+VAULT_RELEASE_NAME
+VAULT_NAMESPACE
+VAULT_CHART
+VAULT_CHART_VERSION
+VAULT_TRANSIT_KEY
+VAULT_TON_POLICY_NAME
+VAULT_BOOTSTRAP_SECRET
+VAULT_BOOTSTRAP_UNSEAL_KEY
+VAULT_BOOTSTRAP_ROOT_TOKEN
+VAULT_LOCALDEV_NODE_SELECTOR
+TON_VAULT_CREDS_SECRET
+VAULT_ADDR_INTERNAL
+VAULT_TOKEN_PERIOD
+
+NAMESPACE_DELETE_PROGRESS_TIMEOUT
+KUBETON_PAUSE_ANNOTATION_KEY
+KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY
+SKIP_STOP_KEY_BACKUP
+STATUS_EXEC_TIMEOUT
+HELPER_POD_READY_TIMEOUT
+HELM_UNINSTALL_CMD_TIMEOUT
+
+PROMETHEUS_IMAGE
+PROMETHEUS_PORT
+PROMETHEUS_LOCAL_PORT_BASE
+PROMETHEUS_PORT_FORWARD_DIR
+PROMETHEUS_PORT_FORWARD_WAIT_SECONDS
+PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS
+PROMETHEUS_PORT_FORWARD_ADDRESS
+PROMETHEUS_TARGET_MODE
+PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX
+PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS
+PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX
+OP_CONTROLLER_DEPLOYMENT
+
+GRAFANA_IMAGE
+GRAFANA_NAMESPACE
+GRAFANA_PORT
+GRAFANA_LOCAL_PORT_BASE
+GRAFANA_PORT_FORWARD_DIR
+GRAFANA_PORT_FORWARD_WAIT_SECONDS
+GRAFANA_PORT_FORWARD_VERIFY_SECONDS
+GRAFANA_PORT_FORWARD_ADDRESS
+GRAFANA_ADMIN_USER
+GRAFANA_ADMIN_PASSWORD
+GRAFANA_ADMIN_SECRET_NAME
+GRAFANA_DASHBOARD_UID
+GRAFANA_DASHBOARD_TITLE
+
+VICTORIA_METRICS_NAMESPACE
+VICTORIA_METRICS_STACK_NAME
+VICTORIA_METRICS_AUTH_USERNAME
+VICTORIA_METRICS_AUTH_PASSWORD
+VM_OPERATOR_VERSION
+VICTORIA_METRICS_OPERATOR_INSTALL_MANIFEST
+VICTORIA_METRICS_OPERATOR_NAMESPACE
+VICTORIA_METRICS_OPERATOR_DEPLOYMENT
+VICTORIA_METRICS_ROLLOUT_TIMEOUT_SECONDS
+VICTORIA_METRICS_AUTH_PORT
+VICTORIA_METRICS_AUTH_LOCAL_PORT_BASE
+VICTORIA_METRICS_API_PROXY_LOCAL_PORT_BASE
+VICTORIA_METRICS_PORT_FORWARD_DIR
+VICTORIA_METRICS_PORT_FORWARD_WAIT_SECONDS
+VICTORIA_METRICS_PORT_FORWARD_VERIFY_SECONDS
+VICTORIA_METRICS_PORT_FORWARD_ADDRESS
+VICTORIA_METRICS_STATE_CONFIGMAP
+
+VICTORIA_LOGS_ENABLED
+VICTORIA_LOGS_NAMESPACE
+VICTORIA_LOGS_RELEASE_NAME
+VICTORIA_LOGS_COLLECTOR_RELEASE_NAME
+VICTORIA_LOGS_HELM_REPO_NAME
+VICTORIA_LOGS_HELM_REPO_URL
+VICTORIA_LOGS_SINGLE_CHART_VERSION
+VICTORIA_LOGS_COLLECTOR_CHART_VERSION
+VICTORIA_LOGS_RETENTION_PERIOD
+VICTORIA_LOGS_PVC_SIZE
+VICTORIA_LOGS_STORAGE_CLASS
+VICTORIA_LOGS_NODE_SELECTOR
+VICTORIA_LOGS_PIN_TO_LONGHORN_CSI
+VICTORIA_LOGS_PORT
+VICTORIA_LOGS_LOCAL_PORT_BASE
+VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE
+VICTORIA_LOGS_PORT_FORWARD_DIR
+VICTORIA_LOGS_PORT_FORWARD_WAIT_SECONDS
+VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS
+VICTORIA_LOGS_PORT_FORWARD_ADDRESS
+VICTORIA_LOGS_STATE_CONFIGMAP
+VICTORIA_LOGS_HELM_TIMEOUT_SECONDS
 ```
 
 ### PROMETHEUS_TARGET_MODE
@@ -356,7 +476,8 @@ Behavior:
 - on bare-metal, pins VictoriaLogs single to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
 - when using `longhorn` storageClass, also adds Longhorn CSI-based nodeAffinity fallback (from `CSINode`) so VictoriaLogs single cannot schedule to nodes without `driver.longhorn.io`
 - starts background `kubectl port-forward` to `VMAuth` and prints VMUI/targets URLs + credentials
-- starts background `kubectl port-forward` to VictoriaLogs and prints log UI/query URLs (`/select/vmui/`, `/select/logsql/query`)
+- exposes VictoriaLogs UI/query through VMAuth (`/select/vmui/`, `/select/logsql/query`) so the same VMAuth username/password is required
+- does not expose unauthenticated external `:9428` by default; remote logs access uses the VMAuth endpoint/port
 - if `port-forward` is unavailable, starts a local `kubectl proxy` fallback and prints localhost VMUI/targets/query URLs via API proxy
 - if port-forward is unavailable (for example kubelet proxy `502` on local k3d), creates kubeton-managed `NodePort` access services and prints node-IP URLs (ExternalIP preferred, InternalIP fallback)
 - printed `*.svc` URLs are in-cluster only (usable from pods or `kubectl exec`), not direct host localhost URLs
@@ -383,8 +504,6 @@ Main environment overrides:
 - `VICTORIA_LOGS_NODE_SELECTOR` (default on bare-metal: `LONGHORN_NODE_SELECTOR`)
 - `VICTORIA_LOGS_PIN_TO_LONGHORN_CSI` (default `true`; adds nodeAffinity to nodes exposing `driver.longhorn.io`)
 - `VICTORIA_LOGS_PORT`
-- `VICTORIA_LOGS_LOCAL_PORT_BASE`
-- `VICTORIA_LOGS_PORT_FORWARD_ADDRESS`
 
 ### Cloud Install Options
 
