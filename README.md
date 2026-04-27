@@ -97,7 +97,7 @@ Restore prerequisites:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
 - `kubeton drop` removes TON resources/PVCs only.
-- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- `kubeton uninstall` removes TON resources/PVCs, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, operator release, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
 - `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
@@ -189,7 +189,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.48/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.49/install.sh" | bash
 ```
 
 The script:
@@ -218,6 +218,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton start
 ./kubeton prometheus start
 ./kubeton grafana start
+./kubeton victoria-metrics install
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton verify
@@ -244,6 +245,14 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # remove kubeton-managed Grafana resources and background port-forward(s)
 ./kubeton grafana stop
 
+# install VictoriaMetrics operator stack, auto-create TonNode scrape resources,
+# install VictoriaLogs single + collector (enabled by default),
+# start background VMAuth/VictoriaLogs port-forward(s), and print endpoints/credentials
+./kubeton victoria-metrics install
+
+# remove kubeton-managed VictoriaMetrics/VictoriaLogs resources and background port-forward(s)
+./kubeton victoria-metrics uninstall
+
 # scale by one replica
 ./kubeton add
 ./kubeton del   # always removes the highest ordinal (tail) replica
@@ -259,7 +268,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # drops TON nodes and storage (PVCs)
 ./kubeton drop
 
-# delete operator release + Longhorn + Vault (keeps TonNode CRD)
+# delete operator release + Longhorn + Vault + kubeton-managed observability stacks (keeps TonNode CRD)
 ./kubeton uninstall
 
 # OR full destructive cleanup including TonNode CRD
@@ -335,6 +344,43 @@ Main environment overrides:
 - `GRAFANA_DASHBOARD_UID`
 - `GRAFANA_DASHBOARD_TITLE`
 
+### kubeton victoria-metrics
+
+`kubeton victoria-metrics install` installs VictoriaMetrics operator (QuickStart-style `install-no-webhook` manifest), deploys `VMSingle` + `VMAgent` + `VMAuth` + `VMUser`, auto-generates TonNode scrape resources (`Service` + `VMServiceScrape`) from TonNode `CUSTOM_PARAMETERS --exporter-address`, and (by default) installs `victoria-logs-single` + `victoria-logs-collector` from the official Helm charts.
+
+Behavior:
+- applies/updates VictoriaMetrics operator in namespace `vm` (configurable)
+- deploys kubeton-managed VM stack resources with generated or user-provided auth credentials
+- creates/updates TonNode scrape resources so `VMAgent` starts scraping TonNode exporters
+- installs/updates VictoriaLogs backend (`victoria-logs-single`) and cluster-wide collector (`victoria-logs-collector` DaemonSet) with `remoteWrite[0].url` pointed at VictoriaLogs
+- starts background `kubectl port-forward` to `VMAuth` and prints VMUI/targets URLs + credentials
+- starts background `kubectl port-forward` to VictoriaLogs and prints log UI/query URLs (`/select/vmui/`, `/select/logsql/query`)
+- if `port-forward` is unavailable, starts a local `kubectl proxy` fallback and prints localhost VMUI/targets/query URLs via API proxy
+- if port-forward is unavailable (for example kubelet proxy `502` on local k3d), creates kubeton-managed `NodePort` access services and prints node-IP URLs (ExternalIP preferred, InternalIP fallback)
+- printed `*.svc` URLs are in-cluster only (usable from pods or `kubectl exec`), not direct host localhost URLs
+
+Main environment overrides:
+- `VICTORIA_METRICS_NAMESPACE`
+- `VICTORIA_METRICS_STACK_NAME`
+- `VICTORIA_METRICS_AUTH_USERNAME`
+- `VICTORIA_METRICS_AUTH_PASSWORD`
+- `VM_OPERATOR_VERSION`
+- `VICTORIA_METRICS_OPERATOR_INSTALL_MANIFEST`
+- `VICTORIA_METRICS_OPERATOR_NAMESPACE`
+- `VICTORIA_METRICS_OPERATOR_DEPLOYMENT`
+- `VICTORIA_METRICS_AUTH_PORT`
+- `VICTORIA_METRICS_AUTH_LOCAL_PORT_BASE`
+- `VICTORIA_METRICS_PORT_FORWARD_ADDRESS`
+- `VICTORIA_LOGS_ENABLED` (default `true`)
+- `VICTORIA_LOGS_NAMESPACE`
+- `VICTORIA_LOGS_RELEASE_NAME`
+- `VICTORIA_LOGS_COLLECTOR_RELEASE_NAME`
+- `VICTORIA_LOGS_RETENTION_PERIOD`
+- `VICTORIA_LOGS_PVC_SIZE`
+- `VICTORIA_LOGS_PORT`
+- `VICTORIA_LOGS_LOCAL_PORT_BASE`
+- `VICTORIA_LOGS_PORT_FORWARD_ADDRESS`
+
 ### Cloud Install Options
 
 For AWS/GCP/AliCloud, you can use any of these install paths:
@@ -378,7 +424,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.48/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.49/install.sh" | bash
 cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade
@@ -516,7 +562,7 @@ For `kubeton`-based full destructive cleanup (including CRD), use:
 ./kubeton purge
 ```
 
-`kubeton purge` includes uninstall of operator, Longhorn, and Vault resources, then deletes TonNode CRD.
+`kubeton purge` includes uninstall of operator, Longhorn, Vault, and kubeton-managed observability resources, then deletes TonNode CRD.
 
 ### Flow C: Cluster User (raw install.yaml fallback)
 
@@ -646,7 +692,7 @@ cd charts/ton-k8s-operator
 ./kubeton drop
 
 # safe cleanup (keeps TonNode CRD)
-# removes operator + Longhorn + Vault resources
+# removes operator + Longhorn + Vault + kubeton-managed observability resources
 ./kubeton uninstall
 
 # OR full destructive cleanup (includes TonNode CRD)
