@@ -99,6 +99,7 @@ VICTORIA_LOGS_RETENTION_PERIOD="${VICTORIA_LOGS_RETENTION_PERIOD:-30d}"
 VICTORIA_LOGS_PVC_SIZE="${VICTORIA_LOGS_PVC_SIZE:-10Gi}"
 VICTORIA_LOGS_STORAGE_CLASS="${VICTORIA_LOGS_STORAGE_CLASS:-}"
 VICTORIA_LOGS_NODE_SELECTOR="${VICTORIA_LOGS_NODE_SELECTOR:-}"
+VICTORIA_LOGS_PIN_TO_LONGHORN_CSI="${VICTORIA_LOGS_PIN_TO_LONGHORN_CSI:-true}"
 VICTORIA_LOGS_PORT="${VICTORIA_LOGS_PORT:-9428}"
 VICTORIA_LOGS_LOCAL_PORT_BASE="${VICTORIA_LOGS_LOCAL_PORT_BASE:-9428}"
 VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE="${VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE:-19428}"
@@ -209,6 +210,7 @@ Environment overrides:
   VICTORIA_LOGS_PVC_SIZE (default: 10Gi)
   VICTORIA_LOGS_STORAGE_CLASS (default: auto; uses longhorn when present, otherwise chart/default StorageClass)
   VICTORIA_LOGS_NODE_SELECTOR (default: bare-metal auto uses LONGHORN_NODE_SELECTOR; set empty to disable pinning)
+  VICTORIA_LOGS_PIN_TO_LONGHORN_CSI (default: true; when using longhorn storage class, force scheduling on nodes that expose driver.longhorn.io)
   VICTORIA_LOGS_PORT (default: 9428)
   VICTORIA_LOGS_LOCAL_PORT_BASE (default: 9428)
   VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE (default: 19428; local fallback kubectl proxy port base when port-forward is unavailable)
@@ -2715,7 +2717,10 @@ ensure_victoria_logs_stack() {
   local helm_timeout_seconds="$8"
   local repo_name repo_url single_chart collector_chart
   local single_chart_version collector_chart_version
-  local logs_storage_class logs_node_selector vls_selector_values_file=""
+  local logs_storage_class logs_node_selector logs_pin_to_longhorn_csi
+  local vls_selector_values_file="" vls_affinity_values_file=""
+  local matched_nodes=0
+  local -a longhorn_csi_nodes=()
   local service_name collector_daemonset access_service_name remote_write_url
   local ds_desired ds_ready
   local -a vls_cmd=()
@@ -2735,6 +2740,7 @@ ensure_victoria_logs_stack() {
   collector_chart_version="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}")"
   logs_storage_class="$(trim_whitespace "${VICTORIA_LOGS_STORAGE_CLASS:-}")"
   logs_node_selector="$(trim_whitespace "${VICTORIA_LOGS_NODE_SELECTOR:-}")"
+  logs_pin_to_longhorn_csi="$(trim_whitespace "${VICTORIA_LOGS_PIN_TO_LONGHORN_CSI:-true}")"
   if [[ -z "$logs_node_selector" && ! cluster_is_k3d ]]; then
     logs_node_selector="$(trim_whitespace "${LONGHORN_NODE_SELECTOR:-}")"
   fi
@@ -2751,6 +2757,15 @@ ensure_victoria_logs_stack() {
   if [[ -z "$logs_storage_class" ]] && kubectl get storageclass longhorn >/dev/null 2>&1; then
     logs_storage_class="longhorn"
   fi
+  if [[ -n "$logs_node_selector" ]]; then
+    matched_nodes="$(kubectl get nodes -l "$logs_node_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    if ! [[ "$matched_nodes" =~ ^[0-9]+$ ]]; then
+      matched_nodes=0
+    fi
+  fi
+  if [[ "$logs_storage_class" == "longhorn" ]] && is_true "$logs_pin_to_longhorn_csi"; then
+    mapfile -t longhorn_csi_nodes < <(list_longhorn_csi_node_names)
+  fi
 
   ensure_namespace "$ns"
   ensure_helm_repo "$repo_name" "$repo_url"
@@ -2760,6 +2775,9 @@ ensure_victoria_logs_stack() {
   collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
   if [[ -n "$logs_node_selector" ]]; then
     vls_selector_values_file="$(build_victoria_logs_single_selector_values_file "$logs_node_selector")" || return 1
+  fi
+  if [[ "${#longhorn_csi_nodes[@]}" -gt 0 ]]; then
+    vls_affinity_values_file="$(build_victoria_logs_single_affinity_values_file longhorn_csi_nodes)" || return 1
   fi
 
   vls_cmd=(helm upgrade --install "$release_name" "$single_chart" -n "$ns" --create-namespace --wait --timeout "${helm_timeout_seconds}s" \
@@ -2771,14 +2789,31 @@ ensure_victoria_logs_stack() {
   if [[ -n "$vls_selector_values_file" ]]; then
     vls_cmd+=(-f "$vls_selector_values_file")
   fi
+  if [[ -n "$vls_affinity_values_file" ]]; then
+    vls_cmd+=(-f "$vls_affinity_values_file")
+  fi
   if [[ -n "$single_chart_version" ]]; then
     vls_cmd+=(--version "$single_chart_version")
   fi
 
   echo "[victoria-metrics] Installing/updating VictoriaLogs single (${release_name}) ..." >&2
+  if [[ -n "$logs_storage_class" ]]; then
+    echo "[victoria-metrics] VictoriaLogs single storageClass: ${logs_storage_class}" >&2
+  fi
+  if [[ -n "$logs_node_selector" ]]; then
+    echo "[victoria-metrics] VictoriaLogs single nodeSelector: ${logs_node_selector} (matched ${matched_nodes} node(s))" >&2
+  fi
+  if [[ "${#longhorn_csi_nodes[@]}" -gt 0 ]]; then
+    echo "[victoria-metrics] VictoriaLogs single Longhorn CSI nodeAffinity enabled for ${#longhorn_csi_nodes[@]} node(s)." >&2
+  elif [[ "$logs_storage_class" == "longhorn" ]] && is_true "$logs_pin_to_longhorn_csi"; then
+    echo "Warning: no Longhorn CSI nodes detected in CSINode objects; cannot apply VictoriaLogs CSI nodeAffinity fallback." >&2
+  fi
   if ! run_with_timeout "${helm_timeout_seconds}s" "${vls_cmd[@]}" >/dev/null; then
     if [[ -n "$vls_selector_values_file" ]]; then
       rm -f "$vls_selector_values_file" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$vls_affinity_values_file" ]]; then
+      rm -f "$vls_affinity_values_file" >/dev/null 2>&1 || true
     fi
     echo "Error: failed to install/upgrade VictoriaLogs single release ${release_name} in namespace ${ns}." >&2
     if [[ -n "$logs_storage_class" ]]; then
@@ -2800,6 +2835,9 @@ ensure_victoria_logs_stack() {
   fi
   if [[ -n "$vls_selector_values_file" ]]; then
     rm -f "$vls_selector_values_file" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$vls_affinity_values_file" ]]; then
+    rm -f "$vls_affinity_values_file" >/dev/null 2>&1 || true
   fi
 
   access_service_name="$(ensure_victoria_logs_access_service "$ns" "$release_name" "$remote_port")"
@@ -3209,6 +3247,43 @@ build_victoria_logs_single_selector_values_file() {
     echo "server:"
     echo "  nodeSelector:"
     write_yaml_map_from_pairs selector_pairs 4
+  } >"$values_file"
+
+  printf '%s' "$values_file"
+}
+
+list_longhorn_csi_node_names() {
+  kubectl get csinode -o go-template='{{range .items}}{{ $node := .metadata.name }}{{range .spec.drivers}}{{if eq .name "driver.longhorn.io"}}{{$node}}{{"\n"}}{{end}}{{end}}{{end}}' 2>/dev/null \
+    | awk 'NF' \
+    | sort -u
+}
+
+build_victoria_logs_single_affinity_values_file() {
+  local input_nodes_array_name="$1"
+  local -n input_nodes_ref="$input_nodes_array_name"
+  local values_file node
+
+  if [[ ${#input_nodes_ref[@]} -eq 0 ]]; then
+    echo "Error: cannot build VictoriaLogs affinity values; Longhorn CSI node list is empty." >&2
+    return 1
+  fi
+
+  values_file="$(mktemp -t kubeton-victoria-logs-single-affinity.XXXXXX.yaml)"
+  {
+    echo "server:"
+    echo "  affinity:"
+    echo "    nodeAffinity:"
+    echo "      requiredDuringSchedulingIgnoredDuringExecution:"
+    echo "        nodeSelectorTerms:"
+    echo "          - matchExpressions:"
+    echo "              - key: kubernetes.io/hostname"
+    echo "                operator: In"
+    echo "                values:"
+    for node in "${input_nodes_ref[@]}"; do
+      node="$(trim_whitespace "$node")"
+      [[ -z "$node" ]] && continue
+      printf '                  - %s\n' "$(yaml_quote "$node")"
+    done
   } >"$values_file"
 
   printf '%s' "$values_file"

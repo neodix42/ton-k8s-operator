@@ -354,6 +354,7 @@ Behavior:
 - creates/updates TonNode scrape resources so `VMAgent` starts scraping TonNode exporters
 - installs/updates VictoriaLogs backend (`victoria-logs-single`) and cluster-wide collector (`victoria-logs-collector` DaemonSet) with `remoteWrite[0].url` pointed at VictoriaLogs
 - on bare-metal, pins VictoriaLogs single to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
+- when using `longhorn` storageClass, also adds Longhorn CSI-based nodeAffinity fallback (from `CSINode`) so VictoriaLogs single cannot schedule to nodes without `driver.longhorn.io`
 - starts background `kubectl port-forward` to `VMAuth` and prints VMUI/targets URLs + credentials
 - starts background `kubectl port-forward` to VictoriaLogs and prints log UI/query URLs (`/select/vmui/`, `/select/logsql/query`)
 - if `port-forward` is unavailable, starts a local `kubectl proxy` fallback and prints localhost VMUI/targets/query URLs via API proxy
@@ -380,6 +381,7 @@ Main environment overrides:
 - `VICTORIA_LOGS_PVC_SIZE`
 - `VICTORIA_LOGS_STORAGE_CLASS` (default auto; uses `longhorn` when available)
 - `VICTORIA_LOGS_NODE_SELECTOR` (default on bare-metal: `LONGHORN_NODE_SELECTOR`)
+- `VICTORIA_LOGS_PIN_TO_LONGHORN_CSI` (default `true`; adds nodeAffinity to nodes exposing `driver.longhorn.io`)
 - `VICTORIA_LOGS_PORT`
 - `VICTORIA_LOGS_LOCAL_PORT_BASE`
 - `VICTORIA_LOGS_PORT_FORWARD_ADDRESS`
