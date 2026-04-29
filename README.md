@@ -223,6 +223,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton wallet create main-wallet
+./kubeton wallet deploy
 ./kubeton wallet deploy main-wallet
 ./kubeton wallet show
 ./kubeton wallet show main-wallet

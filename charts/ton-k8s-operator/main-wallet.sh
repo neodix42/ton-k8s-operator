@@ -322,6 +322,7 @@ send_boc_toncenter() {
 send_boc_liteserver() {
   local boc_file="$1"
   local lite_client_bin
+  local global_config_source global_config_path temp_config_file="" rc=0
 
   lite_client_bin="$(resolve_lite_client_bin || true)"
   lite_client_bin="$(trim_whitespace "$lite_client_bin")"
@@ -333,7 +334,57 @@ send_boc_liteserver() {
     echo "Error: GLOBAL_CONFIG_URL is empty." >&2
     return 1
   fi
-  "$lite_client_bin" -C "$GLOBAL_CONFIG_URL" -c "sendfile $boc_file"
+  global_config_source="$(trim_whitespace "$GLOBAL_CONFIG_URL")"
+  if [[ "$global_config_source" =~ ^https?:// ]]; then
+    require_bin curl
+    require_bin mktemp
+    temp_config_file="$(mktemp)"
+    if ! curl -fsSL "$global_config_source" -o "$temp_config_file"; then
+      rm -f "$temp_config_file"
+      echo "Error: failed to download global config from ${global_config_source}" >&2
+      return 1
+    fi
+    if [[ ! -s "$temp_config_file" ]]; then
+      rm -f "$temp_config_file"
+      echo "Error: downloaded global config is empty: ${global_config_source}" >&2
+      return 1
+    fi
+    global_config_path="$temp_config_file"
+  else
+    global_config_path="${global_config_source#file://}"
+    if [[ ! -r "$global_config_path" ]]; then
+      echo "Error: global config file is not readable: ${global_config_path}" >&2
+      return 1
+    fi
+  fi
+
+  if ! "$lite_client_bin" -C "$global_config_path" -c "sendfile $boc_file"; then
+    rc=$?
+  fi
+  if [[ -n "$temp_config_file" ]]; then
+    rm -f "$temp_config_file"
+  fi
+  return "$rc"
+}
+
+deploy_boc_with_mode() {
+  local wallet_name="$1"
+  local boc_file="$2"
+  local normalized_mode="$3"
+
+  echo "Deploying wallet '${wallet_name}' using BOC '${boc_file##*/}' ..."
+  case "$normalized_mode" in
+    liteserver)
+      send_boc_liteserver "$boc_file"
+      ;;
+    toncenter)
+      send_boc_toncenter "$boc_file"
+      ;;
+    *)
+      echo "Error: unsupported MODE=${MODE}. Use liteserver or toncenter." >&2
+      return 1
+      ;;
+  esac
 }
 
 main_wallet_create() {
@@ -494,28 +545,56 @@ main_wallet_show() {
 }
 
 main_wallet_deploy() {
-  local wallet_name="${1:-$MAIN_WALLET_NAME_DEFAULT}"
-  local boc_file="${MAIN_WALLET_DIR}/${wallet_name}-query.boc"
+  local wallet_name="${1:-}"
+  local boc_file
   local normalized_mode
+  local -a boc_files=()
+  local -a failed_wallets=()
+  local file base
 
-  if [[ ! -s "$boc_file" ]]; then
-    echo "Error: missing BOC file ${boc_file}. Run create first." >&2
+  if (( $# > 1 )); then
+    echo "Error: usage: main-wallet.sh deploy [wallet-name]" >&2
     return 1
   fi
 
   normalized_mode="$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')"
-  case "$normalized_mode" in
-    liteserver)
-      send_boc_liteserver "$boc_file"
-      ;;
-    toncenter)
-      send_boc_toncenter "$boc_file"
-      ;;
-    *)
-      echo "Error: unsupported MODE=${MODE}. Use liteserver or toncenter." >&2
+
+  if [[ -n "$wallet_name" ]]; then
+    boc_file="${MAIN_WALLET_DIR}/${wallet_name}-query.boc"
+    if [[ ! -s "$boc_file" ]]; then
+      echo "Error: missing BOC file ${boc_file}. Run create first." >&2
       return 1
-      ;;
-  esac
+    fi
+    deploy_boc_with_mode "$wallet_name" "$boc_file" "$normalized_mode"
+    return $?
+  fi
+
+  shopt -s nullglob
+  for file in "$MAIN_WALLET_DIR"/*-query.boc; do
+    if [[ -s "$file" ]]; then
+      boc_files+=("$file")
+    fi
+  done
+  shopt -u nullglob
+
+  if [[ ${#boc_files[@]} -eq 0 ]]; then
+    echo "Error: no wallet query BOC files found in ${MAIN_WALLET_DIR}. Run create first." >&2
+    return 1
+  fi
+
+  for file in "${boc_files[@]}"; do
+    base="${file##*/}"
+    wallet_name="${base%-query.boc}"
+    if ! deploy_boc_with_mode "$wallet_name" "$file" "$normalized_mode"; then
+      failed_wallets+=("$wallet_name")
+    fi
+  done
+
+  if [[ ${#failed_wallets[@]} -gt 0 ]]; then
+    echo "Error: failed to deploy wallet(s): ${failed_wallets[*]}" >&2
+    return 1
+  fi
+  return 0
 }
 
 run_action() {

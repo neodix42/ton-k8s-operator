@@ -118,7 +118,7 @@ MAIN_WALLET_BUNDLE_SIZE="${MAIN_WALLET_BUNDLE_SIZE:-5Gi}"
 MAIN_WALLET_BUNDLE_STORAGE_CLASS="${MAIN_WALLET_BUNDLE_STORAGE_CLASS:-$ENCRYPTED_SC_NAME}"
 MAIN_WALLET_BUNDLE_ACCESS_MODE="${MAIN_WALLET_BUNDLE_ACCESS_MODE:-ReadWriteOnce}"
 MAIN_WALLET_MODE="${MAIN_WALLET_MODE:-liteserver}"
-MAIN_WALLET_GLOBAL_CONFIG_URL="${MAIN_WALLET_GLOBAL_CONFIG_URL:-https://ton.org/global.config.json}"
+MAIN_WALLET_GLOBAL_CONFIG_URL="${MAIN_WALLET_GLOBAL_CONFIG_URL:-}"
 MAIN_WALLET_TONCENTER_URL="${MAIN_WALLET_TONCENTER_URL:-https://testnet.toncenter.com}"
 MAIN_WALLET_TONCENTER_API_KEY="${MAIN_WALLET_TONCENTER_API_KEY:-}"
 MAIN_WALLET_NAME="${MAIN_WALLET_NAME:-main-wallet}"
@@ -644,6 +644,58 @@ resolve_tonnode_image() {
   fi
 
   return 1
+}
+
+resolve_tonnode_global_config_url_from_values_file() {
+  local values_file="$1"
+  local url=""
+
+  [[ -f "$values_file" ]] || return 1
+  url="$(awk '
+    /^[[:space:]]*tonNode:[[:space:]]*$/ {in_ton=1; in_network=0; next}
+    in_ton && /^[^[:space:]]/ {in_ton=0; in_network=0}
+    in_ton && /^  network:[[:space:]]*$/ {in_network=1; next}
+    in_ton && in_network && /^  [^[:space:]]/ {in_network=0}
+    in_ton && in_network && /^    globalConfigURL:[[:space:]]*/ {
+      sub(/^    globalConfigURL:[[:space:]]*/, "", $0)
+      sub(/[[:space:]]*#.*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/"$/, "", $0)
+      gsub(/^'\''/, "", $0)
+      gsub(/'\''$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$values_file" 2>/dev/null || true)"
+  url="$(trim_whitespace "$url")"
+  [[ -n "$url" ]] || return 1
+  printf '%s' "$url"
+}
+
+resolve_main_wallet_global_config_url() {
+  local url
+
+  url="$(trim_whitespace "${MAIN_WALLET_GLOBAL_CONFIG_URL:-}")"
+  if [[ -n "$url" ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+
+  url="$(resolve_tonnode_global_config_url_from_values_file "$TON_VALUES_FILE" || true)"
+  url="$(trim_whitespace "$url")"
+  if [[ -n "$url" ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+
+  url="$(resolve_tonnode_global_config_url_from_values_file "$CHART_DIR/values.yaml" || true)"
+  url="$(trim_whitespace "$url")"
+  if [[ -n "$url" ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+
+  printf '%s' "https://ton.org/global.config.json"
 }
 
 extract_image_tag() {
@@ -7899,6 +7951,7 @@ run_wallet() {
       echo "Examples:"
       echo "  kubeton wallet create"
       echo "  kubeton wallet create my-wallet"
+      echo "  kubeton wallet deploy"
       echo "  kubeton wallet deploy my-wallet"
       echo "  kubeton wallet show"
       echo "  kubeton wallet show my-wallet"
@@ -7941,6 +7994,9 @@ run_wallet() {
         echo "Error: usage: kubeton wallet deploy [name]" >&2
         return 1
       fi
+      if (( ${#action_args[@]} == 0 )); then
+        confirm_or_exit "This will deploy (send BOC) for ALL wallets. Continue?"
+      fi
       ;;
     show)
       if (( $# <= 1 )); then
@@ -7960,6 +8016,7 @@ run_wallet() {
   local ns
   local pod_name
   local image
+  local global_config_url
   local timeout_seconds
   local bundle_storage_class=""
   local pod_rc=0
@@ -7981,6 +8038,7 @@ run_wallet() {
   ensure_main_wallet_longhorn_ready "$bundle_storage_class"
 
   image="$(resolve_main_wallet_image)"
+  global_config_url="$(resolve_main_wallet_global_config_url)"
   timeout_seconds="$(main_wallet_timeout_seconds)"
 
   pod_name="kubeton-main-wallet-$RANDOM-$RANDOM"
@@ -8018,7 +8076,7 @@ run_wallet() {
     echo "        - name: MODE"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_MODE")"
     echo "        - name: GLOBAL_CONFIG_URL"
-    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_GLOBAL_CONFIG_URL")"
+    printf '          value: %s\n' "$(yaml_quote "$global_config_url")"
     echo "        - name: TONCENTER_URL"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_TONCENTER_URL")"
     if [[ -n "$MAIN_WALLET_TONCENTER_API_KEY" ]]; then
