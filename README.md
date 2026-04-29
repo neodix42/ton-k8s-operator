@@ -61,6 +61,7 @@ Secure key workflow is available via `spec.keyManagement`:
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
 - sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
+- `kubeton wallet ...` runs in a separate ephemeral pod with its own encrypted bundle PVC; it is intentionally excluded from `kubeton status` and `kubeton backup-keys` flows
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
@@ -221,6 +222,10 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton victoria-metrics install
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
+./kubeton wallet create main-wallet
+./kubeton wallet deploy main-wallet
+./kubeton wallet show
+./kubeton wallet show main-wallet
 ./kubeton verify
 ./kubeton status
 ./kubeton exec "sync"
@@ -289,6 +294,21 @@ OP_VALUES_FILE
 TON_VALUES_FILE
 TON_POD_LABEL
 TON_NAMESPACE
+MAIN_WALLET_IMAGE_REPOSITORY
+MAIN_WALLET_IMAGE
+MAIN_WALLET_SCRIPT_FILE
+MAIN_WALLET_SCRIPT_CONFIGMAP
+MAIN_WALLET_BUNDLE_PVC
+MAIN_WALLET_BUNDLE_SIZE
+MAIN_WALLET_BUNDLE_STORAGE_CLASS
+MAIN_WALLET_BUNDLE_ACCESS_MODE
+MAIN_WALLET_MODE
+MAIN_WALLET_GLOBAL_CONFIG_URL
+MAIN_WALLET_TONCENTER_URL
+MAIN_WALLET_TONCENTER_API_KEY
+MAIN_WALLET_NAME
+MAIN_WALLET_POD_TIMEOUT
+MAIN_WALLET_RUNTIME_TMPFS_SIZE
 
 AUTO_BAREMETAL_BOOTSTRAP
 FORCE_BAREMETAL_BOOTSTRAP

@@ -109,6 +109,21 @@ VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS="${VICTORIA_LOGS_PORT_FORWARD_VERIFY_S
 VICTORIA_LOGS_PORT_FORWARD_ADDRESS="${VICTORIA_LOGS_PORT_FORWARD_ADDRESS:-}"
 VICTORIA_LOGS_STATE_CONFIGMAP="${VICTORIA_LOGS_STATE_CONFIGMAP:-kubeton-victoria-logs-state}"
 VICTORIA_LOGS_HELM_TIMEOUT_SECONDS="${VICTORIA_LOGS_HELM_TIMEOUT_SECONDS:-600}"
+MAIN_WALLET_IMAGE_REPOSITORY="${MAIN_WALLET_IMAGE_REPOSITORY:-ghcr.io/ton-blockchain/ton}"
+MAIN_WALLET_IMAGE="${MAIN_WALLET_IMAGE:-}"
+MAIN_WALLET_SCRIPT_FILE="${MAIN_WALLET_SCRIPT_FILE:-$CHART_DIR/main-wallet.sh}"
+MAIN_WALLET_SCRIPT_CONFIGMAP="${MAIN_WALLET_SCRIPT_CONFIGMAP:-kubeton-main-wallet-script}"
+MAIN_WALLET_BUNDLE_PVC="${MAIN_WALLET_BUNDLE_PVC:-main-wallet-keybundle}"
+MAIN_WALLET_BUNDLE_SIZE="${MAIN_WALLET_BUNDLE_SIZE:-5Gi}"
+MAIN_WALLET_BUNDLE_STORAGE_CLASS="${MAIN_WALLET_BUNDLE_STORAGE_CLASS:-$ENCRYPTED_SC_NAME}"
+MAIN_WALLET_BUNDLE_ACCESS_MODE="${MAIN_WALLET_BUNDLE_ACCESS_MODE:-ReadWriteOnce}"
+MAIN_WALLET_MODE="${MAIN_WALLET_MODE:-liteserver}"
+MAIN_WALLET_GLOBAL_CONFIG_URL="${MAIN_WALLET_GLOBAL_CONFIG_URL:-https://ton.org/global.config.json}"
+MAIN_WALLET_TONCENTER_URL="${MAIN_WALLET_TONCENTER_URL:-https://testnet.toncenter.com}"
+MAIN_WALLET_TONCENTER_API_KEY="${MAIN_WALLET_TONCENTER_API_KEY:-}"
+MAIN_WALLET_NAME="${MAIN_WALLET_NAME:-main-wallet}"
+MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-900s}"
+MAIN_WALLET_RUNTIME_TMPFS_SIZE="${MAIN_WALLET_RUNTIME_TMPFS_SIZE:-512Mi}"
 
 usage() {
   cat <<'EOF'
@@ -130,6 +145,7 @@ Commands:
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
+  wallet               Run ephemeral wallet utility pod (Vault-backed encrypted persistence): kubeton wallet <create|deploy|show> [args...]
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + remove kubeton-managed observability stacks + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
@@ -561,6 +577,109 @@ desired_operator_image() {
     return 0
   fi
   return 1
+}
+
+resolve_tonnode_image_from_values_file() {
+  local values_file="$1"
+  local image=""
+
+  [[ -f "$values_file" ]] || return 1
+  image="$(awk '
+    /^[[:space:]]*tonNode:[[:space:]]*$/ {in_ton=1; next}
+    in_ton && /^[^[:space:]]/ {in_ton=0}
+    in_ton && /^  image:[[:space:]]*/ {
+      sub(/^  image:[[:space:]]*/, "", $0)
+      sub(/[[:space:]]*#.*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/"$/, "", $0)
+      gsub(/^'\''/, "", $0)
+      gsub(/'\''$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$values_file" 2>/dev/null || true)"
+  image="$(trim_whitespace "$image")"
+  [[ -n "$image" ]] || return 1
+  printf '%s' "$image"
+}
+
+resolve_tonnode_image_from_cluster() {
+  local image=""
+  image="$(kubectl get statefulsets -A -l "$TON_POD_LABEL" \
+    -o jsonpath='{range .items[0].spec.template.spec.containers[?(@.name=="ton-node")]}{.image}{end}' 2>/dev/null || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  image="$(kubectl get statefulsets -A -l "$TON_POD_LABEL" \
+    -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+  image="$(trim_whitespace "$image")"
+  [[ -n "$image" ]] || return 1
+  printf '%s' "$image"
+}
+
+resolve_tonnode_image() {
+  local image=""
+  image="$(resolve_tonnode_image_from_cluster || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  image="$(resolve_tonnode_image_from_values_file "$TON_VALUES_FILE" || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  image="$(resolve_tonnode_image_from_values_file "$CHART_DIR/values.yaml" || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  return 1
+}
+
+extract_image_tag() {
+  local image="$1"
+  local ref
+  ref="${image##*/}"
+  ref="${ref%@*}"
+  if [[ "$ref" != *:* ]]; then
+    return 1
+  fi
+  printf '%s' "${ref##*:}"
+}
+
+resolve_main_wallet_image() {
+  local explicit_image tonnode_image tag
+
+  explicit_image="$(trim_whitespace "${MAIN_WALLET_IMAGE:-}")"
+  if [[ -n "$explicit_image" ]]; then
+    printf '%s' "$explicit_image"
+    return 0
+  fi
+
+  tonnode_image="$(resolve_tonnode_image || true)"
+  tonnode_image="$(trim_whitespace "$tonnode_image")"
+  if [[ -z "$tonnode_image" ]]; then
+    echo "Error: cannot resolve TonNode image; set MAIN_WALLET_IMAGE explicitly." >&2
+    return 1
+  fi
+
+  tag="$(extract_image_tag "$tonnode_image" || true)"
+  tag="$(trim_whitespace "$tag")"
+  if [[ -z "$tag" ]]; then
+    echo "Error: cannot derive image tag from TonNode image '${tonnode_image}'. Set MAIN_WALLET_IMAGE explicitly." >&2
+    return 1
+  fi
+  printf '%s:%s' "$MAIN_WALLET_IMAGE_REPOSITORY" "$tag"
 }
 
 current_operator_image() {
@@ -7552,6 +7671,414 @@ run_victoria_metrics() {
   esac
 }
 
+main_wallet_timeout_seconds() {
+  local raw
+  raw="$(trim_whitespace "${MAIN_WALLET_POD_TIMEOUT:-900s}")"
+  if [[ "$raw" =~ ^([0-9]+)s?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf '%s' "900"
+}
+
+find_main_wallet_template_pvc() {
+  local preferred_ns="$1"
+  local sts_name=""
+
+  sts_name="$(kubectl -n "$preferred_ns" get statefulsets -l "$TON_POD_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  sts_name="$(trim_whitespace "$sts_name")"
+  if [[ -n "$sts_name" ]] && kubectl -n "$preferred_ns" get pvc "keybundle-${sts_name}-0" >/dev/null 2>&1; then
+    printf '%s\t%s\n' "$preferred_ns" "keybundle-${sts_name}-0"
+    return 0
+  fi
+
+  local row ns sts
+  while IFS= read -r row; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts _ <<<"$row"
+    [[ -z "$ns" || -z "$sts" ]] && continue
+    if kubectl -n "$ns" get pvc "keybundle-${sts}-0" >/dev/null 2>&1; then
+      printf '%s\t%s\n' "$ns" "keybundle-${sts}-0"
+      return 0
+    fi
+  done < <(list_ton_statefulsets 2>/dev/null || true)
+  return 1
+}
+
+ensure_main_wallet_bundle_pvc() {
+  local ns="$1"
+  local pvc_name="$MAIN_WALLET_BUNDLE_PVC"
+  local source_row source_ns source_pvc
+  local storage_request storage_class volume_mode access_modes_raw
+  local -a access_modes=()
+  local mode
+
+  if kubectl -n "$ns" get pvc "$pvc_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  source_row="$(find_main_wallet_template_pvc "$ns" || true)"
+  source_row="$(trim_whitespace "$source_row")"
+  if [[ -n "$source_row" ]]; then
+    IFS=$'\t' read -r source_ns source_pvc <<<"$source_row"
+    storage_request="$(kubectl -n "$source_ns" get pvc "$source_pvc" -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null || true)"
+    storage_class="$(kubectl -n "$source_ns" get pvc "$source_pvc" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+    volume_mode="$(kubectl -n "$source_ns" get pvc "$source_pvc" -o jsonpath='{.spec.volumeMode}' 2>/dev/null || true)"
+    access_modes_raw="$(kubectl -n "$source_ns" get pvc "$source_pvc" -o jsonpath='{.spec.accessModes[*]}' 2>/dev/null || true)"
+    read -r -a access_modes <<<"$access_modes_raw"
+  fi
+
+  storage_request="$(trim_whitespace "${storage_request:-}")"
+  if [[ -z "$storage_request" ]]; then
+    storage_request="$(trim_whitespace "$MAIN_WALLET_BUNDLE_SIZE")"
+  fi
+  if [[ -z "$storage_request" ]]; then
+    storage_request="5Gi"
+  fi
+
+  storage_class="$(trim_whitespace "${storage_class:-}")"
+  if [[ -z "$storage_class" ]]; then
+    storage_class="$(trim_whitespace "$MAIN_WALLET_BUNDLE_STORAGE_CLASS")"
+  fi
+  ensure_main_wallet_longhorn_ready "$storage_class"
+
+  volume_mode="$(trim_whitespace "${volume_mode:-}")"
+  if [[ ${#access_modes[@]} -eq 0 ]]; then
+    access_modes=("$(trim_whitespace "$MAIN_WALLET_BUNDLE_ACCESS_MODE")")
+  fi
+  if [[ -z "${access_modes[0]:-}" ]]; then
+    access_modes=("ReadWriteOnce")
+  fi
+
+  {
+    echo "apiVersion: v1"
+    echo "kind: PersistentVolumeClaim"
+    echo "metadata:"
+    echo "  name: ${pvc_name}"
+    echo "  namespace: ${ns}"
+    echo "spec:"
+    echo "  accessModes:"
+    for mode in "${access_modes[@]}"; do
+      mode="$(trim_whitespace "$mode")"
+      [[ -z "$mode" ]] && continue
+      echo "  - ${mode}"
+    done
+    if [[ -n "$storage_class" ]]; then
+      echo "  storageClassName: ${storage_class}"
+    fi
+    if [[ -n "$volume_mode" ]]; then
+      echo "  volumeMode: ${volume_mode}"
+    fi
+    echo "  resources:"
+    echo "    requests:"
+    echo "      storage: ${storage_request}"
+  } | kubectl apply -f - >/dev/null
+
+  if pvc_uses_wait_for_first_consumer "$ns" "$pvc_name"; then
+    echo "PVC ${ns}/${pvc_name} uses WaitForFirstConsumer; skipping pre-run Bound wait."
+    return 0
+  fi
+  wait_pvc_bound "$ns" "$pvc_name" 900
+}
+
+ensure_main_wallet_script_configmap() {
+  local ns="$1"
+  if [[ ! -f "$MAIN_WALLET_SCRIPT_FILE" ]]; then
+    echo "Error: main wallet script file not found: ${MAIN_WALLET_SCRIPT_FILE}" >&2
+    return 1
+  fi
+  kubectl -n "$ns" create configmap "$MAIN_WALLET_SCRIPT_CONFIGMAP" \
+    --from-file=main-wallet.sh="$MAIN_WALLET_SCRIPT_FILE" \
+    --dry-run=client -o yaml | kubectl -n "$ns" apply -f - >/dev/null
+}
+
+main_wallet_bundle_storage_class() {
+  local ns="$1"
+  local pvc_name="$2"
+  local storage_class=""
+
+  storage_class="$(kubectl -n "$ns" get pvc "$pvc_name" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+  storage_class="$(trim_whitespace "$storage_class")"
+  if [[ -z "$storage_class" ]]; then
+    storage_class="$(kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null | awk '$2=="true"{print $1; exit}')"
+    storage_class="$(trim_whitespace "$storage_class")"
+  fi
+  printf '%s' "$storage_class"
+}
+
+ensure_main_wallet_longhorn_ready() {
+  local storage_class="$1"
+  local provisioner desired ready
+
+  storage_class="$(trim_whitespace "$storage_class")"
+  [[ -z "$storage_class" ]] && return 0
+
+  if ! kubectl get storageclass "$storage_class" >/dev/null 2>&1; then
+    echo "Error: main-wallet storage class '${storage_class}' not found." >&2
+    return 1
+  fi
+
+  provisioner="$(kubectl get storageclass "$storage_class" -o jsonpath='{.provisioner}' 2>/dev/null || true)"
+  provisioner="$(trim_whitespace "$provisioner")"
+  if [[ "$provisioner" != "driver.longhorn.io" ]]; then
+    return 0
+  fi
+
+  if ! kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-manager >/dev/null 2>&1; then
+    echo "Error: storage class '${storage_class}' uses Longhorn, but daemonset ${LONGHORN_NAMESPACE}/longhorn-manager is missing." >&2
+    echo "Run './kubeton bootstrap-baremetal' or fix Longhorn before running main-wallet." >&2
+    return 1
+  fi
+
+  desired="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-manager -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+  ready="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-manager -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+  desired="$(trim_whitespace "$desired")"
+  ready="$(trim_whitespace "$ready")"
+
+  if ! [[ "$desired" =~ ^[0-9]+$ && "$ready" =~ ^[0-9]+$ ]]; then
+    echo "Error: cannot read Longhorn readiness for daemonset ${LONGHORN_NAMESPACE}/longhorn-manager." >&2
+    return 1
+  fi
+  if (( desired == 0 || ready == 0 )); then
+    echo "Error: Longhorn is required by storage class '${storage_class}', but longhorn-manager readiness is ${ready}/${desired}." >&2
+    return 1
+  fi
+
+  if ! kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/longhorn-manager --timeout=120s >/dev/null 2>&1; then
+    echo "Error: Longhorn manager is not Ready (daemonset ${LONGHORN_NAMESPACE}/longhorn-manager)." >&2
+    return 1
+  fi
+}
+
+wait_main_wallet_pod_completion() {
+  local ns="$1"
+  local pod="$2"
+  local timeout_seconds="$3"
+  local deadline phase exit_code
+
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while (( $(date +%s) < deadline )); do
+    phase="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    phase="$(trim_whitespace "$phase")"
+    case "$phase" in
+      Succeeded)
+        return 0
+        ;;
+      Failed)
+        exit_code="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null || true)"
+        exit_code="$(trim_whitespace "$exit_code")"
+        if [[ "$exit_code" =~ ^[0-9]+$ ]]; then
+          return "$exit_code"
+        fi
+        return 1
+        ;;
+      "")
+        ;;
+      *)
+        ;;
+    esac
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for pod ${ns}/${pod} completion." >&2
+  return 1
+}
+
+run_wallet() {
+  require_bin kubectl
+
+  local action="${1:-}"
+  shift || true
+  if [[ -z "$action" ]]; then
+    echo "Error: usage: kubeton wallet <create|deploy|show> [args...]" >&2
+    exit 1
+  fi
+  case "$action" in
+    help|-h|--help)
+      echo "Usage: kubeton wallet <create|deploy|show> [args...]"
+      echo "Examples:"
+      echo "  kubeton wallet create"
+      echo "  kubeton wallet create my-wallet"
+      echo "  kubeton wallet deploy my-wallet"
+      echo "  kubeton wallet show"
+      echo "  kubeton wallet show my-wallet"
+      return 0
+      ;;
+    create|deploy|show)
+      ;;
+    *)
+      echo "Error: unknown wallet subcommand '$action'." >&2
+      echo "Usage: kubeton wallet <create|deploy|show> [args...]" >&2
+      return 1
+      ;;
+  esac
+
+  local -a action_args=()
+  case "$action" in
+    create)
+      case "$#" in
+        0)
+          action_args=()
+          ;;
+        1)
+          action_args=("0" "42" "$1")
+          ;;
+        3)
+          # Backward-compatible form: create <workchain> <subwallet-id> <wallet-name>
+          action_args=("$1" "$2" "$3")
+          ;;
+        *)
+          echo "Error: usage: kubeton wallet create [name]" >&2
+          echo "       legacy: kubeton wallet create <workchain> <subwallet-id> <wallet-name>" >&2
+          return 1
+          ;;
+      esac
+      ;;
+    deploy)
+      if (( $# <= 1 )); then
+        action_args=("$@")
+      else
+        echo "Error: usage: kubeton wallet deploy [name]" >&2
+        return 1
+      fi
+      ;;
+    show)
+      if (( $# <= 1 )); then
+        action_args=("$@")
+      else
+        echo "Error: usage: kubeton wallet show [name]" >&2
+        return 1
+      fi
+      ;;
+  esac
+
+  if should_bootstrap_baremetal; then
+    ensure_auto_bootstrap_stack_if_needed
+  fi
+  validate_external_key_prereqs
+
+  local ns
+  local pod_name
+  local image
+  local timeout_seconds
+  local bundle_storage_class=""
+  local pod_rc=0
+  local cleanup_required=1
+  local -a command_items=("/scripts/main-wallet.sh" "run" "$action")
+  local item
+
+  for item in "${action_args[@]}"; do
+    command_items+=("$item")
+  done
+
+  ns="$(trim_whitespace "$TON_NAMESPACE")"
+  [[ -z "$ns" ]] && ns="default"
+  ensure_namespace "$ns"
+
+  ensure_main_wallet_script_configmap "$ns"
+  ensure_main_wallet_bundle_pvc "$ns"
+  bundle_storage_class="$(main_wallet_bundle_storage_class "$ns" "$MAIN_WALLET_BUNDLE_PVC")"
+  ensure_main_wallet_longhorn_ready "$bundle_storage_class"
+
+  image="$(resolve_main_wallet_image)"
+  timeout_seconds="$(main_wallet_timeout_seconds)"
+
+  pod_name="kubeton-main-wallet-$RANDOM-$RANDOM"
+
+  cleanup_main_wallet() {
+    [[ "${cleanup_required:-0}" -ne 1 ]] && return 0
+    kubectl -n "$ns" delete pod "$pod_name" --ignore-not-found >/dev/null 2>&1 || true
+  }
+  trap cleanup_main_wallet EXIT INT TERM
+
+  {
+    echo "apiVersion: v1"
+    echo "kind: Pod"
+    echo "metadata:"
+    echo "  name: ${pod_name}"
+    echo "  labels:"
+    echo "    app.kubernetes.io/name: kubeton-main-wallet"
+    echo "    app.kubernetes.io/managed-by: kubeton"
+    echo "spec:"
+    echo "  restartPolicy: Never"
+    echo "  activeDeadlineSeconds: ${timeout_seconds}"
+    echo "  containers:"
+    echo "    - name: main-wallet"
+    echo "      image: ${image}"
+    echo "      imagePullPolicy: IfNotPresent"
+    echo "      command:"
+    for item in "${command_items[@]}"; do
+      printf '        - %s\n' "$(yaml_quote "$item")"
+    done
+    echo "      env:"
+    echo "        - name: KEY_PROVIDER"
+    printf '          value: %s\n' "$(yaml_quote "vault")"
+    echo "        - name: VAULT_TRANSIT_KEY"
+    printf '          value: %s\n' "$(yaml_quote "$VAULT_TRANSIT_KEY")"
+    echo "        - name: MODE"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_MODE")"
+    echo "        - name: GLOBAL_CONFIG_URL"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_GLOBAL_CONFIG_URL")"
+    echo "        - name: TONCENTER_URL"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_TONCENTER_URL")"
+    if [[ -n "$MAIN_WALLET_TONCENTER_API_KEY" ]]; then
+      echo "        - name: TONCENTER_API_KEY"
+      printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_TONCENTER_API_KEY")"
+    fi
+    echo "        - name: MAIN_WALLET_NAME_DEFAULT"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_NAME")"
+    echo "        - name: MAIN_WALLET_DIR"
+    printf '          value: %s\n' "$(yaml_quote "/var/main-wallet/runtime")"
+    echo "        - name: MAIN_WALLET_BUNDLE_DIR"
+    printf '          value: %s\n' "$(yaml_quote "/var/main-wallet/bundle")"
+    echo "      envFrom:"
+    echo "        - secretRef:"
+    echo "            name: ${TON_VAULT_CREDS_SECRET}"
+    echo "            optional: false"
+    echo "      volumeMounts:"
+    echo "        - name: main-wallet-script"
+    echo "          mountPath: /scripts/main-wallet.sh"
+    echo "          subPath: main-wallet.sh"
+    echo "          readOnly: true"
+    echo "        - name: main-wallet-runtime"
+    echo "          mountPath: /var/main-wallet/runtime"
+    echo "        - name: main-wallet-bundle"
+    echo "          mountPath: /var/main-wallet/bundle"
+    echo "  volumes:"
+    echo "    - name: main-wallet-script"
+    echo "      configMap:"
+    echo "        name: ${MAIN_WALLET_SCRIPT_CONFIGMAP}"
+    echo "        defaultMode: 0555"
+    echo "    - name: main-wallet-runtime"
+    echo "      emptyDir:"
+    echo "        medium: Memory"
+    echo "        sizeLimit: ${MAIN_WALLET_RUNTIME_TMPFS_SIZE}"
+    echo "    - name: main-wallet-bundle"
+    echo "      persistentVolumeClaim:"
+    echo "        claimName: ${MAIN_WALLET_BUNDLE_PVC}"
+  } | kubectl -n "$ns" apply -f - >/dev/null
+
+  if wait_main_wallet_pod_completion "$ns" "$pod_name" "$timeout_seconds"; then
+    pod_rc=0
+  else
+    pod_rc=$?
+  fi
+
+  if (( pod_rc != 0 )); then
+    print_helper_pod_failure_context "$ns" "$pod_name" || true
+  fi
+  kubectl -n "$ns" logs "$pod_name" || true
+
+  kubectl -n "$ns" delete pod "$pod_name" --ignore-not-found >/dev/null 2>&1 || true
+  cleanup_required=0
+  trap - EXIT INT TERM
+
+  if (( pod_rc != 0 )); then
+    return "$pod_rc"
+  fi
+  return 0
+}
+
 run_exec() {
   require_bin kubectl
   local cmd="${*:-}"
@@ -7621,6 +8148,13 @@ main() {
       ;;
     restore-keys)
       run_restore_keys "$@"
+      ;;
+    wallet)
+      run_wallet "$@"
+      ;;
+    main-wallet)
+      echo "Warning: 'main-wallet' is deprecated; use 'wallet' instead." >&2
+      run_wallet "$@"
       ;;
     stop)
       run_stop "$@"
