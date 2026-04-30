@@ -18,8 +18,10 @@ usage() {
 Usage:
   main-wallet.sh create [workchain] [subwallet-id] [wallet-name]
   main-wallet.sh deploy [wallet-name]
+  main-wallet.sh send [from-wallet-name] [to-address] [amount]
+  main-wallet.sh send [from-wallet-name] --auto-equal [to-address...]
   main-wallet.sh show [wallet-name]
-  main-wallet.sh run <create|deploy|show> [args...]
+  main-wallet.sh run <create|deploy|send|show> [args...]
 
 Required env for deploy:
   MODE=liteserver|toncenter
@@ -268,6 +270,19 @@ resolve_new_wallet_fif() {
   return 1
 }
 
+resolve_wallet_fif() {
+  local candidate
+  for candidate in \
+    "$MAIN_WALLET_DIR/wallet.fif" \
+    "${SMARTCONT_DIR}/wallet.fif"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 resolve_lite_client_bin() {
   local candidate
   for candidate in /usr/local/bin/lite-client /usr/bin/lite-client lite-client; do
@@ -319,17 +334,9 @@ send_boc_toncenter() {
   fi
 }
 
-send_boc_liteserver() {
-  local boc_file="$1"
-  local lite_client_bin
-  local global_config_source global_config_path temp_config_file="" rc=0
+resolve_local_global_config_path() {
+  local global_config_source global_config_path temp_config_file=""
 
-  lite_client_bin="$(resolve_lite_client_bin || true)"
-  lite_client_bin="$(trim_whitespace "$lite_client_bin")"
-  if [[ -z "$lite_client_bin" ]]; then
-    echo "Error: lite-client binary not found." >&2
-    return 1
-  fi
   if [[ -z "$GLOBAL_CONFIG_URL" ]]; then
     echo "Error: GLOBAL_CONFIG_URL is empty." >&2
     return 1
@@ -349,22 +356,55 @@ send_boc_liteserver() {
       echo "Error: downloaded global config is empty: ${global_config_source}" >&2
       return 1
     fi
-    global_config_path="$temp_config_file"
-  else
-    global_config_path="${global_config_source#file://}"
-    if [[ ! -r "$global_config_path" ]]; then
-      echo "Error: global config file is not readable: ${global_config_path}" >&2
-      return 1
-    fi
+    printf '%s\t%s' "$temp_config_file" "$temp_config_file"
+    return 0
   fi
 
-  if ! "$lite_client_bin" -C "$global_config_path" -c "sendfile $boc_file"; then
+  global_config_path="${global_config_source#file://}"
+  if [[ ! -r "$global_config_path" ]]; then
+    echo "Error: global config file is not readable: ${global_config_path}" >&2
+    return 1
+  fi
+  printf '%s\t' "$global_config_path"
+}
+
+run_liteclient_query() {
+  local query="$1"
+  local lite_client_bin
+  local config_row config_path temp_config_path rc=0
+
+  lite_client_bin="$(resolve_lite_client_bin || true)"
+  lite_client_bin="$(trim_whitespace "$lite_client_bin")"
+  if [[ -z "$lite_client_bin" ]]; then
+    echo "Error: lite-client binary not found." >&2
+    return 1
+  fi
+
+  config_row="$(resolve_local_global_config_path || true)"
+  config_row="$(trim_whitespace "$config_row")"
+  if [[ -z "$config_row" ]]; then
+    return 1
+  fi
+  IFS=$'\t' read -r config_path temp_config_path <<<"$config_row"
+  config_path="$(trim_whitespace "$config_path")"
+  temp_config_path="$(trim_whitespace "$temp_config_path")"
+  if [[ -z "$config_path" ]]; then
+    echo "Error: failed to resolve lite-client config file path." >&2
+    return 1
+  fi
+
+  if ! "$lite_client_bin" -C "$config_path" -v 0 -c "$query"; then
     rc=$?
   fi
-  if [[ -n "$temp_config_file" ]]; then
-    rm -f "$temp_config_file"
+  if [[ -n "$temp_config_path" ]]; then
+    rm -f "$temp_config_path"
   fi
   return "$rc"
+}
+
+send_boc_liteserver() {
+  local boc_file="$1"
+  run_liteclient_query "sendfile $boc_file"
 }
 
 deploy_boc_with_mode() {
@@ -597,6 +637,239 @@ main_wallet_deploy() {
   return 0
 }
 
+resolve_wallet_address_by_name() {
+  local wallet_name="$1"
+  local wallet_meta="$MAIN_WALLET_DIR/${wallet_name}.wallet.meta"
+  local wallet_addr_file="$MAIN_WALLET_DIR/${wallet_name}.addr"
+  local wallet_address=""
+
+  if [[ -f "$wallet_meta" ]]; then
+    wallet_address="$(read_meta_value wallet_address "$wallet_meta")"
+    wallet_address="$(trim_whitespace "$wallet_address")"
+    if [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]+$ ]]; then
+      printf '%s' "$wallet_address"
+      return 0
+    fi
+  fi
+
+  if [[ -f "$wallet_addr_file" ]]; then
+    wallet_address="$(LC_ALL=C tr -cd '[:print:]\n' < "$wallet_addr_file" | sed -n 's/^\([-0-9][0-9]*:[0-9A-Fa-f][0-9A-Fa-f]*\)$/\1/p' | head -n1)"
+    wallet_address="$(trim_whitespace "$wallet_address")"
+    if [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]+$ ]]; then
+      printf '%s' "$wallet_address"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+wallet_seqno_decimal() {
+  local wallet_address="$1"
+  local output seq_hex
+
+  output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
+  if [[ -z "$output" ]]; then
+    echo "Error: failed to query account state for wallet ${wallet_address}." >&2
+    return 1
+  fi
+
+  seq_hex="$(printf '%s\n' "$output" | grep 'x{' | tail -n1 | cut -c 4- | cut -c -8 | tr -cd '0-9A-Fa-f')"
+  seq_hex="$(trim_whitespace "$seq_hex")"
+  if [[ -z "$seq_hex" ]]; then
+    echo "Error: failed to parse wallet seqno from account state for ${wallet_address}." >&2
+    return 1
+  fi
+  printf '%d' "$((16#$seq_hex))"
+}
+
+wallet_balance_nano() {
+  local wallet_address="$1"
+  local output balance
+
+  output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
+  if [[ -z "$output" ]]; then
+    echo "Error: failed to query account state for wallet ${wallet_address}." >&2
+    return 1
+  fi
+
+  balance="$(printf '%s\n' "$output" | awk '
+    /balance:/ {in_balance=1}
+    in_balance && match($0, /value:[[:space:]]*[0-9]+/) {
+      v=substr($0, RSTART, RLENGTH)
+      sub(/value:[[:space:]]*/, "", v)
+      print v
+      exit
+    }
+  ')"
+  balance="$(trim_whitespace "$balance")"
+  if ! [[ "$balance" =~ ^[0-9]+$ ]]; then
+    echo "Error: failed to parse wallet balance for ${wallet_address}." >&2
+    return 1
+  fi
+  printf '%s' "$balance"
+}
+
+nano_to_gram_amount() {
+  local nano="$1"
+  local whole frac
+
+  if ! [[ "$nano" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  whole=$((nano / 1000000000))
+  frac=$((nano % 1000000000))
+  printf '%s.%09d' "$whole" "$frac"
+}
+
+send_single_transfer() {
+  local from_wallet="$1"
+  local destination_address="$2"
+  local amount_gram="$3"
+  local seqno_dec="$4"
+  local normalized_mode="$5"
+  local wallet_fif fift_bin base_path query_file
+  local rc=0
+
+  wallet_fif="$(resolve_wallet_fif || true)"
+  wallet_fif="$(trim_whitespace "$wallet_fif")"
+  if [[ -z "$wallet_fif" ]]; then
+    echo "Error: wallet.fif not found in ${SMARTCONT_DIR}." >&2
+    return 1
+  fi
+
+  fift_bin="$(resolve_fift_bin || true)"
+  fift_bin="$(trim_whitespace "$fift_bin")"
+  if [[ -z "$fift_bin" ]]; then
+    echo "Error: fift binary not found." >&2
+    return 1
+  fi
+
+  base_path="${MAIN_WALLET_DIR}/${from_wallet}"
+  if [[ ! -f "${base_path}.pk" || ! -f "${base_path}.addr" ]]; then
+    echo "Error: source wallet files are missing for '${from_wallet}' (expected ${base_path}.pk/.addr)." >&2
+    return 1
+  fi
+
+  query_file="${MAIN_WALLET_DIR}/${from_wallet}-send-${seqno_dec}.boc"
+  (
+    cd "$MAIN_WALLET_DIR"
+    export FIFTPATH="${FIFTPATH:-/usr/lib/fift:/usr/share/ton/smartcont/}"
+    "$fift_bin" -s "$wallet_fif" "$base_path" "$destination_address" "$seqno_dec" "$amount_gram" "${from_wallet}-send-${seqno_dec}"
+  )
+  if [[ ! -s "$query_file" ]]; then
+    echo "Error: failed to create transfer BOC ${query_file}." >&2
+    return 1
+  fi
+
+  echo "Sending from '${from_wallet}' to '${destination_address}' amount='${amount_gram}' seqno=${seqno_dec} ..."
+  case "$normalized_mode" in
+    liteserver)
+      if ! send_boc_liteserver "$query_file"; then
+        rc=$?
+      fi
+      ;;
+    toncenter)
+      if ! send_boc_toncenter "$query_file"; then
+        rc=$?
+      fi
+      ;;
+    *)
+      echo "Error: unsupported MODE=${MODE}. Use liteserver or toncenter." >&2
+      rc=1
+      ;;
+  esac
+  rm -f "$query_file"
+  return "$rc"
+}
+
+main_wallet_send() {
+  local from_wallet="${1:-}"
+  shift || true
+  local normalized_mode source_wallet_address current_seqno
+  local -a destination_addresses=()
+  local destination_address amount_gram
+  local source_balance_nano amount_each_nano
+  local -a failed_addresses=()
+
+  if [[ -z "$from_wallet" ]]; then
+    echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount]" >&2
+    echo "       usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...]" >&2
+    return 1
+  fi
+
+  normalized_mode="$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')"
+  source_wallet_address="$(resolve_wallet_address_by_name "$from_wallet" || true)"
+  source_wallet_address="$(trim_whitespace "$source_wallet_address")"
+  if [[ -z "$source_wallet_address" ]]; then
+    echo "Error: cannot resolve source wallet address for '${from_wallet}'." >&2
+    return 1
+  fi
+
+  current_seqno="$(wallet_seqno_decimal "$source_wallet_address")"
+  current_seqno="$(trim_whitespace "$current_seqno")"
+  if ! [[ "$current_seqno" =~ ^[0-9]+$ ]]; then
+    echo "Error: failed to resolve source wallet seqno for '${from_wallet}'." >&2
+    return 1
+  fi
+
+  if [[ "${1:-}" == "--auto-equal" ]]; then
+    shift || true
+    if (( $# < 1 )); then
+      echo "Error: usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...]" >&2
+      return 1
+    fi
+    destination_addresses=("$@")
+    source_balance_nano="$(wallet_balance_nano "$source_wallet_address")"
+    source_balance_nano="$(trim_whitespace "$source_balance_nano")"
+    if ! [[ "$source_balance_nano" =~ ^[0-9]+$ ]]; then
+      echo "Error: failed to read source wallet balance for '${from_wallet}'." >&2
+      return 1
+    fi
+    amount_each_nano=$(( source_balance_nano / ${#destination_addresses[@]} ))
+    if (( amount_each_nano <= 0 )); then
+      echo "Error: source wallet balance is too low for equal distribution across ${#destination_addresses[@]} targets." >&2
+      return 1
+    fi
+    amount_gram="$(nano_to_gram_amount "$amount_each_nano")"
+    amount_gram="$(trim_whitespace "$amount_gram")"
+    if [[ -z "$amount_gram" ]]; then
+      echo "Error: failed to convert equal share amount." >&2
+      return 1
+    fi
+
+    for destination_address in "${destination_addresses[@]}"; do
+      destination_address="$(trim_whitespace "$destination_address")"
+      [[ -z "$destination_address" ]] && continue
+      if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode"; then
+        failed_addresses+=("$destination_address")
+      fi
+      current_seqno=$((current_seqno + 1))
+    done
+    if [[ ${#failed_addresses[@]} -gt 0 ]]; then
+      echo "Error: failed to send to destination(s): ${failed_addresses[*]}" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  if (( $# != 2 )); then
+    echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount]" >&2
+    return 1
+  fi
+  destination_address="$(trim_whitespace "${1:-}")"
+  amount_gram="$(trim_whitespace "${2:-}")"
+  if [[ -z "$destination_address" || -z "$amount_gram" ]]; then
+    echo "Error: destination address and amount are required." >&2
+    return 1
+  fi
+  if ! [[ "$amount_gram" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+    echo "Error: amount '${amount_gram}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
+    return 1
+  fi
+  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode"
+}
+
 run_action() {
   local action="${1:-}"
   shift || true
@@ -606,6 +879,9 @@ run_action() {
       ;;
     deploy)
       main_wallet_deploy "$@"
+      ;;
+    send)
+      main_wallet_send "$@"
       ;;
     show)
       main_wallet_show "$@"
@@ -657,12 +933,12 @@ main() {
   case "$command" in
     run)
       if [[ $# -lt 1 ]]; then
-        echo "Error: usage: main-wallet.sh run <create|deploy|show> [args...]" >&2
+        echo "Error: usage: main-wallet.sh run <create|deploy|send|show> [args...]" >&2
         return 1
       fi
       run_with_persistence "$@"
       ;;
-    create|deploy|show)
+    create|deploy|send|show)
       run_action "$command" "$@"
       ;;
     help|-h|--help)

@@ -122,6 +122,7 @@ MAIN_WALLET_GLOBAL_CONFIG_URL="${MAIN_WALLET_GLOBAL_CONFIG_URL:-}"
 MAIN_WALLET_TONCENTER_URL="${MAIN_WALLET_TONCENTER_URL:-https://testnet.toncenter.com}"
 MAIN_WALLET_TONCENTER_API_KEY="${MAIN_WALLET_TONCENTER_API_KEY:-}"
 MAIN_WALLET_NAME="${MAIN_WALLET_NAME:-main-wallet}"
+MAIN_WALLET_TARGET_WALLET_NAME="${MAIN_WALLET_TARGET_WALLET_NAME:-validator_wallet_001}"
 MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-900s}"
 MAIN_WALLET_RUNTIME_TMPFS_SIZE="${MAIN_WALLET_RUNTIME_TMPFS_SIZE:-512Mi}"
 
@@ -145,7 +146,7 @@ Commands:
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
-  wallet               Run ephemeral wallet utility pod (Vault-backed encrypted persistence): kubeton wallet <create|deploy|show> [args...]
+  wallet               Run ephemeral wallet utility pod (Vault-backed encrypted persistence): kubeton wallet <create|deploy|send|show> [args...]
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Stop/drop TON fleet + remove kubeton-managed observability stacks + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
@@ -4291,6 +4292,76 @@ list_ton_statefulsets() {
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
 }
 
+strip_ansi_sequences() {
+  local text="${1:-}"
+  text="${text//$'\r'/}"
+  printf '%s' "$text" | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g'
+}
+
+resolve_tonnode_wallet_address_from_pod() {
+  local ns="$1"
+  local pod="$2"
+  local wallet_name="$3"
+  local output address
+
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+    shopt -s expand_aliases
+    if [[ -f ~/.bashrc ]]; then
+      source ~/.bashrc >/dev/null 2>&1
+    fi
+    if command -v mytonctrl >/dev/null 2>&1; then
+      echo wl | mytonctrl
+    fi
+  ' 2>/dev/null || true)"
+  output="$(strip_ansi_sequences "$output")"
+  address="$(printf '%s\n' "$output" | awk -v wallet_name="$wallet_name" '$1 == wallet_name {print $NF; exit}')"
+  address="$(trim_whitespace "$address")"
+
+  if [[ -z "$address" ]]; then
+    return 1
+  fi
+  printf '%s' "$address"
+}
+
+resolve_tonnode_pod_row_by_name() {
+  local target_name="$1"
+  local row ns pod node_name
+  local exact_match=""
+  local prefix_match=""
+  local prefix_count=0
+
+  target_name="$(trim_whitespace "$target_name")"
+  [[ -z "$target_name" ]] && return 1
+
+  while IFS= read -r row; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pod node_name <<<"$row"
+    [[ -z "$ns" || -z "$pod" ]] && continue
+    if [[ "$pod" == "$target_name" ]]; then
+      exact_match="$row"
+      break
+    fi
+    if [[ "$pod" == "$target_name"-* ]]; then
+      prefix_match="$row"
+      ((prefix_count+=1))
+    fi
+  done < <(list_ton_pods 2>/dev/null || true)
+
+  if [[ -n "$exact_match" ]]; then
+    printf '%s' "$exact_match"
+    return 0
+  fi
+  if (( prefix_count == 1 )) && [[ -n "$prefix_match" ]]; then
+    printf '%s' "$prefix_match"
+    return 0
+  fi
+  if (( prefix_count > 1 )); then
+    echo "Error: tonnode selector '${target_name}' matches multiple TON pods. Use an exact pod name." >&2
+    return 1
+  fi
+  return 1
+}
+
 delete_ton_pvcs_for_statefulsets() {
   local -n sts_rows_ref="$1"
   local row ns sts
@@ -7942,31 +8013,37 @@ run_wallet() {
   local action="${1:-}"
   shift || true
   if [[ -z "$action" ]]; then
-    echo "Error: usage: kubeton wallet <create|deploy|show> [args...]" >&2
+    echo "Error: usage: kubeton wallet <create|deploy|send|show> [args...]" >&2
     exit 1
   fi
   case "$action" in
     help|-h|--help)
-      echo "Usage: kubeton wallet <create|deploy|show> [args...]"
+      echo "Usage: kubeton wallet <create|deploy|send|show> [args...]"
       echo "Examples:"
       echo "  kubeton wallet create"
       echo "  kubeton wallet create my-wallet"
       echo "  kubeton wallet deploy"
       echo "  kubeton wallet deploy my-wallet"
+      echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10."
+      echo "  kubeton wallet send main-wallet"
       echo "  kubeton wallet show"
       echo "  kubeton wallet show my-wallet"
       return 0
       ;;
-    create|deploy|show)
+    create|deploy|send|show)
       ;;
     *)
       echo "Error: unknown wallet subcommand '$action'." >&2
-      echo "Usage: kubeton wallet <create|deploy|show> [args...]" >&2
+      echo "Usage: kubeton wallet <create|deploy|send|show> [args...]" >&2
       return 1
       ;;
   esac
 
   local -a action_args=()
+  local row target_ns target_pod target_node_name target_wallet_name destination_address amount
+  local from_wallet_name to_tonnode_name
+  local -a table_rows=()
+  local -a destination_addresses=()
   case "$action" in
     create)
       case "$#" in
@@ -8005,6 +8082,94 @@ run_wallet() {
         echo "Error: usage: kubeton wallet show [name]" >&2
         return 1
       fi
+      ;;
+    send)
+      case "$#" in
+        1)
+          from_wallet_name="$(trim_whitespace "$1")"
+          if [[ -z "$from_wallet_name" ]]; then
+            echo "Error: usage: kubeton wallet send [from-wallet-name]" >&2
+            return 1
+          fi
+          target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
+          [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
+
+          while IFS= read -r row; do
+            [[ -z "$row" ]] && continue
+            IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
+            [[ -z "$target_ns" || -z "$target_pod" ]] && continue
+            destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
+            destination_address="$(trim_whitespace "$destination_address")"
+            if [[ -z "$destination_address" ]]; then
+              echo "Warning: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
+              continue
+            fi
+            destination_addresses+=("$destination_address")
+            table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"auto-equal")
+          done < <(list_ton_pods 2>/dev/null || true)
+
+          if [[ ${#table_rows[@]} -eq 0 ]]; then
+            echo "Error: no TON wallets resolved for wallet name '${target_wallet_name}'." >&2
+            return 1
+          fi
+          print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
+          confirm_or_exit "This will send equal share from '${from_wallet_name}' to all listed TON wallets. Continue?"
+
+          action_args=("$from_wallet_name" "--auto-equal")
+          for destination_address in "${destination_addresses[@]}"; do
+            action_args+=("$destination_address")
+          done
+          ;;
+        3|4)
+          from_wallet_name="$(trim_whitespace "$1")"
+          to_tonnode_name="$(trim_whitespace "$2")"
+          if [[ -z "$from_wallet_name" || -z "$to_tonnode_name" ]]; then
+            echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount]" >&2
+            return 1
+          fi
+          if (( $# == 3 )); then
+            target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
+            [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
+            amount="$(trim_whitespace "$3")"
+          else
+            target_wallet_name="$(trim_whitespace "$3")"
+            amount="$(trim_whitespace "$4")"
+          fi
+          if [[ -z "$target_wallet_name" || -z "$amount" ]]; then
+            echo "Error: wallet-name and amount are required." >&2
+            return 1
+          fi
+          if ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+            echo "Error: amount '${amount}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
+            return 1
+          fi
+
+          row="$(resolve_tonnode_pod_row_by_name "$to_tonnode_name" || true)"
+          row="$(trim_whitespace "$row")"
+          if [[ -z "$row" ]]; then
+            echo "Error: TON pod '${to_tonnode_name}' not found." >&2
+            return 1
+          fi
+          IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
+          destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
+          destination_address="$(trim_whitespace "$destination_address")"
+          if [[ -z "$destination_address" ]]; then
+            echo "Error: wallet '${target_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
+            return 1
+          fi
+
+          table_rows=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"${amount}")
+          print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
+          confirm_or_exit "Send '${amount}' from '${from_wallet_name}' to '${target_wallet_name}' on ${target_ns}/${target_pod}?"
+
+          action_args=("$from_wallet_name" "$destination_address" "$amount")
+          ;;
+        *)
+          echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount]" >&2
+          echo "       usage: kubeton wallet send [from-wallet-name]" >&2
+          return 1
+          ;;
+      esac
       ;;
   esac
 
