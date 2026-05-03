@@ -7973,6 +7973,42 @@ ensure_main_wallet_longhorn_ready() {
   fi
 }
 
+main_wallet_pod_longhorn_csi_affinity_yaml() {
+  local storage_class="$1"
+  local provisioner=""
+  local -a longhorn_csi_nodes=()
+  local node
+
+  storage_class="$(trim_whitespace "$storage_class")"
+  [[ -z "$storage_class" ]] && return 0
+
+  provisioner="$(kubectl get storageclass "$storage_class" -o jsonpath='{.provisioner}' 2>/dev/null || true)"
+  provisioner="$(trim_whitespace "$provisioner")"
+  if [[ "$provisioner" != "driver.longhorn.io" ]]; then
+    return 0
+  fi
+
+  mapfile -t longhorn_csi_nodes < <(list_longhorn_csi_node_names)
+  if [[ ${#longhorn_csi_nodes[@]} -eq 0 ]]; then
+    echo "Error: storage class '${storage_class}' uses Longhorn, but no nodes with CSI driver 'driver.longhorn.io' were found in CSINode." >&2
+    return 1
+  fi
+
+  echo "  affinity:"
+  echo "    nodeAffinity:"
+  echo "      requiredDuringSchedulingIgnoredDuringExecution:"
+  echo "        nodeSelectorTerms:"
+  echo "          - matchExpressions:"
+  echo "              - key: kubernetes.io/hostname"
+  echo "                operator: In"
+  echo "                values:"
+  for node in "${longhorn_csi_nodes[@]}"; do
+    node="$(trim_whitespace "$node")"
+    [[ -z "$node" ]] && continue
+    printf '                  - %s\n' "$(yaml_quote "$node")"
+  done
+}
+
 wait_main_wallet_pod_completion() {
   local ns="$1"
   local pod="$2"
@@ -8008,36 +8044,75 @@ wait_main_wallet_pod_completion() {
 }
 
 run_wallet() {
-  require_bin kubectl
+  wallet_usage() {
+    echo "Usage: kubeton wallet <create|deploy|send|show> [args...]"
+    echo
+    echo "Subcommands:"
+    echo "  create [name]"
+    echo "    Create wallet with defaults: workchain=0, subwallet-id=42."
+    echo "    If [name] is omitted, MAIN_WALLET_NAME is used (default: main-wallet)."
+    echo
+    echo "  create <workchain> <subwallet-id> <wallet-name>"
+    echo "    Legacy explicit form."
+    echo
+    echo "  deploy [name]"
+    echo "    Deploy one wallet by name."
+    echo "    If [name] is omitted, deploys all wallet BOCs after confirmation."
+    echo
+    echo "  show [name]"
+    echo "    Show one wallet by name, or all wallets if omitted."
+    echo
+    echo "  send <from-wallet-name> [-n]"
+    echo "    Auto-equal mode: sends equal share from source wallet to all TON pods"
+    echo "    using MAIN_WALLET_TARGET_WALLET_NAME (default: validator_wallet_001)."
+    echo
+    echo "  send <from-wallet-name> <to-tonnode-name> <amount> [-n]"
+    echo "    Send to default target wallet name on selected TON pod."
+    echo
+    echo "  send <from-wallet-name> <to-tonnode-name> <wallet-name> <amount> [-n]"
+    echo "    Send to explicit target wallet name on selected TON pod."
+    echo
+    echo "Notes:"
+    echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
+    echo "  - optional -n (last argument) forwards --no-bounce to wallet.fif"
+    echo "  - <to-tonnode-name> is pod name like tonnode-0 (or namespace/pod when applicable)"
+    echo
+    echo "Examples:"
+    echo "  kubeton wallet create"
+    echo "  kubeton wallet create my-wallet"
+    echo "  kubeton wallet create 0 42 my-wallet"
+    echo "  kubeton wallet deploy"
+    echo "  kubeton wallet deploy my-wallet"
+    echo "  kubeton wallet show"
+    echo "  kubeton wallet show my-wallet"
+    echo "  kubeton wallet send main-wallet"
+    echo "  kubeton wallet send main-wallet tonnode-0 10."
+    echo "  kubeton wallet send main-wallet tonnode-0 10. -n"
+    echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10."
+    echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10. -n"
+  }
 
   local action="${1:-}"
   shift || true
   if [[ -z "$action" ]]; then
-    echo "Error: usage: kubeton wallet <create|deploy|send|show> [args...]" >&2
-    exit 1
+    wallet_usage
+    return 0
   fi
   case "$action" in
     help|-h|--help)
-      echo "Usage: kubeton wallet <create|deploy|send|show> [args...]"
-      echo "Examples:"
-      echo "  kubeton wallet create"
-      echo "  kubeton wallet create my-wallet"
-      echo "  kubeton wallet deploy"
-      echo "  kubeton wallet deploy my-wallet"
-      echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10."
-      echo "  kubeton wallet send main-wallet"
-      echo "  kubeton wallet show"
-      echo "  kubeton wallet show my-wallet"
+      wallet_usage
       return 0
       ;;
     create|deploy|send|show)
       ;;
     *)
       echo "Error: unknown wallet subcommand '$action'." >&2
-      echo "Usage: kubeton wallet <create|deploy|send|show> [args...]" >&2
+      wallet_usage >&2
       return 1
       ;;
   esac
+
+  require_bin kubectl
 
   local -a action_args=()
   local row target_ns target_pod target_node_name target_wallet_name destination_address amount
@@ -8084,11 +8159,31 @@ run_wallet() {
       fi
       ;;
     send)
-      case "$#" in
+      local send_no_bounce_flag=""
+      local -a send_args=("$@")
+      local send_last_index send_last_arg send_item
+      if (( ${#send_args[@]} > 0 )); then
+        send_last_index=$(( ${#send_args[@]} - 1 ))
+        send_last_arg="$(trim_whitespace "${send_args[$send_last_index]}")"
+        if [[ "$send_last_arg" == "-n" ]]; then
+          send_no_bounce_flag="-n"
+          unset "send_args[$send_last_index]"
+          send_args=("${send_args[@]}")
+        fi
+      fi
+
+      for send_item in "${send_args[@]}"; do
+        if [[ "$(trim_whitespace "$send_item")" == "-n" ]]; then
+          echo "Error: '-n' must be the last optional argument for wallet send." >&2
+          return 1
+        fi
+      done
+
+      case "${#send_args[@]}" in
         1)
-          from_wallet_name="$(trim_whitespace "$1")"
+          from_wallet_name="$(trim_whitespace "${send_args[0]}")"
           if [[ -z "$from_wallet_name" ]]; then
-            echo "Error: usage: kubeton wallet send [from-wallet-name]" >&2
+            echo "Error: usage: kubeton wallet send [from-wallet-name] [-n]" >&2
             return 1
           fi
           target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
@@ -8119,21 +8214,24 @@ run_wallet() {
           for destination_address in "${destination_addresses[@]}"; do
             action_args+=("$destination_address")
           done
+          if [[ -n "$send_no_bounce_flag" ]]; then
+            action_args+=("$send_no_bounce_flag")
+          fi
           ;;
         3|4)
-          from_wallet_name="$(trim_whitespace "$1")"
-          to_tonnode_name="$(trim_whitespace "$2")"
+          from_wallet_name="$(trim_whitespace "${send_args[0]}")"
+          to_tonnode_name="$(trim_whitespace "${send_args[1]}")"
           if [[ -z "$from_wallet_name" || -z "$to_tonnode_name" ]]; then
-            echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount]" >&2
+            echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
             return 1
           fi
-          if (( $# == 3 )); then
+          if (( ${#send_args[@]} == 3 )); then
             target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
             [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
-            amount="$(trim_whitespace "$3")"
+            amount="$(trim_whitespace "${send_args[2]}")"
           else
-            target_wallet_name="$(trim_whitespace "$3")"
-            amount="$(trim_whitespace "$4")"
+            target_wallet_name="$(trim_whitespace "${send_args[2]}")"
+            amount="$(trim_whitespace "${send_args[3]}")"
           fi
           if [[ -z "$target_wallet_name" || -z "$amount" ]]; then
             echo "Error: wallet-name and amount are required." >&2
@@ -8163,10 +8261,13 @@ run_wallet() {
           confirm_or_exit "Send '${amount}' from '${from_wallet_name}' to '${target_wallet_name}' on ${target_ns}/${target_pod}?"
 
           action_args=("$from_wallet_name" "$destination_address" "$amount")
+          if [[ -n "$send_no_bounce_flag" ]]; then
+            action_args+=("$send_no_bounce_flag")
+          fi
           ;;
         *)
-          echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount]" >&2
-          echo "       usage: kubeton wallet send [from-wallet-name]" >&2
+          echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
+          echo "       usage: kubeton wallet send [from-wallet-name] [-n]" >&2
           return 1
           ;;
       esac
@@ -8184,6 +8285,7 @@ run_wallet() {
   local global_config_url
   local timeout_seconds
   local bundle_storage_class=""
+  local wallet_node_affinity_yaml=""
   local pod_rc=0
   local cleanup_required=1
   local -a command_items=("/scripts/main-wallet.sh" "run" "$action")
@@ -8201,6 +8303,7 @@ run_wallet() {
   ensure_main_wallet_bundle_pvc "$ns"
   bundle_storage_class="$(main_wallet_bundle_storage_class "$ns" "$MAIN_WALLET_BUNDLE_PVC")"
   ensure_main_wallet_longhorn_ready "$bundle_storage_class"
+  wallet_node_affinity_yaml="$(main_wallet_pod_longhorn_csi_affinity_yaml "$bundle_storage_class")" || return 1
 
   image="$(resolve_main_wallet_image)"
   global_config_url="$(resolve_main_wallet_global_config_url)"
@@ -8225,6 +8328,9 @@ run_wallet() {
     echo "spec:"
     echo "  restartPolicy: Never"
     echo "  activeDeadlineSeconds: ${timeout_seconds}"
+    if [[ -n "$wallet_node_affinity_yaml" ]]; then
+      printf '%s\n' "$wallet_node_affinity_yaml"
+    fi
     echo "  containers:"
     echo "    - name: main-wallet"
     echo "      image: ${image}"

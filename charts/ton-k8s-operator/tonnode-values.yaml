@@ -2,7 +2,7 @@ tonNode:
   enabled: true
   namespace: default
   name: tonnode
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:testnet
   replicas: 3
   storage:
     tonWorkSize: 400Gi
@@ -19,7 +19,7 @@ tonNode:
       memory: 256Gi
   nodeSelector: {}
   network:
-    globalConfigURL: https://ton.org/global.config.json
+    globalConfigURL: https://ton.org/testnet-global.config.json
     validatorPort: 30001
     quicPort: 31001
     liteServerPort: 30003
@@ -44,11 +44,11 @@ tonNode:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
+      image: ghcr.io/ton-blockchain/ton-docker-ctrl:testnet
       resources: {}
   env:
     - name: TON_BRANCH
-      value: v2026.04
+      value: testnet
     - name: ARCHIVE_TTL
       value: "86400"
     - name: STATE_TTL
@@ -56,13 +56,13 @@ tonNode:
     - name: SYNC_BEFORE
       value: "60"
     - name: VERBOSITY
-      value: "1"
+      value: "3"
     - name: IGNORE_MINIMAL_REQS
       value: "false"
     - name: TELEMETRY
       value: "true"
     - name: MODE
-      value: liteserver
+      value: validator
     - name: DUMP
       value: "false"
     - name: MYTONCTRL_VERSION

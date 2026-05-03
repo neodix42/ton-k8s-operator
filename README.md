@@ -62,6 +62,7 @@ Secure key workflow is available via `spec.keyManagement`:
 - init container restores/decrypts a bundle before TON start
 - sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
 - `kubeton wallet ...` runs in a separate ephemeral pod with its own encrypted bundle PVC; it is intentionally excluded from `kubeton status` and `kubeton backup-keys` flows
+- when the wallet bundle PVC uses Longhorn storage, `kubeton wallet ...` pins the helper pod to nodes exposing `driver.longhorn.io` (from `CSINode`) to avoid attach failures on non-Longhorn nodes
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
@@ -226,6 +227,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet deploy
 ./kubeton wallet deploy main-wallet
 ./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10.
+./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10. -n
 ./kubeton wallet send main-wallet
 ./kubeton wallet show
 ./kubeton wallet show main-wallet

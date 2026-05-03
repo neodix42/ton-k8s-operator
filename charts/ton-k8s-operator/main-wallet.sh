@@ -18,8 +18,8 @@ usage() {
 Usage:
   main-wallet.sh create [workchain] [subwallet-id] [wallet-name]
   main-wallet.sh deploy [wallet-name]
-  main-wallet.sh send [from-wallet-name] [to-address] [amount]
-  main-wallet.sh send [from-wallet-name] --auto-equal [to-address...]
+  main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]
+  main-wallet.sh send [from-wallet-name] --auto-equal [to-address...] [-n]
   main-wallet.sh show [wallet-name]
   main-wallet.sh run <create|deploy|send|show> [args...]
 
@@ -728,7 +728,9 @@ send_single_transfer() {
   local amount_gram="$3"
   local seqno_dec="$4"
   local normalized_mode="$5"
+  local no_bounce_flag="${6:-}"
   local wallet_fif fift_bin base_path query_file
+  local -a fift_cmd=()
   local rc=0
 
   wallet_fif="$(resolve_wallet_fif || true)"
@@ -752,10 +754,21 @@ send_single_transfer() {
   fi
 
   query_file="${MAIN_WALLET_DIR}/${from_wallet}-send-${seqno_dec}.boc"
+  fift_cmd=(
+    "$fift_bin" -s "$wallet_fif"
+    "$base_path" "$destination_address" "$seqno_dec" "$amount_gram" "${from_wallet}-send-${seqno_dec}"
+  )
+  if [[ -n "$no_bounce_flag" ]]; then
+    if [[ "$no_bounce_flag" != "-n" ]]; then
+      echo "Error: unsupported wallet.fif option '${no_bounce_flag}'." >&2
+      return 1
+    fi
+    fift_cmd+=("$no_bounce_flag")
+  fi
   (
     cd "$MAIN_WALLET_DIR"
     export FIFTPATH="${FIFTPATH:-/usr/lib/fift:/usr/share/ton/smartcont/}"
-    "$fift_bin" -s "$wallet_fif" "$base_path" "$destination_address" "$seqno_dec" "$amount_gram" "${from_wallet}-send-${seqno_dec}"
+    "${fift_cmd[@]}"
   )
   if [[ ! -s "$query_file" ]]; then
     echo "Error: failed to create transfer BOC ${query_file}." >&2
@@ -790,11 +803,26 @@ main_wallet_send() {
   local -a destination_addresses=()
   local destination_address amount_gram
   local source_balance_nano amount_each_nano
+  local no_bounce_flag=""
+  local arg
   local -a failed_addresses=()
 
+  if (( $# > 0 )); then
+    if [[ "$(trim_whitespace "${!#}")" == "-n" ]]; then
+      no_bounce_flag="-n"
+      set -- "${@:1:$(($# - 1))}"
+    fi
+  fi
+  for arg in "$@"; do
+    if [[ "$arg" == "-n" ]]; then
+      echo "Error: '-n' must be the last optional argument." >&2
+      return 1
+    fi
+  done
+
   if [[ -z "$from_wallet" ]]; then
-    echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount]" >&2
-    echo "       usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...]" >&2
+    echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]" >&2
+    echo "       usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...] [-n]" >&2
     return 1
   fi
 
@@ -816,7 +844,7 @@ main_wallet_send() {
   if [[ "${1:-}" == "--auto-equal" ]]; then
     shift || true
     if (( $# < 1 )); then
-      echo "Error: usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...]" >&2
+      echo "Error: usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...] [-n]" >&2
       return 1
     fi
     destination_addresses=("$@")
@@ -841,7 +869,7 @@ main_wallet_send() {
     for destination_address in "${destination_addresses[@]}"; do
       destination_address="$(trim_whitespace "$destination_address")"
       [[ -z "$destination_address" ]] && continue
-      if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode"; then
+      if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode" "$no_bounce_flag"; then
         failed_addresses+=("$destination_address")
       fi
       current_seqno=$((current_seqno + 1))
@@ -854,7 +882,7 @@ main_wallet_send() {
   fi
 
   if (( $# != 2 )); then
-    echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount]" >&2
+    echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]" >&2
     return 1
   fi
   destination_address="$(trim_whitespace "${1:-}")"
@@ -867,7 +895,7 @@ main_wallet_send() {
     echo "Error: amount '${amount_gram}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
     return 1
   fi
-  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode"
+  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode" "$no_bounce_flag"
 }
 
 run_action() {
