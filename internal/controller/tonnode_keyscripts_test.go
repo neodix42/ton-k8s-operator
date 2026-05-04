@@ -32,30 +32,23 @@ func TestKeyBackupScriptIncludesBootstrapArtifacts(t *testing.T) {
 	required := []string{
 		`SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"`,
 		`MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"`,
+		`AUTO_BOOTSTRAP_FLAG="${KEY_AUTO_BOOTSTRAP_BUNDLE:-true}"`,
 		`dir_has_payload() {`,
 		`key_material_present() {`,
+		`is_true() {`,
+		`bundle_present() {`,
+		`auto_backup_ready() {`,
 		`if [ -f "$MTC_DONE_FILE" ]; then`,
 		`cp -a "$SYSTEMD_UNITS_DIR" "$work_dir/stage/tondb/systemd-units"`,
 		`cp -a "$MTC_DONE_FILE" "$work_dir/stage/tondb/mtc_done"`,
 		`echo "manual backup mode enabled"`,
+		`echo "automatic bootstrap backup mode enabled"`,
+		`elif is_true "$AUTO_BOOTSTRAP_FLAG" && ! bundle_present && auto_backup_ready; then`,
+		`automatic bootstrap backup completed`,
 	}
 	for _, fragment := range required {
 		if !strings.Contains(keyBackupScript, fragment) {
 			t.Fatalf("keyBackupScript missing fragment: %q", fragment)
-		}
-	}
-
-	forbidden := []string{
-		`AUTO_DONE_FILE="${BUNDLE_DIR}/.bootstrap-auto-backup.done"`,
-		`bundle_present() {`,
-		`auto_backup_ready() {`,
-		`echo "automatic bootstrap backup mode enabled"`,
-		`automatic bootstrap backup completed`,
-		`key material not ready yet; automatic bootstrap backup retrying`,
-	}
-	for _, fragment := range forbidden {
-		if strings.Contains(keyBackupScript, fragment) {
-			t.Fatalf("keyBackupScript should not include fragment: %q", fragment)
 		}
 	}
 }

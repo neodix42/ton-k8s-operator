@@ -1207,12 +1207,24 @@ META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
 REQUEST_FILE="/tmp/key-backup.request"
 DONE_FILE="/tmp/key-backup.done"
 FAIL_FILE="/tmp/key-backup.failed"
+AUTO_BOOTSTRAP_FLAG="${KEY_AUTO_BOOTSTRAP_BUNDLE:-true}"
 
 need_bin() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "missing required binary: $1" >&2
     exit 1
   }
+}
+
+is_true() {
+  case "$1" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 vault_encrypt() {
@@ -1324,6 +1336,20 @@ backup_sources_present() {
   key_material_present
 }
 
+bundle_present() {
+  [ -s "$BUNDLE_FILE" ] && [ -s "$META_FILE" ]
+}
+
+auto_backup_ready() {
+  if [ ! -f "$MTC_DONE_FILE" ]; then
+    return 1
+  fi
+  if [ ! -s "$DB_CONFIG_FILE" ]; then
+    return 1
+  fi
+  backup_sources_present
+}
+
 perform_backup() {
   need_bin tar
   need_bin openssl
@@ -1385,6 +1411,10 @@ perform_backup() {
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
 echo "manual backup mode enabled"
+auto_backup_retries=0
+if is_true "$AUTO_BOOTSTRAP_FLAG"; then
+  echo "automatic bootstrap backup mode enabled"
+fi
 
 while true; do
   if [ -f "$REQUEST_FILE" ]; then
@@ -1393,6 +1423,16 @@ while true; do
       date -u +%Y-%m-%dT%H:%M:%SZ >"$DONE_FILE"
     else
       echo "backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$FAIL_FILE"
+    fi
+  elif is_true "$AUTO_BOOTSTRAP_FLAG" && ! bundle_present && auto_backup_ready; then
+    if perform_backup; then
+      auto_backup_retries=0
+      echo "automatic bootstrap backup completed"
+    else
+      auto_backup_retries=$((auto_backup_retries + 1))
+      if [ "$auto_backup_retries" -eq 1 ] || [ $((auto_backup_retries % 30)) -eq 0 ]; then
+        echo "automatic bootstrap backup failed; will retry" >&2
+      fi
     fi
   fi
   sleep 2 &
