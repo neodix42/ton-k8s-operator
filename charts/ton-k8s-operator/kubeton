@@ -5362,16 +5362,35 @@ resume_operator_reconcile() {
 wait_statefulset_pods_gone() {
   local ns="$1"
   local sts="$2"
+  local selector="app.kubernetes.io/instance=${sts},app.kubernetes.io/name=ton-node"
+  local start_ts
+  local next_diag
   local deadline=$(( $(date +%s) + 900 ))
+  start_ts="$(date +%s)"
+  next_diag=$(( start_ts + 20 ))
   while (( $(date +%s) < deadline )); do
+    local now
     local count
-    count="$(kubectl -n "$ns" get pods -l "app.kubernetes.io/instance=${sts},app.kubernetes.io/name=ton-node" -o name 2>/dev/null | wc -l | tr -d '[:space:]')"
+    now="$(date +%s)"
+    count="$(kubectl -n "$ns" get pods -l "$selector" -o name 2>/dev/null | wc -l | tr -d '[:space:]')"
     if [[ "${count:-0}" == "0" ]]; then
       return 0
+    fi
+    if (( now >= next_diag )); then
+      local elapsed
+      elapsed=$(( now - start_ts ))
+      echo "[wait] ${ns}/${sts}: ${count} pod(s) still terminating after ${elapsed}s ..."
+      kubectl -n "$ns" get pods -l "$selector" \
+        -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,DELETING:.metadata.deletionTimestamp,NODE:.spec.nodeName \
+        --no-headers 2>/dev/null || true
+      next_diag=$(( now + 20 ))
     fi
     sleep 2
   done
   echo "Error: timeout waiting for pods of ${ns}/${sts} to terminate" >&2
+  kubectl -n "$ns" get pods -l "$selector" \
+    -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,DELETING:.metadata.deletionTimestamp,NODE:.spec.nodeName \
+    --no-headers 2>/dev/null || true
   return 1
 }
 
