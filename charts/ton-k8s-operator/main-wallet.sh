@@ -12,6 +12,8 @@ MAIN_WALLET_BUNDLE_FILE="${MAIN_WALLET_BUNDLE_FILE:-main-wallet.bundle.enc}"
 MAIN_WALLET_BUNDLE_META_FILE="${MAIN_WALLET_BUNDLE_META_FILE:-main-wallet.bundle.meta}"
 MAIN_WALLET_NAME_DEFAULT="${MAIN_WALLET_NAME_DEFAULT:-main-wallet}"
 SMARTCONT_DIR="${SMARTCONT_DIR:-/usr/share/ton/smartcont}"
+MAIN_WALLET_SEND_RETRY_ATTEMPTS="${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-3}"
+MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
 
 usage() {
   cat <<'EOF'
@@ -38,6 +40,26 @@ EOF
 
 trim_whitespace() {
   printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+main_wallet_send_retry_attempts() {
+  local raw
+  raw="$(trim_whitespace "${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-3}")"
+  if [[ "$raw" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '%s' "3"
+}
+
+main_wallet_send_retry_delay_seconds() {
+  local raw
+  raw="$(trim_whitespace "${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}")"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '%s' "2"
 }
 
 require_bin() {
@@ -401,7 +423,9 @@ run_liteclient_query() {
     return 1
   fi
 
-  if ! "$lite_client_bin" -C "$config_path" -v 0 -c "$query"; then
+  if "$lite_client_bin" -C "$config_path" -v 0 -c "$query"; then
+    rc=0
+  else
     rc=$?
   fi
   if [[ -n "$temp_config_path" ]]; then
@@ -412,7 +436,25 @@ run_liteclient_query() {
 
 send_boc_liteserver() {
   local boc_file="$1"
-  run_liteclient_query "sendfile $boc_file"
+  local attempts delay attempt rc=1
+
+  attempts="$(main_wallet_send_retry_attempts)"
+  delay="$(main_wallet_send_retry_delay_seconds)"
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if run_liteclient_query "sendfile $boc_file"; then
+      return 0
+    fi
+    rc=$?
+    if (( attempt < attempts )); then
+      echo "Warning: lite-client sendfile failed (attempt ${attempt}/${attempts}); retrying..." >&2
+      if (( delay > 0 )); then
+        sleep "$delay"
+      fi
+    fi
+  done
+
+  return "$rc"
 }
 
 deploy_boc_with_mode() {
@@ -692,48 +734,90 @@ resolve_wallet_subwallet_id_by_name() {
 
 wallet_seqno_decimal() {
   local wallet_address="$1"
-  local output seq_hex
+  local output seq_hex seq_dec seq_token attempts delay attempt
 
-  output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
-  if [[ -z "$output" ]]; then
-    echo "Error: failed to query account state for wallet ${wallet_address}." >&2
-    return 1
-  fi
+  attempts="$(main_wallet_send_retry_attempts)"
+  delay="$(main_wallet_send_retry_delay_seconds)"
 
-  seq_hex="$(printf '%s\n' "$output" | grep 'x{' | tail -n1 | cut -c 4- | cut -c -8 | tr -cd '0-9A-Fa-f')"
-  seq_hex="$(trim_whitespace "$seq_hex")"
-  if [[ -z "$seq_hex" ]]; then
-    echo "Error: failed to parse wallet seqno from account state for ${wallet_address}." >&2
-    return 1
-  fi
-  printf '%d' "$((16#$seq_hex))"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null || true)"
+    seq_token="$(printf '%s\n' "$output" | awk '
+      /result:/ {capture=1}
+      capture && match($0, /0x[0-9A-Fa-f]+/) {
+        print substr($0, RSTART, RLENGTH)
+        exit
+      }
+      capture && match($0, /-?[0-9]+/) {
+        print substr($0, RSTART, RLENGTH)
+        exit
+      }
+    ')"
+    seq_token="$(trim_whitespace "$seq_token")"
+    seq_dec=""
+    if [[ "$seq_token" =~ ^0x[0-9A-Fa-f]+$ ]]; then
+      seq_dec="$((16#${seq_token:2}))"
+    elif [[ "$seq_token" =~ ^[0-9]+$ ]]; then
+      seq_dec="$seq_token"
+    fi
+    if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$seq_dec"
+      return 0
+    fi
+
+    output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
+    seq_hex="$(printf '%s\n' "$output" | grep 'x{' | tail -n1 | cut -c 4- | cut -c -8 | tr -cd '0-9A-Fa-f')"
+    seq_hex="$(trim_whitespace "$seq_hex")"
+    if [[ -n "$seq_hex" ]]; then
+      printf '%d' "$((16#$seq_hex))"
+      return 0
+    fi
+
+    if (( attempt < attempts )); then
+      echo "Warning: failed to parse wallet seqno for ${wallet_address} (attempt ${attempt}/${attempts}); retrying..." >&2
+      if (( delay > 0 )); then
+        sleep "$delay"
+      fi
+    fi
+  done
+
+  echo "Error: failed to parse wallet seqno from account state for ${wallet_address} after ${attempts} attempts." >&2
+  return 1
 }
 
 wallet_balance_nano() {
   local wallet_address="$1"
-  local output balance
+  local output balance attempts delay attempt
 
-  output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
-  if [[ -z "$output" ]]; then
-    echo "Error: failed to query account state for wallet ${wallet_address}." >&2
-    return 1
-  fi
+  attempts="$(main_wallet_send_retry_attempts)"
+  delay="$(main_wallet_send_retry_delay_seconds)"
 
-  balance="$(printf '%s\n' "$output" | awk '
-    /balance:/ {in_balance=1}
-    in_balance && match($0, /value:[[:space:]]*[0-9]+/) {
-      v=substr($0, RSTART, RLENGTH)
-      sub(/value:[[:space:]]*/, "", v)
-      print v
-      exit
-    }
-  ')"
-  balance="$(trim_whitespace "$balance")"
-  if ! [[ "$balance" =~ ^[0-9]+$ ]]; then
-    echo "Error: failed to parse wallet balance for ${wallet_address}." >&2
-    return 1
-  fi
-  printf '%s' "$balance"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
+    balance="$(printf '%s\n' "$output" | awk '
+      /balance:/ {in_balance=1}
+      in_balance && match($0, /value:[[:space:]]*[0-9]+/) {
+        v=substr($0, RSTART, RLENGTH)
+        sub(/value:[[:space:]]*/, "", v)
+        print v
+        exit
+      }
+    ')"
+    balance="$(trim_whitespace "$balance")"
+    if [[ "$balance" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$balance"
+      return 0
+    fi
+
+    if (( attempt < attempts )); then
+      echo "Warning: failed to parse wallet balance for ${wallet_address} (attempt ${attempt}/${attempts}); retrying..." >&2
+      if (( delay > 0 )); then
+        sleep "$delay"
+      fi
+    fi
+  done
+
+  echo "Error: failed to parse wallet balance for ${wallet_address} after ${attempts} attempts." >&2
+  return 1
 }
 
 nano_to_gram_amount() {
