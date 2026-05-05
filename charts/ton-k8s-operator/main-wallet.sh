@@ -14,6 +14,7 @@ MAIN_WALLET_NAME_DEFAULT="${MAIN_WALLET_NAME_DEFAULT:-main-wallet}"
 SMARTCONT_DIR="${SMARTCONT_DIR:-/usr/share/ton/smartcont}"
 MAIN_WALLET_SEND_RETRY_ATTEMPTS="${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-3}"
 MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
+MAIN_WALLET_MULTI_SEND_PAUSE_SEC="${MAIN_WALLET_MULTI_SEND_PAUSE_SEC:-3}"
 
 usage() {
   cat <<'EOF'
@@ -60,6 +61,16 @@ main_wallet_send_retry_delay_seconds() {
     return 0
   fi
   printf '%s' "2"
+}
+
+main_wallet_multi_send_pause_seconds() {
+  local raw
+  raw="$(trim_whitespace "${MAIN_WALLET_MULTI_SEND_PAUSE_SEC:-3}")"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '%s' "3"
 }
 
 require_bin() {
@@ -954,6 +965,7 @@ main_wallet_send() {
   local destination_address amount_gram
   local total_amount_gram total_amount_nano amount_each_nano remainder_nano
   local split_amount_arg target_count
+  local multi_send_pause_sec
   local no_bounce_flag=""
   local arg
   local -a failed_addresses=()
@@ -997,6 +1009,7 @@ main_wallet_send() {
     echo "Error: failed to resolve source wallet subwallet-id for '${from_wallet}'." >&2
     return 1
   fi
+  multi_send_pause_sec="$(main_wallet_multi_send_pause_seconds)"
 
   split_amount_arg="$(trim_whitespace "${1:-}")"
   if (( $# >= 2 )) && [[ "$split_amount_arg" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
@@ -1038,11 +1051,15 @@ main_wallet_send() {
       echo "Warning: ${remainder_nano} nanoTON remainder is not sent due to equal split rounding." >&2
     fi
 
-    for destination_address in "${destination_addresses[@]}"; do
+    for ((idx = 0; idx < target_count; idx++)); do
+      destination_address="${destination_addresses[$idx]}"
       if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"; then
         failed_addresses+=("$destination_address")
       fi
       current_seqno=$((current_seqno + 1))
+      if (( idx + 1 < target_count )) && (( multi_send_pause_sec > 0 )); then
+        sleep "$multi_send_pause_sec"
+      fi
     done
     if [[ ${#failed_addresses[@]} -gt 0 ]]; then
       echo "Error: failed to send to destination(s): ${failed_addresses[*]}" >&2
