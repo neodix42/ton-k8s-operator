@@ -8081,8 +8081,8 @@ run_wallet() {
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
     echo
-    echo "  send <from-wallet-name> [-n]"
-    echo "    Auto-equal mode: sends equal share from source wallet to all TON pods"
+    echo "  send <from-wallet-name> <amount> [-n]"
+    echo "    Split mode: divides <amount> equally across all TON pods"
     echo "    using MAIN_WALLET_TARGET_WALLET_NAME (default: validator_wallet_001)."
     echo
     echo "  send <from-wallet-name> <to-tonnode-name> <amount> [-n]"
@@ -8104,7 +8104,7 @@ run_wallet() {
     echo "  kubeton wallet deploy my-wallet"
     echo "  kubeton wallet show"
     echo "  kubeton wallet show my-wallet"
-    echo "  kubeton wallet send main-wallet"
+    echo "  kubeton wallet send main-wallet 10."
     echo "  kubeton wallet send main-wallet tonnode-0 10."
     echo "  kubeton wallet send main-wallet tonnode-0 10. -n"
     echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10."
@@ -8199,10 +8199,15 @@ run_wallet() {
       done
 
       case "${#send_args[@]}" in
-        1)
+        2)
           from_wallet_name="$(trim_whitespace "${send_args[0]}")"
-          if [[ -z "$from_wallet_name" ]]; then
-            echo "Error: usage: kubeton wallet send [from-wallet-name] [-n]" >&2
+          amount="$(trim_whitespace "${send_args[1]}")"
+          if [[ -z "$from_wallet_name" || -z "$amount" ]]; then
+            echo "Error: usage: kubeton wallet send [from-wallet-name] [amount] [-n]" >&2
+            return 1
+          fi
+          if ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+            echo "Error: amount '${amount}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
             return 1
           fi
           target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
@@ -8219,7 +8224,7 @@ run_wallet() {
               continue
             fi
             destination_addresses+=("$destination_address")
-            table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"auto-equal")
+            table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"split:${amount}")
           done < <(list_ton_pods 2>/dev/null || true)
 
           if [[ ${#table_rows[@]} -eq 0 ]]; then
@@ -8227,9 +8232,9 @@ run_wallet() {
             return 1
           fi
           print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
-          confirm_or_exit "This will send equal share from '${from_wallet_name}' to all listed TON wallets. Continue?"
+          confirm_or_exit "This will split '${amount}' from '${from_wallet_name}' equally across all listed TON wallets. Continue?"
 
-          action_args=("$from_wallet_name" "--auto-equal")
+          action_args=("$from_wallet_name" "$amount")
           for destination_address in "${destination_addresses[@]}"; do
             action_args+=("$destination_address")
           done
@@ -8286,7 +8291,7 @@ run_wallet() {
           ;;
         *)
           echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
-          echo "       usage: kubeton wallet send [from-wallet-name] [-n]" >&2
+          echo "       usage: kubeton wallet send [from-wallet-name] [amount] [-n]" >&2
           return 1
           ;;
       esac

@@ -228,7 +228,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet deploy main-wallet
 ./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10.
 ./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10. -n
-./kubeton wallet send main-wallet
+./kubeton wallet send main-wallet 10.
 ./kubeton wallet show
 ./kubeton wallet show main-wallet
 ./kubeton verify

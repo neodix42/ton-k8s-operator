@@ -21,7 +21,7 @@ Usage:
   main-wallet.sh create [workchain] [subwallet-id] [wallet-name]
   main-wallet.sh deploy [wallet-name]
   main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]
-  main-wallet.sh send [from-wallet-name] --auto-equal [to-address...] [-n]
+  main-wallet.sh send [from-wallet-name] [amount] [to-address...] [-n]
   main-wallet.sh show [wallet-name]
   main-wallet.sh run <create|deploy|send|show> [args...]
 
@@ -832,6 +832,45 @@ nano_to_gram_amount() {
   printf '%s.%09d' "$whole" "$frac"
 }
 
+gram_amount_to_nano() {
+  local amount="$1"
+  local normalized whole frac padded
+
+  normalized="$(trim_whitespace "$amount")"
+  if ! [[ "$normalized" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+    return 1
+  fi
+  if [[ "$normalized" == *"." ]]; then
+    normalized="${normalized%.}"
+  fi
+
+  whole="$normalized"
+  frac=""
+  if [[ "$normalized" == *"."* ]]; then
+    whole="${normalized%%.*}"
+    frac="${normalized#*.}"
+  fi
+
+  [[ -z "$whole" ]] && whole="0"
+  [[ -z "$frac" ]] && frac="0"
+  if ! [[ "$whole" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if ! [[ "$frac" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if (( ${#frac} > 9 )); then
+    return 1
+  fi
+
+  padded="${frac}"
+  while (( ${#padded} < 9 )); do
+    padded="${padded}0"
+  done
+
+  printf '%s' "$((10#$whole * 1000000000 + 10#$padded))"
+}
+
 send_single_transfer() {
   local from_wallet="$1"
   local destination_address="$2"
@@ -913,7 +952,8 @@ main_wallet_send() {
   local normalized_mode source_wallet_address current_seqno source_subwallet_id
   local -a destination_addresses=()
   local destination_address amount_gram
-  local source_balance_nano amount_each_nano
+  local total_amount_gram total_amount_nano amount_each_nano remainder_nano
+  local split_amount_arg target_count
   local no_bounce_flag=""
   local arg
   local -a failed_addresses=()
@@ -933,7 +973,7 @@ main_wallet_send() {
 
   if [[ -z "$from_wallet" ]]; then
     echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]" >&2
-    echo "       usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...] [-n]" >&2
+    echo "       usage: main-wallet.sh send [from-wallet-name] [amount] [to-address...] [-n]" >&2
     return 1
   fi
 
@@ -958,34 +998,47 @@ main_wallet_send() {
     return 1
   fi
 
-  if [[ "${1:-}" == "--auto-equal" ]]; then
+  split_amount_arg="$(trim_whitespace "${1:-}")"
+  if (( $# >= 2 )) && [[ "$split_amount_arg" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+    total_amount_gram="$split_amount_arg"
     shift || true
-    if (( $# < 1 )); then
-      echo "Error: usage: main-wallet.sh send [from-wallet-name] --auto-equal [to-address...] [-n]" >&2
+
+    destination_addresses=()
+    for destination_address in "$@"; do
+      destination_address="$(trim_whitespace "$destination_address")"
+      [[ -z "$destination_address" ]] && continue
+      destination_addresses+=("$destination_address")
+    done
+    target_count="${#destination_addresses[@]}"
+    if (( target_count < 1 )); then
+      echo "Error: usage: main-wallet.sh send [from-wallet-name] [amount] [to-address...] [-n]" >&2
       return 1
     fi
-    destination_addresses=("$@")
-    source_balance_nano="$(wallet_balance_nano "$source_wallet_address")"
-    source_balance_nano="$(trim_whitespace "$source_balance_nano")"
-    if ! [[ "$source_balance_nano" =~ ^[0-9]+$ ]]; then
-      echo "Error: failed to read source wallet balance for '${from_wallet}'." >&2
+
+    total_amount_nano="$(gram_amount_to_nano "$total_amount_gram" || true)"
+    total_amount_nano="$(trim_whitespace "$total_amount_nano")"
+    if ! [[ "$total_amount_nano" =~ ^[0-9]+$ ]] || (( total_amount_nano <= 0 )); then
+      echo "Error: amount '${total_amount_gram}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
       return 1
     fi
-    amount_each_nano=$(( source_balance_nano / ${#destination_addresses[@]} ))
+
+    amount_each_nano=$(( total_amount_nano / target_count ))
     if (( amount_each_nano <= 0 )); then
-      echo "Error: source wallet balance is too low for equal distribution across ${#destination_addresses[@]} targets." >&2
+      echo "Error: amount '${total_amount_gram}' is too low for equal distribution across ${target_count} targets." >&2
       return 1
     fi
+    remainder_nano=$(( total_amount_nano - (amount_each_nano * target_count) ))
     amount_gram="$(nano_to_gram_amount "$amount_each_nano")"
     amount_gram="$(trim_whitespace "$amount_gram")"
     if [[ -z "$amount_gram" ]]; then
       echo "Error: failed to convert equal share amount." >&2
       return 1
     fi
+    if (( remainder_nano > 0 )); then
+      echo "Warning: ${remainder_nano} nanoTON remainder is not sent due to equal split rounding." >&2
+    fi
 
     for destination_address in "${destination_addresses[@]}"; do
-      destination_address="$(trim_whitespace "$destination_address")"
-      [[ -z "$destination_address" ]] && continue
       if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"; then
         failed_addresses+=("$destination_address")
       fi
@@ -1000,6 +1053,7 @@ main_wallet_send() {
 
   if (( $# != 2 )); then
     echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]" >&2
+    echo "       usage: main-wallet.sh send [from-wallet-name] [amount] [to-address...] [-n]" >&2
     return 1
   fi
   destination_address="$(trim_whitespace "${1:-}")"
