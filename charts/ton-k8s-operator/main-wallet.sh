@@ -273,6 +273,14 @@ resolve_new_wallet_fif() {
 resolve_wallet_fif() {
   local candidate
   for candidate in \
+    "$MAIN_WALLET_DIR/wallet-v3.fif" \
+    "${SMARTCONT_DIR}/wallet-v3.fif"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  for candidate in \
     "$MAIN_WALLET_DIR/wallet.fif" \
     "${SMARTCONT_DIR}/wallet.fif"; do
     if [[ -f "$candidate" ]]; then
@@ -664,6 +672,24 @@ resolve_wallet_address_by_name() {
   return 1
 }
 
+resolve_wallet_subwallet_id_by_name() {
+  local wallet_name="$1"
+  local wallet_meta="$MAIN_WALLET_DIR/${wallet_name}.wallet.meta"
+  local subwallet_id=""
+
+  if [[ -f "$wallet_meta" ]]; then
+    subwallet_id="$(read_meta_value wallet_id "$wallet_meta")"
+    subwallet_id="$(trim_whitespace "$subwallet_id")"
+    if [[ "$subwallet_id" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$subwallet_id"
+      return 0
+    fi
+  fi
+
+  # Keep compatibility with historical defaults when wallet metadata is absent.
+  printf '%s' "42"
+}
+
 wallet_seqno_decimal() {
   local wallet_address="$1"
   local output seq_hex
@@ -727,8 +753,9 @@ send_single_transfer() {
   local destination_address="$2"
   local amount_gram="$3"
   local seqno_dec="$4"
-  local normalized_mode="$5"
-  local no_bounce_flag="${6:-}"
+  local subwallet_id="$5"
+  local normalized_mode="$6"
+  local no_bounce_flag="${7:-}"
   local wallet_fif fift_bin base_path query_file
   local -a fift_cmd=()
   local rc=0
@@ -756,7 +783,7 @@ send_single_transfer() {
   query_file="${MAIN_WALLET_DIR}/${from_wallet}-send-${seqno_dec}.boc"
   fift_cmd=(
     "$fift_bin" -s "$wallet_fif"
-    "$base_path" "$destination_address" "$seqno_dec" "$amount_gram" "${from_wallet}-send-${seqno_dec}"
+    "$base_path" "$destination_address" "$subwallet_id" "$seqno_dec" "$amount_gram" "${from_wallet}-send-${seqno_dec}"
   )
   if [[ -n "$no_bounce_flag" ]]; then
     if [[ "$no_bounce_flag" != "-n" ]]; then
@@ -799,7 +826,7 @@ send_single_transfer() {
 main_wallet_send() {
   local from_wallet="${1:-}"
   shift || true
-  local normalized_mode source_wallet_address current_seqno
+  local normalized_mode source_wallet_address current_seqno source_subwallet_id
   local -a destination_addresses=()
   local destination_address amount_gram
   local source_balance_nano amount_each_nano
@@ -840,6 +867,12 @@ main_wallet_send() {
     echo "Error: failed to resolve source wallet seqno for '${from_wallet}'." >&2
     return 1
   fi
+  source_subwallet_id="$(resolve_wallet_subwallet_id_by_name "$from_wallet" || true)"
+  source_subwallet_id="$(trim_whitespace "$source_subwallet_id")"
+  if ! [[ "$source_subwallet_id" =~ ^[0-9]+$ ]]; then
+    echo "Error: failed to resolve source wallet subwallet-id for '${from_wallet}'." >&2
+    return 1
+  fi
 
   if [[ "${1:-}" == "--auto-equal" ]]; then
     shift || true
@@ -869,7 +902,7 @@ main_wallet_send() {
     for destination_address in "${destination_addresses[@]}"; do
       destination_address="$(trim_whitespace "$destination_address")"
       [[ -z "$destination_address" ]] && continue
-      if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode" "$no_bounce_flag"; then
+      if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"; then
         failed_addresses+=("$destination_address")
       fi
       current_seqno=$((current_seqno + 1))
@@ -895,7 +928,7 @@ main_wallet_send() {
     echo "Error: amount '${amount_gram}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
     return 1
   fi
-  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$normalized_mode" "$no_bounce_flag"
+  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"
 }
 
 run_action() {
