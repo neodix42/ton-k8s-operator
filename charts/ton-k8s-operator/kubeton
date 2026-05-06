@@ -8028,11 +8028,98 @@ main_wallet_pod_longhorn_csi_affinity_yaml() {
   done
 }
 
+main_wallet_helper_pod_uses_pvc() {
+  local ns="$1"
+  local pod="$2"
+  local pvc_name="$3"
+  local claim=""
+
+  while IFS= read -r claim; do
+    claim="$(trim_whitespace "$claim")"
+    [[ -z "$claim" ]] && continue
+    if [[ "$claim" == "$pvc_name" ]]; then
+      return 0
+    fi
+  done < <(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{"\n"}{end}' 2>/dev/null || true)
+
+  return 1
+}
+
+cleanup_terminated_main_wallet_helper_pods() {
+  local ns="$1"
+  kubectl -n "$ns" delete pod -l app.kubernetes.io/name=kubeton-main-wallet --field-selector=status.phase==Succeeded --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete pod -l app.kubernetes.io/name=kubeton-main-wallet --field-selector=status.phase==Failed --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+
+ensure_main_wallet_helper_slot() {
+  local ns="$1"
+  local pvc_name="$2"
+  local timeout_seconds="${3:-120}"
+  local deadline row pod phase deleting
+  local -a conflicting_pods=()
+
+  cleanup_terminated_main_wallet_helper_pods "$ns"
+  deadline=$(( $(date +%s) + timeout_seconds ))
+
+  while (( $(date +%s) < deadline )); do
+    conflicting_pods=()
+    while IFS= read -r row; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r pod phase deleting <<<"$row"
+      pod="$(trim_whitespace "$pod")"
+      phase="$(trim_whitespace "$phase")"
+      deleting="$(trim_whitespace "$deleting")"
+      [[ -z "$pod" ]] && continue
+      [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && continue
+      if ! main_wallet_helper_pod_uses_pvc "$ns" "$pod" "$pvc_name"; then
+        continue
+      fi
+      if [[ -n "$deleting" ]]; then
+        continue
+      fi
+      conflicting_pods+=("${pod} (${phase:-unknown})")
+    done < <(kubectl -n "$ns" get pods -l app.kubernetes.io/name=kubeton-main-wallet -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true)
+
+    if [[ ${#conflicting_pods[@]} -eq 0 ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Error: another main-wallet helper pod is still active and holds PVC '${pvc_name}'." >&2
+  echo "Conflicting pod(s): ${conflicting_pods[*]}" >&2
+  echo "Wait for completion or delete stale helper pod(s) before retrying." >&2
+  return 1
+}
+
+main_wallet_mount_conflict_event() {
+  local ns="$1"
+  local pod="$2"
+  local message
+
+  message="$(kubectl -n "$ns" get events \
+    --field-selector "involvedObject.kind=Pod,involvedObject.name=${pod},type=Warning,reason=FailedMount" \
+    --sort-by=.lastTimestamp \
+    -o custom-columns=MESSAGE:.message \
+    --no-headers 2>/dev/null | tail -n 1 || true)"
+  message="$(trim_whitespace "$message")"
+
+  if [[ -z "$message" ]]; then
+    return 1
+  fi
+
+  if grep -Eiq 'already mapped or mounted|Cannot use device /dev/longhorn/.*in use|already mounted or mount point busy' <<<"$message"; then
+    printf '%s' "$message"
+    return 0
+  fi
+  return 1
+}
+
 wait_main_wallet_pod_completion() {
   local ns="$1"
   local pod="$2"
   local timeout_seconds="$3"
-  local deadline phase exit_code
+  local deadline phase exit_code mount_conflict
 
   deadline=$(( $(date +%s) + timeout_seconds ))
   while (( $(date +%s) < deadline )); do
@@ -8055,6 +8142,11 @@ wait_main_wallet_pod_completion() {
       *)
         ;;
     esac
+    if mount_conflict="$(main_wallet_mount_conflict_event "$ns" "$pod")"; then
+      echo "Error: encrypted volume mount conflict detected for ${ns}/${pod}: ${mount_conflict}" >&2
+      echo "Aborting early to avoid waiting for timeout." >&2
+      return 1
+    fi
     sleep 2
   done
 
@@ -8322,6 +8414,10 @@ run_wallet() {
   ns="$(trim_whitespace "$TON_NAMESPACE")"
   [[ -z "$ns" ]] && ns="default"
   ensure_namespace "$ns"
+
+  if ! ensure_main_wallet_helper_slot "$ns" "$MAIN_WALLET_BUNDLE_PVC" 120; then
+    return 1
+  fi
 
   ensure_main_wallet_script_configmap "$ns"
   ensure_main_wallet_bundle_pvc "$ns"

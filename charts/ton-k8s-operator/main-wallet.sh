@@ -753,14 +753,39 @@ wallet_seqno_decimal() {
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null || true)"
     seq_token="$(printf '%s\n' "$output" | awk '
-      /result:/ {capture=1}
-      capture && match($0, /0x[0-9A-Fa-f]+/) {
-        print substr($0, RSTART, RLENGTH)
-        exit
+      function parse_token(line, m) {
+        if (match(line, /0x[0-9A-Fa-f]+/)) {
+          print substr(line, RSTART, RLENGTH)
+          return 1
+        }
+        # Decimal token bounded by non-word chars to avoid grabbing address/hash fragments.
+        if (match(line, /(^|[^A-Za-z0-9])([0-9]+)([^A-Za-z0-9]|$)/, m)) {
+          print m[2]
+          return 1
+        }
+        return 0
       }
-      capture && match($0, /-?[0-9]+/) {
-        print substr($0, RSTART, RLENGTH)
-        exit
+      {
+        line=$0
+        if (!capture && line ~ /result:[[:space:]]*\[/) {
+          capture=1
+          sub(/.*result:[[:space:]]*\[/, "", line)
+          if (parse_token(line)) {
+            exit
+          }
+          if (line ~ /\]/) {
+            capture=0
+          }
+          next
+        }
+        if (capture) {
+          if (parse_token(line)) {
+            exit
+          }
+          if (line ~ /\]/) {
+            capture=0
+          }
+        }
       }
     ')"
     seq_token="$(trim_whitespace "$seq_token")"
@@ -776,7 +801,50 @@ wallet_seqno_decimal() {
     fi
 
     output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
-    seq_hex="$(printf '%s\n' "$output" | grep 'x{' | tail -n1 | cut -c 4- | cut -c -8 | tr -cd '0-9A-Fa-f')"
+
+    # For undeployed/nonexistent wallets seqno is 0 by definition.
+    if printf '%s\n' "$output" | grep -Eiq 'state:[[:space:]]*(account_uninit|uninit|account_none|none|nonexist)|account_none\$0'; then
+      printf '%s' "0"
+      return 0
+    fi
+
+    # Parse first 32 bits from account data cell: data: x{<seqno><...>}
+    # Keep parsing scoped to "data: x{...}" region only.
+    seq_hex="$(printf '%s\n' "$output" | awk '
+      /data:[[:space:]]*x\{/ {
+        capture=1
+        line=$0
+        sub(/.*data:[[:space:]]*x\{/, "", line)
+        buffer=buffer line
+        if (index(line, "}") > 0) {
+          gsub(/[^0-9A-Fa-f]/, "", buffer)
+          if (length(buffer) >= 8) {
+            print substr(buffer, 1, 8)
+          }
+          exit
+        }
+        next
+      }
+      capture {
+        line=$0
+        buffer=buffer line
+        if (index(line, "}") > 0) {
+          gsub(/[^0-9A-Fa-f]/, "", buffer)
+          if (length(buffer) >= 8) {
+            print substr(buffer, 1, 8)
+          }
+          exit
+        }
+      }
+      END {
+        if (capture && length(buffer) > 0) {
+          gsub(/[^0-9A-Fa-f]/, "", buffer)
+          if (length(buffer) >= 8) {
+            print substr(buffer, 1, 8)
+          }
+        }
+      }
+    ')"
     seq_hex="$(trim_whitespace "$seq_hex")"
     if [[ -n "$seq_hex" ]]; then
       printf '%d' "$((16#$seq_hex))"
@@ -791,6 +859,13 @@ wallet_seqno_decimal() {
     fi
   done
 
+  echo "Debug: runmethod/getaccount parsing failed for ${wallet_address}" >&2
+  {
+    echo "--- runmethod output ---"
+    run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null || true
+    echo "--- getaccount output ---"
+    run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true
+  } >&2
   echo "Error: failed to parse wallet seqno from account state for ${wallet_address} after ${attempts} attempts." >&2
   return 1
 }
