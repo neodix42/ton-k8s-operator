@@ -627,14 +627,120 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		t.Fatalf("add ton scheme: %v", err)
 	}
 
-	t.Run("keeps existing sticky hostnames from affinity", func(t *testing.T) {
-		reconciler := &TonNodeReconciler{}
+	t.Run("keeps existing sticky hostnames from affinity when pods are active", func(t *testing.T) {
 		tonNode := &tonv1alpha1.TonNode{
 			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
 			Spec: tonv1alpha1.TonNodeSpec{
 				Replicas: ptr.To[int32](2),
 			},
 		}
+		labels := labelsForTonNode(tonNode)
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "tonnode-0",
+				Namespace: "default",
+				Labels:    labels,
+			},
+		}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pod).
+			Build()
+		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
+		existingAffinity := &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "kubernetes.io/hostname",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{testHostName2, testHostName1},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		got, err := reconciler.desiredStickyNodeHostnames(
+			context.Background(),
+			tonNode,
+			existingAffinity,
+			labels,
+			nil,
+			int(desiredReplicas(tonNode)),
+		)
+		if err != nil {
+			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
+		}
+		if len(got) != 2 || got[0] != testHostName1 || got[1] != testHostName2 {
+			t.Fatalf("sticky hostnames = %#v, want [%s %s]", got, testHostName1, testHostName2)
+		}
+	})
+
+	t.Run("refreshes stale sticky hostnames after stop-start", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+			Spec: tonv1alpha1.TonNodeSpec{
+				Replicas: ptr.To[int32](2),
+			},
+		}
+		node0 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testK8sNodeName0,
+				Labels: map[string]string{
+					corev1.LabelHostname: testHostName0,
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		node1 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testK8sNodeName1,
+				Labels: map[string]string{
+					corev1.LabelHostname: testHostName1,
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		node2 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testK8sNodeName2,
+				Labels: map[string]string{
+					corev1.LabelHostname: testHostName2,
+				},
+			},
+			Spec: corev1.NodeSpec{
+				Taints: []corev1.Taint{
+					{
+						Key:    "dedicated",
+						Value:  "other",
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(node0, node1, node2).
+			Build()
+		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
 		existingAffinity := &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
@@ -664,8 +770,21 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
 		}
-		if len(got) != 2 || got[0] != testHostName1 || got[1] != testHostName2 {
-			t.Fatalf("sticky hostnames = %#v, want [%s %s]", got, testHostName1, testHostName2)
+		if len(got) != 2 {
+			t.Fatalf("sticky hostnames = %#v, want 2 hostnames", got)
+		}
+		gotSet := map[string]struct{}{
+			got[0]: {},
+			got[1]: {},
+		}
+		if _, ok := gotSet[testHostName0]; !ok {
+			t.Fatalf("sticky hostnames = %#v, want to include %s", got, testHostName0)
+		}
+		if _, ok := gotSet[testHostName1]; !ok {
+			t.Fatalf("sticky hostnames = %#v, want to include %s", got, testHostName1)
+		}
+		if _, ok := gotSet[testHostName2]; ok {
+			t.Fatalf("sticky hostnames = %#v, should not include stale %s", got, testHostName2)
 		}
 	})
 

@@ -1494,22 +1494,60 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 		return nil, nil
 	}
 
+	activePodsKnown := false
+	activePods := false
+	hasActiveTonPods := func() (bool, error) {
+		if activePodsKnown {
+			return activePods, nil
+		}
+		var pods corev1.PodList
+		if err := r.List(ctx, &pods, client.InNamespace(tonNode.Namespace), client.MatchingLabels(labels)); err != nil {
+			return false, err
+		}
+		activePods = hasActivePods(pods.Items)
+		activePodsKnown = true
+		return activePods, nil
+	}
+
 	existing := stickyNodeHostnamesFromAffinity(existingAffinity)
 	if len(existing) > 0 {
+		var eligibleHostnames []string
+		hasActive, err := hasActiveTonPods()
+		if err != nil {
+			return nil, err
+		}
+		if !hasActive {
+			// During stop/start there are no active pods; refresh stale affinity entries
+			// against currently schedulable nodes to avoid deadlocked placement.
+			eligibleHostnames, err = r.eligibleStickyNodeHostnames(ctx, tonNode)
+			if err != nil {
+				return nil, err
+			}
+			existing = keepEligibleHostnames(existing, eligibleHostnames)
+		}
+
 		// Keep existing host affinity stable to avoid automatic rollouts.
-		if targetReplicas <= len(existing) {
+		if len(existing) > 0 && targetReplicas <= len(existing) {
 			return existing, nil
 		}
 
 		ordinalCandidates := stickyHostnamesFromOrdinalMap(ordinalNodeMap, targetReplicas)
+		if len(eligibleHostnames) > 0 {
+			ordinalCandidates = keepEligibleHostnames(ordinalCandidates, eligibleHostnames)
+		}
+		if len(existing) == 0 {
+			existing = ordinalCandidates
+		}
 		expanded := appendMissingHostnames(existing, ordinalCandidates, targetReplicas)
 		if len(expanded) >= targetReplicas {
 			return expanded, nil
 		}
 
-		eligibleHostnames, err := r.eligibleStickyNodeHostnames(ctx, tonNode)
-		if err != nil {
-			return nil, err
+		if len(eligibleHostnames) == 0 {
+			eligibleHostnames, err = r.eligibleStickyNodeHostnames(ctx, tonNode)
+			if err != nil {
+				return nil, err
+			}
 		}
 		expanded = appendMissingHostnames(expanded, eligibleHostnames, targetReplicas)
 		if len(expanded) >= targetReplicas {
@@ -1518,11 +1556,11 @@ func (r *TonNodeReconciler) desiredStickyNodeHostnames(
 		return existing, nil
 	}
 
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(tonNode.Namespace), client.MatchingLabels(labels)); err != nil {
+	hasActive, err := hasActiveTonPods()
+	if err != nil {
 		return nil, err
 	}
-	if hasActivePods(pods.Items) {
+	if hasActive {
 		// Do not retrofit sticky affinity after initial launch; that would update the
 		// StatefulSet template and trigger a rollout of already-running TON pods.
 		return nil, nil
@@ -1694,7 +1732,7 @@ func nodeHasHardScheduleTaint(node *corev1.Node) bool {
 }
 
 func appendMissingHostnames(existing []string, candidates []string, target int) []string {
-	if len(existing) == 0 {
+	if target < 1 {
 		return nil
 	}
 	out := append([]string(nil), existing...)
@@ -1713,6 +1751,28 @@ func appendMissingHostnames(existing []string, candidates []string, target int) 
 		seen[hostname] = struct{}{}
 	}
 	return out
+}
+
+func keepEligibleHostnames(hostnames []string, eligibleHostnames []string) []string {
+	if len(hostnames) == 0 || len(eligibleHostnames) == 0 {
+		return nil
+	}
+	eligibleSet := make(map[string]struct{}, len(eligibleHostnames))
+	for _, hostname := range eligibleHostnames {
+		eligibleSet[strings.TrimSpace(hostname)] = struct{}{}
+	}
+	out := make([]string, 0, len(hostnames))
+	for _, hostname := range hostnames {
+		name := strings.TrimSpace(hostname)
+		if name == "" {
+			continue
+		}
+		if _, ok := eligibleSet[name]; !ok {
+			continue
+		}
+		out = append(out, name)
+	}
+	return uniqueSortedStrings(out)
 }
 
 func stickyHostnamesFromOrdinalMap(ordinalNodeMap map[int]string, targetReplicas int) []string {
