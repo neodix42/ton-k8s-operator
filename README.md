@@ -98,7 +98,7 @@ Restore prerequisites:
 - encrypted bundles can be decrypted only if the same root-of-trust is still available:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
-- `kubeton drop` removes TON resources/PVCs only.
+- `kubeton drop` removes TON resources/PVCs and backing Longhorn volume artifacts (PVs/attachments) only.
 - `kubeton uninstall` removes TON resources/PVCs, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, operator release, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
 - `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
@@ -276,7 +276,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # verify
 ./kubeton verify
 
-# drops TON nodes and storage (PVCs)
+# drops TON nodes and storage (PVCs/PVs/Longhorn resources)
 ./kubeton drop
 
 # delete operator release + Longhorn + Vault + kubeton-managed observability stacks (keeps TonNode CRD)

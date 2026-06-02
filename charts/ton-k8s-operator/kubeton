@@ -4366,10 +4366,14 @@ delete_ton_pvcs_for_statefulsets() {
   local -n sts_rows_ref="$1"
   local row ns sts
   local -a pvc_rows=()
-  local pvc_name
+  local -a pv_rows=()
+  local -a volume_attachment_rows=()
+  local pvc_name ns_label pvc volume
+  local candidate_attachment source_pv
+  local -a pv_match=()
 
   if [[ ${#sts_rows_ref[@]} -eq 0 ]]; then
-    return 0
+    echo "[cleanup] No StatefulSet snapshot was provided; using TON PVC label selector only." >&2
   fi
 
   for row in "${sts_rows_ref[@]}"; do
@@ -4379,22 +4383,80 @@ delete_ton_pvcs_for_statefulsets() {
 
     while IFS= read -r pvc_name; do
       [[ -z "$pvc_name" ]] && continue
-      pvc_rows+=("$ns"$'\t'"$pvc_name")
+      append_unique_item "$ns"$'\t'"$pvc_name" pvc_rows
     done < <(
       kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
         | grep -E "^(ton-work|mytoncore|keybundle)-${sts}-" || true
     )
   done
 
+  while IFS=$'\t' read -r ns_label pvc; do
+    [[ -z "$ns_label" || -z "$pvc" ]] && continue
+    append_unique_item "${ns_label}"$'\t'"${pvc}" pvc_rows
+  done < <(
+    kubectl get pvc -A -l "$TON_POD_LABEL" -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+  )
+
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
   fi
 
-  echo "[cleanup] Deleting TON PVCs by StatefulSet name pattern ..."
   for row in "${pvc_rows[@]}"; do
     IFS=$'\t' read -r ns pvc_name <<<"$row"
     [[ -z "$ns" || -z "$pvc_name" ]] && continue
-    kubectl -n "$ns" delete pvc "$pvc_name" --ignore-not-found >/dev/null 2>&1 || true
+    volume="$(kubectl -n "$ns" get pvc "$pvc_name" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+    volume="$(trim_whitespace "$volume")"
+    if [[ -n "$volume" ]]; then
+      append_unique_item "$volume" pv_rows
+    fi
+  done
+
+  echo "[cleanup] Deleting TON PVCs ..."
+  for row in "${pvc_rows[@]}"; do
+    IFS=$'\t' read -r ns pvc_name <<<"$row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    kubectl -n "$ns" delete pvc "$pvc_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  for row in "${pvc_rows[@]}"; do
+    IFS=$'\t' read -r ns pvc_name <<<"$row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    wait_pvc_gone "$ns" "$pvc_name" 120 || true
+  done
+
+  if [[ ${#pv_rows[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  mapfile -t volume_attachment_rows < <(
+    kubectl get volumeattachments.storage.k8s.io \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.source.persistentVolumeName}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  for candidate_attachment in "${volume_attachment_rows[@]}"; do
+    [[ -z "$candidate_attachment" ]] && continue
+    IFS=$'\t' read -r attachment_name source_pv <<<"$candidate_attachment"
+    [[ -z "$attachment_name" ]] && continue
+    [[ -z "$source_pv" ]] && continue
+
+    pv_match=()
+    for volume in "${pv_rows[@]}"; do
+      if [[ "$source_pv" == "$volume" ]]; then
+        pv_match+=("${volume}")
+      fi
+    done
+    if [[ ${#pv_match[@]} -eq 0 ]]; then
+      continue
+    fi
+    echo "[cleanup] Deleting stale VolumeAttachment ${attachment_name} for PV ${source_pv} ..."
+    kubectl delete volumeattachment "$attachment_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  for volume in "${pv_rows[@]}"; do
+    echo "[cleanup] Deleting Longhorn volume ${volume} ..."
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    echo "[cleanup] Deleting PV ${volume} ..."
+    kubectl delete pv "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done
 }
 
@@ -6868,7 +6930,6 @@ run_drop() {
   confirm_or_exit "This will stop TON pods and DELETE TON PVC data. Continue?"
   run_stop_without_backup
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
-  kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
   delete_ton_pvcs_for_statefulsets drop_sts_rows
 }
 
@@ -7184,7 +7245,6 @@ run_uninstall_core() {
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
 
   echo "[uninstall] Step 3/9: deleting TON PVCs ..."
-  kubectl delete pvc -A -l "$TON_POD_LABEL" --ignore-not-found
   delete_ton_pvcs_for_statefulsets uninstall_sts_rows
 
   echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
