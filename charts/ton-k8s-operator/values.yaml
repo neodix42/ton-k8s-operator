@@ -60,7 +60,7 @@ tonNode:
   name: tonnode
   namespace: ""
   labels: {}
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.05-1-amd64
   replicas: 3
   storage:
     tonWorkSize: 400Gi
@@ -103,11 +103,11 @@ tonNode:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
+      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.05-1-amd64
       resources: {}
   env:
     - name: TON_BRANCH
-      value: v2026.04
+      value: v2026.05-1
     - name: ARCHIVE_TTL
       value: "86400"
     - name: STATE_TTL
