@@ -4467,10 +4467,16 @@ delete_ton_pvcs_for_statefulsets() {
   done
 
   for volume in "${pv_rows[@]}"; do
+    wait_volume_attachments_gone "$volume" 180 || true
+  done
+
+  for volume in "${pv_rows[@]}"; do
     echo "[cleanup] Deleting Longhorn volume ${volume} ..."
     kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     echo "[cleanup] Deleting PV ${volume} ..."
     kubectl delete pv "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    wait_pv_gone "$volume" 180 || true
+    wait_longhorn_volume_gone "$volume" 300 || true
   done
 }
 
@@ -4534,6 +4540,62 @@ wait_pvc_gone() {
   done
 
   echo "Error: timeout waiting for PVC ${ns}/${pvc} to be deleted." >&2
+  return 1
+}
+
+wait_pv_gone() {
+  local pv="$1"
+  local timeout_seconds="${2:-300}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+
+  while (( $(date +%s) < deadline )); do
+    if ! kubectl get pv "$pv" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Warning: timeout waiting for PV ${pv} to be deleted." >&2
+  return 1
+}
+
+wait_longhorn_volume_gone() {
+  local volume="$1"
+  local timeout_seconds="${2:-300}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+
+  if ! kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  while (( $(date +%s) < deadline )); do
+    if ! kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$volume" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Warning: timeout waiting for Longhorn volume ${volume} to be deleted." >&2
+  return 1
+}
+
+wait_volume_attachments_gone() {
+  local pv="$1"
+  local timeout_seconds="${2:-180}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local count
+
+  while (( $(date +%s) < deadline )); do
+    count="$(kubectl get volumeattachments.storage.k8s.io \
+      -o jsonpath='{range .items[?(@.spec.source.persistentVolumeName=="'"${pv}"'")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+      | awk 'NF{c++} END{print c+0}')"
+    if [[ "${count:-0}" == "0" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Warning: timeout waiting for VolumeAttachment objects for PV ${pv} to be deleted." >&2
   return 1
 }
 
@@ -5468,6 +5530,50 @@ wait_statefulset_pods_gone() {
     -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,DELETING:.metadata.deletionTimestamp,NODE:.spec.nodeName \
     --no-headers 2>/dev/null || true
   return 1
+}
+
+scale_statefulset_rows_to_zero() {
+  local -n sts_rows_ref="$1"
+  local row ns sts
+
+  for row in "${sts_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts _ <<<"$row"
+    [[ -z "$ns" || -z "$sts" ]] && continue
+    kubectl -n "$ns" scale statefulset "$sts" --replicas=0 >/dev/null 2>&1 || true
+  done
+}
+
+wait_statefulset_rows_pods_gone() {
+  local -n sts_rows_ref="$1"
+  local row ns sts
+  local failed=0
+
+  for row in "${sts_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts _ <<<"$row"
+    [[ -z "$ns" || -z "$sts" ]] && continue
+    wait_statefulset_pods_gone "$ns" "$sts" || failed=1
+  done
+
+  return "$failed"
+}
+
+stop_ton_for_destructive_cleanup() {
+  local sts_rows_name="$1"
+
+  if ! run_stop_without_backup; then
+    echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing with direct TonNode/StatefulSet cleanup." >&2
+  fi
+
+  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
+
+  # If the operator or Helm path is unhealthy, scaling the captured StatefulSets
+  # still prevents live pods from holding PVCs while deletion starts.
+  scale_statefulset_rows_to_zero "$sts_rows_name"
+
+  echo "Waiting for TON pods to terminate before PVC deletion ..."
+  wait_statefulset_rows_pods_gone "$sts_rows_name"
 }
 
 trigger_key_backup_once() {
@@ -6942,8 +7048,7 @@ run_drop() {
 
   mapfile -t drop_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
   confirm_or_exit "This will stop TON pods and DELETE TON PVC data. Continue?"
-  run_stop_without_backup
-  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
+  stop_ton_for_destructive_cleanup drop_sts_rows
   delete_ton_pvcs_for_statefulsets drop_sts_rows
 }
 
@@ -7281,45 +7386,40 @@ run_uninstall_core() {
 
   mapfile -t uninstall_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
 
-  echo "[uninstall] Step 1/10: disabling TON resources in Helm release ${RELEASE_NAME} ..."
-  if ! run_stop_without_backup; then
-    echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing uninstall cleanup." >&2
-  fi
+  echo "[uninstall] Step 1/9: stopping TON resources and waiting for pods to terminate ..."
+  stop_ton_for_destructive_cleanup uninstall_sts_rows
 
-  echo "[uninstall] Step 2/10: deleting TonNode custom resources ..."
-  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
-
-  echo "[uninstall] Step 3/10: deleting TON PVCs ..."
+  echo "[uninstall] Step 2/9: deleting TON PVCs ..."
   delete_ton_pvcs_for_statefulsets uninstall_sts_rows
 
-  echo "[uninstall] Step 4/10: cleaning leftover kubectl debug pods ..."
+  echo "[uninstall] Step 3/9: cleaning leftover kubectl debug pods ..."
   cleanup_kubectl_debug_pods || true
 
-  echo "[uninstall] Step 5/10: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
+  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
   cleanup_prometheus_resources
   cleanup_grafana_resources
   cleanup_victoria_metrics_resources
 
-  echo "[uninstall] Step 6/10: uninstalling operator Helm release ${RELEASE_NAME} ..."
+  echo "[uninstall] Step 5/9: uninstalling operator Helm release ${RELEASE_NAME} ..."
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
   delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 7/10: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
+  echo "[uninstall] Step 6/9: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
   kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
 
-  echo "[uninstall] Step 8/10: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
+  echo "[uninstall] Step 7/9: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   uninstall_longhorn || true
   cleanup_longhorn_force || true
   delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 9/10: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
+  echo "[uninstall] Step 8/9: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
   uninstall_vault || true
   cleanup_vault_force || true
   delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
   cleanup_kubectl_debug_pods "uninstall" || true
 
-  echo "[uninstall] Step 10/10: uninstall core complete."
+  echo "[uninstall] Step 9/9: uninstall core complete."
 }
 
 run_uninstall() {
