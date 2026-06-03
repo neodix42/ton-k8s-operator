@@ -46,6 +46,7 @@ KUBETON_DEBUG_POD_PREFIX="${KUBETON_DEBUG_POD_PREFIX:-node-debugger-}"
 KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL="${KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL:-true}"
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL="${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL:-true}"
 KUBETON_LONGHORN_NODE_CLEANUP_ON_START="${KUBETON_LONGHORN_NODE_CLEANUP_ON_START:-true}"
+KUBETON_LONGHORN_MOUNT_RECOVERY_SECONDS="${KUBETON_LONGHORN_MOUNT_RECOVERY_SECONDS:-180}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
@@ -3949,31 +3950,254 @@ EOF
 }
 
 cleanup_longhorn_node_residues_for_start() {
-  local -a nodes
-  local node
-
   if [[ "${KUBETON_LONGHORN_NODE_CLEANUP_ON_START:-}" != "true" ]]; then
     echo "[bootstrap] Skipping start-time Longhorn residue cleanup because KUBETON_LONGHORN_NODE_CLEANUP_ON_START != true."
     return 0
   fi
 
-  mapfile -t nodes < <(kubectl get nodes -o name 2>/dev/null | sed 's#node/##')
-  if (( ${#nodes[@]} == 0 )); then
-    echo "Warning: no nodes found for bootstrap cleanup; skipping."
+  recover_longhorn_mount_conflicts_until_quiet "bootstrap" 90 || true
+}
+
+longhorn_mount_conflict_pattern() {
+  printf '%s\n' 'apparently in use by the system|already mapped or mounted|Cannot use device /dev/longhorn/.*in use|already mounted or mount point busy'
+}
+
+pod_longhorn_mount_conflict_message() {
+  local ns="$1"
+  local pod="$2"
+  local pattern message
+
+  pattern="$(longhorn_mount_conflict_pattern)"
+  message="$(kubectl -n "$ns" get events \
+    --field-selector "involvedObject.kind=Pod,involvedObject.name=${pod},type=Warning,reason=FailedMount" \
+    --sort-by=.lastTimestamp \
+    -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null \
+    | grep -E "$pattern" \
+    | tail -n 1 || true)"
+  message="$(trim_whitespace "$message")"
+
+  [[ -n "$message" ]] || return 1
+  printf '%s' "$message"
+}
+
+extract_longhorn_conflict_volumes() {
+  local text="${1:-}"
+  printf '%s\n' "$text" | grep -Eo 'pvc-[0-9a-fA-F-]{36}' | sort -u
+}
+
+extract_longhorn_conflict_mount_targets() {
+  local text="${1:-}"
+  printf '%s\n' "$text" \
+    | grep -Eo 'target:\("[^"]+"\)' \
+    | sed -E 's/^target:\("([^"]+)"\)$/\1/' \
+    | grep -E '^/var/lib/kubelet/plugins/kubernetes\.io/csi/driver\.longhorn\.io/.+/globalmount$' \
+    | sort -u
+}
+
+cleanup_longhorn_conflict_residue_on_node() {
+  local node="$1"
+  shift
+
+  local script rc
+  local -a items=("$@")
+
+  if (( ${#items[@]} == 0 )); then
+    echo "Warning: no Longhorn conflict items provided for node ${node}; skipping targeted cleanup." >&2
     return 0
   fi
 
-  echo "[bootstrap] Cleaning stale Longhorn node residue on ${#nodes[@]} node(s) before bootstrap ..."
-  for node in "${nodes[@]}"; do
-    echo "[bootstrap] Cleaning node: ${node}"
-    cleanup_longhorn_residue_on_node "$node" || true
+  script="$(cat <<'EOF'
+set -eu
+
+cleanup_mapper() {
+  local mapper="$1"
+  [ -e "$mapper" ] || return 0
+  if command -v cryptsetup >/dev/null 2>&1; then
+    cryptsetup close "$mapper" || true
+  fi
+  if command -v dmsetup >/dev/null 2>&1; then
+    dmsetup remove "$(basename "$mapper")" >/dev/null 2>&1 || dmsetup remove -f "$(basename "$mapper")" >/dev/null 2>&1 || true
+  fi
+}
+
+for item in "$@"; do
+  case "$item" in
+    path:*)
+      path="${item#path:}"
+      case "$path" in
+        /var/lib/kubelet/plugins/kubernetes.io/csi/driver.longhorn.io/*/globalmount)
+          umount -lf "$path" >/dev/null 2>&1 || true
+          rm -rf "$path" >/dev/null 2>&1 || true
+          ;;
+      esac
+      ;;
+  esac
+done
+
+for item in "$@"; do
+  case "$item" in
+    vol:*)
+      vol="${item#vol:}"
+      [ -n "$vol" ] || continue
+
+      if [ -f /proc/mounts ]; then
+        awk -v vol="$vol" '$0 ~ vol {print $2}' /proc/mounts | sort -ru | while IFS= read -r mp; do
+          [ -n "$mp" ] || continue
+          umount -lf "$mp" >/dev/null 2>&1 || true
+        done
+      fi
+
+      if [ -e "/dev/longhorn/$vol" ]; then
+        dev="$(readlink -f "/dev/longhorn/$vol" 2>/dev/null || printf '%s' "/dev/longhorn/$vol")"
+        block="$(basename "$dev")"
+        for holder in /sys/class/block/"$block"/holders/*; do
+          [ -e "$holder" ] || continue
+          holder_name="$(basename "$holder")"
+          if command -v findmnt >/dev/null 2>&1; then
+            findmnt -rn -S "/dev/mapper/$holder_name" -o TARGET 2>/dev/null | while IFS= read -r mp; do
+              [ -n "$mp" ] || continue
+              umount -lf "$mp" >/dev/null 2>&1 || true
+            done
+          fi
+          cleanup_mapper "/dev/mapper/$holder_name"
+        done
+      fi
+
+      for mapper in /dev/mapper/"$vol" /dev/mapper/*"$vol"* /dev/mapper/longhorn-"$vol" /dev/mapper/longhorn-*"$vol"*; do
+        cleanup_mapper "$mapper"
+      done
+
+      if command -v dmsetup >/dev/null 2>&1; then
+        dmsetup ls 2>/dev/null | awk -v vol="$vol" '$1 ~ vol {print $1}' | while IFS= read -r name; do
+          [ -n "$name" ] || continue
+          dmsetup remove "$name" >/dev/null 2>&1 || dmsetup remove -f "$name" >/dev/null 2>&1 || true
+        done
+      fi
+      ;;
+  esac
+done
+EOF
+)"
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "Warning: kubectl not found; skipping targeted node residue cleanup for ${node}." >&2
+    return 0
+  fi
+
+  if kubectl debug node/"${node}" --profile=sysadmin --image="${KUBETON_NODE_DEBUG_IMAGE}" -- chroot /host sh -ec "$script" sh "${items[@]}"; then
+    return 0
+  fi
+  rc=$?
+  echo "Warning: targeted cleanup on node ${node} failed with exit ${rc}; continuing recovery flow." >&2
+  return 1
+}
+
+KUBETON_LAST_LONGHORN_RECOVERY_COUNT=0
+
+recover_longhorn_mount_conflicts_once() {
+  local label="${1:-start}"
+  local row ns pod node message volume target
+  local recovered=0
+  local -a pod_rows=()
+  local -a items=()
+  local -A seen_pods=()
+
+  KUBETON_LAST_LONGHORN_RECOVERY_COUNT=0
+
+  if ! is_true "${KUBETON_LONGHORN_NODE_CLEANUP_ON_START:-false}"; then
+    return 0
+  fi
+
+  if kubectl -n "$VAULT_NAMESPACE" get pod "${VAULT_RELEASE_NAME}-0" >/dev/null 2>&1; then
+    pod_rows+=("${VAULT_NAMESPACE}"$'\t'"${VAULT_RELEASE_NAME}-0")
+  fi
+
+  while IFS=$'\t' read -r ns pod; do
+    ns="$(trim_whitespace "$ns")"
+    pod="$(trim_whitespace "$pod")"
+    [[ -n "$ns" && -n "$pod" ]] || continue
+    pod_rows+=("${ns}"$'\t'"${pod}")
+  done < <(kubectl get pods -A -l "$TON_POD_LABEL" -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+
+  for row in "${pod_rows[@]}"; do
+    IFS=$'\t' read -r ns pod <<<"$row"
+    [[ -n "$ns" && -n "$pod" ]] || continue
+    if [[ -n "${seen_pods["${ns}/${pod}"]:-}" ]]; then
+      continue
+    fi
+    seen_pods["${ns}/${pod}"]=1
+
+    message="$(pod_longhorn_mount_conflict_message "$ns" "$pod" || true)"
+    [[ -n "$message" ]] || continue
+
+    node="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+    node="$(trim_whitespace "$node")"
+    if [[ -z "$node" ]]; then
+      echo "Warning: ${label}: ${ns}/${pod} has Longhorn mount conflict but no assigned node yet; skipping cleanup for now." >&2
+      continue
+    fi
+
+    items=()
+    while IFS= read -r volume; do
+      volume="$(trim_whitespace "$volume")"
+      [[ -n "$volume" ]] || continue
+      items+=("vol:${volume}")
+    done < <(extract_longhorn_conflict_volumes "$message")
+    while IFS= read -r target; do
+      target="$(trim_whitespace "$target")"
+      [[ -n "$target" ]] || continue
+      items+=("path:${target}")
+    done < <(extract_longhorn_conflict_mount_targets "$message")
+
+    if (( ${#items[@]} == 0 )); then
+      echo "Warning: ${label}: ${ns}/${pod} has Longhorn mount conflict but no pvc/globalmount IDs were parsed." >&2
+      continue
+    fi
+
+    echo "[${label}] Recovering stale Longhorn mount state for ${ns}/${pod} on ${node} ..."
+    cleanup_longhorn_conflict_residue_on_node "$node" "${items[@]}" || true
+    kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    ((recovered += 1))
   done
+
+  if (( recovered > 0 )); then
+    cleanup_kubectl_debug_pods "${label}" || true
+  fi
+  KUBETON_LAST_LONGHORN_RECOVERY_COUNT="$recovered"
+  return 0
+}
+
+recover_longhorn_mount_conflicts_until_quiet() {
+  local label="${1:-start}"
+  local timeout_seconds="${2:-$KUBETON_LONGHORN_MOUNT_RECOVERY_SECONDS}"
+  local deadline
+  local quiet_checks=0
+
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds <= 0 )); then
+    return 0
+  fi
+
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while (( $(date +%s) < deadline )); do
+    recover_longhorn_mount_conflicts_once "$label" || true
+    if (( KUBETON_LAST_LONGHORN_RECOVERY_COUNT == 0 )); then
+      ((quiet_checks += 1))
+      if (( quiet_checks >= 2 )); then
+        return 0
+      fi
+      sleep 10
+      continue
+    fi
+    quiet_checks=0
+    sleep 15
+  done
+  return 0
 }
 
 vault_longhorn_mount_device_in_use_error() {
   kubectl -n "$VAULT_NAMESPACE" get events --field-selector reason=FailedMount --sort-by=.lastTimestamp \
     -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null \
-    | grep -E -q "apparently in use by the system|already .* in use|already mapped" || return 1
+    | grep -E -q "$(longhorn_mount_conflict_pattern)" || return 1
 }
 
 run_vault_helm_install() {
@@ -3997,6 +4221,7 @@ run_vault_helm_install() {
 
   echo "[bootstrap] Installing/ensuring Vault chart ${VAULT_CHART_VERSION} ..."
 
+  rc_ref=0
   run_with_namespace_progress "vault" "$VAULT_NAMESPACE" "${helm_args[@]}" || rc_ref=$?
 }
 
@@ -4067,8 +4292,8 @@ ensure_vault_installed() {
 
     if is_true "${KUBETON_LONGHORN_NODE_CLEANUP_ON_START:-false}" && vault_longhorn_mount_device_in_use_error; then
       echo "[bootstrap] Detected Longhorn mount-device stale state (\"apparently in use by the system\")."
-      echo "[bootstrap] Running bootstrap-time Longhorn node residue cleanup and retrying Vault install ..."
-      cleanup_longhorn_node_residues_for_start || true
+      echo "[bootstrap] Running targeted Longhorn mount recovery and retrying Vault install ..."
+      recover_longhorn_mount_conflicts_until_quiet "bootstrap" 90 || true
       sleep 10
     else
       break
@@ -6270,6 +6495,7 @@ run_start() {
   if (( restore_from_stop_metadata == 1 )); then
     run_start_stopped_fleet
   fi
+  recover_longhorn_mount_conflicts_until_quiet "start" "$KUBETON_LONGHORN_MOUNT_RECOVERY_SECONDS" || true
 }
 
 run_backup_keys() {
@@ -7000,7 +7226,7 @@ cleanup_longhorn_residue_on_node() {
   local node="$1"
   local script rc
 
-  read -r -d '' script <<'EOF'
+  script="$(cat <<'EOF'
 set -eu
 # Close stale Longhorn/CSI mounts and mappings.
 if [ -f /proc/mounts ]; then
@@ -7011,12 +7237,14 @@ if [ -f /proc/mounts ]; then
 fi
 
 if command -v cryptsetup >/dev/null 2>&1; then
-  for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
+  for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn* /dev/mapper/pvc-*; do
     [ -e "$m" ] || continue
     cryptsetup close "$m" || true
   done
-elif command -v dmsetup >/dev/null 2>&1; then
-  for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
+fi
+
+if command -v dmsetup >/dev/null 2>&1; then
+  for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn* /dev/mapper/pvc-*; do
     [ -e "$m" ] || continue
     name="$(basename "$m")"
     dmsetup remove "$name" || dmsetup remove -f "$name" || true
@@ -7034,6 +7262,7 @@ if command -v lsblk >/dev/null 2>&1; then
   fi
 fi
 EOF
+)"
 
   if ! command -v kubectl >/dev/null 2>&1; then
     echo "Warning: kubectl not found; skipping node residue cleanup for ${node}." >&2
@@ -7071,12 +7300,13 @@ cleanup_longhorn_node_residues() {
 }
 
 cleanup_kubectl_debug_pods() {
+  local label="${1:-uninstall}"
   local node_debug_prefix
   local count=0
   local ns name
 
   if [[ "${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL}" != "true" ]]; then
-    echo "[uninstall] Skipping debug pod cleanup because KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL != true."
+    echo "[${label}] Skipping debug pod cleanup because KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL != true."
     return 0
   fi
 
@@ -7085,18 +7315,18 @@ cleanup_kubectl_debug_pods() {
   while IFS= read -r ns name; do
     [[ -n "$ns" ]] || continue
     [[ -n "$name" ]] || continue
-    echo "[uninstall] Deleting kubectl debug pod: ${ns}/${name}"
+    echo "[${label}] Deleting kubectl debug pod: ${ns}/${name}"
     kubectl delete pod "$name" -n "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     ((count += 1))
   done < <(
-    kubectl get pods -A --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' \
+    kubectl get pods -A --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null \
       | awk -v prefix="${node_debug_prefix}" 'index($2, prefix) == 1 { print $1 " " $2 }'
   )
 
   if ((count == 0)); then
-    echo "[uninstall] No debug pods found with prefix '${node_debug_prefix}'."
+    echo "[${label}] No debug pods found with prefix '${node_debug_prefix}'."
   else
-    echo "[uninstall] Deleted ${count} debug pod(s) with prefix '${node_debug_prefix}'."
+    echo "[${label}] Deleted ${count} debug pod(s) with prefix '${node_debug_prefix}'."
   fi
 }
 
@@ -7419,6 +7649,7 @@ run_uninstall_core() {
 
   echo "[uninstall] Step 5/11: cleaning node-local Longhorn residue before deletion ..."
   cleanup_longhorn_node_residues || true
+  cleanup_kubectl_debug_pods "uninstall" || true
 
   echo "[uninstall] Step 6/11: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
   cleanup_prometheus_resources
@@ -7441,6 +7672,8 @@ run_uninstall_core() {
   uninstall_vault || true
   cleanup_vault_force || true
   delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
+
+  cleanup_kubectl_debug_pods "uninstall" || true
 
   echo "[uninstall] Step 11/11: uninstall core complete."
 }
