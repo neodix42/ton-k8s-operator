@@ -45,6 +45,8 @@ KUBETON_DEBUG_POD_PREFIX="${KUBETON_DEBUG_POD_PREFIX:-node-debugger-}"
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL="${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL:-true}"
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
+KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS:-900}"
+KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS="${KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS:-2}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
@@ -3348,6 +3350,37 @@ build_vault_selector_values_file() {
   printf '%s' "$values_file"
 }
 
+build_vault_csi_affinity_values_file() {
+  local input_nodes_array_name="$1"
+  local -n input_nodes_ref="$input_nodes_array_name"
+  local values_file node
+
+  if [[ ${#input_nodes_ref[@]} -eq 0 ]]; then
+    echo "Error: cannot build Vault affinity values; Longhorn CSI node list is empty." >&2
+    return 1
+  fi
+
+  values_file="$(mktemp -t kubeton-vault-csi-affinity.XXXXXX.yaml)"
+  {
+    echo "server:"
+    echo "  affinity:"
+    echo "    nodeAffinity:"
+    echo "      requiredDuringSchedulingIgnoredDuringExecution:"
+    echo "        nodeSelectorTerms:"
+    echo "          - matchExpressions:"
+    echo "              - key: kubernetes.io/hostname"
+    echo "                operator: In"
+    echo "                values:"
+    for node in "${input_nodes_ref[@]}"; do
+      node="$(trim_whitespace "$node")"
+      [[ -z "$node" ]] && continue
+      printf '                  - %s\n' "$(yaml_quote "$node")"
+    done
+  } >"$values_file"
+
+  printf '%s' "$values_file"
+}
+
 build_victoria_logs_single_selector_values_file() {
   local selector="$1"
   local -a selector_pairs=()
@@ -3607,6 +3640,91 @@ recover_stuck_longhorn_namespace() {
   wait_namespace_gone "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
 }
 
+delete_volume_attachments_for_pv() {
+  local pv="$1"
+  local attachment
+
+  kubectl get volumeattachments.storage.k8s.io \
+    -o jsonpath='{range .items[?(@.spec.source.persistentVolumeName=="'"${pv}"'")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+    | while IFS= read -r attachment; do
+        attachment="$(trim_whitespace "$attachment")"
+        [[ -z "$attachment" ]] && continue
+        echo "[cleanup] Deleting stale VolumeAttachment ${attachment} for PV ${pv} ..."
+        kubectl delete volumeattachment "$attachment" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      done
+}
+
+delete_vault_pvcs_and_backing_volumes() {
+  local -a pvc_rows=()
+  local -a pv_rows=()
+  local row pvc pv
+
+  if ! kubectl get namespace "$VAULT_NAMESPACE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  while IFS=$'\t' read -r pvc pv; do
+    pvc="$(trim_whitespace "$pvc")"
+    pv="$(trim_whitespace "$pv")"
+    [[ -z "$pvc" ]] && continue
+    pvc_rows+=("$pvc")
+    if [[ -n "$pv" ]]; then
+      append_unique_item "$pv" pv_rows
+    fi
+  done < <(
+    kubectl -n "$VAULT_NAMESPACE" get pvc \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.volumeName}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  if [[ ${#pvc_rows[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "[cleanup] Deleting Vault PVCs ..."
+  for pvc in "${pvc_rows[@]}"; do
+    [[ -z "$pvc" ]] && continue
+    kubectl -n "$VAULT_NAMESPACE" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  for pvc in "${pvc_rows[@]}"; do
+    [[ -z "$pvc" ]] && continue
+    if ! wait_pvc_gone "$VAULT_NAMESPACE" "$pvc" 180; then
+      echo "Warning: Vault PVC ${VAULT_NAMESPACE}/${pvc} did not delete normally; clearing finalizers." >&2
+      kubectl -n "$VAULT_NAMESPACE" patch pvc "$pvc" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+      kubectl -n "$VAULT_NAMESPACE" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      wait_pvc_gone "$VAULT_NAMESPACE" "$pvc" 60 || true
+    fi
+  done
+
+  for pv in "${pv_rows[@]}"; do
+    [[ -z "$pv" ]] && continue
+    if ! wait_volume_attachments_gone "$pv" 180; then
+      delete_volume_attachments_for_pv "$pv"
+      wait_volume_attachments_gone "$pv" 60 || true
+    fi
+  done
+
+  for pv in "${pv_rows[@]}"; do
+    [[ -z "$pv" ]] && continue
+    if kubectl get pv "$pv" >/dev/null 2>&1; then
+      echo "[cleanup] Deleting Vault PV ${pv} ..."
+      kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      if ! wait_pv_gone "$pv" 180; then
+        echo "Warning: Vault PV ${pv} did not delete normally; clearing finalizers." >&2
+        kubectl patch "pv/${pv}" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        wait_pv_gone "$pv" 60 || true
+      fi
+    fi
+
+    if kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
+      echo "[cleanup] Deleting Vault Longhorn volume ${pv} ..."
+      kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      wait_longhorn_volume_gone "$pv" 300 || true
+    fi
+  done
+}
+
 cleanup_vault_force() {
   echo "[uninstall] Forcing Vault cleanup ..."
 
@@ -3617,16 +3735,7 @@ cleanup_vault_force() {
   # Ensure workload references are gone so pvc-protection can clear.
   kubectl -n "$VAULT_NAMESPACE" delete statefulset vault --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl -n "$VAULT_NAMESPACE" delete pod --all --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
-
-  local pvc pv
-  for pvc in $(kubectl -n "$VAULT_NAMESPACE" get pvc -o name 2>/dev/null || true); do
-    kubectl -n "$VAULT_NAMESPACE" patch "$pvc" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    pv="$(kubectl -n "$VAULT_NAMESPACE" get "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
-    if [[ -n "$pv" ]]; then
-      kubectl patch "pv/${pv}" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    fi
-  done
-  kubectl -n "$VAULT_NAMESPACE" delete pvc --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  delete_vault_pvcs_and_backing_volumes
 
   local resource
   for resource in $(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null || true); do
@@ -3741,6 +3850,90 @@ longhorn_release_metadata_present() {
   local count
   count="$(kubectl -n "$LONGHORN_NAMESPACE" get secret,configmap -l "owner=helm,name=${LONGHORN_RELEASE_NAME}" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}' || true)"
   [[ "${count:-0}" != "0" ]]
+}
+
+storage_class_provisioner() {
+  local storage_class="$1"
+  kubectl get storageclass "$storage_class" -o jsonpath='{.provisioner}' 2>/dev/null | tr -d '[:space:]'
+}
+
+storage_class_is_longhorn() {
+  local storage_class="$1"
+  [[ "$(storage_class_provisioner "$storage_class")" == "driver.longhorn.io" ]]
+}
+
+longhorn_selector_to_kubectl_selector() {
+  local selector="$1"
+  local -a selector_pairs=()
+  local kubectl_selector=""
+  local pair
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  for pair in "${selector_pairs[@]}"; do
+    if [[ -n "$kubectl_selector" ]]; then
+      kubectl_selector+=","
+    fi
+    kubectl_selector+="$pair"
+  done
+  printf '%s' "$kubectl_selector"
+}
+
+wait_longhorn_storage_ready() {
+  local storage_class="${1:-longhorn}"
+  local timeout_seconds="${2:-$KUBETON_LONGHORN_READY_TIMEOUT_SECONDS}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local provisioner=""
+  local expected_ready=0
+  local csi_nodes_count=0
+  local dep
+
+  echo "[baremetal] Waiting for Longhorn CSI/storage readiness (timeout ${timeout_seconds}s) ..."
+
+  while (( $(date +%s) < deadline )); do
+    provisioner="$(storage_class_provisioner "$storage_class")"
+    if [[ "$provisioner" == "driver.longhorn.io" ]]; then
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$provisioner" != "driver.longhorn.io" ]]; then
+    echo "Error: StorageClass ${storage_class} is not available with Longhorn provisioner driver.longhorn.io." >&2
+    return 1
+  fi
+
+  if kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-manager >/dev/null 2>&1; then
+    kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/longhorn-manager --timeout="${timeout_seconds}s" >/dev/null
+  fi
+
+  while (( $(date +%s) < deadline )); do
+    if kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-csi-plugin >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+  if ! kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-csi-plugin >/dev/null 2>&1; then
+    echo "Error: Longhorn CSI daemonset ${LONGHORN_NAMESPACE}/longhorn-csi-plugin was not created." >&2
+    return 1
+  fi
+  kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/longhorn-csi-plugin --timeout="${timeout_seconds}s" >/dev/null
+
+  for dep in csi-attacher csi-provisioner csi-resizer csi-snapshotter longhorn-driver-deployer; do
+    if kubectl -n "$LONGHORN_NAMESPACE" get deployment "$dep" >/dev/null 2>&1; then
+      kubectl -n "$LONGHORN_NAMESPACE" rollout status "deployment/${dep}" --timeout="${timeout_seconds}s" >/dev/null
+    fi
+  done
+
+  while (( $(date +%s) < deadline )); do
+    expected_ready="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-csi-plugin -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+    csi_nodes_count="$(list_longhorn_csi_node_names | awk 'NF{c++} END{print c+0}')"
+    if [[ "${expected_ready:-0}" != "0" && "${csi_nodes_count:-0}" -ge "${expected_ready:-0}" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for Longhorn CSI registration in CSINode objects (${csi_nodes_count:-0}/${expected_ready:-0})." >&2
+  return 1
 }
 
 repair_stale_longhorn_release() {
@@ -3866,6 +4059,8 @@ ensure_longhorn_installed() {
   if (( install_rc != 0 )); then
     return "$install_rc"
   fi
+
+  wait_longhorn_storage_ready "longhorn"
 }
 
 ensure_longhorn_crypto_secret() {
@@ -3962,7 +4157,6 @@ run_vault_helm_install() {
     --set "server.dataStorage.enabled=true"
     --set-string "server.dataStorage.storageClass=${vault_storage_class}"
     --set "injector.enabled=false"
-    --wait
     --timeout 30m
   )
 
@@ -3972,14 +4166,78 @@ run_vault_helm_install() {
   run_with_namespace_progress "vault" "$VAULT_NAMESPACE" "${helm_args[@]}" || rc_ref=$?
 }
 
+vault_mount_conflict_event() {
+  local message
+
+  message="$(kubectl -n "$VAULT_NAMESPACE" get events \
+    --field-selector "involvedObject.kind=Pod,involvedObject.name=${VAULT_RELEASE_NAME}-0,type=Warning,reason=FailedMount" \
+    --sort-by=.lastTimestamp \
+    -o custom-columns=MESSAGE:.message \
+    --no-headers 2>/dev/null | tail -n 1 || true)"
+  message="$(trim_whitespace "$message")"
+
+  if [[ -z "$message" ]]; then
+    return 1
+  fi
+
+  if grep -Eiq 'already mapped or mounted|Cannot use device /dev/longhorn/.*in use|is apparently in use by the system|already mounted or mount point busy' <<<"$message"; then
+    printf '%s' "$message"
+    return 0
+  fi
+  return 1
+}
+
+wait_vault_ready_or_mount_conflict() {
+  local timeout_seconds="${1:-$KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local phase conflict_message
+
+  while (( $(date +%s) < deadline )); do
+    if kubectl -n "$VAULT_NAMESPACE" wait --for=condition=Ready "pod/${VAULT_RELEASE_NAME}-0" --timeout=5s >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if conflict_message="$(vault_mount_conflict_event)"; then
+      echo "Warning: detected Vault Longhorn mount conflict: ${conflict_message}" >&2
+      return 2
+    fi
+
+    phase="$(kubectl -n "$VAULT_NAMESPACE" get pod "${VAULT_RELEASE_NAME}-0" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    phase="$(trim_whitespace "$phase")"
+    if [[ "$phase" == "Failed" ]]; then
+      echo "Error: Vault pod ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0 failed." >&2
+      kubectl -n "$VAULT_NAMESPACE" describe pod "${VAULT_RELEASE_NAME}-0" >&2 || true
+      return 1
+    fi
+    sleep 3
+  done
+
+  echo "Error: timeout waiting for Vault pod ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0 to become Ready." >&2
+  if conflict_message="$(vault_mount_conflict_event)"; then
+    echo "Last Vault mount conflict: ${conflict_message}" >&2
+    return 2
+  fi
+  kubectl -n "$VAULT_NAMESPACE" describe pod "${VAULT_RELEASE_NAME}-0" >&2 || true
+  return 1
+}
+
 ensure_vault_installed() {
   local vault_storage_class="${1:-longhorn}"
   local vault_selector_values_file=""
+  local vault_csi_affinity_values_file=""
   local -a vault_selector_values_files=()
   local -a vault_extra_args=()
+  local -a longhorn_csi_nodes=()
   local k3d_selector=""
   local k3d_matched_nodes=0
+  local attempt=1
+  local max_attempts="$KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS"
+  local install_rc=0
+  local wait_rc=0
   require_bin helm
+  if ! [[ "$max_attempts" =~ ^[0-9]+$ ]] || (( max_attempts < 1 )); then
+    max_attempts=1
+  fi
   ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240
   ensure_helm_repo "hashicorp" "https://helm.releases.hashicorp.com"
   helm repo update hashicorp >/dev/null
@@ -4024,9 +4282,44 @@ ensure_vault_installed() {
     echo "[baremetal] Restricting Vault server to Longhorn nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
   fi
 
-  echo "[bootstrap] Waiting for Vault components to become Ready (timeout 30m) ..."
-  local install_rc=0
-  run_vault_helm_install "$vault_storage_class" install_rc "${vault_extra_args[@]}"
+  if storage_class_is_longhorn "$vault_storage_class"; then
+    wait_longhorn_storage_ready "$vault_storage_class"
+    mapfile -t longhorn_csi_nodes < <(list_longhorn_csi_node_names)
+    if [[ ${#longhorn_csi_nodes[@]} -eq 0 ]]; then
+      echo "Error: storage class '${vault_storage_class}' uses Longhorn, but no CSINode reports driver.longhorn.io." >&2
+      return 1
+    fi
+    vault_csi_affinity_values_file="$(build_vault_csi_affinity_values_file longhorn_csi_nodes)"
+    vault_selector_values_files+=("$vault_csi_affinity_values_file")
+    vault_extra_args+=(-f "$vault_csi_affinity_values_file")
+    echo "[bootstrap] Vault Longhorn CSI nodeAffinity enabled for ${#longhorn_csi_nodes[@]} node(s)."
+  fi
+
+  echo "[bootstrap] Waiting for Vault pod to become Ready (timeout ${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS}s) ..."
+  while (( attempt <= max_attempts )); do
+    install_rc=0
+    wait_rc=0
+    run_vault_helm_install "$vault_storage_class" install_rc "${vault_extra_args[@]}"
+    if (( install_rc != 0 )); then
+      break
+    fi
+
+    wait_vault_ready_or_mount_conflict "$KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS" || wait_rc=$?
+    if (( wait_rc == 0 )); then
+      break
+    fi
+    if (( wait_rc != 2 || attempt >= max_attempts )); then
+      install_rc="$wait_rc"
+      break
+    fi
+
+    echo "[bootstrap] Recreating Vault after Longhorn mount conflict (attempt ${attempt}/${max_attempts}) ..."
+    uninstall_vault || true
+    cleanup_vault_force || true
+    delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
+    ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240
+    ((attempt+=1))
+  done
 
   for vault_selector_values_file in "${vault_selector_values_files[@]}"; do
     [[ -n "$vault_selector_values_file" ]] || continue
@@ -7538,18 +7831,18 @@ run_uninstall_core() {
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
   delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 6/9: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
-  kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
-
-  echo "[uninstall] Step 7/9: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
-  uninstall_longhorn || true
-  cleanup_longhorn_force || true
-  delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
-
-  echo "[uninstall] Step 8/9: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
+  echo "[uninstall] Step 6/9: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
   uninstall_vault || true
   cleanup_vault_force || true
   delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
+
+  echo "[uninstall] Step 7/9: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
+  kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
+
+  echo "[uninstall] Step 8/9: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
+  uninstall_longhorn || true
+  cleanup_longhorn_force || true
+  delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
   cleanup_kubectl_debug_pods "uninstall" || true
 
