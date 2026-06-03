@@ -41,6 +41,10 @@ NAMESPACE_DELETE_PROGRESS_TIMEOUT="${NAMESPACE_DELETE_PROGRESS_TIMEOUT:-60}"
 KUBETON_PAUSE_ANNOTATION_KEY="${KUBETON_PAUSE_ANNOTATION_KEY:-ton.ton.org/kubeton-paused-replicas}"
 KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY="${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY:-ton.ton.org/kubeton-paused-nodemap}"
 KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
+KUBETON_NODE_DEBUG_IMAGE="${KUBETON_NODE_DEBUG_IMAGE:-alpine:3.20}"
+KUBETON_DEBUG_POD_PREFIX="${KUBETON_DEBUG_POD_PREFIX:-node-debugger-}"
+KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL="${KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL:-true}"
+KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL="${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
@@ -6933,6 +6937,110 @@ run_drop() {
   delete_ton_pvcs_for_statefulsets drop_sts_rows
 }
 
+cleanup_longhorn_residue_on_node() {
+  local node="$1"
+  local script rc
+
+  script='
+    set -eu
+    # Close stale Longhorn/CSI mounts and mappings.
+    if [ -f /proc/mounts ]; then
+      awk '\$1 ~ /longhorn/ || \$2 ~ /longhorn|driver\\.longhorn\\.io/ {print \$2}' /proc/mounts | sort -u | while IFS= read -r mp; do
+        [ -n "$mp" ] || continue
+        umount -lf "$mp" || true
+      done
+    fi
+
+    if command -v cryptsetup >/dev/null 2>&1; then
+      for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
+        [ -e "$m" ] || continue
+        cryptsetup close "$m" || true
+      done
+    elif command -v dmsetup >/dev/null 2>&1; then
+      for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
+        [ -e "$m" ] || continue
+        name="$(basename "$m")"
+        dmsetup remove "$name" || dmsetup remove -f "$name" || true
+      done
+    fi
+
+    rm -rf /var/lib/longhorn
+    rm -rf /var/lib/kubelet/plugins/kubernetes.io/csi/driver.longhorn.io
+    rm -rf /var/lib/kubelet/plugins/kubernetes.io~csi/driver.longhorn.io
+    rm -rf /var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/*longhorn* || true
+
+    if command -v lsblk >/dev/null 2>&1; then
+      if lsblk | grep -q "longhorn"; then
+        echo "Warning: longhorn block mappings still visible after cleanup on $(hostname)."
+      fi
+    fi
+  '
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "Warning: kubectl not found; skipping node residue cleanup for ${node}." >&2
+    return 0
+  fi
+
+  if kubectl debug node/"${node}" --profile=sysadmin --image="${KUBETON_NODE_DEBUG_IMAGE}" -- chroot /host sh -ec "$script"; then
+    return 0
+  fi
+  rc=$?
+  echo "Warning: cleanup on node ${node} failed with exit ${rc}; continuing uninstall flow." >&2
+  return 1
+}
+
+cleanup_longhorn_node_residues() {
+  local -a nodes
+  local node
+
+  if [[ "${KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL}" != "true" ]]; then
+    echo "[uninstall] Skipping Longhorn node residue cleanup because KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL != true."
+    return 0
+  fi
+
+  mapfile -t nodes < <(kubectl get nodes -o name 2>/dev/null | sed 's#node/##')
+  if (( ${#nodes[@]} == 0 )); then
+    echo "Warning: no nodes found for residue cleanup; skipping."
+    return 0
+  fi
+
+  echo "[uninstall] Cleaning Longhorn residue on ${#nodes[@]} node(s)."
+  for node in "${nodes[@]}"; do
+    echo "[uninstall] Cleaning node: ${node}"
+    cleanup_longhorn_residue_on_node "$node" || true
+  done
+}
+
+cleanup_kubectl_debug_pods() {
+  local node_debug_prefix
+  local count=0
+  local ns name
+
+  if [[ "${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL}" != "true" ]]; then
+    echo "[uninstall] Skipping debug pod cleanup because KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL != true."
+    return 0
+  fi
+
+  node_debug_prefix="${KUBETON_DEBUG_POD_PREFIX:-node-debugger-}"
+
+  while IFS= read -r ns name; do
+    [[ -n "$ns" ]] || continue
+    [[ -n "$name" ]] || continue
+    echo "[uninstall] Deleting kubectl debug pod: ${ns}/${name}"
+    kubectl delete pod "$name" -n "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    ((count += 1))
+  done < <(
+    kubectl get pods -A --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' \
+      | awk -v prefix="${node_debug_prefix}" 'index($2, prefix) == 1 { print $1 " " $2 }'
+  )
+
+  if ((count == 0)); then
+    echo "[uninstall] No debug pods found with prefix '${node_debug_prefix}'."
+  else
+    echo "[uninstall] Deleted ${count} debug pod(s) with prefix '${node_debug_prefix}'."
+  fi
+}
+
 cleanup_longhorn_force() {
   echo "[uninstall] Forcing Longhorn cleanup ..."
 
@@ -7236,46 +7344,52 @@ run_uninstall_core() {
 
   mapfile -t uninstall_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
 
-  echo "[uninstall] Step 1/9: disabling TON resources in Helm release ${RELEASE_NAME} ..."
+  echo "[uninstall] Step 1/11: disabling TON resources in Helm release ${RELEASE_NAME} ..."
   if ! run_stop_without_backup; then
     echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing uninstall cleanup." >&2
   fi
 
-  echo "[uninstall] Step 2/9: deleting TonNode custom resources ..."
+  echo "[uninstall] Step 2/11: deleting TonNode custom resources ..."
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
 
-  echo "[uninstall] Step 3/9: deleting TON PVCs ..."
+  echo "[uninstall] Step 3/11: deleting TON PVCs ..."
   delete_ton_pvcs_for_statefulsets uninstall_sts_rows
 
-  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
+  echo "[uninstall] Step 4/11: cleaning self-created kubectl debug pods ..."
+  cleanup_kubectl_debug_pods || true
+
+  echo "[uninstall] Step 5/11: cleaning node-local Longhorn residue before deletion ..."
+  cleanup_longhorn_node_residues || true
+
+  echo "[uninstall] Step 6/11: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
   cleanup_prometheus_resources
   cleanup_grafana_resources
   cleanup_victoria_metrics_resources
 
-  echo "[uninstall] Step 5/9: uninstalling operator Helm release ${RELEASE_NAME} ..."
+  echo "[uninstall] Step 7/11: uninstalling operator Helm release ${RELEASE_NAME} ..."
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
   delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 6/9: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
+  echo "[uninstall] Step 8/11: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
   kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
 
-  echo "[uninstall] Step 7/9: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
+  echo "[uninstall] Step 9/11: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   uninstall_longhorn || true
   cleanup_longhorn_force || true
   delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 8/9: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
+  echo "[uninstall] Step 10/11: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
   uninstall_vault || true
   cleanup_vault_force || true
   delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
 
-  echo "[uninstall] Step 9/9: uninstall core complete."
+  echo "[uninstall] Step 11/11: uninstall core complete."
 }
 
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, delete kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, clean leftover kubectl-debug pods, delete kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
   run_uninstall_core
 }
 
