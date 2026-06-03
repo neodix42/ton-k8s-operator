@@ -45,6 +45,7 @@ KUBETON_NODE_DEBUG_IMAGE="${KUBETON_NODE_DEBUG_IMAGE:-alpine:3.20}"
 KUBETON_DEBUG_POD_PREFIX="${KUBETON_DEBUG_POD_PREFIX:-node-debugger-}"
 KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL="${KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL:-true}"
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL="${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL:-true}"
+KUBETON_LONGHORN_NODE_CLEANUP_ON_START="${KUBETON_LONGHORN_NODE_CLEANUP_ON_START:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
@@ -3947,6 +3948,58 @@ volumeBindingMode: ${volume_binding_mode}
 EOF
 }
 
+cleanup_longhorn_node_residues_for_start() {
+  local -a nodes
+  local node
+
+  if [[ "${KUBETON_LONGHORN_NODE_CLEANUP_ON_START:-}" != "true" ]]; then
+    echo "[bootstrap] Skipping start-time Longhorn residue cleanup because KUBETON_LONGHORN_NODE_CLEANUP_ON_START != true."
+    return 0
+  fi
+
+  mapfile -t nodes < <(kubectl get nodes -o name 2>/dev/null | sed 's#node/##')
+  if (( ${#nodes[@]} == 0 )); then
+    echo "Warning: no nodes found for bootstrap cleanup; skipping."
+    return 0
+  fi
+
+  echo "[bootstrap] Cleaning stale Longhorn node residue on ${#nodes[@]} node(s) before bootstrap ..."
+  for node in "${nodes[@]}"; do
+    echo "[bootstrap] Cleaning node: ${node}"
+    cleanup_longhorn_residue_on_node "$node" || true
+  done
+}
+
+vault_longhorn_mount_device_in_use_error() {
+  kubectl -n "$VAULT_NAMESPACE" get events --field-selector reason=FailedMount --sort-by=.lastTimestamp \
+    -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null \
+    | grep -E -q "apparently in use by the system|already .* in use|already mapped" || return 1
+}
+
+run_vault_helm_install() {
+  local vault_storage_class="$1"
+  local -n rc_ref="$2"
+  local -a selector_files=("${@:3}")
+  local -a helm_args=(
+    helm upgrade --install "$VAULT_RELEASE_NAME" "$VAULT_CHART"
+    "${selector_files[@]}"
+    --version "$VAULT_CHART_VERSION"
+    -n "$VAULT_NAMESPACE"
+    --create-namespace
+    --set "server.ha.enabled=false"
+    --set "server.standalone.enabled=true"
+    --set "server.dataStorage.enabled=true"
+    --set-string "server.dataStorage.storageClass=${vault_storage_class}"
+    --set "injector.enabled=false"
+    --wait
+    --timeout 30m
+  )
+
+  echo "[bootstrap] Installing/ensuring Vault chart ${VAULT_CHART_VERSION} ..."
+
+  run_with_namespace_progress "vault" "$VAULT_NAMESPACE" "${helm_args[@]}" || rc_ref=$?
+}
+
 ensure_vault_installed() {
   local vault_storage_class="${1:-longhorn}"
   local vault_selector_values_file=""
@@ -3999,22 +4052,28 @@ ensure_vault_installed() {
     echo "[baremetal] Restricting Vault server to Longhorn nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
   fi
 
-  echo "[bootstrap] Installing/ensuring Vault chart ${VAULT_CHART_VERSION} ..."
   echo "[bootstrap] Waiting for Vault components to become Ready (timeout 30m) ..."
   local install_rc=0
-  run_with_namespace_progress "vault" "$VAULT_NAMESPACE" \
-    helm upgrade --install "$VAULT_RELEASE_NAME" "$VAULT_CHART" \
-    "${vault_extra_args[@]}" \
-    --version "$VAULT_CHART_VERSION" \
-    -n "$VAULT_NAMESPACE" \
-    --create-namespace \
-    --set "server.ha.enabled=false" \
-    --set "server.standalone.enabled=true" \
-    --set "server.dataStorage.enabled=true" \
-    --set-string "server.dataStorage.storageClass=${vault_storage_class}" \
-    --set "injector.enabled=false" \
-    --wait \
-    --timeout 30m || install_rc=$?
+  local attempt=1
+  for attempt in 1 2; do
+    echo "[bootstrap] Installing/ensuring Vault chart ${VAULT_CHART_VERSION} (attempt ${attempt}) ..."
+    run_vault_helm_install "$vault_storage_class" install_rc "${vault_extra_args[@]}"
+    if (( install_rc == 0 )); then
+      break
+    fi
+    if (( attempt == 2 )); then
+      break
+    fi
+
+    if is_true "${KUBETON_LONGHORN_NODE_CLEANUP_ON_START:-false}" && vault_longhorn_mount_device_in_use_error; then
+      echo "[bootstrap] Detected Longhorn mount-device stale state (\"apparently in use by the system\")."
+      echo "[bootstrap] Running bootstrap-time Longhorn node residue cleanup and retrying Vault install ..."
+      cleanup_longhorn_node_residues_for_start || true
+      sleep 10
+    else
+      break
+    fi
+  done
 
   for vault_selector_values_file in "${vault_selector_values_files[@]}"; do
     [[ -n "$vault_selector_values_file" ]] || continue
