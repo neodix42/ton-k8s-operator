@@ -47,6 +47,7 @@ KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS:-900}"
 KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS="${KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS:-2}"
+KUBETON_FAIL_ON_LONGHORN_MULTIPATHD="${KUBETON_FAIL_ON_LONGHORN_MULTIPATHD:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
@@ -3927,12 +3928,73 @@ wait_longhorn_storage_ready() {
     expected_ready="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-csi-plugin -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
     csi_nodes_count="$(list_longhorn_csi_node_names | awk 'NF{c++} END{print c+0}')"
     if [[ "${expected_ready:-0}" != "0" && "${csi_nodes_count:-0}" -ge "${expected_ready:-0}" ]]; then
+      verify_longhorn_multipathd_safe
       return 0
     fi
     sleep 2
   done
 
   echo "Error: timeout waiting for Longhorn CSI registration in CSINode objects (${csi_nodes_count:-0}/${expected_ready:-0})." >&2
+  return 1
+}
+
+verify_longhorn_multipathd_safe() {
+  if ! is_true "$KUBETON_FAIL_ON_LONGHORN_MULTIPATHD"; then
+    return 0
+  fi
+  if ! kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! kubectl -n "$LONGHORN_NAMESPACE" get nodes.longhorn.io >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local selector=""
+  local selected_count=0
+  local node status reason message row
+  local -A selected_nodes=()
+  local -a bad_nodes=()
+
+  if [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
+    selector="$(longhorn_selector_to_kubectl_selector "$LONGHORN_NODE_SELECTOR")" || return 1
+    while IFS= read -r node; do
+      node="$(trim_whitespace "$node")"
+      [[ -z "$node" ]] && continue
+      selected_nodes["$node"]=1
+      ((selected_count+=1))
+    done < <(kubectl get nodes -l "$selector" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  fi
+
+  while IFS=$'\t' read -r node status reason message; do
+    node="$(trim_whitespace "$node")"
+    status="$(trim_whitespace "$status")"
+    reason="$(trim_whitespace "$reason")"
+    message="$(trim_whitespace "$message")"
+    [[ -z "$node" ]] && continue
+    if (( selected_count > 0 )) && [[ -z "${selected_nodes[$node]:-}" ]]; then
+      continue
+    fi
+    if [[ "$status" == "False" || "$reason" == "MultipathdIsRunning" ]]; then
+      row="$node"
+      [[ -n "$reason" ]] && row+=" (${reason})"
+      [[ -n "$message" ]] && row+=": ${message}"
+      bad_nodes+=("$row")
+    fi
+  done < <(
+    kubectl -n "$LONGHORN_NAMESPACE" get nodes.longhorn.io \
+      -o go-template='{{range .items}}{{ $node := .metadata.name }}{{range .status.conditions}}{{if eq .type "Multipathd"}}{{$node}}{{"\t"}}{{.status}}{{"\t"}}{{.reason}}{{"\t"}}{{.message}}{{"\n"}}{{end}}{{end}}{{end}}' 2>/dev/null || true
+  )
+
+  if [[ ${#bad_nodes[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "Error: Longhorn reports multipathd running on selected storage node(s)." >&2
+  printf '  - %s\n' "${bad_nodes[@]}" >&2
+  echo "Longhorn volumes can be claimed by multipathd and fail first mount with:" >&2
+  echo "  /dev/longhorn/pvc-* is apparently in use by the system; will not make a filesystem here" >&2
+  echo "Fix the host OS before running kubeton start: disable multipathd if unused, or blacklist Longhorn devices in /etc/multipath.conf." >&2
+  echo "Temporary bypass: KUBETON_FAIL_ON_LONGHORN_MULTIPATHD=false, but Vault/TON mounts may fail." >&2
   return 1
 }
 
@@ -4187,16 +4249,12 @@ vault_mount_conflict_event() {
   return 1
 }
 
-wait_vault_ready_or_mount_conflict() {
+wait_vault_status_or_mount_conflict() {
   local timeout_seconds="${1:-$KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
-  local phase conflict_message
+  local phase conflict_message status initialized sealed
 
   while (( $(date +%s) < deadline )); do
-    if kubectl -n "$VAULT_NAMESPACE" wait --for=condition=Ready "pod/${VAULT_RELEASE_NAME}-0" --timeout=5s >/dev/null 2>&1; then
-      return 0
-    fi
-
     if conflict_message="$(vault_mount_conflict_event)"; then
       echo "Warning: detected Vault Longhorn mount conflict: ${conflict_message}" >&2
       return 2
@@ -4204,6 +4262,16 @@ wait_vault_ready_or_mount_conflict() {
 
     phase="$(kubectl -n "$VAULT_NAMESPACE" get pod "${VAULT_RELEASE_NAME}-0" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     phase="$(trim_whitespace "$phase")"
+    if [[ "$phase" == "Running" ]]; then
+      status="$(kubectl -n "$VAULT_NAMESPACE" exec "${VAULT_RELEASE_NAME}-0" -- vault status 2>&1 || true)"
+      initialized="$(printf '%s\n' "$status" | awk '/^Initialized[[:space:]]+/ {print tolower($2); exit}')"
+      sealed="$(printf '%s\n' "$status" | awk '/^Sealed[[:space:]]+/ {print tolower($2); exit}')"
+      if [[ "$initialized" == "true" || "$initialized" == "false" ]]; then
+        echo "[bootstrap] Vault status is reachable (initialized=${initialized}, sealed=${sealed:-unknown})."
+        return 0
+      fi
+    fi
+
     if [[ "$phase" == "Failed" ]]; then
       echo "Error: Vault pod ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0 failed." >&2
       kubectl -n "$VAULT_NAMESPACE" describe pod "${VAULT_RELEASE_NAME}-0" >&2 || true
@@ -4212,7 +4280,7 @@ wait_vault_ready_or_mount_conflict() {
     sleep 3
   done
 
-  echo "Error: timeout waiting for Vault pod ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0 to become Ready." >&2
+  echo "Error: timeout waiting for Vault status from ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}-0." >&2
   if conflict_message="$(vault_mount_conflict_event)"; then
     echo "Last Vault mount conflict: ${conflict_message}" >&2
     return 2
@@ -4295,7 +4363,7 @@ ensure_vault_installed() {
     echo "[bootstrap] Vault Longhorn CSI nodeAffinity enabled for ${#longhorn_csi_nodes[@]} node(s)."
   fi
 
-  echo "[bootstrap] Waiting for Vault pod to become Ready (timeout ${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS}s) ..."
+  echo "[bootstrap] Waiting for Vault status to become reachable (timeout ${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS}s) ..."
   while (( attempt <= max_attempts )); do
     install_rc=0
     wait_rc=0
@@ -4304,7 +4372,7 @@ ensure_vault_installed() {
       break
     fi
 
-    wait_vault_ready_or_mount_conflict "$KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS" || wait_rc=$?
+    wait_vault_status_or_mount_conflict "$KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS" || wait_rc=$?
     if (( wait_rc == 0 )); then
       break
     fi
