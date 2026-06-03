@@ -6941,40 +6941,40 @@ cleanup_longhorn_residue_on_node() {
   local node="$1"
   local script rc
 
-  script='
-    set -eu
-    # Close stale Longhorn/CSI mounts and mappings.
-    if [ -f /proc/mounts ]; then
-      awk '\$1 ~ /longhorn/ || \$2 ~ /longhorn|driver\\.longhorn\\.io/ {print \$2}' /proc/mounts | sort -u | while IFS= read -r mp; do
-        [ -n "$mp" ] || continue
-        umount -lf "$mp" || true
-      done
-    fi
+  read -r -d '' script <<'EOF'
+set -eu
+# Close stale Longhorn/CSI mounts and mappings.
+if [ -f /proc/mounts ]; then
+  awk '$1 ~ /longhorn/ || $2 ~ /longhorn|driver\.longhorn\.io/ {print $2}' /proc/mounts | sort -u | while IFS= read -r mp; do
+    [ -n "$mp" ] || continue
+    umount -lf "$mp" || true
+  done
+fi
 
-    if command -v cryptsetup >/dev/null 2>&1; then
-      for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
-        [ -e "$m" ] || continue
-        cryptsetup close "$m" || true
-      done
-    elif command -v dmsetup >/dev/null 2>&1; then
-      for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
-        [ -e "$m" ] || continue
-        name="$(basename "$m")"
-        dmsetup remove "$name" || dmsetup remove -f "$name" || true
-      done
-    fi
+if command -v cryptsetup >/dev/null 2>&1; then
+  for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
+    [ -e "$m" ] || continue
+    cryptsetup close "$m" || true
+  done
+elif command -v dmsetup >/dev/null 2>&1; then
+  for m in /dev/mapper/longhorn-* /dev/mapper/*longhorn*; do
+    [ -e "$m" ] || continue
+    name="$(basename "$m")"
+    dmsetup remove "$name" || dmsetup remove -f "$name" || true
+  done
+fi
 
-    rm -rf /var/lib/longhorn
-    rm -rf /var/lib/kubelet/plugins/kubernetes.io/csi/driver.longhorn.io
-    rm -rf /var/lib/kubelet/plugins/kubernetes.io~csi/driver.longhorn.io
-    rm -rf /var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/*longhorn* || true
+rm -rf /var/lib/longhorn
+rm -rf /var/lib/kubelet/plugins/kubernetes.io/csi/driver.longhorn.io
+rm -rf /var/lib/kubelet/plugins/kubernetes.io~csi/driver.longhorn.io
+rm -rf /var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/*longhorn* || true
 
-    if command -v lsblk >/dev/null 2>&1; then
-      if lsblk | grep -q "longhorn"; then
-        echo "Warning: longhorn block mappings still visible after cleanup on $(hostname)."
-      fi
-    fi
-  '
+if command -v lsblk >/dev/null 2>&1; then
+  if lsblk | grep -q "longhorn"; then
+    echo "Warning: longhorn block mappings still visible after cleanup on $(hostname)."
+  fi
+fi
+EOF
 
   if ! command -v kubectl >/dev/null 2>&1; then
     echo "Warning: kubectl not found; skipping node residue cleanup for ${node}." >&2
