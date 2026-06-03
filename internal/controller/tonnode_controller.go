@@ -312,7 +312,7 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 		sts.Spec.Replicas = ptr.To(replicas)
 		sts.Spec.ServiceName = serviceName
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
-		sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
+		sts.Spec.PodManagementPolicy = appsv1.OrderedReadyPodManagement
 		sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType}
 		sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP, stickyNodeHostnames)
 		sts.Spec.VolumeClaimTemplates = desiredVolumeClaims(tonNode, storageClassName)

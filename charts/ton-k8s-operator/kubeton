@@ -43,6 +43,8 @@ KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY="${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY:-to
 KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 KUBETON_DEBUG_POD_PREFIX="${KUBETON_DEBUG_POD_PREFIX:-node-debugger-}"
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL="${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL:-true}"
+KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-true}"
+KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
@@ -4636,6 +4638,37 @@ wait_pod_ready() {
   return 1
 }
 
+wait_pod_volume_stage_complete() {
+  local ns="$1"
+  local pod="$2"
+  local timeout_seconds="${3:-$KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local phase init_count container_count deleting latest_mount_warning
+
+  while (( $(date +%s) < deadline )); do
+    phase="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    deleting="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)"
+    init_count="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .status.initContainerStatuses[*]}x{"\n"}{end}' 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    container_count="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}x{"\n"}{end}' 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+
+    if [[ -z "$deleting" ]] && [[ "$phase" == "Running" || "$phase" == "Succeeded" || "${init_count:-0}" != "0" || "${container_count:-0}" != "0" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  latest_mount_warning="$(kubectl -n "$ns" get events \
+    --field-selector "involvedObject.kind=Pod,involvedObject.name=${pod},type=Warning,reason=FailedMount" \
+    --sort-by=.lastTimestamp \
+    -o custom-columns=MESSAGE:.message \
+    --no-headers 2>/dev/null | tail -n 1 || true)"
+  echo "Error: timeout waiting for pod ${ns}/${pod} to finish volume staging." >&2
+  if [[ -n "$(trim_whitespace "$latest_mount_warning")" ]]; then
+    echo "Latest mount warning: $(trim_whitespace "$latest_mount_warning")" >&2
+  fi
+  return 1
+}
+
 wait_pod_gone() {
   local ns="$1"
   local pod="$2"
@@ -5576,6 +5609,77 @@ stop_ton_for_destructive_cleanup() {
   wait_statefulset_rows_pods_gone "$sts_rows_name"
 }
 
+wait_ton_statefulsets_present() {
+  local timeout_seconds="${1:-300}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local -a sts_rows=()
+
+  while (( $(date +%s) < deadline )); do
+    mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+    if (( ${#sts_rows[@]} > 0 )) && [[ -n "${sts_rows[0]:-}" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for TON StatefulSet creation." >&2
+  return 1
+}
+
+set_tonnode_or_statefulset_replicas() {
+  local ns="$1"
+  local name="$2"
+  local replicas="$3"
+
+  if kubectl -n "$ns" get tonnodes.ton.ton.org "$name" >/dev/null 2>&1; then
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$name" --type=merge \
+      -p "{\"spec\":{\"replicas\":${replicas}}}" >/dev/null
+    return 0
+  fi
+
+  set_ton_replicas "$ns" "$name" "$replicas"
+}
+
+sequential_start_ton_fleet() {
+  local target_replicas="$1"
+  local -a sts_rows=()
+  local row ns sts current_replicas ordinal pod
+
+  if ! [[ "$target_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    return 0
+  fi
+  if (( target_replicas <= 1 )); then
+    return 0
+  fi
+
+  wait_ton_statefulsets_present 300 || return 1
+  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+  if (( ${#sts_rows[@]} == 0 )) || [[ -z "${sts_rows[0]:-}" ]]; then
+    echo "Error: no TON StatefulSets found for sequential start." >&2
+    return 1
+  fi
+
+  echo "[start] Sequential TON volume staging enabled: scaling to ${target_replicas} one ordinal at a time."
+  for ordinal in $(seq 0 $((target_replicas - 1))); do
+    current_replicas=$((ordinal + 1))
+    for row in "${sts_rows[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r ns sts _ <<<"$row"
+      [[ -z "$ns" || -z "$sts" ]] && continue
+      set_tonnode_or_statefulset_replicas "$ns" "$sts" "$current_replicas"
+    done
+
+    for row in "${sts_rows[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r ns sts _ <<<"$row"
+      [[ -z "$ns" || -z "$sts" ]] && continue
+      pod="${sts}-${ordinal}"
+      echo "[start] Waiting for ${ns}/${pod} volumes to stage ..."
+      wait_pod_volume_stage_complete "$ns" "$pod" "$KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS" || return 1
+    done
+  done
+}
+
 trigger_key_backup_once() {
   local ns="$1"
   local pod="$2"
@@ -6282,6 +6386,7 @@ run_start() {
   local ton_selector_values_file=""
   local -a helm_cmd=()
   local helm_rc=0
+  local sequential_start=0
 
   desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
   if ! [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
@@ -6294,6 +6399,12 @@ run_start() {
   if fleet_has_stop_annotations; then
     restore_from_stop_metadata=1
     echo "[start] Detected stopped TON fleet metadata; applying chart update before restoring previous replicas."
+  fi
+  if (( restore_from_stop_metadata == 0 )) \
+    && is_true "$KUBETON_SEQUENTIAL_TON_START" \
+    && [[ "$desired_replicas_for_start" =~ ^[0-9]+$ ]] \
+    && (( desired_replicas_for_start > 1 )); then
+    sequential_start=1
   fi
 
   if should_bootstrap_baremetal; then
@@ -6315,9 +6426,32 @@ run_start() {
   )
 
   helm_cmd+=("${extra_overrides[@]}")
+  if (( sequential_start == 1 )); then
+    helm_cmd+=(--set tonNode.replicas=1)
+  fi
 
   "${helm_cmd[@]}" || helm_rc=$?
 
+  if (( helm_rc != 0 )); then
+    if [[ -n "$ton_selector_values_file" ]]; then
+      rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+    fi
+    return "$helm_rc"
+  fi
+  if (( sequential_start == 1 )); then
+    sequential_start_ton_fleet "$desired_replicas_for_start" || {
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    }
+    helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
+      -n "$OP_NAMESPACE" \
+      -f "$OP_VALUES_FILE" \
+      -f "$TON_VALUES_FILE" \
+      "${extra_overrides[@]}" \
+      --set "tonNode.replicas=${desired_replicas_for_start}" >/dev/null || helm_rc=$?
+  fi
   if [[ -n "$ton_selector_values_file" ]]; then
     rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
   fi
