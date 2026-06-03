@@ -64,8 +64,8 @@ tonNode:
     - name: MODE
       value: validator
     - name: DUMP
-      value: "false"
+      value: "true"
     - name: MYTONCTRL_VERSION
-      value: dump
+      value: master
     - name: CUSTOM_PARAMETERS
       value: "--exporter-address 0.0.0.0:9777"
