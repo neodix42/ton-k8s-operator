@@ -298,7 +298,7 @@ auto_label_default_longhorn_nodes() {
     required_count="$(desired_longhorn_node_count)"
   fi
 
-  mapfile -t matched_nodes < <(kubectl get nodes -l 'node.longhorn.io/create-default-disk=true' -o name 2>/dev/null | sed 's#^node/##' | awk 'NF' | sort)
+  mapfile -t matched_nodes < <(list_schedulable_nodes_by_selector 'node.longhorn.io/create-default-disk=true')
   currently_labeled="${#matched_nodes[@]}"
   if (( currently_labeled >= required_count )); then
     return 0
@@ -308,9 +308,9 @@ auto_label_default_longhorn_nodes() {
     already_labeled["$node"]=1
   done
 
-  mapfile -t target_nodes < <(kubectl get nodes -l '!node-role.kubernetes.io/control-plane,!node-role.kubernetes.io/master' -o name 2>/dev/null | sed 's#^node/##' | awk 'NF' | sort)
+  mapfile -t target_nodes < <(list_schedulable_nodes_by_selector '!node-role.kubernetes.io/control-plane,!node-role.kubernetes.io/master')
   if [[ ${#target_nodes[@]} -eq 0 ]]; then
-    mapfile -t target_nodes < <(kubectl get nodes -o name 2>/dev/null | sed 's#^node/##' | awk 'NF' | sort)
+    mapfile -t target_nodes < <(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.unschedulable}{"\n"}{end}' 2>/dev/null | awk -F'\t' '$2!="true"{print $1}' | awk 'NF' | sort)
   fi
 
   if [[ ${#target_nodes[@]} -eq 0 ]]; then
@@ -3409,6 +3409,16 @@ list_longhorn_csi_node_names() {
     | sort -u
 }
 
+list_schedulable_nodes_by_selector() {
+  local selector="$1"
+
+  kubectl get nodes -l "$selector" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.unschedulable}{"\n"}{end}' 2>/dev/null \
+    | awk -F'\t' '$2!="true"{print $1}' \
+    | awk 'NF' \
+    | sort -u
+}
+
 build_victoria_logs_single_affinity_values_file() {
   local input_nodes_array_name="$1"
   local -n input_nodes_ref="$input_nodes_array_name"
@@ -3962,7 +3972,12 @@ verify_longhorn_multipathd_safe() {
       [[ -z "$node" ]] && continue
       selected_nodes["$node"]=1
       ((selected_count+=1))
-    done < <(kubectl get nodes -l "$selector" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    done < <(list_schedulable_nodes_by_selector "$selector" || true)
+    if (( selected_count == 0 )); then
+      echo "Error: LONGHORN_NODE_SELECTOR='${LONGHORN_NODE_SELECTOR}' matched no schedulable Kubernetes nodes." >&2
+      echo "Cordoned nodes are ignored for Vault/TON mount preflight because workloads cannot schedule there." >&2
+      return 1
+    fi
   fi
 
   while IFS=$'\t' read -r node status reason message; do
@@ -4073,13 +4088,13 @@ ensure_longhorn_installed() {
       kubectl_selector+="$pair"
     done
 
-    matched_nodes="$(kubectl get nodes -l "$kubectl_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    matched_nodes="$(list_schedulable_nodes_by_selector "$kubectl_selector" | awk 'NF{c++} END{print c+0}')"
     if is_default_longhorn_node_selector "$LONGHORN_NODE_SELECTOR"; then
       desired_nodes="$(desired_longhorn_node_count)"
       if (( matched_nodes < desired_nodes )); then
         auto_label_default_longhorn_nodes "$desired_nodes" || true
       fi
-      matched_nodes="$(kubectl get nodes -l "$kubectl_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+      matched_nodes="$(list_schedulable_nodes_by_selector "$kubectl_selector" | awk 'NF{c++} END{print c+0}')"
     fi
     if [[ "${matched_nodes:-0}" == "0" ]]; then
       echo "Error: LONGHORN_NODE_SELECTOR='${LONGHORN_NODE_SELECTOR}' matched 0 Kubernetes nodes." >&2
@@ -4097,7 +4112,7 @@ ensure_longhorn_installed() {
 
     longhorn_selector_values_file="$(build_longhorn_selector_values_file "$LONGHORN_NODE_SELECTOR")"
     longhorn_extra_args+=(-f "$longhorn_selector_values_file")
-    echo "[baremetal] Restricting Longhorn components to nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
+    echo "[baremetal] Restricting Longhorn components to schedulable nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
   fi
 
   echo "[baremetal] Installing/ensuring Longhorn ${LONGHORN_CHART_VERSION} ..."
@@ -4338,16 +4353,16 @@ ensure_vault_installed() {
       fi
       kubectl_selector+="$pair"
     done
-    matched_nodes="$(kubectl get nodes -l "$kubectl_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
+    matched_nodes="$(list_schedulable_nodes_by_selector "$kubectl_selector" | awk 'NF{c++} END{print c+0}')"
     if [[ "${matched_nodes:-0}" == "0" ]]; then
-      echo "Error: Vault cannot be scheduled because LONGHORN_NODE_SELECTOR='${LONGHORN_NODE_SELECTOR}' matched 0 nodes." >&2
+      echo "Error: Vault cannot be scheduled because LONGHORN_NODE_SELECTOR='${LONGHORN_NODE_SELECTOR}' matched 0 schedulable nodes." >&2
       return 1
     fi
 
     vault_selector_values_file="$(build_vault_selector_values_file "$LONGHORN_NODE_SELECTOR")"
     vault_selector_values_files+=("$vault_selector_values_file")
     vault_extra_args+=(-f "$vault_selector_values_file")
-    echo "[baremetal] Restricting Vault server to Longhorn nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
+    echo "[baremetal] Restricting Vault server to schedulable Longhorn nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
   fi
 
   if storage_class_is_longhorn "$vault_storage_class"; then
