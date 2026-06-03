@@ -191,7 +191,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.64/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.65/install.sh" | bash
 ```
 
 The script:
@@ -347,9 +347,6 @@ VAULT_TOKEN_PERIOD
 NAMESPACE_DELETE_PROGRESS_TIMEOUT
 KUBETON_PAUSE_ANNOTATION_KEY
 KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY
-KUBETON_LONGHORN_NODE_CLEANUP_ON_START
-KUBETON_LONGHORN_MOUNT_RECOVERY_SECONDS
-KUBETON_LONGHORN_NODE_CLEANUP_ON_UNINSTALL
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL
 KUBETON_DEBUG_POD_PREFIX
 SKIP_STOP_KEY_BACKUP
@@ -578,7 +575,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.64/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.65/install.sh" | bash
 cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade
