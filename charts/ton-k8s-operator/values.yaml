@@ -65,7 +65,7 @@ tonNode:
   storage:
     tonWorkSize: 400Gi
     myTonCoreSize: 20Gi
-    storageClassName: ""
+    storageClassName: local-path
     accessModes:
       - ReadWriteOnce
   resources:

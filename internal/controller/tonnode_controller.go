@@ -2015,10 +2015,15 @@ func (r *TonNodeReconciler) detectStorageClassName(
 
 	defaultClasses := make([]string, 0)
 	allClasses := make([]string, 0, len(scList.Items))
+	localClasses := make(map[string]struct{})
 	hasLonghorn := false
 	for i := range scList.Items {
 		sc := scList.Items[i]
 		allClasses = append(allClasses, sc.Name)
+		switch sc.Name {
+		case "local-path", "local-storage", "openebs-hostpath", "hostpath":
+			localClasses[sc.Name] = struct{}{}
+		}
 		if sc.Name == "longhorn" {
 			hasLonghorn = true
 		}
@@ -2028,6 +2033,12 @@ func (r *TonNodeReconciler) detectStorageClassName(
 		}
 	}
 
+	for _, name := range []string{"local-path", "local-storage", "openebs-hostpath", "hostpath"} {
+		if _, ok := localClasses[name]; ok {
+			selected := name
+			return &selected, nil
+		}
+	}
 	if hasLonghorn {
 		selected := "longhorn"
 		return &selected, nil

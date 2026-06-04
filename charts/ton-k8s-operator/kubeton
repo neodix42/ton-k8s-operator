@@ -8,6 +8,7 @@ OP_VALUES_FILE="${OP_VALUES_FILE:-$CHART_DIR/operator-values.yaml}"
 TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
 TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
 TON_NAMESPACE="${TON_NAMESPACE:-default}"
+TON_STORAGE_CLASS_NAME="${TON_STORAGE_CLASS_NAME:-local-path}"
 
 AUTO_BAREMETAL_BOOTSTRAP="${AUTO_BAREMETAL_BOOTSTRAP:-true}"
 FORCE_BAREMETAL_BOOTSTRAP="${FORCE_BAREMETAL_BOOTSTRAP:-false}"
@@ -4674,6 +4675,53 @@ append_baremetal_key_overrides() {
   target+=(--set-string "tonNode.keyManagement.encryptedBundle.storageClassName=${ENCRYPTED_SC_NAME}")
 }
 
+ton_storage_class_name() {
+  trim_whitespace "${TON_STORAGE_CLASS_NAME:-local-path}"
+}
+
+ton_storage_class_auto() {
+  [[ "$(ton_storage_class_name)" == "auto" ]]
+}
+
+ensure_ton_storage_class_available() {
+  local storage_class
+
+  if ton_storage_class_auto; then
+    return 0
+  fi
+
+  storage_class="$(ton_storage_class_name)"
+  if [[ -z "$storage_class" ]]; then
+    echo "Error: TON_STORAGE_CLASS_NAME is empty. Use a local StorageClass name such as local-path, or set TON_STORAGE_CLASS_NAME=auto." >&2
+    return 1
+  fi
+
+  if kubectl get storageclass "$storage_class" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Error: TON data StorageClass '${storage_class}' was not found." >&2
+  echo "/var/ton-work/db is stored in the ton-work PVC, so kubeton now requires a local TON StorageClass by default." >&2
+  echo "Install/provide a local provisioner, for example local-path, or override:" >&2
+  echo "  TON_STORAGE_CLASS_NAME=<your-local-storage-class> ./kubeton start" >&2
+  echo "Use TON_STORAGE_CLASS_NAME=auto only if you intentionally want operator auto-detection." >&2
+  return 1
+}
+
+append_ton_storage_overrides() {
+  local -n target="$1"
+  local storage_class
+
+  if ton_storage_class_auto; then
+    echo "[start] TON storageClassName override disabled (TON_STORAGE_CLASS_NAME=auto); operator will auto-detect storage." >&2
+    return 0
+  fi
+
+  storage_class="$(ton_storage_class_name)"
+  target+=(--set-string "tonNode.storage.storageClassName=${storage_class}")
+  echo "[start] Using TON data StorageClass '${storage_class}' for /var/ton-work and /var/ton-work/db." >&2
+}
+
 list_ton_pods() {
   kubectl get pods -A -l "$TON_POD_LABEL" \
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
@@ -6782,6 +6830,9 @@ run_start() {
     && (( desired_replicas_for_start > 1 )); then
     sequential_start=1
   fi
+
+  ensure_ton_storage_class_available
+  append_ton_storage_overrides extra_overrides
 
   if should_bootstrap_baremetal; then
     ensure_auto_bootstrap_stack

@@ -487,7 +487,7 @@ spec:
                   storageClassName:
                     description: |-
                       StorageClassName explicitly selects the StorageClass.
-                      If not set, the operator prefers Longhorn, then default StorageClass.
+                      If not set, the operator prefers known local classes, then Longhorn, then default StorageClass.
                     type: string
                   tonWorkSize:
                     default: 200Gi

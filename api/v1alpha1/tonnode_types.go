@@ -75,7 +75,7 @@ type TonNodeStorageSpec struct {
 	MyTonCoreSize string `json:"myTonCoreSize,omitempty"`
 
 	// StorageClassName explicitly selects the StorageClass.
-	// If not set, the operator prefers Longhorn, then default StorageClass.
+	// If not set, the operator prefers known local classes, then Longhorn, then default StorageClass.
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
 

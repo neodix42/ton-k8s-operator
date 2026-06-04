@@ -152,6 +152,7 @@ kubectl get sc
 Bare-metal/local-dev default setup is automated by `kubeton`:
 - detects bare-metal cluster (`spec.providerID` empty on all nodes) or local k3d cluster (context/node name starts with `k3d-`)
 - on bare-metal: installs Longhorn v1 (`LONGHORN_CHART_VERSION`, default `1.10.0`) and creates encrypted StorageClass `encrypted-sc` (LUKS/dm-crypt, `aes-xts-plain64`, `sha256`, `argon2i`, replica count `3`)
+- on bare-metal, TON data PVCs (`/var/ton-work`, including `/var/ton-work/db`) use `TON_STORAGE_CLASS_NAME` by default (`local-path`) so dump download writes to node-local storage instead of Longhorn
 - on bare-metal, `kubeton start` aligns TON pod placement with `LONGHORN_NODE_SELECTOR` by setting `tonNode.nodeSelector` automatically
 - on bare-metal, Vault server pod is also constrained to `LONGHORN_NODE_SELECTOR` so its PVC can attach only on nodes with Longhorn CSI
 - with default `LONGHORN_NODE_SELECTOR=node.longhorn.io/create-default-disk=true`: if there are not enough labeled nodes, `kubeton start` auto-labels only the required number of nodes (based on requested TON replicas)
@@ -299,6 +300,7 @@ OP_VALUES_FILE
 TON_VALUES_FILE
 TON_POD_LABEL
 TON_NAMESPACE
+TON_STORAGE_CLASS_NAME
 MAIN_WALLET_IMAGE_REPOSITORY
 MAIN_WALLET_IMAGE
 MAIN_WALLET_SCRIPT_FILE
@@ -754,7 +756,8 @@ Run them from repo root:
 - When `spec.network.publicIP` is empty, operator pins replicas to a preselected worker hostname set before first launch to avoid advertised-IP drift after pod restarts.
 - Private cloud workers (no public node IP): provide per-node/per-replica public forwarding; one shared LB endpoint/port pair is not sufficient for many TON replicas.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
-- Bare metal: if Longhorn exists, the operator prefers it automatically.
+- Bare metal: `kubeton start` sets TON data storage to `TON_STORAGE_CLASS_NAME` by default (`local-path`); set `TON_STORAGE_CLASS_NAME=<class>` to use another local class or `TON_STORAGE_CLASS_NAME=auto` to use operator auto-detection.
+- Operator auto-detection prefers known local classes (`local-path`, `local-storage`, `openebs-hostpath`, `hostpath`), then Longhorn, then the default StorageClass.
 - If no StorageClass exists in the cluster, `TonNode` will stay `Ready=False` with reason `StorageClassMissing`.
 - `IGNORE_MINIMAL_REQS`: default is `true` for easier local/k3d startup; for production set `spec.env: [{ name: IGNORE_MINIMAL_REQS, value: "false" }]`.
 - Right-size resources in `spec.resources` for TON fullnode/validator workloads.
