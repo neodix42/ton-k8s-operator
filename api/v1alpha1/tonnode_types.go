@@ -67,7 +67,7 @@ type TonNodeSpec struct {
 // TonNodeStorageSpec defines persistent storage settings.
 type TonNodeStorageSpec struct {
 	// TonWorkSize is the PVC size for /var/ton-work.
-	// +kubebuilder:default:="200Gi"
+	// +kubebuilder:default:="700Gi"
 	TonWorkSize string `json:"tonWorkSize,omitempty"`
 
 	// MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore.

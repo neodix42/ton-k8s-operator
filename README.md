@@ -192,7 +192,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.71/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.72/install.sh" | bash
 ```
 
 The script:
@@ -582,7 +582,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.71/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.72/install.sh" | bash
 cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade
@@ -770,6 +770,7 @@ With this operator setup:
 - Each TON pod gets its own PVCs (`ton-work-...` and `mytoncore-...`).
 - PVCs are `ReadWriteOnce`, so one PVC is attached to one pod.
 - For 20 replicas, the total PVC count is 40.
+- `tonWorkSize` defaults to `700Gi` because dump bootstrap keeps the compressed dump and extracted DB on `/var/ton-work` at the same time.
 
 If you use `local-path` StorageClass:
 - Data is written to the local disk on the node where that pod volume is provisioned.

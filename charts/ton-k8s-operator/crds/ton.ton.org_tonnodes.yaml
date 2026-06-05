@@ -490,7 +490,7 @@ spec:
                       If not set, the operator prefers known local classes, then Longhorn, then default StorageClass.
                     type: string
                   tonWorkSize:
-                    default: 200Gi
+                    default: 700Gi
                     description: TonWorkSize is the PVC size for /var/ton-work.
                     type: string
                 type: object

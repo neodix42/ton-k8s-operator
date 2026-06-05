@@ -6,7 +6,7 @@ namespace:
 
 image:
   repository: ghcr.io/neodix42/ton-k8s-operator
-  tag: 0.1.71
+  tag: 0.1.72
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -63,7 +63,7 @@ tonNode:
   image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.05-1-amd64
   replicas: 3
   storage:
-    tonWorkSize: 400Gi
+    tonWorkSize: 700Gi
     myTonCoreSize: 20Gi
     storageClassName: local-path
     accessModes:

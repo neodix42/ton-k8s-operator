@@ -47,7 +47,7 @@ import (
 const (
 	defaultImage                       = "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
 	defaultReplicas              int32 = 1
-	defaultTonWorkSize                 = "200Gi"
+	defaultTonWorkSize                 = "700Gi"
 	defaultMyTonCoreSize               = "20Gi"
 	defaultCPURequest                  = "16000m"
 	defaultMemoryRequest               = "64Gi"
