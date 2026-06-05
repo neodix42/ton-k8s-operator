@@ -1120,6 +1120,40 @@ fix_validator_ownership() {
   chown -R validator:validator "$DB_KEYRING_DIR" "$SYSTEMD_UNITS_DIR" || true
 }
 
+dir_has_payload() {
+  dir="$1"
+  [ -d "$dir" ] || return 1
+  [ -n "$(find "$dir" -mindepth 1 ! -name 'lost+found' -print -quit)" ]
+}
+
+bundle_has_complete_bootstrap() {
+  unpacked_dir="$1"
+  [ -s "$unpacked_dir/tondb/config.json" ] || return 1
+  [ -f "$unpacked_dir/tondb/mtc_done" ] || return 1
+  dir_has_payload "$unpacked_dir/tondb/systemd-units" || return 1
+}
+
+current_bootstrap_complete() {
+  [ -s "$DB_CONFIG_FILE" ] || return 1
+  [ -f "$MTC_DONE_FILE" ] || return 1
+  dir_has_payload "$SYSTEMD_UNITS_DIR" || return 1
+}
+
+clear_partial_bootstrap_state() {
+  find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+  find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+  rm -f "$DB_CONFIG_FILE" || true
+  rm -rf "$DB_KEYRING_DIR" || true
+  rm -rf "$SYSTEMD_UNITS_DIR" || true
+  rm -f "$MTC_DONE_FILE" || true
+}
+
+quarantine_incomplete_bundle() {
+  suffix=".invalid.$(date -u +%Y%m%dT%H%M%SZ)"
+  mv "$BUNDLE_FILE" "${BUNDLE_FILE}${suffix}" 2>/dev/null || true
+  mv "$META_FILE" "${META_FILE}${suffix}" 2>/dev/null || true
+}
+
 need_bin tar
 need_bin openssl
 need_bin base64
@@ -1154,12 +1188,17 @@ openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 \
 mkdir -p "$work_dir/unpacked"
 tar -xzf "$work_dir/bundle.tar.gz" -C "$work_dir/unpacked"
 
-find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-rm -f "$DB_CONFIG_FILE" || true
-rm -rf "$DB_KEYRING_DIR" || true
-rm -rf "$SYSTEMD_UNITS_DIR" || true
-rm -f "$MTC_DONE_FILE" || true
+if ! bundle_has_complete_bootstrap "$work_dir/unpacked"; then
+  echo "encrypted key bundle is incomplete (missing config.json, mtc_done, or systemd-units); quarantining and continuing without key restore" >&2
+  quarantine_incomplete_bundle
+  if ! current_bootstrap_complete; then
+    echo "current bootstrap state is incomplete; clearing partial bootstrap artifacts before fresh startup" >&2
+    clear_partial_bootstrap_state
+  fi
+  exit 0
+fi
+
+clear_partial_bootstrap_state
 
 if [ -d "$work_dir/unpacked/keys" ]; then
   cp -a "$work_dir/unpacked/keys/." "$KEYS_DIR/"
@@ -1332,8 +1371,21 @@ key_material_present() {
   return 1
 }
 
+complete_bootstrap_present() {
+  if [ ! -f "$MTC_DONE_FILE" ]; then
+    return 1
+  fi
+  if [ ! -s "$DB_CONFIG_FILE" ]; then
+    return 1
+  fi
+  if ! dir_has_payload "$SYSTEMD_UNITS_DIR"; then
+    return 1
+  fi
+  return 0
+}
+
 backup_sources_present() {
-  key_material_present
+  complete_bootstrap_present && key_material_present
 }
 
 bundle_present() {
@@ -1341,12 +1393,6 @@ bundle_present() {
 }
 
 auto_backup_ready() {
-  if [ ! -f "$MTC_DONE_FILE" ]; then
-    return 1
-  fi
-  if [ ! -s "$DB_CONFIG_FILE" ]; then
-    return 1
-  fi
   backup_sources_present
 }
 
@@ -1357,7 +1403,7 @@ perform_backup() {
   mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
   if ! backup_sources_present; then
-    echo "key material not present yet; backup skipped" >&2
+    echo "complete bootstrap state not present yet; backup skipped" >&2
     return 1
   fi
 
