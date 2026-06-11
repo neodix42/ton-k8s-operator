@@ -26,6 +26,8 @@ tonNode:
     validatorConsolePort: 30002
     hostPortsEnabled: true
     publicIP: ""
+  debug:
+    holdOnFailure: false
   keyManagement:
     enabled: true
     provider: vault

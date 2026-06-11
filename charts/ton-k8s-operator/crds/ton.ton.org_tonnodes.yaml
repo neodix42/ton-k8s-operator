@@ -66,6 +66,17 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              debug:
+                description: Debug configures temporary diagnostic behavior for TON
+                  pods.
+                properties:
+                  holdOnFailure:
+                    default: false
+                    description: |-
+                      HoldOnFailure wraps the TON entrypoint so non-zero exits sleep forever instead of
+                      letting the StatefulSet restart the container. This is intended only for debugging.
+                    type: boolean
+                type: object
               env:
                 description: Env allows passing extra environment variables to the
                   TON container.
@@ -368,6 +379,12 @@ spec:
                     maximum: 65535
                     minimum: 1
                     type: integer
+                  publicIP:
+                    description: |-
+                      PublicIP explicitly sets PUBLIC_IP for TON.
+                      If omitted and replicas=1, operator prefers the scheduled node ExternalIP.
+                      If not available, it falls back to the Pod's host IP.
+                    type: string
                   quicPort:
                     default: 31001
                     description: QuicPort is the validator QUIC UDP port.
@@ -375,12 +392,6 @@ spec:
                     maximum: 65535
                     minimum: 1
                     type: integer
-                  publicIP:
-                    description: |-
-                      PublicIP explicitly sets PUBLIC_IP for TON.
-                      If omitted and replicas=1, operator prefers the scheduled node ExternalIP.
-                      If not available, it falls back to the Pod's host IP.
-                    type: string
                   validatorConsolePort:
                     default: 30002
                     description: ValidatorConsolePort is the validator console TCP

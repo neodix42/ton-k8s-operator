@@ -59,6 +59,10 @@ type TonNodeSpec struct {
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
+	// Debug configures temporary diagnostic behavior for TON pods.
+	// +optional
+	Debug TonNodeDebugSpec `json:"debug,omitempty"`
+
 	// KeyManagement enables secure key handling with in-memory keys and encrypted bundles.
 	// +optional
 	KeyManagement *TonNodeKeyManagementSpec `json:"keyManagement,omitempty"`
@@ -126,6 +130,15 @@ type TonNodeNetworkSpec struct {
 	// +kubebuilder:default:=true
 	// +optional
 	HostPortsEnabled *bool `json:"hostPortsEnabled,omitempty"`
+}
+
+// TonNodeDebugSpec defines temporary pod debug behavior.
+type TonNodeDebugSpec struct {
+	// HoldOnFailure wraps the TON entrypoint so non-zero exits sleep forever instead of
+	// letting the StatefulSet restart the container. This is intended only for debugging.
+	// +kubebuilder:default:=false
+	// +optional
+	HoldOnFailure bool `json:"holdOnFailure,omitempty"`
 }
 
 // TonNodeKeyManagementSpec defines key protection workflow.

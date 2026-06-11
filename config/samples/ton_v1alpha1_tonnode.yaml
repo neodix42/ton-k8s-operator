@@ -20,6 +20,8 @@ spec:
     hostPortsEnabled: true
   keyManagement:
     enabled: false
+  debug:
+    holdOnFailure: false
   env:
   - name: MODE
     value: liteserver

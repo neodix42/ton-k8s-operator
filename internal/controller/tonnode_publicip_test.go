@@ -302,6 +302,44 @@ func TestDesiredPodTemplateHostPorts(t *testing.T) {
 	})
 }
 
+func TestDesiredPodTemplateHoldOnFailure(t *testing.T) {
+	reconciler := &TonNodeReconciler{}
+	labels := map[string]string{"app.kubernetes.io/instance": "tonnode"}
+	publicIP := corev1.EnvVar{Name: "PUBLIC_IP", Value: "95.217.73.161"}
+
+	t.Run("disabled by default", func(t *testing.T) {
+		tpl := reconciler.desiredPodTemplate(&tonv1alpha1.TonNode{}, labels, publicIP, nil)
+		container := tpl.Spec.Containers[0]
+
+		if len(container.Command) != 0 {
+			t.Fatalf("command = %v, want image entrypoint", container.Command)
+		}
+		if len(container.Args) != 0 {
+			t.Fatalf("args = %v, want image defaults", container.Args)
+		}
+	})
+
+	t.Run("wraps entrypoint when enabled", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			Spec: tonv1alpha1.TonNodeSpec{
+				Debug: tonv1alpha1.TonNodeDebugSpec{
+					HoldOnFailure: true,
+				},
+			},
+		}
+
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
+		container := tpl.Spec.Containers[0]
+
+		if len(container.Command) != 2 || container.Command[0] != "bash" || container.Command[1] != "-lc" {
+			t.Fatalf("command = %v, want [bash -lc]", container.Command)
+		}
+		if len(container.Args) != 1 || container.Args[0] != holdOnFailureEntrypointScript {
+			t.Fatalf("args = %v, want hold-on-failure script", container.Args)
+		}
+	})
+}
+
 func TestDesiredPodTemplateStickyNodeAffinity(t *testing.T) {
 	reconciler := &TonNodeReconciler{}
 	labels := map[string]string{"app.kubernetes.io/instance": "tonnode"}

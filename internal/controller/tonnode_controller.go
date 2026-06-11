@@ -81,6 +81,8 @@ const (
 
 	readyConditionType = "Ready"
 
+	holdOnFailureEntrypointScript = `/scripts/entrypoint.sh; rc=$?; if [ "$rc" -ne 0 ]; then echo "ton-node entrypoint exited with rc=${rc}; sleeping for debug because spec.debug.holdOnFailure=true"; sleep infinity; fi; exit "$rc"`
+
 	// kubetonPauseReplicasAnnotationKey stores the pre-pause replica count on TonNode/StatefulSet.
 	// When present with a parseable integer value, reconciliation keeps StatefulSet replicas at 0.
 	kubetonPauseReplicasAnnotationKey = "ton.ton.org/kubeton-paused-replicas"
@@ -620,6 +622,10 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		Resources:       desiredResources(tonNode),
 		Ports:           containerPorts,
 		VolumeMounts:    volumeMounts,
+	}
+	if holdOnFailureEnabled(tonNode) {
+		container.Command = []string{"bash", "-lc"}
+		container.Args = []string{holdOnFailureEntrypointScript}
 	}
 
 	podSpec := corev1.PodSpec{
@@ -2214,6 +2220,13 @@ func hostPortsEnabled(tonNode *tonv1alpha1.TonNode) bool {
 		return true
 	}
 	return *tonNode.Spec.Network.HostPortsEnabled
+}
+
+func holdOnFailureEnabled(tonNode *tonv1alpha1.TonNode) bool {
+	if tonNode == nil {
+		return false
+	}
+	return tonNode.Spec.Debug.HoldOnFailure
 }
 
 func stickyPlacementEnabled(tonNode *tonv1alpha1.TonNode) bool {

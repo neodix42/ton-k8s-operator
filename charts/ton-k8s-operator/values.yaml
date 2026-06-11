@@ -85,6 +85,8 @@ tonNode:
     hostPortsEnabled: true
     publicIP: ""
   configRefName: ""
+  debug:
+    holdOnFailure: false
   keyManagement:
     enabled: true
     provider: vault

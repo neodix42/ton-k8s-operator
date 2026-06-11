@@ -44,6 +44,10 @@ spec:
   configRef:
     name: {{ . }}
   {{- end }}
+  {{- with .Values.tonNode.debug }}
+  debug:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with .Values.tonNode.keyManagement }}
   {{- if .enabled }}
   keyManagement:
