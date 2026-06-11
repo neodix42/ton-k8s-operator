@@ -384,6 +384,61 @@ resolve_ton_replicas_from_values_file() {
   return 1
 }
 
+resolve_tonnode_scalar_from_values_file() {
+  local values_file="$1"
+  local key="$2"
+  local value=""
+
+  [[ -f "$values_file" ]] || return 1
+  value="$(awk -v key="$key" '
+    /^[[:space:]]*tonNode:[[:space:]]*$/ {in_ton=1; next}
+    in_ton && /^[^[:space:]]/ {in_ton=0}
+    in_ton && $0 ~ "^[[:space:]]*" key ":[[:space:]]*" {
+      sub("^[[:space:]]*" key ":[[:space:]]*", "", $0)
+      sub(/[[:space:]]*#.*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/"$/, "", $0)
+      gsub(/^'\''/, "", $0)
+      gsub(/'\''$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$values_file" 2>/dev/null || true)"
+  value="$(trim_whitespace "$value")"
+  [[ -n "$value" ]] || return 1
+  printf '%s' "$value"
+}
+
+resolve_tonnode_name_from_values() {
+  local name=""
+
+  name="$(resolve_tonnode_scalar_from_values_file "$TON_VALUES_FILE" "name" || true)"
+  name="$(trim_whitespace "$name")"
+  if [[ -z "$name" ]]; then
+    name="$(resolve_tonnode_scalar_from_values_file "$CHART_DIR/values.yaml" "name" || true)"
+    name="$(trim_whitespace "$name")"
+  fi
+  if [[ -z "$name" ]]; then
+    name="tonnode"
+  fi
+  printf '%s' "$name"
+}
+
+resolve_tonnode_namespace_from_values() {
+  local ns=""
+
+  ns="$(resolve_tonnode_scalar_from_values_file "$TON_VALUES_FILE" "namespace" || true)"
+  ns="$(trim_whitespace "$ns")"
+  if [[ -z "$ns" ]]; then
+    ns="$(resolve_tonnode_scalar_from_values_file "$CHART_DIR/values.yaml" "namespace" || true)"
+    ns="$(trim_whitespace "$ns")"
+  fi
+  if [[ -z "$ns" ]]; then
+    ns="$TON_NAMESPACE"
+  fi
+  printf '%s' "$ns"
+}
+
 cluster_has_tonnodes() {
   kubectl get tonnodes.ton.ton.org -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null \
     | awk 'NF {found=1; exit} END {exit(found ? 0 : 1)}'
@@ -4732,6 +4787,64 @@ list_ton_statefulsets() {
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
 }
 
+collect_expected_ton_pvc_rows_from_values() {
+  local -n rows_ref="$1"
+  local ns sts replicas claim_prefix ordinal pvc_name
+  local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
+
+  ns="$(resolve_tonnode_namespace_from_values)"
+  sts="$(resolve_tonnode_name_from_values)"
+  replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
+  if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    replicas="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
+  fi
+  if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    replicas=1
+  fi
+
+  for claim_prefix in "${claim_prefixes[@]}"; do
+    for ((ordinal=0; ordinal<replicas; ordinal++)); do
+      append_unique_item "$ns"$'\t'"${claim_prefix}-${sts}-${ordinal}" rows_ref
+    done
+  done
+
+  # Also include any higher ordinals from an older replica count.
+  while IFS= read -r pvc_name; do
+    [[ -z "$pvc_name" ]] && continue
+    append_unique_item "$ns"$'\t'"$pvc_name" rows_ref
+  done < <(
+    kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+      | grep -E "^(ton-work|mytoncore|keybundle)-${sts}-" || true
+  )
+}
+
+collect_labeled_ton_pvc_rows() {
+  local -n rows_ref="$1"
+  local ns pvc
+
+  while IFS=$'\t' read -r ns pvc; do
+    [[ -z "$ns" || -z "$pvc" ]] && continue
+    append_unique_item "$ns"$'\t'"$pvc" rows_ref
+  done < <(
+    kubectl get pvc -A -l "$TON_POD_LABEL" -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+  )
+}
+
+collect_existing_pvc_rows() {
+  local -n candidate_rows_ref="$1"
+  local -n existing_rows_ref="$2"
+  local row ns pvc
+
+  for row in "${candidate_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pvc <<<"$row"
+    [[ -z "$ns" || -z "$pvc" ]] && continue
+    if kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+      append_unique_item "$ns"$'\t'"$pvc" existing_rows_ref
+    fi
+  done
+}
+
 strip_ansi_sequences() {
   local text="${1:-}"
   text="${text//$'\r'/}"
@@ -4808,12 +4921,12 @@ delete_ton_pvcs_for_statefulsets() {
   local -a pvc_rows=()
   local -a pv_rows=()
   local -a volume_attachment_rows=()
-  local pvc_name ns_label pvc volume
+  local pvc_name volume
   local candidate_attachment source_pv
   local -a pv_match=()
 
   if [[ ${#sts_rows_ref[@]} -eq 0 ]]; then
-    echo "[cleanup] No StatefulSet snapshot was provided; using TON PVC label selector only." >&2
+    echo "[cleanup] No StatefulSet snapshot was provided; using expected TON PVC names and label selector." >&2
   fi
 
   for row in "${sts_rows_ref[@]}"; do
@@ -4830,12 +4943,8 @@ delete_ton_pvcs_for_statefulsets() {
     )
   done
 
-  while IFS=$'\t' read -r ns_label pvc; do
-    [[ -z "$ns_label" || -z "$pvc" ]] && continue
-    append_unique_item "${ns_label}"$'\t'"${pvc}" pvc_rows
-  done < <(
-    kubectl get pvc -A -l "$TON_POD_LABEL" -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
-  )
+  collect_expected_ton_pvc_rows_from_values pvc_rows
+  collect_labeled_ton_pvc_rows pvc_rows
 
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
@@ -4904,6 +5013,74 @@ delete_ton_pvcs_for_statefulsets() {
     wait_pv_gone "$volume" 180 || true
     wait_longhorn_volume_gone "$volume" 300 || true
   done
+}
+
+ton_fleet_resources_exist() {
+  local -a sts_rows=()
+
+  if cluster_has_tonnodes; then
+    return 0
+  fi
+
+  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+  [[ ${#sts_rows[@]} -gt 0 && -n "${sts_rows[0]:-}" ]]
+}
+
+delete_stale_ton_pvcs_without_fleet() {
+  local label="${1:-cleanup}"
+  local force="${2:-false}"
+  local -a candidate_rows=()
+  local -a existing_rows=()
+  local -a empty_sts_rows=()
+  local row ns pvc
+
+  if [[ "$force" != "true" ]] && ton_fleet_resources_exist; then
+    return 0
+  fi
+
+  collect_expected_ton_pvc_rows_from_values candidate_rows
+  collect_labeled_ton_pvc_rows candidate_rows
+  collect_existing_pvc_rows candidate_rows existing_rows
+
+  if [[ ${#existing_rows[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$force" == "true" ]]; then
+    echo "[${label}] Found TON PVCs during forced cleanup; deleting them so bootstrap cannot reuse partial state:"
+  else
+    echo "[${label}] Found stale TON PVCs with no active TON fleet; deleting them so bootstrap cannot reuse partial state:"
+  fi
+  for row in "${existing_rows[@]}"; do
+    IFS=$'\t' read -r ns pvc <<<"$row"
+    [[ -z "$ns" || -z "$pvc" ]] && continue
+    echo "  - ${ns}/${pvc}"
+  done
+
+  delete_ton_pvcs_for_statefulsets empty_sts_rows
+
+  candidate_rows=()
+  existing_rows=()
+  collect_expected_ton_pvc_rows_from_values candidate_rows
+  collect_labeled_ton_pvc_rows candidate_rows
+  collect_existing_pvc_rows candidate_rows existing_rows
+
+  if [[ ${#existing_rows[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "Error: stale TON PVCs are still present after cleanup; refusing to continue with reusable partial state:" >&2
+  for row in "${existing_rows[@]}"; do
+    IFS=$'\t' read -r ns pvc <<<"$row"
+    [[ -z "$ns" || -z "$pvc" ]] && continue
+    echo "  - ${ns}/${pvc}" >&2
+  done
+  echo "Delete these PVCs/PVs manually or rerun kubeton uninstall/drop before starting." >&2
+  return 1
+}
+
+delete_stale_ton_pvcs_before_fresh_start() {
+  delete_stale_ton_pvcs_without_fleet "start"
 }
 
 set_ton_replicas() {
@@ -6845,6 +7022,10 @@ run_start() {
     validate_external_key_prereqs
   fi
 
+  if (( restore_from_stop_metadata == 0 )); then
+    delete_stale_ton_pvcs_before_fresh_start
+  fi
+
   helm_cmd=(
     helm upgrade "$RELEASE_NAME" "$CHART_DIR"
     -n "$OP_NAMESPACE"
@@ -7611,6 +7792,8 @@ run_drop() {
   confirm_or_exit "This will stop TON pods and DELETE TON PVC data. Continue?"
   stop_ton_for_destructive_cleanup drop_sts_rows
   delete_ton_pvcs_for_statefulsets drop_sts_rows
+  echo "[drop] Verifying no stale TON PVCs remain ..."
+  delete_stale_ton_pvcs_without_fleet "drop" true
 }
 
 cleanup_kubectl_debug_pods() {
@@ -7977,6 +8160,9 @@ run_uninstall_core() {
   uninstall_longhorn || true
   cleanup_longhorn_force || true
   delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
+
+  echo "[uninstall] Verifying no stale TON PVCs remain ..."
+  delete_stale_ton_pvcs_without_fleet "uninstall" true
 
   cleanup_kubectl_debug_pods "uninstall" || true
 
