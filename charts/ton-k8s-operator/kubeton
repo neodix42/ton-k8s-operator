@@ -131,11 +131,15 @@ MAIN_WALLET_BUNDLE_PVC="${MAIN_WALLET_BUNDLE_PVC:-main-wallet-keybundle}"
 MAIN_WALLET_BUNDLE_SIZE="${MAIN_WALLET_BUNDLE_SIZE:-5Gi}"
 MAIN_WALLET_BUNDLE_STORAGE_CLASS="${MAIN_WALLET_BUNDLE_STORAGE_CLASS:-$ENCRYPTED_SC_NAME}"
 MAIN_WALLET_BUNDLE_ACCESS_MODE="${MAIN_WALLET_BUNDLE_ACCESS_MODE:-ReadWriteOnce}"
-MAIN_WALLET_MODE="${MAIN_WALLET_MODE:-liteserver}"
+MAIN_WALLET_MODE="${MAIN_WALLET_MODE:-auto}"
 MAIN_WALLET_GLOBAL_CONFIG_URL="${MAIN_WALLET_GLOBAL_CONFIG_URL:-}"
 MAIN_WALLET_TONCENTER_URL="${MAIN_WALLET_TONCENTER_URL:-https://testnet.toncenter.com}"
 MAIN_WALLET_TONCENTER_API_KEY="${MAIN_WALLET_TONCENTER_API_KEY:-}"
 MAIN_WALLET_NAME="${MAIN_WALLET_NAME:-main-wallet}"
+MAIN_WALLET_SEND_RETRY_ATTEMPTS="${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-2}"
+MAIN_WALLET_LITESERVER_SEND_ATTEMPTS="${MAIN_WALLET_LITESERVER_SEND_ATTEMPTS:-$MAIN_WALLET_SEND_RETRY_ATTEMPTS}"
+MAIN_WALLET_TONCENTER_SEND_ATTEMPTS="${MAIN_WALLET_TONCENTER_SEND_ATTEMPTS:-$MAIN_WALLET_SEND_RETRY_ATTEMPTS}"
+MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
 MAIN_WALLET_TARGET_WALLET_NAME="${MAIN_WALLET_TARGET_WALLET_NAME:-validator_wallet_001}"
 MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-900s}"
 MAIN_WALLET_RUNTIME_TMPFS_SIZE="${MAIN_WALLET_RUNTIME_TMPFS_SIZE:-512Mi}"
@@ -748,7 +752,19 @@ resolve_tonnode_global_config_url_from_values_file() {
 }
 
 resolve_main_wallet_global_config_url() {
+  local network="${1:-}"
   local url
+
+  case "$network" in
+    mainnet)
+      printf '%s' "https://ton.org/global.config.json"
+      return 0
+      ;;
+    testnet)
+      printf '%s' "https://ton.org/testnet-global.config.json"
+      return 0
+      ;;
+  esac
 
   url="$(trim_whitespace "${MAIN_WALLET_GLOBAL_CONFIG_URL:-}")"
   if [[ -n "$url" ]]; then
@@ -771,6 +787,41 @@ resolve_main_wallet_global_config_url() {
   fi
 
   printf '%s' "https://ton.org/global.config.json"
+}
+
+resolve_main_wallet_toncenter_url() {
+  local network="${1:-}"
+
+  case "$network" in
+    mainnet)
+      printf '%s' "https://toncenter.com"
+      return 0
+      ;;
+    testnet)
+      printf '%s' "https://testnet.toncenter.com"
+      return 0
+      ;;
+  esac
+
+  printf '%s' "$MAIN_WALLET_TONCENTER_URL"
+}
+
+normalize_wallet_network() {
+  local raw
+
+  raw="$(trim_whitespace "${1:-}")"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    mainnet|main)
+      printf '%s' "mainnet"
+      ;;
+    testnet|test)
+      printf '%s' "testnet"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 extract_image_tag() {
@@ -9981,24 +10032,25 @@ run_wallet() {
     echo "  create <workchain> <subwallet-id> <wallet-name>"
     echo "    Legacy explicit form."
     echo
-    echo "  deploy [name]"
+    echo "  deploy <mainnet|testnet> [name]"
     echo "    Deploy one wallet by name."
     echo "    If [name] is omitted, deploys all wallet BOCs after confirmation."
     echo
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
     echo
-    echo "  send <from-wallet-name> <amount> [-n]"
+    echo "  send <mainnet|testnet> <from-wallet-name> <amount> [-n]"
     echo "    Split mode: divides <amount> equally across all TON pods"
     echo "    using MAIN_WALLET_TARGET_WALLET_NAME (default: validator_wallet_001)."
     echo
-    echo "  send <from-wallet-name> <to-tonnode-name> <amount> [-n]"
+    echo "  send <mainnet|testnet> <from-wallet-name> <to-tonnode-name> <amount> [-n]"
     echo "    Send to default target wallet name on selected TON pod."
     echo
-    echo "  send <from-wallet-name> <to-tonnode-name> <wallet-name> <amount> [-n]"
+    echo "  send <mainnet|testnet> <from-wallet-name> <to-tonnode-name> <wallet-name> <amount> [-n]"
     echo "    Send to explicit target wallet name on selected TON pod."
     echo
     echo "Notes:"
+    echo "  - deploy/send require an explicit network; this selects lite-server and TONCenter endpoints."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
     echo "  - optional -n (last argument) forwards --no-bounce to wallet.fif"
     echo "  - <to-tonnode-name> is pod name like tonnode-0 (or namespace/pod when applicable)"
@@ -10007,15 +10059,15 @@ run_wallet() {
     echo "  kubeton wallet create"
     echo "  kubeton wallet create my-wallet"
     echo "  kubeton wallet create 0 42 my-wallet"
-    echo "  kubeton wallet deploy"
-    echo "  kubeton wallet deploy my-wallet"
+    echo "  kubeton wallet deploy testnet"
+    echo "  kubeton wallet deploy testnet my-wallet"
     echo "  kubeton wallet show"
     echo "  kubeton wallet show my-wallet"
-    echo "  kubeton wallet send main-wallet 10."
-    echo "  kubeton wallet send main-wallet tonnode-0 10."
-    echo "  kubeton wallet send main-wallet tonnode-0 10. -n"
-    echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10."
-    echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10. -n"
+    echo "  kubeton wallet send testnet main-wallet 10."
+    echo "  kubeton wallet send testnet main-wallet tonnode-0 10."
+    echo "  kubeton wallet send testnet main-wallet tonnode-0 10. -n"
+    echo "  kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10."
+    echo "  kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10. -n"
   }
 
   local action="${1:-}"
@@ -10043,6 +10095,7 @@ run_wallet() {
   local -a action_args=()
   local row target_ns target_pod target_node_name target_wallet_name destination_address amount
   local from_wallet_name to_tonnode_name
+  local wallet_network=""
   local -a table_rows=()
   local -a destination_addresses=()
   case "$action" in
@@ -10066,14 +10119,18 @@ run_wallet() {
       esac
       ;;
     deploy)
-      if (( $# <= 1 )); then
-        action_args=("$@")
-      else
-        echo "Error: usage: kubeton wallet deploy [name]" >&2
+      if (( $# < 1 || $# > 2 )); then
+        echo "Error: usage: kubeton wallet deploy <mainnet|testnet> [name]" >&2
         return 1
       fi
+      if ! wallet_network="$(normalize_wallet_network "$1")"; then
+        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
+        return 1
+      fi
+      shift || true
+      action_args=("$@")
       if (( ${#action_args[@]} == 0 )); then
-        confirm_or_exit "This will deploy (send BOC) for ALL wallets. Continue?"
+        confirm_or_exit "This will deploy (send BOC) for ALL wallets on ${wallet_network}. Continue?"
       fi
       ;;
     show)
@@ -10086,6 +10143,15 @@ run_wallet() {
       ;;
     send)
       local send_no_bounce_flag=""
+      if (( $# < 1 )); then
+        echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
+        return 1
+      fi
+      if ! wallet_network="$(normalize_wallet_network "$1")"; then
+        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
+        return 1
+      fi
+      shift || true
       local -a send_args=("$@")
       local send_last_index send_last_arg send_item
       if (( ${#send_args[@]} > 0 )); then
@@ -10110,7 +10176,7 @@ run_wallet() {
           from_wallet_name="$(trim_whitespace "${send_args[0]}")"
           amount="$(trim_whitespace "${send_args[1]}")"
           if [[ -z "$from_wallet_name" || -z "$amount" ]]; then
-            echo "Error: usage: kubeton wallet send [from-wallet-name] [amount] [-n]" >&2
+            echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [amount] [-n]" >&2
             return 1
           fi
           if ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
@@ -10139,7 +10205,7 @@ run_wallet() {
             return 1
           fi
           print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
-          confirm_or_exit "This will split '${amount}' from '${from_wallet_name}' equally across all listed TON wallets. Continue?"
+          confirm_or_exit "This will split '${amount}' from '${from_wallet_name}' on ${wallet_network} equally across all listed TON wallets. Continue?"
 
           action_args=("$from_wallet_name" "$amount")
           for destination_address in "${destination_addresses[@]}"; do
@@ -10153,7 +10219,7 @@ run_wallet() {
           from_wallet_name="$(trim_whitespace "${send_args[0]}")"
           to_tonnode_name="$(trim_whitespace "${send_args[1]}")"
           if [[ -z "$from_wallet_name" || -z "$to_tonnode_name" ]]; then
-            echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
+            echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
             return 1
           fi
           if (( ${#send_args[@]} == 3 )); then
@@ -10189,7 +10255,7 @@ run_wallet() {
 
           table_rows=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"${amount}")
           print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
-          confirm_or_exit "Send '${amount}' from '${from_wallet_name}' to '${target_wallet_name}' on ${target_ns}/${target_pod}?"
+          confirm_or_exit "Send '${amount}' from '${from_wallet_name}' on ${wallet_network} to '${target_wallet_name}' on ${target_ns}/${target_pod}?"
 
           action_args=("$from_wallet_name" "$destination_address" "$amount")
           if [[ -n "$send_no_bounce_flag" ]]; then
@@ -10197,8 +10263,8 @@ run_wallet() {
           fi
           ;;
         *)
-          echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
-          echo "       usage: kubeton wallet send [from-wallet-name] [amount] [-n]" >&2
+          echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
+          echo "       usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [amount] [-n]" >&2
           return 1
           ;;
       esac
@@ -10214,6 +10280,7 @@ run_wallet() {
   local pod_name
   local image
   local global_config_url
+  local toncenter_url
   local timeout_seconds
   local bundle_storage_class=""
   local wallet_node_affinity_yaml=""
@@ -10241,7 +10308,8 @@ run_wallet() {
   wallet_node_affinity_yaml="$(main_wallet_pod_longhorn_csi_affinity_yaml "$bundle_storage_class")" || return 1
 
   image="$(resolve_main_wallet_image)"
-  global_config_url="$(resolve_main_wallet_global_config_url)"
+  global_config_url="$(resolve_main_wallet_global_config_url "$wallet_network")"
+  toncenter_url="$(resolve_main_wallet_toncenter_url "$wallet_network")"
   timeout_seconds="$(main_wallet_timeout_seconds)"
 
   pod_name="kubeton-main-wallet-$RANDOM-$RANDOM"
@@ -10284,11 +10352,19 @@ run_wallet() {
     echo "        - name: GLOBAL_CONFIG_URL"
     printf '          value: %s\n' "$(yaml_quote "$global_config_url")"
     echo "        - name: TONCENTER_URL"
-    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_TONCENTER_URL")"
+    printf '          value: %s\n' "$(yaml_quote "$toncenter_url")"
     if [[ -n "$MAIN_WALLET_TONCENTER_API_KEY" ]]; then
       echo "        - name: TONCENTER_API_KEY"
       printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_TONCENTER_API_KEY")"
     fi
+    echo "        - name: MAIN_WALLET_SEND_RETRY_ATTEMPTS"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_SEND_RETRY_ATTEMPTS")"
+    echo "        - name: MAIN_WALLET_LITESERVER_SEND_ATTEMPTS"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_LITESERVER_SEND_ATTEMPTS")"
+    echo "        - name: MAIN_WALLET_TONCENTER_SEND_ATTEMPTS"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_TONCENTER_SEND_ATTEMPTS")"
+    echo "        - name: MAIN_WALLET_SEND_RETRY_DELAY_SEC"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_SEND_RETRY_DELAY_SEC")"
     echo "        - name: MAIN_WALLET_NAME_DEFAULT"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_NAME")"
     echo "        - name: MAIN_WALLET_DIR"

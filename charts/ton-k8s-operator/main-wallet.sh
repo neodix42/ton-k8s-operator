@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODE="${MODE:-liteserver}"
+MODE="${MODE:-auto}"
 GLOBAL_CONFIG_URL="${GLOBAL_CONFIG_URL:-https://ton.org/global.config.json}"
 TONCENTER_URL="${TONCENTER_URL:-https://testnet.toncenter.com}"
 TONCENTER_API_KEY="${TONCENTER_API_KEY:-}"
@@ -12,7 +12,9 @@ MAIN_WALLET_BUNDLE_FILE="${MAIN_WALLET_BUNDLE_FILE:-main-wallet.bundle.enc}"
 MAIN_WALLET_BUNDLE_META_FILE="${MAIN_WALLET_BUNDLE_META_FILE:-main-wallet.bundle.meta}"
 MAIN_WALLET_NAME_DEFAULT="${MAIN_WALLET_NAME_DEFAULT:-main-wallet}"
 SMARTCONT_DIR="${SMARTCONT_DIR:-/usr/share/ton/smartcont}"
-MAIN_WALLET_SEND_RETRY_ATTEMPTS="${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-3}"
+MAIN_WALLET_SEND_RETRY_ATTEMPTS="${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-2}"
+MAIN_WALLET_LITESERVER_SEND_ATTEMPTS="${MAIN_WALLET_LITESERVER_SEND_ATTEMPTS:-$MAIN_WALLET_SEND_RETRY_ATTEMPTS}"
+MAIN_WALLET_TONCENTER_SEND_ATTEMPTS="${MAIN_WALLET_TONCENTER_SEND_ATTEMPTS:-$MAIN_WALLET_SEND_RETRY_ATTEMPTS}"
 MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
 MAIN_WALLET_MULTI_SEND_PAUSE_SEC="${MAIN_WALLET_MULTI_SEND_PAUSE_SEC:-3}"
 
@@ -27,7 +29,7 @@ Usage:
   main-wallet.sh run <create|deploy|send|show> [args...]
 
 Required env for deploy:
-  MODE=liteserver|toncenter
+  MODE=auto|liteserver|toncenter
   GLOBAL_CONFIG_URL=https://ton.org/global.config.json
   TONCENTER_URL=https://testnet.toncenter.com (or mainnet URL)
 
@@ -45,12 +47,32 @@ trim_whitespace() {
 
 main_wallet_send_retry_attempts() {
   local raw
-  raw="$(trim_whitespace "${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-3}")"
+  raw="$(trim_whitespace "${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-2}")"
   if [[ "$raw" =~ ^[1-9][0-9]*$ ]]; then
     printf '%s' "$raw"
     return 0
   fi
-  printf '%s' "3"
+  printf '%s' "2"
+}
+
+main_wallet_liteserver_send_attempts() {
+  local raw
+  raw="$(trim_whitespace "${MAIN_WALLET_LITESERVER_SEND_ATTEMPTS:-$(main_wallet_send_retry_attempts)}")"
+  if [[ "$raw" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '%s' "2"
+}
+
+main_wallet_toncenter_send_attempts() {
+  local raw
+  raw="$(trim_whitespace "${MAIN_WALLET_TONCENTER_SEND_ATTEMPTS:-$(main_wallet_send_retry_attempts)}")"
+  if [[ "$raw" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '%s' "2"
 }
 
 main_wallet_send_retry_delay_seconds() {
@@ -346,9 +368,13 @@ resolve_fift_bin() {
   return 1
 }
 
-send_boc_toncenter() {
+toncenter_endpoint() {
+  printf '%s' "${TONCENTER_URL%/}/api/v2/sendBoc"
+}
+
+send_boc_toncenter_once() {
   local boc_file="$1"
-  local boc_b64 response curl_args=()
+  local boc_b64 http_response http_code response curl_args=()
 
   require_bin curl
   require_bin base64
@@ -361,18 +387,58 @@ send_boc_toncenter() {
   fi
 
   boc_b64="$(base64 -w0 "$boc_file" 2>/dev/null || base64 < "$boc_file" | tr -d '\r\n')"
-  response="$(curl -fsS \
+  if http_response="$(curl -sS \
+    -w $'\n%{http_code}' \
     "${curl_args[@]}" \
     -H "Content-Type: application/json" \
     --request POST \
     --data "{\"boc\":\"${boc_b64}\"}" \
-    "${TONCENTER_URL%/}/api/v2/sendBoc")"
+    "$(toncenter_endpoint)")"; then
+    :
+  else
+    local curl_rc=$?
+    echo "Error: TONCenter sendBoc request failed with curl exit code ${curl_rc}." >&2
+    return "$curl_rc"
+  fi
+
+  http_code="${http_response##*$'\n'}"
+  response="${http_response%$'\n'*}"
 
   printf '%s\n' "$response"
+  if ! [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    echo "Error: TONCenter sendBoc returned HTTP ${http_code}." >&2
+    return 1
+  fi
   if ! printf '%s' "$response" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
     echo "Error: TONCenter sendBoc request did not return ok=true." >&2
     return 1
   fi
+}
+
+send_boc_toncenter() {
+  local boc_file="$1"
+  local attempts delay attempt rc=1
+
+  attempts="$(main_wallet_toncenter_send_attempts)"
+  delay="$(main_wallet_send_retry_delay_seconds)"
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    echo "Sending BOC via TONCenter $(toncenter_endpoint) (attempt ${attempt}/${attempts}) ..." >&2
+    if send_boc_toncenter_once "$boc_file"; then
+      return 0
+    else
+      rc=$?
+    fi
+    if (( attempt < attempts )); then
+      echo "Warning: TONCenter sendBoc failed (attempt ${attempt}/${attempts}); retrying..." >&2
+      if (( delay > 0 )); then
+        sleep "$delay"
+      fi
+    fi
+  done
+
+  echo "Error: TONCenter sendBoc failed after ${attempts} attempt(s)." >&2
+  return "$rc"
 }
 
 resolve_local_global_config_path() {
@@ -407,6 +473,19 @@ resolve_local_global_config_path() {
     return 1
   fi
   printf '%s\t' "$global_config_path"
+}
+
+warn_liteserver_toncenter_network_mismatch() {
+  local global_config_lower toncenter_lower
+
+  global_config_lower="$(printf '%s' "$GLOBAL_CONFIG_URL" | tr '[:upper:]' '[:lower:]')"
+  toncenter_lower="$(printf '%s' "$TONCENTER_URL" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "$toncenter_lower" == *testnet* && "$global_config_lower" != *testnet* ]]; then
+    echo "Warning: lite-server GLOBAL_CONFIG_URL=${GLOBAL_CONFIG_URL} does not look like testnet, but TONCENTER_URL=${TONCENTER_URL} does." >&2
+    echo "Warning: if the wallet is funded on testnet, lite-client sendfile is being sent to the wrong network." >&2
+    echo "Warning: use 'kubeton wallet deploy testnet ...' or 'kubeton wallet send testnet ...' for testnet sends." >&2
+  fi
 }
 
 run_liteclient_query() {
@@ -449,10 +528,11 @@ send_boc_liteserver() {
   local boc_file="$1"
   local attempts delay attempt rc=1
 
-  attempts="$(main_wallet_send_retry_attempts)"
+  attempts="$(main_wallet_liteserver_send_attempts)"
   delay="$(main_wallet_send_retry_delay_seconds)"
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
+    echo "Sending BOC via lite-server config ${GLOBAL_CONFIG_URL} (attempt ${attempt}/${attempts}) ..." >&2
     if run_liteclient_query "sendfile $boc_file"; then
       return 0
     else
@@ -468,6 +548,39 @@ send_boc_liteserver() {
 
   echo "Error: lite-client sendfile failed after ${attempts} attempt(s)." >&2
   return "$rc"
+}
+
+send_boc_payload() {
+  local boc_file="$1"
+  local normalized_mode="$2"
+  local liteserver_rc=0
+  local toncenter_rc=0
+
+  case "$normalized_mode" in
+    auto|fallback|both)
+      warn_liteserver_toncenter_network_mismatch
+      send_boc_liteserver "$boc_file" && return 0
+      liteserver_rc=$?
+      echo "Warning: lite-server BOC send failed; trying TONCenter fallback." >&2
+      send_boc_toncenter "$boc_file" && return 0
+      toncenter_rc=$?
+      echo "Error: BOC send failed via lite-server and TONCenter." >&2
+      return "$toncenter_rc"
+      ;;
+    liteserver)
+      warn_liteserver_toncenter_network_mismatch
+      send_boc_liteserver "$boc_file" || liteserver_rc=$?
+      return "$liteserver_rc"
+      ;;
+    toncenter)
+      send_boc_toncenter "$boc_file" || toncenter_rc=$?
+      return "$toncenter_rc"
+      ;;
+    *)
+      echo "Error: unsupported MODE=${MODE}. Use auto, liteserver, or toncenter." >&2
+      return 1
+      ;;
+  esac
 }
 
 print_wallet_deploy_failure_hint() {
@@ -494,7 +607,7 @@ print_wallet_deploy_failure_hint() {
   if [[ -n "$bounceable" && "$bounceable" != "unknown" ]]; then
     echo "Hint: after deployment, use the bounceable address: ${bounceable}" >&2
   fi
-  echo "Hint: rerun 'kubeton wallet deploy ${wallet_name}' after the funding transaction is visible on-chain." >&2
+  echo "Hint: rerun 'kubeton wallet deploy <mainnet|testnet> ${wallet_name}' after the funding transaction is visible on-chain." >&2
 }
 
 deploy_boc_with_mode() {
@@ -504,18 +617,7 @@ deploy_boc_with_mode() {
   local rc=0
 
   echo "Deploying wallet '${wallet_name}' using BOC '${boc_file##*/}' ..."
-  case "$normalized_mode" in
-    liteserver)
-      send_boc_liteserver "$boc_file" || rc=$?
-      ;;
-    toncenter)
-      send_boc_toncenter "$boc_file" || rc=$?
-      ;;
-    *)
-      echo "Error: unsupported MODE=${MODE}. Use liteserver or toncenter." >&2
-      return 1
-      ;;
-  esac
+  send_boc_payload "$boc_file" "$normalized_mode" || rc=$?
 
   if (( rc != 0 )); then
     print_wallet_deploy_failure_hint "$wallet_name"
@@ -1048,18 +1150,7 @@ send_single_transfer() {
   fi
 
   echo "Sending from '${from_wallet}' to '${destination_address}' amount='${amount_gram}' seqno=${seqno_dec} ..."
-  case "$normalized_mode" in
-    liteserver)
-      send_boc_liteserver "$query_file" || rc=$?
-      ;;
-    toncenter)
-      send_boc_toncenter "$query_file" || rc=$?
-      ;;
-    *)
-      echo "Error: unsupported MODE=${MODE}. Use liteserver or toncenter." >&2
-      rc=1
-      ;;
-  esac
+  send_boc_payload "$query_file" "$normalized_mode" || rc=$?
   rm -f "$query_file"
   return "$rc"
 }

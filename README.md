@@ -226,11 +226,11 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton wallet create main-wallet
-./kubeton wallet deploy
-./kubeton wallet deploy main-wallet
-./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10.
-./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10. -n
-./kubeton wallet send main-wallet 10.
+./kubeton wallet deploy testnet
+./kubeton wallet deploy testnet main-wallet
+./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10.
+./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10. -n
+./kubeton wallet send testnet main-wallet 10.
 ./kubeton wallet show
 ./kubeton wallet show main-wallet
 ./kubeton verify
@@ -240,7 +240,13 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 `kubeton wallet create` only generates wallet files and the init BOC. Before
 `kubeton wallet deploy` can activate a new wallet, send funds to the
 non-bounceable init address printed by `wallet create`, wait until the funding
-transaction is visible on-chain, then rerun `kubeton wallet deploy <name>`.
+transaction is visible on-chain, then rerun
+`kubeton wallet deploy <mainnet|testnet> <name>`.
+`kubeton wallet deploy` and `kubeton wallet send` require an explicit
+`mainnet` or `testnet` argument. That argument selects both the lite-server
+global config and TONCenter endpoint. By default wallet BOC sending uses
+`MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
+attempts.
 
 # install TON k8s operator only
 ./kubeton install
@@ -320,6 +326,10 @@ MAIN_WALLET_GLOBAL_CONFIG_URL
 MAIN_WALLET_TONCENTER_URL
 MAIN_WALLET_TONCENTER_API_KEY
 MAIN_WALLET_NAME
+MAIN_WALLET_SEND_RETRY_ATTEMPTS
+MAIN_WALLET_LITESERVER_SEND_ATTEMPTS
+MAIN_WALLET_TONCENTER_SEND_ATTEMPTS
+MAIN_WALLET_SEND_RETRY_DELAY_SEC
 MAIN_WALLET_POD_TIMEOUT
 MAIN_WALLET_RUNTIME_TMPFS_SIZE
 
