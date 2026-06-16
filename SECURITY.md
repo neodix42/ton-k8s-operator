@@ -240,8 +240,9 @@ Root-of-trust continuity requirement:
 - If Vault is reinitialized (new storage/new keys) or old KMS key is deleted/disabled, old bundles are not decryptable.
 
 Operational note about `drop`/`uninstall`:
-- `kubeton drop` removes TON resources/PVCs only.
-- `kubeton uninstall` removes TON resources/PVCs, operator release, Longhorn release/namespace, and `encrypted-sc` StorageClass.
+- `kubeton drop` removes TON resources/PVCs, Longhorn backing artifacts, and kubeton TON directories left under the local-path provisioner root.
+- `kubeton uninstall` is a full best-effort cleanup of kubeton-managed resources: TON PVCs, local-path backing directories, observability/VictoriaLogs resources, main-wallet/debug helpers, operator, Longhorn, Vault, and `encrypted-sc` StorageClass. It keeps the cluster-scoped `TonNode` CRD; use `kubeton purge` to remove it.
+- if Kubernetes is still terminating resources or a cleanup step errors, uninstall reports leftovers and asks you to rerun `./kubeton uninstall`.
 - If admins manually delete Vault data (or the whole cluster), Transit key history is lost and encrypted bundles cannot be decrypted.
 
 ## 6. Storage Encryption for Keys Only

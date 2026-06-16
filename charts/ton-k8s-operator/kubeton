@@ -44,6 +44,11 @@ KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY="${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY:-to
 KUBETON_TARGET_TON_REPLICAS="${KUBETON_TARGET_TON_REPLICAS:-}"
 KUBETON_DEBUG_POD_PREFIX="${KUBETON_DEBUG_POD_PREFIX:-node-debugger-}"
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL="${KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL:-true}"
+KUBETON_LOCAL_PATH_CLEANUP="${KUBETON_LOCAL_PATH_CLEANUP:-true}"
+LOCAL_PATH_PROVISIONER_ROOT="${LOCAL_PATH_PROVISIONER_ROOT:-/opt/local-path-provisioner}"
+KUBETON_LOCAL_PATH_CLEANUP_IMAGE="${KUBETON_LOCAL_PATH_CLEANUP_IMAGE:-busybox:1.36}"
+KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE="${KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE:-}"
+KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS="${KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS:-180}"
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS:-900}"
@@ -157,8 +162,8 @@ Commands:
   wallet               Run ephemeral wallet utility pod (Vault-backed encrypted persistence): kubeton wallet <create|deploy|send|show> [args...]
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
-  uninstall            Stop/drop TON fleet + remove kubeton-managed observability stacks + uninstall operator, Longhorn, and Vault (with confirmation; keeps TonNode CRD).
-  purge                Full destructive cleanup: uninstall (including kubeton-managed observability stacks) + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
+  uninstall            Full best-effort cleanup of kubeton-managed resources (with confirmation; keeps TonNode CRD).
+  purge                Full best-effort cleanup + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
   verify               Verify operator and TON resources (deploy, pods with node/server, tonnodes, sts, pvc).
   status               Run wallet/adnl/sync/db checks in each TON pod; print node/pod/wallet/adnl/sync/cell db/archive db.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
@@ -210,6 +215,11 @@ json_quote() {
   value="${value//$'\r'/}"
   value="${value//$'\t'/\\t}"
   printf '"%s"' "$value"
+}
+
+shell_quote() {
+  local value="${1:-}"
+  printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
 }
 
 parse_selector_pairs() {
@@ -3723,7 +3733,10 @@ delete_volume_attachments_for_pv() {
 
 delete_vault_pvcs_and_backing_volumes() {
   local -a pvc_rows=()
+  local -a pvc_ref_rows=()
   local -a pv_rows=()
+  local -a local_path_exact_rows=()
+  local -a local_path_pattern_rows=()
   local row pvc pv
 
   if ! kubectl get namespace "$VAULT_NAMESPACE" >/dev/null 2>&1; then
@@ -3735,8 +3748,10 @@ delete_vault_pvcs_and_backing_volumes() {
     pv="$(trim_whitespace "$pv")"
     [[ -z "$pvc" ]] && continue
     pvc_rows+=("$pvc")
+    pvc_ref_rows+=("$VAULT_NAMESPACE"$'\t'"$pvc")
     if [[ -n "$pv" ]]; then
       append_unique_item "$pv" pv_rows
+      append_local_path_exact_cleanup_rows_for_pv "$pv" "${VAULT_NAMESPACE}/${pvc}" local_path_exact_rows
     fi
   done < <(
     kubectl -n "$VAULT_NAMESPACE" get pvc \
@@ -3746,6 +3761,8 @@ delete_vault_pvcs_and_backing_volumes() {
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
   fi
+
+  collect_local_path_pattern_cleanup_rows_for_pvcs pvc_ref_rows local_path_pattern_rows
 
   echo "[cleanup] Deleting Vault PVCs ..."
   for pvc in "${pvc_rows[@]}"; do
@@ -3762,6 +3779,8 @@ delete_vault_pvcs_and_backing_volumes() {
       wait_pvc_gone "$VAULT_NAMESPACE" "$pvc" 60 || true
     fi
   done
+
+  cleanup_local_path_provisioner_data local_path_exact_rows local_path_pattern_rows "cleanup" || true
 
   for pv in "${pv_rows[@]}"; do
     [[ -z "$pv" ]] && continue
@@ -4787,6 +4806,431 @@ list_ton_statefulsets() {
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
 }
 
+list_node_names() {
+  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+    | awk 'NF' \
+    | sort -u
+}
+
+local_path_provisioner_root() {
+  local root
+  root="$(trim_whitespace "${LOCAL_PATH_PROVISIONER_ROOT:-/opt/local-path-provisioner}")"
+  root="${root%/}"
+  if [[ -z "$root" || "$root" == "/" || "$root" != /* ]]; then
+    echo "Error: invalid LOCAL_PATH_PROVISIONER_ROOT='${LOCAL_PATH_PROVISIONER_ROOT}'." >&2
+    return 1
+  fi
+  printf '%s' "$root"
+}
+
+local_path_relative_target() {
+  local path="$1"
+  local root rel
+  root="$(local_path_provisioner_root)" || return 1
+  path="$(trim_whitespace "$path")"
+  path="${path%/}"
+  if [[ -z "$path" || "$path" == "$root" || "$path" != "$root"/* ]]; then
+    return 1
+  fi
+  rel="${path#"$root"/}"
+  case "$rel" in
+    ""|"."|".."|/*|../*|*/../*|*//*) return 1 ;;
+  esac
+  printf '%s' "$rel"
+}
+
+local_path_safe_name_component() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+local_path_cleanup_namespace() {
+  local ns phase
+  for ns in "$KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE" kube-system "$TON_NAMESPACE" default; do
+    ns="$(trim_whitespace "$ns")"
+    [[ -z "$ns" ]] && continue
+    if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
+      continue
+    fi
+    phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [[ "$phase" != "Terminating" ]]; then
+      printf '%s' "$ns"
+      return 0
+    fi
+  done
+  echo "Error: no usable namespace found for local-path cleanup pod." >&2
+  return 1
+}
+
+local_path_pv_host_path() {
+  local pv="$1"
+  local path
+  path="$(kubectl get pv "$pv" -o jsonpath='{.spec.hostPath.path}' 2>/dev/null || true)"
+  path="$(trim_whitespace "$path")"
+  if [[ -z "$path" ]]; then
+    path="$(kubectl get pv "$pv" -o jsonpath='{.spec.local.path}' 2>/dev/null || true)"
+    path="$(trim_whitespace "$path")"
+  fi
+  printf '%s' "$path"
+}
+
+resolve_node_name_for_hostname_value() {
+  local hostname_value="$1"
+  local node
+  hostname_value="$(trim_whitespace "$hostname_value")"
+  [[ -n "$hostname_value" ]] || return 1
+
+  if kubectl get node "$hostname_value" >/dev/null 2>&1; then
+    printf '%s' "$hostname_value"
+    return 0
+  fi
+
+  node="$(kubectl get nodes -l "kubernetes.io/hostname=${hostname_value}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  node="$(trim_whitespace "$node")"
+  [[ -n "$node" ]] || return 1
+  printf '%s' "$node"
+}
+
+collect_local_path_nodes_for_pv() {
+  local pv="$1"
+  local -n nodes_ref="$2"
+  local node resolved_node
+
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -z "$node" ]] && continue
+    resolved_node="$(resolve_node_name_for_hostname_value "$node" || true)"
+    resolved_node="$(trim_whitespace "$resolved_node")"
+    [[ -z "$resolved_node" ]] && continue
+    append_unique_item "$resolved_node" nodes_ref
+  done < <(
+    kubectl get pv "$pv" \
+      -o jsonpath='{range .spec.nodeAffinity.required.nodeSelectorTerms[*].matchExpressions[?(@.key=="kubernetes.io/hostname")].values[*]}{.}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  if [[ ${#nodes_ref[@]} -gt 0 ]]; then
+    return 0
+  fi
+
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -z "$node" ]] && continue
+    append_unique_item "$node" nodes_ref
+  done < <(list_node_names)
+}
+
+append_local_path_exact_cleanup_rows_for_pv() {
+  local pv="$1"
+  local pvc_ref="$2"
+  local -n rows_ref="$3"
+  local path rel node
+  local -a nodes=()
+
+  is_true "$KUBETON_LOCAL_PATH_CLEANUP" || return 0
+  [[ -n "$pv" ]] || return 0
+
+  path="$(local_path_pv_host_path "$pv")"
+  rel="$(local_path_relative_target "$path" 2>/dev/null || true)"
+  [[ -n "$rel" ]] || return 0
+
+  collect_local_path_nodes_for_pv "$pv" nodes
+  for node in "${nodes[@]}"; do
+    node="$(trim_whitespace "$node")"
+    [[ -z "$node" ]] && continue
+    append_unique_item "$node"$'\t'"$path"$'\t'"$pv"$'\t'"$pvc_ref" rows_ref
+  done
+}
+
+collect_local_path_pattern_cleanup_rows_for_pvcs() {
+  local -n pvc_rows_ref="$1"
+  local -n rows_ref="$2"
+  local row ns pvc node
+  local -a nodes=()
+
+  is_true "$KUBETON_LOCAL_PATH_CLEANUP" || return 0
+  mapfile -t nodes < <(list_node_names)
+  [[ ${#nodes[@]} -gt 0 ]] || return 0
+
+  for row in "${pvc_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pvc <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    pvc="$(trim_whitespace "$pvc")"
+    [[ -z "$ns" || -z "$pvc" ]] && continue
+    local_path_safe_name_component "$ns" || continue
+    local_path_safe_name_component "$pvc" || continue
+    for node in "${nodes[@]}"; do
+      node="$(trim_whitespace "$node")"
+      [[ -z "$node" ]] && continue
+      append_unique_item "$node"$'\t'"$ns"$'\t'"$pvc" rows_ref
+    done
+  done
+}
+
+build_local_path_cleanup_script() {
+  local node="$1"
+  local root="$2"
+  local exact_rows_name="$3"
+  local pattern_rows_name="$4"
+  local -n exact_rows_ref="$exact_rows_name"
+  local -n pattern_rows_ref="$pattern_rows_name"
+  local row row_node path pv pvc_ref ns pvc rel pattern
+  local emitted=0
+
+  {
+    printf 'set -eu\n'
+    printf 'root=%s\n' "$(shell_quote "/host${root}")"
+    printf 'if [ ! -d "$root" ]; then exit 0; fi\n'
+    printf 'remaining=0\n'
+
+    for row in "${exact_rows_ref[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r row_node path pv pvc_ref <<<"$row"
+      [[ "$row_node" == "$node" ]] || continue
+      rel="$(local_path_relative_target "$path" 2>/dev/null || true)"
+      [[ -n "$rel" ]] || continue
+      printf 'target="$root"/%s\n' "$(shell_quote "$rel")"
+      printf 'if [ -e "$target" ]; then echo "[cleanup] Removing local-path PV directory: ${target#$root/}"; rm -rf -- "$target"; fi\n'
+      printf 'if [ -e "$target" ]; then echo "Error: local-path PV directory still exists: ${target#$root/}" >&2; remaining=1; fi\n'
+      emitted=1
+    done
+
+    for row in "${pattern_rows_ref[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r row_node ns pvc <<<"$row"
+      [[ "$row_node" == "$node" ]] || continue
+      local_path_safe_name_component "$ns" || continue
+      local_path_safe_name_component "$pvc" || continue
+      pattern="*_${ns}_${pvc}"
+      printf 'find "$root" -mindepth 1 -maxdepth 1 -type d -name %s -exec rm -rf -- {} +\n' "$(shell_quote "$pattern")"
+      printf 'if [ -n "$(find "$root" -mindepth 1 -maxdepth 1 -type d -name %s -print -quit)" ]; then echo "Error: local-path directory matching %s still exists" >&2; remaining=1; fi\n' "$(shell_quote "$pattern")" "$(shell_quote "$pattern")"
+      emitted=1
+    done
+
+    printf 'exit "$remaining"\n'
+  } || return 1
+
+  (( emitted == 1 ))
+}
+
+wait_local_path_cleanup_pod_done() {
+  local ns="$1"
+  local pod="$2"
+  local timeout_seconds="$3"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local phase
+
+  while (( $(date +%s) < deadline )); do
+    phase="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    case "$phase" in
+      Succeeded)
+        return 0
+        ;;
+      Failed)
+        echo "Error: local-path cleanup pod ${ns}/${pod} failed." >&2
+        kubectl -n "$ns" logs "$pod" >&2 || true
+        return 1
+        ;;
+    esac
+    sleep 2
+  done
+
+  echo "Error: timeout waiting for local-path cleanup pod ${ns}/${pod}." >&2
+  kubectl -n "$ns" logs "$pod" >&2 || true
+  return 1
+}
+
+run_local_path_cleanup_pod_for_node() {
+  local cleanup_ns="$1"
+  local node="$2"
+  local root="$3"
+  local label="$4"
+  local exact_rows_name="$5"
+  local pattern_rows_name="$6"
+  local script pod node_fragment timeout_seconds rc=0
+
+  script="$(build_local_path_cleanup_script "$node" "$root" "$exact_rows_name" "$pattern_rows_name")" || return 0
+  node_fragment="$(sanitize_k8s_name_fragment "$node")"
+  node_fragment="${node_fragment:0:32}"
+  [[ -z "$node_fragment" ]] && node_fragment="node"
+  pod="kubeton-lpp-clean-${node_fragment}-${RANDOM}-${RANDOM}"
+  timeout_seconds="$(trim_whitespace "${KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS:-180}")"
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 30 )); then
+    timeout_seconds=180
+  fi
+
+  echo "[${label}] Purging local-path data on node ${node} under ${root} ..."
+  cat <<EOF | kubectl -n "$cleanup_ns" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  labels:
+    app.kubernetes.io/name: kubeton-local-path-cleanup
+    app.kubernetes.io/managed-by: kubeton
+spec:
+  restartPolicy: Never
+  nodeName: $(yaml_quote "$node")
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: cleanup
+      image: ${KUBETON_LOCAL_PATH_CLEANUP_IMAGE}
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/sh
+        - -ec
+      args:
+        - |
+$(printf '%s\n' "$script" | sed 's/^/          /')
+      securityContext:
+        privileged: true
+        runAsUser: 0
+        allowPrivilegeEscalation: true
+      volumeMounts:
+        - name: host-root
+          mountPath: /host
+  volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+EOF
+
+  if ! wait_local_path_cleanup_pod_done "$cleanup_ns" "$pod" "$timeout_seconds"; then
+    rc=1
+  fi
+  kubectl -n "$cleanup_ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+cleanup_local_path_provisioner_data() {
+  local exact_rows_name="$1"
+  local pattern_rows_name="$2"
+  local label="${3:-cleanup}"
+  local -n exact_rows_ref="$exact_rows_name"
+  local -n pattern_rows_ref="$pattern_rows_name"
+  local root cleanup_ns row node rc=0
+  local -a nodes=()
+
+  is_true "$KUBETON_LOCAL_PATH_CLEANUP" || return 0
+  if [[ ${#exact_rows_ref[@]} -eq 0 && ${#pattern_rows_ref[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  root="$(local_path_provisioner_root)" || return 1
+  cleanup_ns="$(local_path_cleanup_namespace)" || return 1
+
+  for row in "${exact_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r node _ <<<"$row"
+    node="$(trim_whitespace "$node")"
+    [[ -z "$node" ]] && continue
+    append_unique_item "$node" nodes
+  done
+  for row in "${pattern_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r node _ <<<"$row"
+    node="$(trim_whitespace "$node")"
+    [[ -z "$node" ]] && continue
+    append_unique_item "$node" nodes
+  done
+
+  for node in "${nodes[@]}"; do
+    [[ -z "$node" ]] && continue
+    if ! run_local_path_cleanup_pod_for_node "$cleanup_ns" "$node" "$root" "$label" "$exact_rows_name" "$pattern_rows_name"; then
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+delete_pvc_rows_and_backing_volumes() {
+  local pvc_rows_name="$1"
+  local label="${2:-cleanup}"
+  local -n pvc_rows_ref="$pvc_rows_name"
+  local -a pv_rows=()
+  local -a volume_attachment_rows=()
+  local -a local_path_exact_rows=()
+  local -a local_path_pattern_rows=()
+  local row ns pvc_name volume
+  local candidate_attachment attachment_name source_pv
+  local local_path_cleanup_rc=0
+  local -a pv_match=()
+
+  if [[ ${#pvc_rows_ref[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  collect_local_path_pattern_cleanup_rows_for_pvcs "$pvc_rows_name" local_path_pattern_rows
+
+  for row in "${pvc_rows_ref[@]}"; do
+    IFS=$'\t' read -r ns pvc_name <<<"$row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    volume="$(kubectl -n "$ns" get pvc "$pvc_name" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+    volume="$(trim_whitespace "$volume")"
+    if [[ -n "$volume" ]]; then
+      append_unique_item "$volume" pv_rows
+      append_local_path_exact_cleanup_rows_for_pv "$volume" "${ns}/${pvc_name}" local_path_exact_rows
+    fi
+  done
+
+  echo "[${label}] Deleting PVCs ..."
+  for row in "${pvc_rows_ref[@]}"; do
+    IFS=$'\t' read -r ns pvc_name <<<"$row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    kubectl -n "$ns" delete pvc "$pvc_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  for row in "${pvc_rows_ref[@]}"; do
+    IFS=$'\t' read -r ns pvc_name <<<"$row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    wait_pvc_gone "$ns" "$pvc_name" 120 || true
+  done
+
+  cleanup_local_path_provisioner_data local_path_exact_rows local_path_pattern_rows "$label" || local_path_cleanup_rc=1
+
+  if [[ ${#pv_rows[@]} -eq 0 ]]; then
+    return "$local_path_cleanup_rc"
+  fi
+
+  mapfile -t volume_attachment_rows < <(
+    kubectl get volumeattachments.storage.k8s.io \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.source.persistentVolumeName}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  for candidate_attachment in "${volume_attachment_rows[@]}"; do
+    [[ -z "$candidate_attachment" ]] && continue
+    IFS=$'\t' read -r attachment_name source_pv <<<"$candidate_attachment"
+    [[ -z "$attachment_name" || -z "$source_pv" ]] && continue
+
+    pv_match=()
+    for volume in "${pv_rows[@]}"; do
+      if [[ "$source_pv" == "$volume" ]]; then
+        pv_match+=("${volume}")
+      fi
+    done
+    if [[ ${#pv_match[@]} -eq 0 ]]; then
+      continue
+    fi
+    echo "[${label}] Deleting stale VolumeAttachment ${attachment_name} for PV ${source_pv} ..."
+    kubectl delete volumeattachment "$attachment_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+
+  for volume in "${pv_rows[@]}"; do
+    wait_volume_attachments_gone "$volume" 180 || true
+  done
+
+  for volume in "${pv_rows[@]}"; do
+    echo "[${label}] Deleting Longhorn volume ${volume} ..."
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    echo "[${label}] Deleting PV ${volume} ..."
+    kubectl delete pv "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    wait_pv_gone "$volume" 180 || true
+    wait_longhorn_volume_gone "$volume" 300 || true
+  done
+  return "$local_path_cleanup_rc"
+}
+
 collect_expected_ton_pvc_rows_from_values() {
   local -n rows_ref="$1"
   local ns sts replicas claim_prefix ordinal pvc_name
@@ -4919,11 +5363,7 @@ delete_ton_pvcs_for_statefulsets() {
   local -n sts_rows_ref="$1"
   local row ns sts
   local -a pvc_rows=()
-  local -a pv_rows=()
-  local -a volume_attachment_rows=()
-  local pvc_name volume
-  local candidate_attachment source_pv
-  local -a pv_match=()
+  local pvc_name
 
   if [[ ${#sts_rows_ref[@]} -eq 0 ]]; then
     echo "[cleanup] No StatefulSet snapshot was provided; using expected TON PVC names and label selector." >&2
@@ -4950,69 +5390,7 @@ delete_ton_pvcs_for_statefulsets() {
     return 0
   fi
 
-  for row in "${pvc_rows[@]}"; do
-    IFS=$'\t' read -r ns pvc_name <<<"$row"
-    [[ -z "$ns" || -z "$pvc_name" ]] && continue
-    volume="$(kubectl -n "$ns" get pvc "$pvc_name" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
-    volume="$(trim_whitespace "$volume")"
-    if [[ -n "$volume" ]]; then
-      append_unique_item "$volume" pv_rows
-    fi
-  done
-
-  echo "[cleanup] Deleting TON PVCs ..."
-  for row in "${pvc_rows[@]}"; do
-    IFS=$'\t' read -r ns pvc_name <<<"$row"
-    [[ -z "$ns" || -z "$pvc_name" ]] && continue
-    kubectl -n "$ns" delete pvc "$pvc_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done
-
-  for row in "${pvc_rows[@]}"; do
-    IFS=$'\t' read -r ns pvc_name <<<"$row"
-    [[ -z "$ns" || -z "$pvc_name" ]] && continue
-    wait_pvc_gone "$ns" "$pvc_name" 120 || true
-  done
-
-  if [[ ${#pv_rows[@]} -eq 0 ]]; then
-    return 0
-  fi
-
-  mapfile -t volume_attachment_rows < <(
-    kubectl get volumeattachments.storage.k8s.io \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.source.persistentVolumeName}{"\n"}{end}' 2>/dev/null || true
-  )
-
-  for candidate_attachment in "${volume_attachment_rows[@]}"; do
-    [[ -z "$candidate_attachment" ]] && continue
-    IFS=$'\t' read -r attachment_name source_pv <<<"$candidate_attachment"
-    [[ -z "$attachment_name" ]] && continue
-    [[ -z "$source_pv" ]] && continue
-
-    pv_match=()
-    for volume in "${pv_rows[@]}"; do
-      if [[ "$source_pv" == "$volume" ]]; then
-        pv_match+=("${volume}")
-      fi
-    done
-    if [[ ${#pv_match[@]} -eq 0 ]]; then
-      continue
-    fi
-    echo "[cleanup] Deleting stale VolumeAttachment ${attachment_name} for PV ${source_pv} ..."
-    kubectl delete volumeattachment "$attachment_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done
-
-  for volume in "${pv_rows[@]}"; do
-    wait_volume_attachments_gone "$volume" 180 || true
-  done
-
-  for volume in "${pv_rows[@]}"; do
-    echo "[cleanup] Deleting Longhorn volume ${volume} ..."
-    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    echo "[cleanup] Deleting PV ${volume} ..."
-    kubectl delete pv "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    wait_pv_gone "$volume" 180 || true
-    wait_longhorn_volume_gone "$volume" 300 || true
-  done
+  delete_pvc_rows_and_backing_volumes pvc_rows "cleanup"
 }
 
 ton_fleet_resources_exist() {
@@ -6200,7 +6578,7 @@ stop_ton_for_destructive_cleanup() {
     echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing with direct TonNode/StatefulSet cleanup." >&2
   fi
 
-  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found
+  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found || true
 
   # If the operator or Helm path is unhealthy, scaling the captured StatefulSets
   # still prevents live pods from holding PVCs while deletion starts.
@@ -8021,6 +8399,135 @@ cleanup_grafana_resources() {
   cleanup_grafana_port_forwards
 }
 
+collect_pvc_rows_by_prefix() {
+  local prefix="$1"
+  local -n rows_ref="$2"
+  local ns pvc
+
+  prefix="$(trim_whitespace "$prefix")"
+  [[ -n "$prefix" ]] || return 0
+
+  while IFS=$'\t' read -r ns pvc; do
+    ns="$(trim_whitespace "$ns")"
+    pvc="$(trim_whitespace "$pvc")"
+    [[ -z "$ns" || -z "$pvc" ]] && continue
+    [[ "$pvc" == "$prefix"* ]] || continue
+    append_unique_item "$ns"$'\t'"$pvc" rows_ref
+  done < <(
+    kubectl get pvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+  )
+}
+
+collect_victoria_logs_release_rows() {
+  local single_rows_name="$1"
+  local collector_rows_name="$2"
+  local -n single_rows_ref="$single_rows_name"
+  local -n collector_rows_ref="$collector_rows_name"
+  local default_ns default_release default_collector row state_ns ns release collector
+
+  default_ns="$(victoria_logs_namespace)"
+  default_release="$(victoria_logs_release_name)"
+  default_collector="$(victoria_logs_collector_release_name)"
+  append_unique_item "$default_ns"$'\t'"$default_release" single_rows_ref
+  append_unique_item "$default_ns"$'\t'"$default_collector" collector_rows_ref
+
+  while IFS=$'\t' read -r state_ns ns release collector; do
+    state_ns="$(trim_whitespace "$state_ns")"
+    ns="$(trim_whitespace "$ns")"
+    release="$(trim_whitespace "$release")"
+    collector="$(trim_whitespace "$collector")"
+    [[ -z "$ns" ]] && ns="$state_ns"
+    [[ -z "$release" ]] && release="$default_release"
+    [[ -z "$collector" ]] && collector="$default_collector"
+    [[ -n "$ns" && -n "$release" ]] && append_unique_item "$ns"$'\t'"$release" single_rows_ref
+    [[ -n "$ns" && -n "$collector" ]] && append_unique_item "$ns"$'\t'"$collector" collector_rows_ref
+  done < <(
+    kubectl get configmap -A \
+      -l 'app.kubernetes.io/name=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.data.namespace}{"\t"}{.data.releaseName}{"\t"}{.data.collectorReleaseName}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  while IFS=$'\t' read -r ns release; do
+    ns="$(trim_whitespace "$ns")"
+    release="$(trim_whitespace "$release")"
+    [[ -z "$ns" || -z "$release" ]] && continue
+    case "$release" in
+      kubeton*|"${default_release}")
+        append_unique_item "$ns"$'\t'"$release" single_rows_ref
+        ;;
+    esac
+  done < <(
+    kubectl get statefulset -A \
+      -l 'app.kubernetes.io/name=victoria-logs-single' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.app\.kubernetes\.io/instance}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  while IFS=$'\t' read -r ns collector; do
+    ns="$(trim_whitespace "$ns")"
+    collector="$(trim_whitespace "$collector")"
+    [[ -z "$ns" || -z "$collector" ]] && continue
+    case "$collector" in
+      kubeton*|"${default_collector}")
+        append_unique_item "$ns"$'\t'"$collector" collector_rows_ref
+        ;;
+    esac
+  done < <(
+    kubectl get daemonset -A \
+      -l 'app.kubernetes.io/name=victoria-logs-collector' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.app\.kubernetes\.io/instance}{"\n"}{end}' 2>/dev/null || true
+  )
+}
+
+cleanup_main_wallet_resources() {
+  local ns
+  local -a pvc_rows=()
+
+  ns="$(trim_whitespace "$TON_NAMESPACE")"
+  [[ -z "$ns" ]] && ns="default"
+
+  echo "[uninstall] Deleting kubeton main-wallet helper resources ..."
+  kubectl -n "$ns" delete pod -l 'app.kubernetes.io/name=kubeton-main-wallet' --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete configmap "$MAIN_WALLET_SCRIPT_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
+
+  if kubectl -n "$ns" get pvc "$MAIN_WALLET_BUNDLE_PVC" >/dev/null 2>&1; then
+    pvc_rows+=("$ns"$'\t'"$MAIN_WALLET_BUNDLE_PVC")
+  fi
+  delete_pvc_rows_and_backing_volumes pvc_rows "uninstall" || true
+}
+
+delete_labeled_resources_all_namespaces() {
+  local selector="$1"
+  local label="${2:-uninstall}"
+  local resource
+
+  selector="$(trim_whitespace "$selector")"
+  [[ -n "$selector" ]] || return 0
+
+  while IFS= read -r resource; do
+    resource="$(trim_whitespace "$resource")"
+    [[ -z "$resource" ]] && continue
+    kubectl delete "$resource" -A -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done < <(kubectl api-resources --verbs=list --namespaced=true -o name 2>/dev/null || true)
+
+  while IFS= read -r resource; do
+    resource="$(trim_whitespace "$resource")"
+    [[ -z "$resource" ]] && continue
+    case "$resource" in
+      namespaces|nodes|persistentvolumes|storageclasses.storage.k8s.io|customresourcedefinitions.apiextensions.k8s.io)
+        continue
+        ;;
+    esac
+    kubectl delete "$resource" -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done < <(kubectl api-resources --verbs=list --namespaced=false -o name 2>/dev/null || true)
+
+  echo "[${label}] Requested deletion for resources matching ${selector}."
+}
+
+cleanup_kubeton_managed_labeled_resources() {
+  echo "[uninstall] Deleting remaining kubeton-managed labeled resources ..."
+  delete_labeled_resources_all_namespaces 'app.kubernetes.io/managed-by=kubeton' "uninstall"
+}
+
 cleanup_victoria_metrics_operator() {
   local ns="$1"
   local operator_selector='app.kubernetes.io/name=victoria-metrics-operator'
@@ -8029,13 +8536,18 @@ cleanup_victoria_metrics_operator() {
   kubectl -n "$ns" delete deployment,service,serviceaccount,role,rolebinding,configmap,secret -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete clusterrole,clusterrolebinding -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete validatingwebhookconfiguration,mutatingwebhookconfiguration -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl get crd -o name 2>/dev/null \
+    | grep 'operator.victoriametrics.com' \
+    | xargs -r kubectl delete --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 
 cleanup_victoria_logs_resources() {
-  local ns state_ns release_name collector_release_name
-  local state_value
+  local ns state_ns release_name collector_release_name row
+  local state_value service_name
   local access_selector='app.kubernetes.io/part-of=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton'
-  local service_name
+  local -a single_release_rows=()
+  local -a collector_release_rows=()
+  local -a pvc_rows=()
 
   ns="$(victoria_logs_namespace)"
   state_ns="$ns"
@@ -8063,29 +8575,60 @@ cleanup_victoria_logs_resources() {
     collector_release_name="$(victoria_logs_collector_release_name)"
   fi
   service_name="$(victoria_logs_service_name "$release_name")"
+  append_unique_item "$ns"$'\t'"$release_name" single_release_rows
+  append_unique_item "$ns"$'\t'"$collector_release_name" collector_release_rows
+  collect_victoria_logs_release_rows single_release_rows collector_release_rows
 
   echo "[uninstall] Deleting kubeton-managed VictoriaLogs access resources ..."
   kubectl delete service -A -l "$access_selector" --ignore-not-found >/dev/null 2>&1 || true
 
-  echo "[uninstall] Uninstalling VictoriaLogs releases (${release_name}, ${collector_release_name}) ..."
+  echo "[uninstall] Uninstalling VictoriaLogs releases ..."
   if command -v helm >/dev/null 2>&1; then
-    helm uninstall "$collector_release_name" -n "$ns" >/dev/null 2>&1 || true
-    helm uninstall "$release_name" -n "$ns" >/dev/null 2>&1 || true
+    for row in "${collector_release_rows[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r ns collector_release_name <<<"$row"
+      ns="$(trim_whitespace "$ns")"
+      collector_release_name="$(trim_whitespace "$collector_release_name")"
+      [[ -z "$ns" || -z "$collector_release_name" ]] && continue
+      helm uninstall "$collector_release_name" -n "$ns" >/dev/null 2>&1 || true
+    done
+    for row in "${single_release_rows[@]}"; do
+      [[ -z "$row" ]] && continue
+      IFS=$'\t' read -r ns release_name <<<"$row"
+      ns="$(trim_whitespace "$ns")"
+      release_name="$(trim_whitespace "$release_name")"
+      [[ -z "$ns" || -z "$release_name" ]] && continue
+      helm uninstall "$release_name" -n "$ns" >/dev/null 2>&1 || true
+    done
   else
     echo "Warning: helm is not installed; attempting best-effort kubectl cleanup for VictoriaLogs resources." >&2
   fi
 
-  kubectl -n "$ns" delete daemonset,serviceaccount -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete clusterrole,clusterrolebinding -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "$ns" delete statefulset,service -l "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "$ns" get pvc -o name 2>/dev/null \
-    | awk -v prefix="persistentvolumeclaim/server-volume-${service_name}-" 'index($0, prefix) == 1 {print $0}' \
-    | xargs -r kubectl -n "$ns" delete --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  for row in "${collector_release_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns collector_release_name <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    collector_release_name="$(trim_whitespace "$collector_release_name")"
+    [[ -z "$ns" || -z "$collector_release_name" ]] && continue
+    kubectl -n "$ns" delete daemonset,serviceaccount -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete clusterrole,clusterrolebinding -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" --ignore-not-found >/dev/null 2>&1 || true
+  done
+
+  for row in "${single_release_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns release_name <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    release_name="$(trim_whitespace "$release_name")"
+    [[ -z "$ns" || -z "$release_name" ]] && continue
+    service_name="$(victoria_logs_service_name "$release_name")"
+    kubectl -n "$ns" delete statefulset,service,configmap,secret -l "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    collect_pvc_rows_by_prefix "server-volume-${service_name}-" pvc_rows
+  done
+
+  delete_pvc_rows_and_backing_volumes pvc_rows "uninstall" || true
 
   kubectl -n "$state_ns" delete configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
-  if [[ "$state_ns" != "$ns" ]]; then
-    kubectl -n "$ns" delete configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
-  fi
+  kubectl delete configmap -A -l 'app.kubernetes.io/name=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton' --ignore-not-found >/dev/null 2>&1 || true
   cleanup_victoria_logs_port_forwards
 }
 
@@ -8117,62 +8660,276 @@ cleanup_victoria_metrics_resources() {
   kubectl delete vmservicescrape,service -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
 
   echo "[uninstall] Deleting kubeton-managed VictoriaMetrics stack resources ..."
+  kubectl delete vmuser,vmauth,vmagent,vmsingle -A -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl delete secret,configmap,service -A -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl -n "$ns" delete vmuser,vmauth,vmagent,vmsingle "$stack_name" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "$ns" delete secret "vmuser-${stack_name}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "$operator_ns" delete configmap "$VICTORIA_METRICS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete configmap -A -l 'app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton' --ignore-not-found >/dev/null 2>&1 || true
   cleanup_victoria_metrics_port_forwards
   cleanup_victoria_logs_resources
   cleanup_victoria_metrics_operator "$operator_ns"
 }
 
+run_uninstall_step() {
+  local failures_name="$1"
+  local description="$2"
+  shift 2
+  local -n failures_ref="$failures_name"
+
+  echo "[uninstall] ${description}"
+  if "$@"; then
+    return 0
+  fi
+
+  echo "Warning: uninstall step failed: ${description}; continuing with remaining cleanup." >&2
+  failures_ref+=("$description")
+  return 0
+}
+
+cleanup_operator_release() {
+  local rc=0
+  helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" >/dev/null 2>&1 || true
+  delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
+  return "$rc"
+}
+
+cleanup_vault_release() {
+  local rc=0
+  uninstall_vault || true
+  cleanup_vault_force || true
+  delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
+  return "$rc"
+}
+
+cleanup_encrypted_storage_class() {
+  kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+cleanup_longhorn_release() {
+  local rc=0
+  uninstall_longhorn || true
+  cleanup_longhorn_force || true
+  delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
+  return "$rc"
+}
+
+cleanup_observability_resources() {
+  cleanup_prometheus_resources || true
+  cleanup_grafana_resources || true
+  cleanup_victoria_metrics_resources || true
+  cleanup_main_wallet_resources || true
+  cleanup_kubeton_managed_labeled_resources || true
+}
+
+collect_labeled_resource_leftovers() {
+  local selector="$1"
+  local rows_name="$2"
+  local -n rows_ref="$rows_name"
+  local resource ns name
+
+  selector="$(trim_whitespace "$selector")"
+  [[ -n "$selector" ]] || return 0
+
+  while IFS= read -r resource; do
+    resource="$(trim_whitespace "$resource")"
+    [[ -z "$resource" ]] && continue
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      ns="${line%%[[:space:]]*}"
+      name="${line#*[[:space:]]}"
+      ns="$(trim_whitespace "$ns")"
+      name="$(trim_whitespace "$name")"
+      [[ -z "$name" || "$name" == "<none>" ]] && continue
+      append_unique_item "${resource} ${ns}/${name}" rows_ref
+    done < <(
+      kubectl get "$resource" -A -l "$selector" --no-headers \
+        -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null || true
+    )
+  done < <(kubectl api-resources --verbs=list --namespaced=true -o name 2>/dev/null || true)
+
+  while IFS= read -r resource; do
+    resource="$(trim_whitespace "$resource")"
+    [[ -z "$resource" ]] && continue
+    while IFS= read -r name; do
+      name="$(trim_whitespace "$name")"
+      [[ -z "$name" || "$name" == "<none>" ]] && continue
+      append_unique_item "${resource} ${name}" rows_ref
+    done < <(
+      kubectl get "$resource" -l "$selector" --no-headers \
+        -o custom-columns='NAME:.metadata.name' 2>/dev/null || true
+    )
+  done < <(kubectl api-resources --verbs=list --namespaced=false -o name 2>/dev/null || true)
+}
+
+collect_uninstall_leftovers() {
+  local rows_name="$1"
+  local -n rows_ref="$rows_name"
+  local ns name row release collector service_name pvc
+  local -a candidate_pvcs=()
+  local -a existing_pvcs=()
+  local -a single_release_rows=()
+  local -a collector_release_rows=()
+  local -a vlogs_pvc_rows=()
+
+  while IFS=$'\t' read -r ns name; do
+    ns="$(trim_whitespace "$ns")"
+    name="$(trim_whitespace "$name")"
+    [[ -n "$ns" && -n "$name" ]] && append_unique_item "TonNode ${ns}/${name}" rows_ref
+  done < <(
+    kubectl get tonnodes.ton.ton.org -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  while IFS=$'\t' read -r ns name; do
+    ns="$(trim_whitespace "$ns")"
+    name="$(trim_whitespace "$name")"
+    [[ -n "$ns" && -n "$name" ]] && append_unique_item "StatefulSet ${ns}/${name}" rows_ref
+  done < <(list_ton_statefulsets 2>/dev/null || true)
+
+  collect_expected_ton_pvc_rows_from_values candidate_pvcs
+  collect_labeled_ton_pvc_rows candidate_pvcs
+  collect_existing_pvc_rows candidate_pvcs existing_pvcs
+  for row in "${existing_pvcs[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pvc <<<"$row"
+    [[ -n "$ns" && -n "$pvc" ]] && append_unique_item "PVC ${ns}/${pvc}" rows_ref
+  done
+
+  for ns in "$OP_NAMESPACE" "$VAULT_NAMESPACE" "$LONGHORN_NAMESPACE"; do
+    ns="$(trim_whitespace "$ns")"
+    [[ -z "$ns" ]] && continue
+    if kubectl get namespace "$ns" >/dev/null 2>&1; then
+      append_unique_item "Namespace ${ns}" rows_ref
+    fi
+  done
+
+  if kubectl get storageclass "$ENCRYPTED_SC_NAME" >/dev/null 2>&1; then
+    append_unique_item "StorageClass ${ENCRYPTED_SC_NAME}" rows_ref
+  fi
+
+  if command -v helm >/dev/null 2>&1; then
+    helm status "$RELEASE_NAME" -n "$OP_NAMESPACE" >/dev/null 2>&1 && append_unique_item "HelmRelease ${OP_NAMESPACE}/${RELEASE_NAME}" rows_ref
+    helm status "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" >/dev/null 2>&1 && append_unique_item "HelmRelease ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}" rows_ref
+    helm status "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && append_unique_item "HelmRelease ${LONGHORN_NAMESPACE}/${LONGHORN_RELEASE_NAME}" rows_ref
+  fi
+
+  collect_victoria_logs_release_rows single_release_rows collector_release_rows
+  for row in "${single_release_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns release <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    release="$(trim_whitespace "$release")"
+    [[ -z "$ns" || -z "$release" ]] && continue
+    if command -v helm >/dev/null 2>&1 && helm status "$release" -n "$ns" >/dev/null 2>&1; then
+      append_unique_item "HelmRelease ${ns}/${release}" rows_ref
+    fi
+    service_name="$(victoria_logs_service_name "$release")"
+    collect_pvc_rows_by_prefix "server-volume-${service_name}-" vlogs_pvc_rows
+  done
+  for row in "${collector_release_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns collector <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    collector="$(trim_whitespace "$collector")"
+    [[ -z "$ns" || -z "$collector" ]] && continue
+    if command -v helm >/dev/null 2>&1 && helm status "$collector" -n "$ns" >/dev/null 2>&1; then
+      append_unique_item "HelmRelease ${ns}/${collector}" rows_ref
+    fi
+  done
+  for row in "${vlogs_pvc_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pvc <<<"$row"
+    [[ -n "$ns" && -n "$pvc" ]] && append_unique_item "PVC ${ns}/${pvc}" rows_ref
+  done
+
+  while IFS= read -r name; do
+    name="$(trim_whitespace "$name")"
+    [[ -n "$name" ]] && append_unique_item "CRD ${name#customresourcedefinition.apiextensions.k8s.io/}" rows_ref
+  done < <(kubectl get crd -o name 2>/dev/null | grep 'operator.victoriametrics.com' || true)
+
+  collect_labeled_resource_leftovers 'app.kubernetes.io/managed-by=kubeton' "$rows_name"
+}
+
+verify_uninstall_leftovers() {
+  local -a leftovers=()
+  local item
+
+  collect_uninstall_leftovers leftovers
+  if [[ ${#leftovers[@]} -eq 0 ]]; then
+    echo "[uninstall] No kubeton-managed leftovers found."
+    return 0
+  fi
+
+  echo "Warning: kubeton uninstall removed as much as possible, but these resources still remain:" >&2
+  for item in "${leftovers[@]}"; do
+    [[ -z "$item" ]] && continue
+    echo "  - ${item}" >&2
+  done
+  echo "Run './kubeton uninstall' again after Kubernetes finishes terminating resources. If the same items remain repeatedly, inspect their finalizers/events." >&2
+  return 1
+}
+
 run_uninstall_core() {
   local -a uninstall_sts_rows=()
+  local -a uninstall_failures=()
+  local item
 
   mapfile -t uninstall_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
 
-  echo "[uninstall] Step 1/9: stopping TON resources and waiting for pods to terminate ..."
-  stop_ton_for_destructive_cleanup uninstall_sts_rows
+  run_uninstall_step uninstall_failures "Step 1/10: stopping TON resources and waiting for pods to terminate ..." \
+    stop_ton_for_destructive_cleanup uninstall_sts_rows
 
-  echo "[uninstall] Step 2/9: deleting TON PVCs ..."
-  delete_ton_pvcs_for_statefulsets uninstall_sts_rows
+  run_uninstall_step uninstall_failures "Step 2/10: deleting TON PVCs and backing storage ..." \
+    delete_ton_pvcs_for_statefulsets uninstall_sts_rows
 
-  echo "[uninstall] Step 3/9: cleaning leftover kubectl debug pods ..."
-  cleanup_kubectl_debug_pods || true
+  run_uninstall_step uninstall_failures "Step 3/10: cleaning leftover kubectl debug pods ..." \
+    cleanup_kubectl_debug_pods
 
-  echo "[uninstall] Step 4/9: deleting kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources and port-forwards ..."
-  cleanup_prometheus_resources
-  cleanup_grafana_resources
-  cleanup_victoria_metrics_resources
+  run_uninstall_step uninstall_failures "Step 4/10: deleting kubeton-managed observability, VictoriaLogs, and wallet helper resources ..." \
+    cleanup_observability_resources
 
-  echo "[uninstall] Step 5/9: uninstalling operator Helm release ${RELEASE_NAME} ..."
-  helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" || true
-  delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
+  run_uninstall_step uninstall_failures "Step 5/10: uninstalling operator Helm release ${RELEASE_NAME} ..." \
+    cleanup_operator_release
 
-  echo "[uninstall] Step 6/9: uninstalling Vault release ${VAULT_RELEASE_NAME} ..."
-  uninstall_vault || true
-  cleanup_vault_force || true
-  delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
+  run_uninstall_step uninstall_failures "Step 6/10: uninstalling Vault release ${VAULT_RELEASE_NAME} ..." \
+    cleanup_vault_release
 
-  echo "[uninstall] Step 7/9: deleting StorageClass ${ENCRYPTED_SC_NAME} ..."
-  kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  run_uninstall_step uninstall_failures "Step 7/10: deleting StorageClass ${ENCRYPTED_SC_NAME} ..." \
+    cleanup_encrypted_storage_class
 
-  echo "[uninstall] Step 8/9: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..."
-  uninstall_longhorn || true
-  cleanup_longhorn_force || true
-  delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT"
+  run_uninstall_step uninstall_failures "Step 8/10: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..." \
+    cleanup_longhorn_release
 
-  echo "[uninstall] Verifying no stale TON PVCs remain ..."
-  delete_stale_ton_pvcs_without_fleet "uninstall" true
+  run_uninstall_step uninstall_failures "Step 9/10: verifying no stale TON PVCs remain ..." \
+    delete_stale_ton_pvcs_without_fleet "uninstall" true
+
+  run_uninstall_step uninstall_failures "Step 10/10: final kubeton-managed resource sweep ..." \
+    cleanup_kubeton_managed_labeled_resources
 
   cleanup_kubectl_debug_pods "uninstall" || true
 
-  echo "[uninstall] Step 9/9: uninstall core complete."
+  if ! verify_uninstall_leftovers; then
+    if [[ ${#uninstall_failures[@]} -gt 0 ]]; then
+      echo "Uninstall steps that reported errors before the leftover check:" >&2
+      for item in "${uninstall_failures[@]}"; do
+        [[ -z "$item" ]] && continue
+        echo "  - ${item}" >&2
+      done
+    fi
+    return 1
+  fi
+
+  if [[ ${#uninstall_failures[@]} -gt 0 ]]; then
+    echo "Warning: some uninstall steps reported errors, but no kubeton-managed leftovers were found." >&2
+  fi
+
+  echo "[uninstall] Uninstall complete."
 }
 
 run_uninstall() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, clean leftover kubectl-debug pods, delete kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources/port-forwards, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. If Helm Longhorn uninstall hook fails, kubeton will run force-cleanup. Continue?"
+  confirm_or_exit "WARNING: This will stop/delete TON pods and PVCs, purge known backing storage, remove kubeton-managed observability/VictoriaLogs/wallet/debug resources, uninstall operator, uninstall Longhorn release ${LONGHORN_RELEASE_NAME}, uninstall Vault release ${VAULT_RELEASE_NAME}, and delete StorageClass ${ENCRYPTED_SC_NAME}. TonNode CRD is kept. kubeton will continue cleanup after step errors and report any leftovers to rerun uninstall for. Continue?"
   run_uninstall_core
 }
 
@@ -8180,9 +8937,26 @@ run_purge() {
   require_bin helm
   require_bin kubectl
   confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
-  run_uninstall_core
+  local uninstall_rc=0
+  local purge_rc=0
+  run_uninstall_core || uninstall_rc=$?
   echo "[purge] Deleting CRD tonnodes.ton.ton.org ..."
-  kubectl delete crd tonnodes.ton.ton.org --ignore-not-found
+  kubectl delete crd tonnodes.ton.ton.org --ignore-not-found || true
+
+  if kubectl get crd tonnodes.ton.ton.org >/dev/null 2>&1; then
+    echo "Warning: TonNode CRD tonnodes.ton.ton.org still exists after purge attempted to delete it." >&2
+    purge_rc=1
+  fi
+
+  if (( uninstall_rc != 0 )); then
+    echo "[purge] Rechecking leftovers after TonNode CRD deletion ..."
+    verify_uninstall_leftovers || purge_rc=1
+  fi
+
+  if (( purge_rc != 0 )); then
+    echo "Warning: purge removed as much as possible, but leftovers remain. Run './kubeton uninstall' again after Kubernetes finishes terminating resources." >&2
+    return "$purge_rc"
+  fi
   echo "[purge] Completed."
 }
 

@@ -98,8 +98,9 @@ Restore prerequisites:
 - encrypted bundles can be decrypted only if the same root-of-trust is still available:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
-- `kubeton drop` removes TON resources/PVCs and backing Longhorn volume artifacts (PVs/attachments) only.
-- `kubeton uninstall` removes TON resources/PVCs, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, operator release, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- `kubeton drop` removes TON resources/PVCs, backing Longhorn volume artifacts (PVs/attachments), and kubeton TON directories left under the local-path provisioner root.
+- `kubeton uninstall` is a full best-effort cleanup: it removes TON resources/PVCs, kubeton local-path volume directories, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, main-wallet/debug helper resources, operator release/namespace, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and asks you to rerun `./kubeton uninstall`.
 - `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
@@ -192,7 +193,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.75/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.76/install.sh" | bash
 ```
 
 The script:
@@ -280,7 +281,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 # drops TON nodes and storage (PVCs/PVs/Longhorn resources)
 ./kubeton drop
 
-# delete operator release + Longhorn + Vault + kubeton-managed observability stacks (keeps TonNode CRD)
+# full best-effort cleanup of kubeton-managed resources (keeps TonNode CRD)
 ./kubeton uninstall
 
 # OR full destructive cleanup including TonNode CRD
@@ -351,6 +352,11 @@ KUBETON_PAUSE_ANNOTATION_KEY
 KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL
 KUBETON_DEBUG_POD_PREFIX
+KUBETON_LOCAL_PATH_CLEANUP
+LOCAL_PATH_PROVISIONER_ROOT
+KUBETON_LOCAL_PATH_CLEANUP_IMAGE
+KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE
+KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS
 KUBETON_SEQUENTIAL_TON_START
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS
@@ -582,7 +588,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.75/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.76/install.sh" | bash
 cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade
@@ -720,7 +726,7 @@ For `kubeton`-based full destructive cleanup (including CRD), use:
 ./kubeton purge
 ```
 
-`kubeton purge` includes uninstall of operator, Longhorn, Vault, and kubeton-managed observability resources, then deletes TonNode CRD.
+`kubeton purge` includes full uninstall of kubeton-managed resources, then deletes TonNode CRD.
 
 ### Flow C: Cluster User (raw install.yaml fallback)
 
@@ -776,6 +782,9 @@ If you use `local-path` StorageClass:
 - Data is written to the local disk on the node where that pod volume is provisioned.
 - Storage is distributed across nodes/pods, not centralized.
 - If a node is lost, data tied to that node-local volume is also lost (unless you use replicated storage such as Longhorn).
+- `kubeton drop` purges kubeton TON volume directories under `/opt/local-path-provisioner` by default.
+- `kubeton uninstall` also purges known kubeton-managed local-path volume directories, including TON, Vault, VictoriaLogs, and main-wallet PVC backing directories when those PVCs use local-path storage.
+- override `LOCAL_PATH_PROVISIONER_ROOT` if your provisioner uses another root, or set `KUBETON_LOCAL_PATH_CLEANUP=false` to disable this host cleanup.
 
 ## Local Development and Testing (k3d)
 
@@ -852,7 +861,7 @@ cd charts/ton-k8s-operator
 ./kubeton drop
 
 # safe cleanup (keeps TonNode CRD)
-# removes operator + Longhorn + Vault + kubeton-managed observability resources
+# full best-effort cleanup of kubeton-managed resources
 ./kubeton uninstall
 
 # OR full destructive cleanup (includes TonNode CRD)
