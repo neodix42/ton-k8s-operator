@@ -233,6 +233,9 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet send testnet main-wallet 10.
 ./kubeton wallet show
 ./kubeton wallet show main-wallet
+./kubeton wallet show testnet balance
+./kubeton wallet show testnet balance tonnode-0
+./kubeton wallet show testnet balance tonnode-0 validator_wallet_001
 ./kubeton verify
 ./kubeton status
 ./kubeton exec "sync"
@@ -247,6 +250,8 @@ transaction is visible on-chain, then rerun
 global config and TONCenter endpoint. By default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
+`kubeton wallet show <mainnet|testnet> balance ...` reads balances from
+`mytonctrl wl` inside TON pods.
 
 # install TON k8s operator only
 ./kubeton install

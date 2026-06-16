@@ -5414,6 +5414,81 @@ resolve_tonnode_wallet_address_from_pod() {
   printf '%s' "$address"
 }
 
+resolve_tonnode_wallet_row_from_pod() {
+  local ns="$1"
+  local pod="$2"
+  local wallet_name="$3"
+  local output row
+
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+    shopt -s expand_aliases
+    if [[ -f ~/.bashrc ]]; then
+      source ~/.bashrc >/dev/null 2>&1
+    fi
+    if command -v mytonctrl >/dev/null 2>&1; then
+      echo wl | mytonctrl
+    fi
+  ' 2>/dev/null || true)"
+  output="$(strip_ansi_sequences "$output")"
+  row="$(printf '%s\n' "$output" | awk -v wallet_name="$wallet_name" '
+    $1 == wallet_name && NF >= 6 {
+      print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $NF
+      exit
+    }
+  ')"
+  row="$(trim_whitespace "$row")"
+  if [[ -z "$row" ]]; then
+    return 1
+  fi
+  printf '%s' "$row"
+}
+
+run_wallet_balance_show() {
+  local wallet_network="$1"
+  local target_pod_name="${2:-}"
+  local target_wallet_name="${3:-validator_wallet_001}"
+  local row target_ns target_pod target_node_name wallet_row
+  local wallet_name status balance version workchain address
+  local -a pod_rows=()
+  local -a table_rows=()
+
+  [[ -n "$wallet_network" ]] || return 1
+  target_wallet_name="$(trim_whitespace "$target_wallet_name")"
+  [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
+
+  if [[ -n "$target_pod_name" ]]; then
+    row="$(resolve_tonnode_pod_row_by_name "$target_pod_name" || true)"
+    row="$(trim_whitespace "$row")"
+    if [[ -z "$row" ]]; then
+      echo "Error: TON pod '${target_pod_name}' not found." >&2
+      return 1
+    fi
+    pod_rows+=("$row")
+  else
+    mapfile -t pod_rows < <(list_ton_pods 2>/dev/null || true)
+  fi
+
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
+    [[ -z "$target_ns" || -z "$target_pod" ]] && continue
+    wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
+    wallet_row="$(trim_whitespace "$wallet_row")"
+    if [[ -z "$wallet_row" ]]; then
+      echo "Warning: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
+      continue
+    fi
+    IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
+    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${version}"$'\t'"${workchain}"$'\t'"${address}")
+  done
+
+  if [[ ${#table_rows[@]} -eq 0 ]]; then
+    echo "Error: no TON wallet balances resolved for wallet name '${target_wallet_name}'." >&2
+    return 1
+  fi
+  print_aligned_table_8col "namespace" "tonnode pod" "wallet-name" "status" "balance" "ver" "wch" "wallet-address" "${table_rows[@]}"
+}
+
 resolve_tonnode_pod_row_by_name() {
   local target_name="$1"
   local row ns pod node_name
@@ -7146,6 +7221,50 @@ print_aligned_table_7col() {
     IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 <<<"$row"
     printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
       "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5" "$w6" "$c6" "$w7" "$c7"
+  done
+}
+
+print_aligned_table_8col() {
+  local h1="$1"
+  local h2="$2"
+  local h3="$3"
+  local h4="$4"
+  local h5="$5"
+  local h6="$6"
+  local h7="$7"
+  local h8="$8"
+  shift 8
+  local -a rows=("$@")
+  local w1=${#h1}
+  local w2=${#h2}
+  local w3=${#h3}
+  local w4=${#h4}
+  local w5=${#h5}
+  local w6=${#h6}
+  local w7=${#h7}
+  local w8=${#h8}
+  local row c1 c2 c3 c4 c5 c6 c7 c8
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 <<<"$row"
+    (( ${#c1} > w1 )) && w1=${#c1}
+    (( ${#c2} > w2 )) && w2=${#c2}
+    (( ${#c3} > w3 )) && w3=${#c3}
+    (( ${#c4} > w4 )) && w4=${#c4}
+    (( ${#c5} > w5 )) && w5=${#c5}
+    (( ${#c6} > w6 )) && w6=${#c6}
+    (( ${#c7} > w7 )) && w7=${#c7}
+    (( ${#c8} > w8 )) && w8=${#c8}
+  done
+
+  printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+    "$w1" "$h1" "$w2" "$h2" "$w3" "$h3" "$w4" "$h4" "$w5" "$h5" "$w6" "$h6" "$w7" "$h7" "$w8" "$h8"
+  printf "|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n" \
+    "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")" "$(dash_line "$w4")" "$(dash_line "$w5")" "$(dash_line "$w6")" "$(dash_line "$w7")" "$(dash_line "$w8")"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 <<<"$row"
+    printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+      "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5" "$w6" "$c6" "$w7" "$c7" "$w8" "$c8"
   done
 }
 
@@ -10039,6 +10158,10 @@ run_wallet() {
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
     echo
+    echo "  show <mainnet|testnet> balance [to-tonnode-name] [wallet-name]"
+    echo "    Show mytonctrl wallet balance inside one TON pod, or all TON pods if omitted."
+    echo "    If [wallet-name] is omitted, validator_wallet_001 is used."
+    echo
     echo "  send <mainnet|testnet> <from-wallet-name> <amount> [-n]"
     echo "    Split mode: divides <amount> equally across all TON pods"
     echo "    using MAIN_WALLET_TARGET_WALLET_NAME (default: validator_wallet_001)."
@@ -10063,6 +10186,9 @@ run_wallet() {
     echo "  kubeton wallet deploy testnet my-wallet"
     echo "  kubeton wallet show"
     echo "  kubeton wallet show my-wallet"
+    echo "  kubeton wallet show testnet balance"
+    echo "  kubeton wallet show testnet balance tonnode-0"
+    echo "  kubeton wallet show testnet balance tonnode-0 validator_wallet_001"
     echo "  kubeton wallet send testnet main-wallet 10."
     echo "  kubeton wallet send testnet main-wallet tonnode-0 10."
     echo "  kubeton wallet send testnet main-wallet tonnode-0 10. -n"
@@ -10134,6 +10260,20 @@ run_wallet() {
       fi
       ;;
     show)
+      if (( $# >= 1 )) && wallet_network="$(normalize_wallet_network "$1")"; then
+        shift || true
+        if [[ "$(trim_whitespace "${1:-}")" != "balance" ]]; then
+          echo "Error: usage: kubeton wallet show <mainnet|testnet> balance [to-tonnode-name] [wallet-name]" >&2
+          return 1
+        fi
+        shift || true
+        if (( $# > 2 )); then
+          echo "Error: usage: kubeton wallet show <mainnet|testnet> balance [to-tonnode-name] [wallet-name]" >&2
+          return 1
+        fi
+        run_wallet_balance_show "$wallet_network" "${1:-}" "${2:-validator_wallet_001}"
+        return $?
+      fi
       if (( $# <= 1 )); then
         action_args=("$@")
       else

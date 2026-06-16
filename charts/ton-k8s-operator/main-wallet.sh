@@ -891,14 +891,19 @@ wallet_seqno_decimal() {
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null || true)"
     seq_token="$(printf '%s\n' "$output" | awk '
-      function parse_token(line, m) {
+      function parse_token(line, work, parts, count) {
         if (match(line, /0x[0-9A-Fa-f]+/)) {
           print substr(line, RSTART, RLENGTH)
           return 1
         }
         # Decimal token bounded by non-word chars to avoid grabbing address/hash fragments.
-        if (match(line, /(^|[^A-Za-z0-9])([0-9]+)([^A-Za-z0-9]|$)/, m)) {
-          print m[2]
+        work=line
+        gsub(/[^0-9]+/, " ", work)
+        sub(/^[[:space:]]+/, "", work)
+        sub(/[[:space:]]+$/, "", work)
+        count=split(work, parts, /[[:space:]]+/)
+        if (count > 0 && parts[1] ~ /^[0-9]+$/) {
+          print parts[1]
           return 1
         }
         return 0
