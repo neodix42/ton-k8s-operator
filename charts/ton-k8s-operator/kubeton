@@ -49,6 +49,7 @@ LOCAL_PATH_PROVISIONER_ROOT="${LOCAL_PATH_PROVISIONER_ROOT:-/opt/local-path-prov
 KUBETON_LOCAL_PATH_CLEANUP_IMAGE="${KUBETON_LOCAL_PATH_CLEANUP_IMAGE:-busybox:1.36}"
 KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE="${KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE:-}"
 KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS="${KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS:-180}"
+KUBETON_LOCAL_PATH_PATTERN_CLEANUP="${KUBETON_LOCAL_PATH_PATTERN_CLEANUP:-false}"
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS:-900}"
@@ -4947,6 +4948,7 @@ collect_local_path_pattern_cleanup_rows_for_pvcs() {
   local -a nodes=()
 
   is_true "$KUBETON_LOCAL_PATH_CLEANUP" || return 0
+  is_true "$KUBETON_LOCAL_PATH_PATTERN_CLEANUP" || return 0
   mapfile -t nodes < <(list_node_names)
   [[ ${#nodes[@]} -gt 0 ]] || return 0
 
@@ -5270,8 +5272,28 @@ collect_labeled_ton_pvc_rows() {
     [[ -z "$ns" || -z "$pvc" ]] && continue
     append_unique_item "$ns"$'\t'"$pvc" rows_ref
   done < <(
-    kubectl get pvc -A -l "$TON_POD_LABEL" -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+    kubectl get pvc -A -l 'app.kubernetes.io/name=ton-node,app.kubernetes.io/managed-by=ton-k8s-operator' -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
   )
+}
+
+pvc_has_kubeton_attribution() {
+  local ns="$1"
+  local pvc="$2"
+  local managed_by app_name
+
+  if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  managed_by="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+  app_name="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)"
+  managed_by="$(trim_whitespace "$managed_by")"
+  app_name="$(trim_whitespace "$app_name")"
+
+  [[ "$managed_by" == "kubeton" ]] && return 0
+  [[ "$managed_by" == "ton-k8s-operator" && "$app_name" == "ton-node" ]] && return 0
+
+  return 1
 }
 
 collect_existing_pvc_rows() {
@@ -5285,6 +5307,27 @@ collect_existing_pvc_rows() {
     [[ -z "$ns" || -z "$pvc" ]] && continue
     if kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
       append_unique_item "$ns"$'\t'"$pvc" existing_rows_ref
+    fi
+  done
+}
+
+collect_existing_kubeton_pvc_rows() {
+  local -n candidate_rows_ref="$1"
+  local -n existing_rows_ref="$2"
+  local label="${3:-cleanup}"
+  local row ns pvc
+
+  for row in "${candidate_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pvc <<<"$row"
+    [[ -z "$ns" || -z "$pvc" ]] && continue
+    if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+      continue
+    fi
+    if pvc_has_kubeton_attribution "$ns" "$pvc"; then
+      append_unique_item "$ns"$'\t'"$pvc" existing_rows_ref
+    else
+      echo "[${label}] Skipping PVC ${ns}/${pvc}: missing kubeton/ton-k8s-operator ownership labels." >&2
     fi
   done
 }
@@ -5362,6 +5405,7 @@ resolve_tonnode_pod_row_by_name() {
 delete_ton_pvcs_for_statefulsets() {
   local -n sts_rows_ref="$1"
   local row ns sts
+  local -a candidate_rows=()
   local -a pvc_rows=()
   local pvc_name
 
@@ -5376,15 +5420,16 @@ delete_ton_pvcs_for_statefulsets() {
 
     while IFS= read -r pvc_name; do
       [[ -z "$pvc_name" ]] && continue
-      append_unique_item "$ns"$'\t'"$pvc_name" pvc_rows
+      append_unique_item "$ns"$'\t'"$pvc_name" candidate_rows
     done < <(
       kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
         | grep -E "^(ton-work|mytoncore|keybundle)-${sts}-" || true
     )
   done
 
-  collect_expected_ton_pvc_rows_from_values pvc_rows
-  collect_labeled_ton_pvc_rows pvc_rows
+  collect_expected_ton_pvc_rows_from_values candidate_rows
+  collect_labeled_ton_pvc_rows candidate_rows
+  collect_existing_kubeton_pvc_rows candidate_rows pvc_rows "cleanup"
 
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
@@ -5418,7 +5463,7 @@ delete_stale_ton_pvcs_without_fleet() {
 
   collect_expected_ton_pvc_rows_from_values candidate_rows
   collect_labeled_ton_pvc_rows candidate_rows
-  collect_existing_pvc_rows candidate_rows existing_rows
+  collect_existing_kubeton_pvc_rows candidate_rows existing_rows "$label"
 
   if [[ ${#existing_rows[@]} -eq 0 ]]; then
     return 0
@@ -5441,7 +5486,7 @@ delete_stale_ton_pvcs_without_fleet() {
   existing_rows=()
   collect_expected_ton_pvc_rows_from_values candidate_rows
   collect_labeled_ton_pvc_rows candidate_rows
-  collect_existing_pvc_rows candidate_rows existing_rows
+  collect_existing_kubeton_pvc_rows candidate_rows existing_rows "$label"
 
   if [[ ${#existing_rows[@]} -eq 0 ]]; then
     return 0
@@ -8402,9 +8447,11 @@ cleanup_grafana_resources() {
 collect_pvc_rows_by_prefix() {
   local prefix="$1"
   local -n rows_ref="$2"
+  local selector="${3:-}"
   local ns pvc
 
   prefix="$(trim_whitespace "$prefix")"
+  selector="$(trim_whitespace "$selector")"
   [[ -n "$prefix" ]] || return 0
 
   while IFS=$'\t' read -r ns pvc; do
@@ -8414,7 +8461,11 @@ collect_pvc_rows_by_prefix() {
     [[ "$pvc" == "$prefix"* ]] || continue
     append_unique_item "$ns"$'\t'"$pvc" rows_ref
   done < <(
-    kubectl get pvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+    if [[ -n "$selector" ]]; then
+      kubectl get pvc -A -l "$selector" -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+    else
+      kubectl get pvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+    fi
   )
 }
 
@@ -8480,16 +8531,28 @@ collect_victoria_logs_release_rows() {
 
 cleanup_main_wallet_resources() {
   local ns
+  local pvc_is_kubeton=0
   local -a pvc_rows=()
 
   ns="$(trim_whitespace "$TON_NAMESPACE")"
   [[ -z "$ns" ]] && ns="default"
 
+  if kubectl -n "$ns" get pvc "$MAIN_WALLET_BUNDLE_PVC" >/dev/null 2>&1; then
+    if pvc_has_kubeton_attribution "$ns" "$MAIN_WALLET_BUNDLE_PVC" \
+      || kubectl -n "$ns" get pod -l 'app.kubernetes.io/name=kubeton-main-wallet,app.kubernetes.io/managed-by=kubeton' \
+        -o jsonpath='{range .items[*].spec.volumes[*]}{.persistentVolumeClaim.claimName}{"\n"}{end}' 2>/dev/null \
+        | grep -Fxq "$MAIN_WALLET_BUNDLE_PVC"; then
+      pvc_is_kubeton=1
+    else
+      echo "[uninstall] Skipping PVC ${ns}/${MAIN_WALLET_BUNDLE_PVC}: missing kubeton ownership labels or active kubeton wallet pod reference." >&2
+    fi
+  fi
+
   echo "[uninstall] Deleting kubeton main-wallet helper resources ..."
-  kubectl -n "$ns" delete pod -l 'app.kubernetes.io/name=kubeton-main-wallet' --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete pod -l 'app.kubernetes.io/name=kubeton-main-wallet,app.kubernetes.io/managed-by=kubeton' --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl -n "$ns" delete configmap "$MAIN_WALLET_SCRIPT_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
 
-  if kubectl -n "$ns" get pvc "$MAIN_WALLET_BUNDLE_PVC" >/dev/null 2>&1; then
+  if (( pvc_is_kubeton == 1 )); then
     pvc_rows+=("$ns"$'\t'"$MAIN_WALLET_BUNDLE_PVC")
   fi
   delete_pvc_rows_and_backing_volumes pvc_rows "uninstall" || true
@@ -8622,7 +8685,7 @@ cleanup_victoria_logs_resources() {
     [[ -z "$ns" || -z "$release_name" ]] && continue
     service_name="$(victoria_logs_service_name "$release_name")"
     kubectl -n "$ns" delete statefulset,service,configmap,secret -l "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    collect_pvc_rows_by_prefix "server-volume-${service_name}-" pvc_rows
+    collect_pvc_rows_by_prefix "server-volume-${service_name}-" pvc_rows "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}"
   done
 
   delete_pvc_rows_and_backing_volumes pvc_rows "uninstall" || true
@@ -8788,7 +8851,7 @@ collect_uninstall_leftovers() {
 
   collect_expected_ton_pvc_rows_from_values candidate_pvcs
   collect_labeled_ton_pvc_rows candidate_pvcs
-  collect_existing_pvc_rows candidate_pvcs existing_pvcs
+  collect_existing_kubeton_pvc_rows candidate_pvcs existing_pvcs "uninstall"
   for row in "${existing_pvcs[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pvc <<<"$row"
@@ -8824,7 +8887,7 @@ collect_uninstall_leftovers() {
       append_unique_item "HelmRelease ${ns}/${release}" rows_ref
     fi
     service_name="$(victoria_logs_service_name "$release")"
-    collect_pvc_rows_by_prefix "server-volume-${service_name}-" vlogs_pvc_rows
+    collect_pvc_rows_by_prefix "server-volume-${service_name}-" vlogs_pvc_rows "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release}"
   done
   for row in "${collector_release_rows[@]}"; do
     [[ -z "$row" ]] && continue
@@ -9629,6 +9692,9 @@ ensure_main_wallet_bundle_pvc() {
     echo "metadata:"
     echo "  name: ${pvc_name}"
     echo "  namespace: ${ns}"
+    echo "  labels:"
+    echo "    app.kubernetes.io/name: kubeton-main-wallet"
+    echo "    app.kubernetes.io/managed-by: kubeton"
     echo "spec:"
     echo "  accessModes:"
     for mode in "${access_modes[@]}"; do

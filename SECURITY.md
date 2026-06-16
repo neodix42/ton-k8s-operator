@@ -242,6 +242,7 @@ Root-of-trust continuity requirement:
 Operational note about `drop`/`uninstall`:
 - `kubeton drop` removes TON resources/PVCs, Longhorn backing artifacts, and kubeton TON directories left under the local-path provisioner root.
 - `kubeton uninstall` is a full best-effort cleanup of kubeton-managed resources: TON PVCs, local-path backing directories, observability/VictoriaLogs resources, main-wallet/debug helpers, operator, Longhorn, Vault, and `encrypted-sc` StorageClass. It keeps the cluster-scoped `TonNode` CRD; use `kubeton purge` to remove it.
+- local-path host cleanup uses exact PV paths captured from live PVC/PV objects by default; wildcard stale-directory cleanup by PVC name is opt-in with `KUBETON_LOCAL_PATH_PATTERN_CLEANUP=true`.
 - if Kubernetes is still terminating resources or a cleanup step errors, uninstall reports leftovers and asks you to rerun `./kubeton uninstall`.
 - If admins manually delete Vault data (or the whole cluster), Transit key history is lost and encrypted bundles cannot be decrypted.
 

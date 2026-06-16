@@ -357,6 +357,7 @@ LOCAL_PATH_PROVISIONER_ROOT
 KUBETON_LOCAL_PATH_CLEANUP_IMAGE
 KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE
 KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS
+KUBETON_LOCAL_PATH_PATTERN_CLEANUP
 KUBETON_SEQUENTIAL_TON_START
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS
@@ -784,7 +785,8 @@ If you use `local-path` StorageClass:
 - If a node is lost, data tied to that node-local volume is also lost (unless you use replicated storage such as Longhorn).
 - `kubeton drop` purges kubeton TON volume directories under `/opt/local-path-provisioner` by default.
 - `kubeton uninstall` also purges known kubeton-managed local-path volume directories, including TON, Vault, VictoriaLogs, and main-wallet PVC backing directories when those PVCs use local-path storage.
-- override `LOCAL_PATH_PROVISIONER_ROOT` if your provisioner uses another root, or set `KUBETON_LOCAL_PATH_CLEANUP=false` to disable this host cleanup.
+- local-path host cleanup uses exact PV paths captured from live PVC/PV objects by default; wildcard cleanup by PVC name is disabled because it cannot prove ownership of stale directories.
+- override `LOCAL_PATH_PROVISIONER_ROOT` if your provisioner uses another root, set `KUBETON_LOCAL_PATH_CLEANUP=false` to disable host cleanup, or set `KUBETON_LOCAL_PATH_PATTERN_CLEANUP=true` only in isolated kubeton-owned clusters where wildcard stale-directory cleanup is acceptable.
 
 ## Local Development and Testing (k3d)
 
