@@ -359,10 +359,6 @@ spec:
                 description: Network defines TON networking parameters passed via
                   environment variables.
                 properties:
-                  globalConfigURL:
-                    default: https://ton.org/global.config.json
-                    description: GlobalConfigURL is the TON global config URL.
-                    type: string
                   hostPortsEnabled:
                     default: true
                     description: |-

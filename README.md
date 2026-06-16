@@ -27,7 +27,8 @@ This operator creates and manages:
   4. no class (cluster policy decides)
 - Passes TON env vars expected by `ton-docker-ctrl`:
   - `PUBLIC_IP` (explicit `spec.network.publicIP`, otherwise auto node `ExternalIP` for single-replica; fallback `status.hostIP`)
-  - `GLOBAL_CONFIG_URL`
+  - `NETWORK` (defaults to `mainnet`; use `testnet` for testnet)
+  - `GLOBAL_CONFIG_URL` derived from `NETWORK` (`https://ton.org/global.config.json` for mainnet, `https://ton.org/testnet-global.config.json` for testnet)
   - `VALIDATOR_PORT`
   - `LITESERVER_PORT`
   - `VALIDATOR_CONSOLE_PORT`

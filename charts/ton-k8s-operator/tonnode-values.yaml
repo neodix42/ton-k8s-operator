@@ -2,7 +2,7 @@ tonNode:
   enabled: true
   namespace: default
   name: tonnode
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.05-1-amd64
+  image: ghcr.io/ton-blockchain/ton-docker-ctrl:testnet
   replicas: 3
   storage:
     tonWorkSize: 700Gi
@@ -19,7 +19,6 @@ tonNode:
       memory: 256Gi
   nodeSelector: {}
   network:
-    globalConfigURL: https://ton.org/global.config.json
     validatorPort: 30001
     quicPort: 31001
     liteServerPort: 30003
@@ -46,11 +45,13 @@ tonNode:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.05-1-amd64
+      image: ghcr.io/ton-blockchain/ton-docker-ctrl:testnet
       resources: {}
   env:
+    - name: NETWORK
+      value: testnet
     - name: TON_BRANCH
-      value: v2026.05-1
+      value: testnet
     - name: ARCHIVE_TTL
       value: "86400"
     - name: STATE_TTL
@@ -66,6 +67,6 @@ tonNode:
     - name: DUMP
       value: "true"
     - name: MYTONCTRL_VERSION
-      value: master
+      value: dump
     - name: CUSTOM_PARAMETERS
       value: "--exporter-address 0.0.0.0:9777"

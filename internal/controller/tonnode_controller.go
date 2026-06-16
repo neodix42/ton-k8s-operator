@@ -53,7 +53,9 @@ const (
 	defaultMemoryRequest               = "64Gi"
 	defaultCPULimit                    = "128000m"
 	defaultMemoryLimit                 = "256Gi"
+	defaultNetwork                     = "mainnet"
 	defaultGlobalConfigURL             = "https://ton.org/global.config.json"
+	testnetGlobalConfigURL             = "https://ton.org/testnet-global.config.json"
 	defaultValidatorPort         int32 = 30001
 	defaultLiteServerPort        int32 = 30003
 	defaultQuicPort              int32 = 31001
@@ -568,6 +570,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	stickyNodeHostnames []string,
 ) corev1.PodTemplateSpec {
 	env := mergeEnvVars(defaultTonEnv(tonNode, publicIP), tonNode.Spec.Env)
+	env = reconcileNetworkEnv(env)
 	containerPorts := []corev1.ContainerPort{
 		{
 			Name:          "validator-udp",
@@ -2242,13 +2245,53 @@ func stickyPlacementEnabled(tonNode *tonv1alpha1.TonNode) bool {
 func defaultTonEnv(tonNode *tonv1alpha1.TonNode, publicIP corev1.EnvVar) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		publicIP,
-		{Name: "GLOBAL_CONFIG_URL", Value: desiredGlobalConfigURL(tonNode)},
+		{Name: "NETWORK", Value: defaultNetwork},
+		{Name: "GLOBAL_CONFIG_URL", Value: globalConfigURLForNetwork(defaultNetwork)},
 		{Name: "VALIDATOR_PORT", Value: strconv.Itoa(int(desiredValidatorPort(tonNode)))},
 		{Name: "LITESERVER_PORT", Value: strconv.Itoa(int(desiredLiteServerPort(tonNode)))},
 		{Name: "VALIDATOR_CONSOLE_PORT", Value: strconv.Itoa(int(desiredConsolePort(tonNode)))},
 		// Default to true for local/dev clusters; override through spec.env for prod.
 		{Name: "IGNORE_MINIMAL_REQS", Value: "true"},
 	}
+}
+
+func reconcileNetworkEnv(envVars []corev1.EnvVar) []corev1.EnvVar {
+	network := networkFromEnv(envVars)
+	envVars = upsertEnvVar(envVars, "NETWORK", network)
+	envVars = upsertEnvVar(envVars, "GLOBAL_CONFIG_URL", globalConfigURLForNetwork(network))
+	return envVars
+}
+
+func networkFromEnv(envVars []corev1.EnvVar) string {
+	raw := strings.ToLower(envVarValueByName(envVars, "NETWORK"))
+	switch raw {
+	case "mainnet", "testnet":
+		return raw
+	case "":
+		return defaultNetwork
+	default:
+		return raw
+	}
+}
+
+func globalConfigURLForNetwork(network string) string {
+	switch strings.ToLower(strings.TrimSpace(network)) {
+	case "testnet":
+		return testnetGlobalConfigURL
+	default:
+		return defaultGlobalConfigURL
+	}
+}
+
+func upsertEnvVar(envVars []corev1.EnvVar, name string, value string) []corev1.EnvVar {
+	for i := range envVars {
+		if envVars[i].Name == name {
+			envVars[i].Value = value
+			envVars[i].ValueFrom = nil
+			return envVars
+		}
+	}
+	return append(envVars, corev1.EnvVar{Name: name, Value: value})
 }
 
 func mergeEnvVars(base []corev1.EnvVar, extra []corev1.EnvVar) []corev1.EnvVar {
@@ -2445,13 +2488,6 @@ func pausedReplicasAnnotation(tonNode *tonv1alpha1.TonNode) (int32, bool) {
 		return 0, false
 	}
 	return int32(parsed), true
-}
-
-func desiredGlobalConfigURL(tonNode *tonv1alpha1.TonNode) string {
-	if url := strings.TrimSpace(tonNode.Spec.Network.GlobalConfigURL); url != "" {
-		return url
-	}
-	return defaultGlobalConfigURL
 }
 
 func desiredValidatorPort(tonNode *tonv1alpha1.TonNode) int32 {

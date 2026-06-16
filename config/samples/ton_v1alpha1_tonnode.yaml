@@ -12,7 +12,6 @@ spec:
     tonWorkSize: 700Gi
     myTonCoreSize: 20Gi
   network:
-    globalConfigURL: https://ton.org/global.config.json
     validatorPort: 30001
     quicPort: 31001
     liteServerPort: 30003
@@ -23,6 +22,8 @@ spec:
   debug:
     holdOnFailure: false
   env:
+  - name: NETWORK
+    value: mainnet
   - name: MODE
     value: liteserver
   - name: DUMP

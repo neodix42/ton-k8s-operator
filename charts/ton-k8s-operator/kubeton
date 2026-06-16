@@ -725,32 +725,6 @@ resolve_tonnode_image() {
   return 1
 }
 
-resolve_tonnode_global_config_url_from_values_file() {
-  local values_file="$1"
-  local url=""
-
-  [[ -f "$values_file" ]] || return 1
-  url="$(awk '
-    /^[[:space:]]*tonNode:[[:space:]]*$/ {in_ton=1; in_network=0; next}
-    in_ton && /^[^[:space:]]/ {in_ton=0; in_network=0}
-    in_ton && /^  network:[[:space:]]*$/ {in_network=1; next}
-    in_ton && in_network && /^  [^[:space:]]/ {in_network=0}
-    in_ton && in_network && /^    globalConfigURL:[[:space:]]*/ {
-      sub(/^    globalConfigURL:[[:space:]]*/, "", $0)
-      sub(/[[:space:]]*#.*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"$/, "", $0)
-      gsub(/^'\''/, "", $0)
-      gsub(/'\''$/, "", $0)
-      print $0
-      exit
-    }
-  ' "$values_file" 2>/dev/null || true)"
-  url="$(trim_whitespace "$url")"
-  [[ -n "$url" ]] || return 1
-  printf '%s' "$url"
-}
-
 resolve_main_wallet_global_config_url() {
   local network="${1:-}"
   local url
@@ -767,20 +741,6 @@ resolve_main_wallet_global_config_url() {
   esac
 
   url="$(trim_whitespace "${MAIN_WALLET_GLOBAL_CONFIG_URL:-}")"
-  if [[ -n "$url" ]]; then
-    printf '%s' "$url"
-    return 0
-  fi
-
-  url="$(resolve_tonnode_global_config_url_from_values_file "$TON_VALUES_FILE" || true)"
-  url="$(trim_whitespace "$url")"
-  if [[ -n "$url" ]]; then
-    printf '%s' "$url"
-    return 0
-  fi
-
-  url="$(resolve_tonnode_global_config_url_from_values_file "$CHART_DIR/values.yaml" || true)"
-  url="$(trim_whitespace "$url")"
   if [[ -n "$url" ]]; then
     printf '%s' "$url"
     return 0

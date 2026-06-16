@@ -340,6 +340,44 @@ func TestDesiredPodTemplateHoldOnFailure(t *testing.T) {
 	})
 }
 
+func TestDesiredPodTemplateNetworkEnv(t *testing.T) {
+	reconciler := &TonNodeReconciler{}
+	labels := map[string]string{"app.kubernetes.io/instance": "tonnode"}
+	publicIP := corev1.EnvVar{Name: "PUBLIC_IP", Value: "95.217.73.161"}
+
+	t.Run("defaults to mainnet", func(t *testing.T) {
+		tpl := reconciler.desiredPodTemplate(&tonv1alpha1.TonNode{}, labels, publicIP, nil)
+		env := tpl.Spec.Containers[0].Env
+
+		if !hasEnv(env, "NETWORK", "mainnet") {
+			t.Fatalf("missing NETWORK=mainnet in env: %#v", env)
+		}
+		if !hasEnv(env, "GLOBAL_CONFIG_URL", "https://ton.org/global.config.json") {
+			t.Fatalf("missing mainnet GLOBAL_CONFIG_URL in env: %#v", env)
+		}
+	})
+
+	t.Run("derives testnet global config from network env", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			Spec: tonv1alpha1.TonNodeSpec{
+				Env: []corev1.EnvVar{
+					{Name: "NETWORK", Value: "testnet"},
+				},
+			},
+		}
+
+		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
+		env := tpl.Spec.Containers[0].Env
+
+		if !hasEnv(env, "NETWORK", "testnet") {
+			t.Fatalf("missing NETWORK=testnet in env: %#v", env)
+		}
+		if !hasEnv(env, "GLOBAL_CONFIG_URL", "https://ton.org/testnet-global.config.json") {
+			t.Fatalf("missing testnet GLOBAL_CONFIG_URL in env: %#v", env)
+		}
+	})
+}
+
 func TestDesiredPodTemplateStickyNodeAffinity(t *testing.T) {
 	reconciler := &TonNodeReconciler{}
 	labels := map[string]string{"app.kubernetes.io/instance": "tonnode"}

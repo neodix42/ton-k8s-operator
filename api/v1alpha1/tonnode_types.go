@@ -91,10 +91,6 @@ type TonNodeStorageSpec struct {
 
 // TonNodeNetworkSpec defines TON network-related settings.
 type TonNodeNetworkSpec struct {
-	// GlobalConfigURL is the TON global config URL.
-	// +kubebuilder:default:="https://ton.org/global.config.json"
-	GlobalConfigURL string `json:"globalConfigURL,omitempty"`
-
 	// ValidatorPort is the validator UDP port.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
