@@ -237,6 +237,11 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton status
 ./kubeton exec "sync"
 
+`kubeton wallet create` only generates wallet files and the init BOC. Before
+`kubeton wallet deploy` can activate a new wallet, send funds to the
+non-bounceable init address printed by `wallet create`, wait until the funding
+transaction is visible on-chain, then rerun `kubeton wallet deploy <name>`.
+
 # install TON k8s operator only
 ./kubeton install
 

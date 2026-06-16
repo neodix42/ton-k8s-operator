@@ -455,8 +455,9 @@ send_boc_liteserver() {
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     if run_liteclient_query "sendfile $boc_file"; then
       return 0
+    else
+      rc=$?
     fi
-    rc=$?
     if (( attempt < attempts )); then
       echo "Warning: lite-client sendfile failed (attempt ${attempt}/${attempts}); retrying..." >&2
       if (( delay > 0 )); then
@@ -465,27 +466,62 @@ send_boc_liteserver() {
     fi
   done
 
+  echo "Error: lite-client sendfile failed after ${attempts} attempt(s)." >&2
   return "$rc"
+}
+
+print_wallet_deploy_failure_hint() {
+  local wallet_name="$1"
+  local meta_file="${MAIN_WALLET_DIR}/${wallet_name}.wallet.meta"
+  local non_bounceable bounceable wallet_address
+
+  non_bounceable=""
+  bounceable=""
+  wallet_address=""
+  if [[ -f "$meta_file" ]]; then
+    non_bounceable="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
+    bounceable="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
+    wallet_address="$(trim_whitespace "$(read_meta_value wallet_address "$meta_file")")"
+  fi
+
+  echo "Hint: wallet deployment sends an external init message; it does not fund the wallet." >&2
+  echo "Hint: an inactive/unfunded wallet usually rejects deploy because gas must be paid from the wallet balance." >&2
+  if [[ -n "$non_bounceable" && "$non_bounceable" != "unknown" ]]; then
+    echo "Hint: first send funds to the non-bounceable init address: ${non_bounceable}" >&2
+  elif [[ -n "$wallet_address" && "$wallet_address" != "unknown" ]]; then
+    echo "Hint: first fund wallet address ${wallet_address}; use the non-bounceable form for initial funding if available." >&2
+  fi
+  if [[ -n "$bounceable" && "$bounceable" != "unknown" ]]; then
+    echo "Hint: after deployment, use the bounceable address: ${bounceable}" >&2
+  fi
+  echo "Hint: rerun 'kubeton wallet deploy ${wallet_name}' after the funding transaction is visible on-chain." >&2
 }
 
 deploy_boc_with_mode() {
   local wallet_name="$1"
   local boc_file="$2"
   local normalized_mode="$3"
+  local rc=0
 
   echo "Deploying wallet '${wallet_name}' using BOC '${boc_file##*/}' ..."
   case "$normalized_mode" in
     liteserver)
-      send_boc_liteserver "$boc_file"
+      send_boc_liteserver "$boc_file" || rc=$?
       ;;
     toncenter)
-      send_boc_toncenter "$boc_file"
+      send_boc_toncenter "$boc_file" || rc=$?
       ;;
     *)
       echo "Error: unsupported MODE=${MODE}. Use liteserver or toncenter." >&2
       return 1
       ;;
   esac
+
+  if (( rc != 0 )); then
+    print_wallet_deploy_failure_hint "$wallet_name"
+    return "$rc"
+  fi
+  return 0
 }
 
 main_wallet_create() {
@@ -1014,14 +1050,10 @@ send_single_transfer() {
   echo "Sending from '${from_wallet}' to '${destination_address}' amount='${amount_gram}' seqno=${seqno_dec} ..."
   case "$normalized_mode" in
     liteserver)
-      if ! send_boc_liteserver "$query_file"; then
-        rc=$?
-      fi
+      send_boc_liteserver "$query_file" || rc=$?
       ;;
     toncenter)
-      if ! send_boc_toncenter "$query_file"; then
-        rc=$?
-      fi
+      send_boc_toncenter "$query_file" || rc=$?
       ;;
     *)
       echo "Error: unsupported MODE=${MODE}. Use liteserver or toncenter." >&2
