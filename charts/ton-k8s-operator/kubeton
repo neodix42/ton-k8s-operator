@@ -7330,6 +7330,7 @@ sync_value() {
   local pod="$2"
   local output=""
   local sync=""
+  local initial_sync_lag=""
 
   output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
     shopt -s expand_aliases
@@ -7353,6 +7354,14 @@ sync_value() {
     }
   ')"
   sync="$(trim_whitespace "$sync")"
+
+  if [[ -z "$sync" ]]; then
+    initial_sync_lag="$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*Local validator initial sync status:.*last known block was[[:space:]]*([0-9]+)[[:space:]]*s ago.*/\1 s ago/p' | head -n1)"
+    initial_sync_lag="$(trim_whitespace "$initial_sync_lag")"
+    if [[ -n "$initial_sync_lag" ]]; then
+      sync="$initial_sync_lag"
+    fi
+  fi
 
   if [[ -z "$sync" ]]; then
     echo "N/A"
