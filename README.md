@@ -232,6 +232,9 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10.
 ./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10. -n
 ./kubeton wallet send testnet main-wallet 10.
+./kubeton wallet activate testnet
+./kubeton wallet activate testnet tonnode-0
+./kubeton wallet activate testnet tonnode-0 validator_wallet_001
 ./kubeton wallet show
 ./kubeton wallet show main-wallet
 ./kubeton wallet show testnet balance
@@ -240,15 +243,23 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton verify
 ./kubeton status
 ./kubeton exec "sync"
+./kubeton exec-mtc "set stake 1000000"
 
-`kubeton wallet create` only generates wallet files and the init BOC. Before
-`kubeton wallet deploy` can activate a new wallet, send funds to the
+`kubeton wallet create` only generates main-wallet files and the init BOC.
+Before `kubeton wallet deploy <mainnet|testnet> <name>` can deploy a new main
+wallet, send funds to the
 non-bounceable init address printed by `wallet create`, wait until the funding
 transaction is visible on-chain, then rerun
 `kubeton wallet deploy <mainnet|testnet> <name>`.
-`kubeton wallet deploy` and `kubeton wallet send` require an explicit
-`mainnet` or `testnet` argument. That argument selects both the lite-server
-global config and TONCenter endpoint. By default wallet BOC sending uses
+After topping up mytonctrl wallets inside TON pods with split mode, for example
+`kubeton wallet send testnet my-wallet 2`, activate those pod wallets with
+`kubeton wallet activate <mainnet|testnet> [tonnode-name] [wallet-name]`. The
+activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
+pod and does not send a BOC payload to the network.
+`kubeton wallet deploy`, `kubeton wallet activate`, and `kubeton wallet send`
+require an explicit `mainnet` or `testnet` argument. For deploy/send that
+argument selects both the lite-server global config and TONCenter endpoint. By
+default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
 `kubeton wallet show <mainnet|testnet> balance ...` reads balances from

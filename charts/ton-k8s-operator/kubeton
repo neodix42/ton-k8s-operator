@@ -164,7 +164,7 @@ Commands:
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
-  wallet               Run ephemeral wallet utility pod (Vault-backed encrypted persistence): kubeton wallet <create|deploy|send|show> [args...]
+  wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|show> [args...]
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Full best-effort cleanup of kubeton-managed resources (with confirmation; keeps TonNode CRD).
@@ -172,6 +172,7 @@ Commands:
   verify               Verify operator and TON resources (deploy, pods with node/server, tonnodes, sts, pvc).
   status               Run wallet/adnl/sync/db checks in each TON pod; print node/pod/wallet/adnl/sync/cell db/archive db.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
+  exec-mtc <cmd>       Run a command in each TON pod inside mytonctrl and print table with node/pod/exit code.
 
 Environment overrides:
   See README.md section "Environment overrides".
@@ -5449,6 +5450,107 @@ run_wallet_balance_show() {
   print_aligned_table_8col "namespace" "tonnode pod" "wallet-name" "status" "balance" "ver" "wch" "wallet-address" "${table_rows[@]}"
 }
 
+activate_tonnode_wallet_in_pod() {
+  local ns="$1"
+  local pod="$2"
+  local wallet_name="$3"
+  local output
+
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+    set -euo pipefail
+    wallet_name="$1"
+    shopt -s expand_aliases
+    if [[ -f ~/.bashrc ]]; then
+      source ~/.bashrc >/dev/null 2>&1
+    fi
+    if ! command -v mytonctrl >/dev/null 2>&1; then
+      echo "Error: mytonctrl command not found." >&2
+      exit 127
+    fi
+    printf "aw %s\n" "$wallet_name" | mytonctrl
+  ' _ "$wallet_name" 2>&1)" || {
+    output="$(strip_ansi_sequences "$output")"
+    printf '%s\n' "$output"
+    return 1
+  }
+  output="$(strip_ansi_sequences "$output")"
+  printf '%s\n' "$output"
+}
+
+run_wallet_activate() {
+  local wallet_network="$1"
+  local target_pod_name="${2:-}"
+  local target_wallet_name="${3:-validator_wallet_001}"
+  local row target_ns target_pod target_node_name wallet_row
+  local wallet_name status balance version workchain address
+  local rc=0
+  local activated_count=0
+  local -a pod_rows=()
+  local -a table_rows=()
+
+  [[ -n "$wallet_network" ]] || return 1
+  target_wallet_name="$(trim_whitespace "$target_wallet_name")"
+  [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
+  if ! [[ "$target_wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Error: invalid wallet name '${target_wallet_name}'." >&2
+    return 1
+  fi
+
+  if [[ -n "$target_pod_name" ]]; then
+    row="$(resolve_tonnode_pod_row_by_name "$target_pod_name" || true)"
+    row="$(trim_whitespace "$row")"
+    if [[ -z "$row" ]]; then
+      echo "Error: TON pod '${target_pod_name}' not found." >&2
+      return 1
+    fi
+    pod_rows+=("$row")
+  else
+    mapfile -t pod_rows < <(list_ton_pods 2>/dev/null || true)
+  fi
+
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
+    [[ -z "$target_ns" || -z "$target_pod" ]] && continue
+    wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
+    wallet_row="$(trim_whitespace "$wallet_row")"
+    if [[ -z "$wallet_row" ]]; then
+      if [[ -n "$target_pod_name" ]]; then
+        echo "Error: wallet '${target_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
+        return 1
+      fi
+      echo "Warning: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
+      continue
+    fi
+    IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
+    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${address}"$'\t'"aw ${wallet_name}")
+  done
+
+  if [[ ${#table_rows[@]} -eq 0 ]]; then
+    echo "Error: no TON wallets resolved for wallet name '${target_wallet_name}'." >&2
+    return 1
+  fi
+
+  print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "mytonctrl-command" "${table_rows[@]}"
+  confirm_or_exit "Activate '${target_wallet_name}' with mytonctrl aw on ${#table_rows[@]} TON pod(s)?"
+
+  for row in "${table_rows[@]}"; do
+    IFS=$'\t' read -r target_ns target_pod wallet_name address _ <<<"$row"
+    echo "[wallet] Activating ${wallet_name} in ${target_ns}/${target_pod} using: aw ${wallet_name}" >&2
+    if activate_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$wallet_name"; then
+      ((activated_count+=1))
+    else
+      rc=1
+    fi
+  done
+
+  if (( rc != 0 )); then
+    echo "Error: activated ${activated_count}/${#table_rows[@]} wallet(s); at least one mytonctrl aw command failed." >&2
+    return 1
+  fi
+  echo "[wallet] Activated ${activated_count}/${#table_rows[@]} wallet(s) with mytonctrl aw."
+}
+
 resolve_tonnode_pod_row_by_name() {
   local target_name="$1"
   local row ns pod node_name
@@ -10110,7 +10212,7 @@ wait_main_wallet_pod_completion() {
 
 run_wallet() {
   wallet_usage() {
-    echo "Usage: kubeton wallet <create|deploy|send|show> [args...]"
+    echo "Usage: kubeton wallet <create|deploy|activate|send|show> [args...]"
     echo
     echo "Subcommands:"
     echo "  create [name]"
@@ -10121,8 +10223,13 @@ run_wallet() {
     echo "    Legacy explicit form."
     echo
     echo "  deploy <mainnet|testnet> [name]"
-    echo "    Deploy one wallet by name."
+    echo "    Deploy one main wallet by sending its generated BOC."
     echo "    If [name] is omitted, deploys all wallet BOCs after confirmation."
+    echo
+    echo "  activate <mainnet|testnet> [to-tonnode-name] [wallet-name]"
+    echo "    Activate mytonctrl wallet(s) inside TON pod(s) using: aw <wallet-name>."
+    echo "    If [to-tonnode-name] is omitted, activates the wallet in all TON pods."
+    echo "    If [wallet-name] is omitted, validator_wallet_001 is used."
     echo
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
@@ -10142,7 +10249,9 @@ run_wallet() {
     echo "    Send to explicit target wallet name on selected TON pod."
     echo
     echo "Notes:"
-    echo "  - deploy/send require an explicit network; this selects lite-server and TONCenter endpoints."
+    echo "  - deploy/activate/send require an explicit network."
+    echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
+    echo "  - activate runs mytonctrl aw inside TON pods and does not send BOC payloads."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
     echo "  - optional -n (last argument) forwards --no-bounce to wallet.fif"
     echo "  - <to-tonnode-name> is pod name like tonnode-0 (or namespace/pod when applicable)"
@@ -10153,6 +10262,9 @@ run_wallet() {
     echo "  kubeton wallet create 0 42 my-wallet"
     echo "  kubeton wallet deploy testnet"
     echo "  kubeton wallet deploy testnet my-wallet"
+    echo "  kubeton wallet activate testnet"
+    echo "  kubeton wallet activate testnet tonnode-0"
+    echo "  kubeton wallet activate testnet tonnode-0 validator_wallet_001"
     echo "  kubeton wallet show"
     echo "  kubeton wallet show my-wallet"
     echo "  kubeton wallet show testnet balance"
@@ -10176,7 +10288,7 @@ run_wallet() {
       wallet_usage
       return 0
       ;;
-    create|deploy|send|show)
+    create|deploy|activate|send|show)
       ;;
     *)
       echo "Error: unknown wallet subcommand '$action'." >&2
@@ -10227,6 +10339,19 @@ run_wallet() {
       if (( ${#action_args[@]} == 0 )); then
         confirm_or_exit "This will deploy (send BOC) for ALL wallets on ${wallet_network}. Continue?"
       fi
+      ;;
+    activate)
+      if (( $# < 1 || $# > 3 )); then
+        echo "Error: usage: kubeton wallet activate <mainnet|testnet> [to-tonnode-name] [wallet-name]" >&2
+        return 1
+      fi
+      if ! wallet_network="$(normalize_wallet_network "$1")"; then
+        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
+        return 1
+      fi
+      shift || true
+      run_wallet_activate "$wallet_network" "${1:-}" "${2:-validator_wallet_001}"
+      return $?
       ;;
     show)
       if (( $# >= 1 )) && wallet_network="$(normalize_wallet_network "$1")"; then
@@ -10560,6 +10685,47 @@ run_exec() {
   print_aligned_table_3col "server name" "pod name" "exit code" "${table_rows[@]}"
 }
 
+run_exec_mtc() {
+  require_bin kubectl
+  local cmd="${*:-}"
+  if [[ -z "$cmd" ]]; then
+    echo "Error: missing command for exec-mtc." >&2
+    usage
+    exit 1
+  fi
+
+  mapfile -t pod_rows < <(list_ton_pods)
+  if [[ ${#pod_rows[@]} -eq 0 || -z "${pod_rows[0]}" ]]; then
+    echo "No TON pods found."
+    return
+  fi
+
+  local -a table_rows=()
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns pod node_name <<<"$row"
+
+    if kubectl -n "$ns" exec "$pod" -- bash -lc '
+      shopt -s expand_aliases
+      if [[ -f ~/.bashrc ]]; then
+        source ~/.bashrc >/dev/null 2>&1
+      fi
+      if ! command -v mytonctrl >/dev/null 2>&1; then
+        exit 127
+      fi
+      printf "%s\n" "$1" | mytonctrl
+    ' _ "$cmd" >/dev/null 2>&1; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
+    [[ -z "$node_name" ]] && node_name="N/A"
+    table_rows+=("$node_name"$'\t'"$pod"$'\t'"$exit_code")
+  done
+
+  print_aligned_table_3col "server name" "pod name" "exit code" "${table_rows[@]}"
+}
+
 main() {
   local command="${1:-help}"
   shift || true
@@ -10625,6 +10791,9 @@ main() {
       ;;
     exec)
       run_exec "$@"
+      ;;
+    exec-mtc)
+      run_exec_mtc "$@"
       ;;
     help|-h|--help)
       usage
