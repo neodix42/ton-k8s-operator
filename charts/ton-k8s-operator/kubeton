@@ -207,6 +207,16 @@ run_with_timeout() {
   "$@"
 }
 
+print_prefixed_lines() {
+  local prefix="$1"
+  local text="${2:-}"
+  if [[ -z "$text" ]]; then
+    printf '%s<no output>\n' "$prefix"
+    return
+  fi
+  printf '%s\n' "$text" | sed "s/^/${prefix}/"
+}
+
 yaml_quote() {
   local value="${1:-}"
   value="${value//\\/\\\\}"
@@ -5456,27 +5466,42 @@ activate_tonnode_wallet_in_pod() {
   local pod="$2"
   local wallet_name="$3"
   local output
+  local exec_rc=0
 
   output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
-    set -euo pipefail
     wallet_name="$1"
     mtc_cmd="aw ${wallet_name}"
     shopt -s expand_aliases
     if [[ -f ~/.bashrc ]]; then
-      source ~/.bashrc >/dev/null 2>&1
+      source ~/.bashrc >/dev/null 2>&1 || true
     fi
     if ! command -v mytonctrl >/dev/null 2>&1; then
       echo "Error: mytonctrl command not found." >&2
       exit 127
     fi
-    printf "%s\n" "$mtc_cmd" | mytonctrl
-  ' _ "$wallet_name" 2>&1)" || {
-    output="$(strip_ansi_sequences "$output")"
-    printf '%s\n' "$output"
-    return 1
-  }
+    set +e
+    mytonctrl --cmd "$mtc_cmd"
+    mtc_rc=$?
+    if (( mtc_rc == 2 )); then
+      printf "%s\n" "$mtc_cmd" | mytonctrl
+    else
+      exit "$mtc_rc"
+    fi
+  ' _ "$wallet_name" 2>&1)" || exec_rc=$?
   output="$(strip_ansi_sequences "$output")"
-  printf '%s\n' "$output"
+  if (( exec_rc != 0 )); then
+    echo "Error: mytonctrl aw failed in ${ns}/${pod} with exit code ${exec_rc}." >&2
+    if (( exec_rc == 124 )); then
+      echo "Error: command timed out after MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}." >&2
+    fi
+    echo "mytonctrl output from ${ns}/${pod}:" >&2
+    print_prefixed_lines "  ${pod}> " "$output" >&2
+    return "$exec_rc"
+  fi
+  if [[ -n "$output" ]]; then
+    echo "mytonctrl output from ${ns}/${pod}:"
+    print_prefixed_lines "  ${pod}> " "$output"
+  fi
 }
 
 run_wallet_activate() {
