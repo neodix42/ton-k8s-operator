@@ -5356,7 +5356,7 @@ resolve_tonnode_wallet_address_from_pod() {
   local wallet_name="$3"
   local output address
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     shopt -s expand_aliases
     if [[ -f ~/.bashrc ]]; then
       source ~/.bashrc >/dev/null 2>&1
@@ -5381,7 +5381,7 @@ resolve_tonnode_wallet_row_from_pod() {
   local wallet_name="$3"
   local output row
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     shopt -s expand_aliases
     if [[ -f ~/.bashrc ]]; then
       source ~/.bashrc >/dev/null 2>&1
@@ -5456,9 +5456,10 @@ activate_tonnode_wallet_in_pod() {
   local wallet_name="$3"
   local output
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     set -euo pipefail
     wallet_name="$1"
+    mtc_cmd="aw ${wallet_name}"
     shopt -s expand_aliases
     if [[ -f ~/.bashrc ]]; then
       source ~/.bashrc >/dev/null 2>&1
@@ -5467,7 +5468,11 @@ activate_tonnode_wallet_in_pod() {
       echo "Error: mytonctrl command not found." >&2
       exit 127
     fi
-    printf "aw %s\n" "$wallet_name" | mytonctrl
+    if mytonctrl --help 2>&1 | grep -q -- "--cmd"; then
+      mytonctrl --cmd "$mtc_cmd"
+    else
+      printf "%s\n" "$mtc_cmd" | mytonctrl
+    fi
   ' _ "$wallet_name" 2>&1)" || {
     output="$(strip_ansi_sequences "$output")"
     printf '%s\n' "$output"
@@ -5485,6 +5490,9 @@ run_wallet_activate() {
   local wallet_name status balance version workchain address
   local rc=0
   local activated_count=0
+  local pending_count=0
+  local skipped_count=0
+  local action
   local -a pod_rows=()
   local -a table_rows=()
 
@@ -5523,7 +5531,13 @@ run_wallet_activate() {
       continue
     fi
     IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
-    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${address}"$'\t'"aw ${wallet_name}")
+    if [[ "${status,,}" == "active" ]]; then
+      action="already active"
+    else
+      action="aw ${wallet_name}"
+      ((pending_count+=1))
+    fi
+    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${address}"$'\t'"${action}")
   done
 
   if [[ ${#table_rows[@]} -eq 0 ]]; then
@@ -5532,10 +5546,18 @@ run_wallet_activate() {
   fi
 
   print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "mytonctrl-command" "${table_rows[@]}"
-  confirm_or_exit "Activate '${target_wallet_name}' with mytonctrl aw on ${#table_rows[@]} TON pod(s)?"
+  if (( pending_count == 0 )); then
+    echo "[wallet] All ${#table_rows[@]} resolved wallet(s) are already active."
+    return 0
+  fi
+  confirm_or_exit "Activate '${target_wallet_name}' with mytonctrl aw on ${pending_count} TON pod(s)?"
 
   for row in "${table_rows[@]}"; do
-    IFS=$'\t' read -r target_ns target_pod wallet_name address _ <<<"$row"
+    IFS=$'\t' read -r target_ns target_pod wallet_name address action <<<"$row"
+    if [[ "$action" == "already active" ]]; then
+      ((skipped_count+=1))
+      continue
+    fi
     echo "[wallet] Activating ${wallet_name} in ${target_ns}/${target_pod} using: aw ${wallet_name}" >&2
     if activate_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$wallet_name"; then
       ((activated_count+=1))
@@ -5545,10 +5567,10 @@ run_wallet_activate() {
   done
 
   if (( rc != 0 )); then
-    echo "Error: activated ${activated_count}/${#table_rows[@]} wallet(s); at least one mytonctrl aw command failed." >&2
+    echo "Error: activated ${activated_count}/${pending_count} wallet(s), skipped ${skipped_count} already active wallet(s); at least one mytonctrl aw command failed." >&2
     return 1
   fi
-  echo "[wallet] Activated ${activated_count}/${#table_rows[@]} wallet(s) with mytonctrl aw."
+  echo "[wallet] Activated ${activated_count}/${pending_count} wallet(s) with mytonctrl aw; skipped ${skipped_count} already active wallet(s)."
 }
 
 resolve_tonnode_pod_row_by_name() {
@@ -10705,7 +10727,8 @@ run_exec_mtc() {
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pod node_name <<<"$row"
 
-    if kubectl -n "$ns" exec "$pod" -- bash -lc '
+    if kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+      mtc_cmd="$1"
       shopt -s expand_aliases
       if [[ -f ~/.bashrc ]]; then
         source ~/.bashrc >/dev/null 2>&1
@@ -10713,7 +10736,11 @@ run_exec_mtc() {
       if ! command -v mytonctrl >/dev/null 2>&1; then
         exit 127
       fi
-      printf "%s\n" "$1" | mytonctrl
+      if mytonctrl --help 2>&1 | grep -q -- "--cmd"; then
+        mytonctrl --cmd "$mtc_cmd"
+      else
+        printf "%s\n" "$mtc_cmd" | mytonctrl
+      fi
     ' _ "$cmd" >/dev/null 2>&1; then
       exit_code=0
     else
