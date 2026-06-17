@@ -56,6 +56,7 @@ KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS
 KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS="${KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS:-2}"
 KUBETON_FAIL_ON_LONGHORN_MULTIPATHD="${KUBETON_FAIL_ON_LONGHORN_MULTIPATHD:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
+MYTONCTRL_EXEC_TIMEOUT="${MYTONCTRL_EXEC_TIMEOUT:-180s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
 HELM_UNINSTALL_CMD_TIMEOUT="${HELM_UNINSTALL_CMD_TIMEOUT:-900s}"
@@ -5456,7 +5457,7 @@ activate_tonnode_wallet_in_pod() {
   local wallet_name="$3"
   local output
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     set -euo pipefail
     wallet_name="$1"
     mtc_cmd="aw ${wallet_name}"
@@ -5468,11 +5469,7 @@ activate_tonnode_wallet_in_pod() {
       echo "Error: mytonctrl command not found." >&2
       exit 127
     fi
-    if mytonctrl --help 2>&1 | grep -q -- "--cmd"; then
-      mytonctrl --cmd "$mtc_cmd"
-    else
-      printf "%s\n" "$mtc_cmd" | mytonctrl
-    fi
+    printf "%s\n" "$mtc_cmd" | mytonctrl
   ' _ "$wallet_name" 2>&1)" || {
     output="$(strip_ansi_sequences "$output")"
     printf '%s\n' "$output"
@@ -10273,7 +10270,8 @@ run_wallet() {
     echo "Notes:"
     echo "  - deploy/activate/send require an explicit network."
     echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
-    echo "  - activate runs mytonctrl aw inside TON pods and does not send BOC payloads."
+    echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
+    echo "  - activate/exec-mtc timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
     echo "  - optional -n (last argument) forwards --no-bounce to wallet.fif"
     echo "  - <to-tonnode-name> is pod name like tonnode-0 (or namespace/pod when applicable)"
@@ -10727,7 +10725,7 @@ run_exec_mtc() {
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pod node_name <<<"$row"
 
-    if kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+    if run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
       mtc_cmd="$1"
       shopt -s expand_aliases
       if [[ -f ~/.bashrc ]]; then
@@ -10736,11 +10734,7 @@ run_exec_mtc() {
       if ! command -v mytonctrl >/dev/null 2>&1; then
         exit 127
       fi
-      if mytonctrl --help 2>&1 | grep -q -- "--cmd"; then
-        mytonctrl --cmd "$mtc_cmd"
-      else
-        printf "%s\n" "$mtc_cmd" | mytonctrl
-      fi
+      printf "%s\n" "$mtc_cmd" | mytonctrl
     ' _ "$cmd" >/dev/null 2>&1; then
       exit_code=0
     else
