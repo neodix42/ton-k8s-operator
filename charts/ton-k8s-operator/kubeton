@@ -53,6 +53,7 @@ KUBETON_LOCAL_PATH_PATTERN_CLEANUP="${KUBETON_LOCAL_PATH_PATTERN_CLEANUP:-false}
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS:-900}"
+KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY="${KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY:-true}"
 KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS="${KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS:-2}"
 KUBETON_FAIL_ON_LONGHORN_MULTIPATHD="${KUBETON_FAIL_ON_LONGHORN_MULTIPATHD:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
@@ -3956,6 +3957,66 @@ longhorn_release_status() {
     | awk -F': ' '/^STATUS:/ {print tolower($2); exit}'
 }
 
+longhorn_latest_deployed_revision() {
+  helm history "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" 2>/dev/null \
+    | awk '$1 ~ /^[0-9]+$/ && $0 ~ /[[:space:]]deployed[[:space:]]/ {rev=$1} END{if (rev != "") print rev}'
+}
+
+longhorn_daemonset_ready_quick() {
+  local name="$1"
+  local desired ready updated
+
+  if ! kubectl -n "$LONGHORN_NAMESPACE" get daemonset "$name" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  desired="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset "$name" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+  ready="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset "$name" -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+  updated="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset "$name" -o jsonpath='{.status.updatedNumberScheduled}' 2>/dev/null || true)"
+
+  [[ "$desired" =~ ^[0-9]+$ && "$ready" =~ ^[0-9]+$ && "$updated" =~ ^[0-9]+$ ]] || return 1
+  (( desired > 0 && ready == desired && updated == desired ))
+}
+
+longhorn_deployment_ready_quick() {
+  local name="$1"
+  local desired available updated
+
+  if ! kubectl -n "$LONGHORN_NAMESPACE" get deployment "$name" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  desired="$(kubectl -n "$LONGHORN_NAMESPACE" get deployment "$name" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  available="$(kubectl -n "$LONGHORN_NAMESPACE" get deployment "$name" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)"
+  updated="$(kubectl -n "$LONGHORN_NAMESPACE" get deployment "$name" -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || true)"
+  [[ -z "$desired" ]] && desired="1"
+  [[ -z "$available" ]] && available="0"
+  [[ -z "$updated" ]] && updated="0"
+
+  [[ "$desired" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ && "$updated" =~ ^[0-9]+$ ]] || return 1
+  (( available >= desired && updated >= desired ))
+}
+
+longhorn_storage_ready_quick() {
+  local storage_class="${1:-longhorn}"
+  local provisioner expected_ready csi_nodes_count dep
+
+  provisioner="$(storage_class_provisioner "$storage_class")"
+  [[ "$provisioner" == "driver.longhorn.io" ]] || return 1
+
+  longhorn_daemonset_ready_quick longhorn-manager || return 1
+  longhorn_daemonset_ready_quick longhorn-csi-plugin || return 1
+
+  for dep in csi-attacher csi-provisioner csi-resizer csi-snapshotter longhorn-driver-deployer; do
+    longhorn_deployment_ready_quick "$dep" || return 1
+  done
+
+  expected_ready="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-csi-plugin -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+  csi_nodes_count="$(list_longhorn_csi_node_names | awk 'NF{c++} END{print c+0}')"
+  [[ "$expected_ready" =~ ^[0-9]+$ && "$csi_nodes_count" =~ ^[0-9]+$ ]] || return 1
+  (( expected_ready > 0 && csi_nodes_count >= expected_ready ))
+}
+
 longhorn_release_metadata_present() {
   local count
   count="$(kubectl -n "$LONGHORN_NAMESPACE" get secret,configmap -l "owner=helm,name=${LONGHORN_RELEASE_NAME}" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}' || true)"
@@ -4141,6 +4202,37 @@ repair_stale_longhorn_release() {
   cleanup_longhorn_force || true
 }
 
+recover_longhorn_release_non_destructive() {
+  local status="$1"
+  local deployed_revision post_status
+
+  case "$status" in
+    failed|pending-install|pending-upgrade|pending-rollback) ;;
+    *) return 1 ;;
+  esac
+
+  deployed_revision="$(longhorn_latest_deployed_revision || true)"
+  deployed_revision="$(trim_whitespace "$deployed_revision")"
+  if [[ -z "$deployed_revision" ]]; then
+    echo "Warning: Longhorn Helm release is '${status}', but no deployed revision was found for non-destructive recovery." >&2
+    return 1
+  fi
+
+  echo "[baremetal] Longhorn Helm release is '${status}'; rolling back to deployed revision ${deployed_revision} ..."
+  if ! helm rollback "$LONGHORN_RELEASE_NAME" "$deployed_revision" -n "$LONGHORN_NAMESPACE" --wait --timeout 20m; then
+    echo "Warning: non-destructive Longhorn rollback to revision ${deployed_revision} failed." >&2
+    return 1
+  fi
+
+  post_status="$(longhorn_release_status || true)"
+  if [[ "$post_status" != "deployed" ]]; then
+    echo "Warning: Longhorn rollback completed but Helm status is '${post_status:-unknown}', not deployed." >&2
+    return 1
+  fi
+
+  return 0
+}
+
 ensure_longhorn_installed() {
   require_bin helm
   require_bin kubectl
@@ -4158,13 +4250,24 @@ ensure_longhorn_installed() {
   local lh_status=""
   lh_status="$(longhorn_release_status || true)"
   if [[ -n "$lh_status" && "$lh_status" != "deployed" ]]; then
-    repair_stale_longhorn_release "$lh_status"
-    recover_stuck_longhorn_namespace
-    ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+    if recover_longhorn_release_non_destructive "$lh_status"; then
+      lh_status="$(longhorn_release_status || true)"
+    else
+      repair_stale_longhorn_release "$lh_status"
+      recover_stuck_longhorn_namespace
+      ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+      lh_status="$(longhorn_release_status || true)"
+    fi
   elif [[ -z "$lh_status" ]] && kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && longhorn_release_metadata_present; then
     repair_stale_longhorn_release ""
     recover_stuck_longhorn_namespace
     ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+  fi
+
+  if [[ "$lh_status" == "deployed" ]] && is_true "$KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY" && longhorn_storage_ready_quick "longhorn"; then
+    verify_longhorn_multipathd_safe
+    echo "[baremetal] Longhorn is already deployed and CSI/storage are Ready; skipping Helm upgrade."
+    return 0
   fi
 
   ensure_helm_repo "longhorn" "https://charts.longhorn.io"
