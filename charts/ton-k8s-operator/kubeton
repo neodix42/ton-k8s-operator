@@ -5109,6 +5109,33 @@ build_local_path_cleanup_script() {
     printf 'root=%s\n' "$(shell_quote "/host${root}")"
     printf 'if [ ! -d "$root" ]; then exit 0; fi\n'
     printf 'remaining=0\n'
+    printf 'rm_errors="/tmp/kubeton-local-path-rm.err"\n'
+    printf 'remove_path_if_present() {\n'
+    printf '  target="$1"\n'
+    printf '  label="$2"\n'
+    printf '  [ -e "$target" ] || return 0\n'
+    printf '  echo "[cleanup] Removing local-path PV directory: ${label}"\n'
+    printf '  : > "$rm_errors"\n'
+    printf '  rm -rf -- "$target" 2>"$rm_errors" || true\n'
+    printf '  if [ -e "$target" ]; then\n'
+    printf '    echo "Error: local-path PV directory still exists: ${label}" >&2\n'
+    printf '    if [ -s "$rm_errors" ]; then cat "$rm_errors" >&2; fi\n'
+    printf '    remaining=1\n'
+    printf '  fi\n'
+    printf '  rm -f "$rm_errors" >/dev/null 2>&1 || true\n'
+    printf '}\n'
+    printf 'remove_pattern_matches() {\n'
+    printf '  pattern="$1"\n'
+    printf '  label="$2"\n'
+    printf '  : > "$rm_errors"\n'
+    printf '  find "$root" -mindepth 1 -maxdepth 1 -type d -name "$pattern" -exec rm -rf -- {} + 2>"$rm_errors" || true\n'
+    printf '  if [ -n "$(find "$root" -mindepth 1 -maxdepth 1 -type d -name "$pattern" -print -quit)" ]; then\n'
+    printf '    echo "Error: local-path directory matching ${label} still exists" >&2\n'
+    printf '    if [ -s "$rm_errors" ]; then cat "$rm_errors" >&2; fi\n'
+    printf '    remaining=1\n'
+    printf '  fi\n'
+    printf '  rm -f "$rm_errors" >/dev/null 2>&1 || true\n'
+    printf '}\n'
 
     for row in "${exact_rows_ref[@]}"; do
       [[ -z "$row" ]] && continue
@@ -5117,8 +5144,7 @@ build_local_path_cleanup_script() {
       rel="$(local_path_relative_target "$path" 2>/dev/null || true)"
       [[ -n "$rel" ]] || continue
       printf 'target="$root"/%s\n' "$(shell_quote "$rel")"
-      printf 'if [ -e "$target" ]; then echo "[cleanup] Removing local-path PV directory: ${target#$root/}"; rm -rf -- "$target"; fi\n'
-      printf 'if [ -e "$target" ]; then echo "Error: local-path PV directory still exists: ${target#$root/}" >&2; remaining=1; fi\n'
+      printf 'remove_path_if_present "$target" "${target#$root/}"\n'
       emitted=1
     done
 
@@ -5129,8 +5155,7 @@ build_local_path_cleanup_script() {
       local_path_safe_name_component "$ns" || continue
       local_path_safe_name_component "$pvc" || continue
       pattern="*_${ns}_${pvc}"
-      printf 'find "$root" -mindepth 1 -maxdepth 1 -type d -name %s -exec rm -rf -- {} +\n' "$(shell_quote "$pattern")"
-      printf 'if [ -n "$(find "$root" -mindepth 1 -maxdepth 1 -type d -name %s -print -quit)" ]; then echo "Error: local-path directory matching %s still exists" >&2; remaining=1; fi\n' "$(shell_quote "$pattern")" "$(shell_quote "$pattern")"
+      printf 'remove_pattern_matches %s %s\n' "$(shell_quote "$pattern")" "$(shell_quote "$pattern")"
       emitted=1
     done
 
@@ -5742,7 +5767,9 @@ delete_ton_pvcs_for_statefulsets() {
   local row ns sts
   local -a candidate_rows=()
   local -a pvc_rows=()
+  local -a live_ton_pod_rows=()
   local pvc_name
+  local live_row live_ns live_pod live_node
 
   if [[ ${#sts_rows_ref[@]} -eq 0 ]]; then
     echo "[cleanup] No StatefulSet snapshot was provided; using expected TON PVC names and label selector." >&2
@@ -5768,6 +5795,19 @@ delete_ton_pvcs_for_statefulsets() {
 
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
+  fi
+
+  mapfile -t live_ton_pod_rows < <(list_ton_pods 2>/dev/null || true)
+  if [[ ${#live_ton_pod_rows[@]} -gt 0 && -n "${live_ton_pod_rows[0]:-}" ]]; then
+    echo "Error: refusing to delete TON PVCs while TON pod(s) still exist:" >&2
+    for live_row in "${live_ton_pod_rows[@]}"; do
+      [[ -z "$live_row" ]] && continue
+      IFS=$'\t' read -r live_ns live_pod live_node <<<"$live_row"
+      [[ -z "$live_ns" || -z "$live_pod" ]] && continue
+      echo "  - ${live_ns}/${live_pod} on ${live_node:-unknown}" >&2
+    done
+    echo "Wait for the pods to terminate, then rerun cleanup/uninstall." >&2
+    return 1
   fi
 
   delete_pvc_rows_and_backing_volumes pvc_rows "cleanup"
