@@ -9,6 +9,7 @@ This operator creates and manages:
 - Two PVC templates per replica:
   - `/var/ton-work`
   - `/usr/local/bin/mytoncore`
+- `/usr/src/ton` is persisted as a subPath on the `/var/ton-work` PVC.
 
 ## Behavior Implemented
 
@@ -815,6 +816,8 @@ Data from all TON pods is not stored in one shared place.
 
 With this operator setup:
 - Each TON pod gets its own PVCs (`ton-work-...` and `mytoncore-...`).
+- `/usr/src/ton` is mounted from the pod's `ton-work` PVC via a subPath so
+  the TON source checkout used by MyTonCtrl/Fift survives pod recreation.
 - PVCs are `ReadWriteOnce`, so one PVC is attached to one pod.
 - For 20 replicas, the total PVC count is 40.
 - `tonWorkSize` defaults to `700Gi` because dump bootstrap keeps the compressed dump and extracted DB on `/var/ton-work` at the same time.

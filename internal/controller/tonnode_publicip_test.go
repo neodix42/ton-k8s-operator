@@ -668,6 +668,9 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	}
 
 	main := tpl.Spec.Containers[0]
+	if !hasMountWithSubPath(main.VolumeMounts, tonWorkClaimName, tonSourcePath, tonSourceSubPath) {
+		t.Fatalf("main container missing persistent TON source mount")
+	}
 	if !hasMount(main.VolumeMounts, keysTmpfsVolume, "/var/ton-work/keys") {
 		t.Fatalf("main container missing keys tmpfs mount")
 	}
@@ -1169,6 +1172,15 @@ func assertQuantityEqual(t *testing.T, actual resource.Quantity, expected string
 func hasMount(mounts []corev1.VolumeMount, name string, path string) bool {
 	for _, mount := range mounts {
 		if mount.Name == name && mount.MountPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMountWithSubPath(mounts []corev1.VolumeMount, name string, path string, subPath string) bool {
+	for _, mount := range mounts {
+		if mount.Name == name && mount.MountPath == path && mount.SubPath == subPath {
 			return true
 		}
 	}

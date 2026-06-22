@@ -72,6 +72,8 @@ const (
 	tonWorkClaimName = "ton-work"
 	myTonCoreClaim   = "mytoncore"
 	keyBundleClaim   = "keybundle"
+	tonSourcePath    = "/usr/src/ton"
+	tonSourceSubPath = "usr-src-ton"
 
 	headlessServiceSuffix    = "headless"
 	bootstrapConfigVolume    = "bootstrap-config"
@@ -607,6 +609,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
+		{Name: tonWorkClaimName, MountPath: tonSourcePath, SubPath: tonSourceSubPath},
 		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
 	}
 	if keyManagementEnabled(tonNode) {
