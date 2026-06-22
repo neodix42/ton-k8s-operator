@@ -5902,7 +5902,8 @@ run_wallet_collect() {
   local amount="alld"
   local candidate=""
   local main_wallet_address=""
-  local row target_ns target_pod target_node_name source_address
+  local row target_ns target_pod target_node_name wallet_row
+  local wallet_name status balance version workchain source_address status_lc
   local rc=0 collected_count=0
   local -a pod_rows=()
   local -a table_rows=()
@@ -5980,9 +5981,9 @@ run_wallet_collect() {
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
     [[ -z "$target_ns" || -z "$target_pod" ]] && continue
-    source_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$source_wallet_name" || true)"
-    source_address="$(trim_whitespace "$source_address")"
-    if [[ -z "$source_address" ]]; then
+    wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$source_wallet_name" || true)"
+    wallet_row="$(trim_whitespace "$wallet_row")"
+    if [[ -z "$wallet_row" ]]; then
       if [[ -n "$target_pod_name" ]]; then
         echo "Error: wallet '${source_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
         return 1
@@ -5990,19 +5991,42 @@ run_wallet_collect() {
       echo "Warning: cannot resolve wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
       continue
     fi
-    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${source_wallet_name}"$'\t'"${source_address}"$'\t'"${amount}")
+    IFS=$'\t' read -r wallet_name status balance version workchain source_address <<<"$wallet_row"
+    status="$(trim_whitespace "$status")"
+    status_lc="${status,,}"
+    source_address="$(trim_whitespace "$source_address")"
+    if [[ "$status_lc" != "active" ]]; then
+      if [[ -n "$target_pod_name" ]]; then
+        echo "Error: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active." >&2
+        echo "Hint: after funding it, run: ./kubeton wallet activate ${wallet_network} ${target_pod} ${source_wallet_name}" >&2
+        return 1
+      fi
+      echo "Warning: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active; skipping." >&2
+      echo "Warning: after funding it, run: ./kubeton wallet activate ${wallet_network} ${target_pod} ${source_wallet_name}" >&2
+      continue
+    fi
+    if [[ -z "$source_address" ]]; then
+      if [[ -n "$target_pod_name" ]]; then
+        echo "Error: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is active but has no address in mytonctrl wl output." >&2
+        return 1
+      fi
+      echo "Warning: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is active but has no address; skipping." >&2
+      continue
+    fi
+    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${source_address}"$'\t'"${amount}")
   done
 
   if [[ ${#table_rows[@]} -eq 0 ]]; then
-    echo "Error: no TON wallets resolved for wallet name '${source_wallet_name}'." >&2
+    echo "Error: no active TON wallets resolved for wallet name '${source_wallet_name}'." >&2
+    echo "Hint: check source status with './kubeton wallet show ${wallet_network} balance' and activate funded wallets with './kubeton wallet activate ${wallet_network} [tonnode-name] ${source_wallet_name}'." >&2
     return 1
   fi
 
-  print_aligned_table_5col "namespace" "tonnode pod" "from-wallet" "wallet-address" "amount" "${table_rows[@]}"
+  print_aligned_table_7col "namespace" "tonnode pod" "from-wallet" "status" "balance" "wallet-address" "amount" "${table_rows[@]}"
   confirm_or_exit "Collect '${amount}' from '${source_wallet_name}' on ${#table_rows[@]} TON wallet(s) to main wallet '${main_wallet_name}' (${main_wallet_address}) on ${wallet_network}?"
 
   for row in "${table_rows[@]}"; do
-    IFS=$'\t' read -r target_ns target_pod source_wallet_name source_address amount <<<"$row"
+    IFS=$'\t' read -r target_ns target_pod source_wallet_name status balance source_address amount <<<"$row"
     echo "[wallet] Collecting ${amount} from ${source_wallet_name} in ${target_ns}/${target_pod} to ${main_wallet_address} using mytonctrl mg" >&2
     if collect_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$source_wallet_name" "$main_wallet_address" "$amount"; then
       ((collected_count+=1))
@@ -10745,6 +10769,7 @@ run_wallet() {
     echo "  - deploy/activate/send/collect require an explicit network."
     echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
+    echo "  - collect only runs mytonctrl mg for source wallets reported as active by mytonctrl wl."
     echo "  - activate/exec-mtc timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
     echo "  - optional -n (last argument) forwards --no-bounce to wallet.fif"

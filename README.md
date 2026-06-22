@@ -261,6 +261,9 @@ After topping up mytonctrl wallets inside TON pods with split mode, for example
 `kubeton wallet activate <mainnet|testnet> [tonnode-name] [wallet-name]`. The
 activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
 pod and does not send a BOC payload to the network.
+`kubeton wallet collect` reads the same `mytonctrl wl` status and only runs
+`mg` for source wallets that are already `active`; activate funded pod wallets
+before collecting from them.
 `kubeton wallet deploy`, `kubeton wallet activate`, `kubeton wallet send`, and `kubeton wallet collect`
 require an explicit `mainnet` or `testnet` argument. For deploy/send that
 argument selects both the lite-server global config and TONCenter endpoint. By
