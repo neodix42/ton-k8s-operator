@@ -232,6 +232,11 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10.
 ./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10. -n
 ./kubeton wallet send testnet main-wallet 10.
+./kubeton wallet collect testnet main-wallet
+./kubeton wallet collect testnet main-wallet 10.
+./kubeton wallet collect testnet main-wallet tonnode-0
+./kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 10.
+./kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 alld
 ./kubeton wallet activate testnet
 ./kubeton wallet activate testnet tonnode-0
 ./kubeton wallet activate testnet tonnode-0 validator_wallet_001
@@ -256,7 +261,7 @@ After topping up mytonctrl wallets inside TON pods with split mode, for example
 `kubeton wallet activate <mainnet|testnet> [tonnode-name] [wallet-name]`. The
 activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
 pod and does not send a BOC payload to the network.
-`kubeton wallet deploy`, `kubeton wallet activate`, and `kubeton wallet send`
+`kubeton wallet deploy`, `kubeton wallet activate`, `kubeton wallet send`, and `kubeton wallet collect`
 require an explicit `mainnet` or `testnet` argument. For deploy/send that
 argument selects both the lite-server global config and TONCenter endpoint. By
 default wallet BOC sending uses

@@ -166,7 +166,7 @@ Commands:
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
-  wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|show> [args...]
+  wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|collect|show> [args...]
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Full best-effort cleanup of kubeton-managed resources (with confirmation; keeps TonNode CRD).
@@ -790,6 +790,92 @@ normalize_wallet_network() {
       ;;
     testnet|test)
       printf '%s' "testnet"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ton_nano_to_gram_amount() {
+  local nano="$1"
+  local whole frac
+
+  if ! [[ "$nano" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  whole=$((nano / 1000000000))
+  frac=$((nano % 1000000000))
+  printf '%s.%09d' "$whole" "$frac"
+}
+
+ton_gram_amount_to_nano() {
+  local amount="$1"
+  local normalized whole frac padded
+
+  normalized="$(trim_whitespace "$amount")"
+  if ! [[ "$normalized" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+    return 1
+  fi
+  if [[ "$normalized" == *"." ]]; then
+    normalized="${normalized%.}"
+  fi
+
+  whole="$normalized"
+  frac=""
+  if [[ "$normalized" == *"."* ]]; then
+    whole="${normalized%%.*}"
+    frac="${normalized#*.}"
+  fi
+
+  [[ -z "$whole" ]] && whole="0"
+  [[ -z "$frac" ]] && frac="0"
+  if ! [[ "$whole" =~ ^[0-9]+$ && "$frac" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if (( ${#frac} > 9 )); then
+    return 1
+  fi
+
+  padded="$frac"
+  while (( ${#padded} < 9 )); do
+    padded="${padded}0"
+  done
+
+  printf '%s' "$((10#$whole * 1000000000 + 10#$padded))"
+}
+
+looks_like_ton_address() {
+  local address
+  address="$(trim_whitespace "${1:-}")"
+
+  [[ "$address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]] && return 0
+  [[ "$address" =~ ^[A-Za-z0-9_-]{48}$ ]] && return 0
+  return 1
+}
+
+ton_address_valid_for_network() {
+  local address="$1"
+  local network="$2"
+  local first_char
+
+  address="$(trim_whitespace "$address")"
+  network="$(trim_whitespace "$network")"
+
+  if [[ "$address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]]; then
+    return 0
+  fi
+  if ! [[ "$address" =~ ^[A-Za-z0-9_-]{48}$ ]]; then
+    return 1
+  fi
+
+  first_char="${address:0:1}"
+  case "$network" in
+    mainnet)
+      [[ "$first_char" == "E" || "$first_char" == "U" ]]
+      ;;
+    testnet)
+      [[ "$first_char" == "E" || "$first_char" == "U" || "$first_char" == "k" || "$first_char" == "0" ]]
       ;;
     *)
       return 1
@@ -5723,6 +5809,215 @@ run_wallet_activate() {
   echo "[wallet] Activated ${activated_count}/${pending_count} wallet(s) with mytonctrl aw; skipped ${skipped_count} already active wallet(s)."
 }
 
+resolve_main_wallet_receive_address() {
+  local wallet_network="$1"
+  local wallet_name="$2"
+  local output address
+
+  wallet_name="$(trim_whitespace "$wallet_name")"
+  [[ -n "$wallet_name" ]] || return 1
+
+  output="$(run_wallet show "$wallet_name" 2>&1)" || {
+    local rc=$?
+    printf '%s\n' "$output" >&2
+    return "$rc"
+  }
+  output="$(strip_ansi_sequences "$output")"
+  address="$(printf '%s\n' "$output" | awk -v wallet_name="$wallet_name" '
+    $3 == wallet_name {
+      if ($5 != "" && $5 != "unknown") {
+        print $5
+      } else if ($4 != "" && $4 != "unknown") {
+        print $4
+      }
+      exit
+    }
+  ')"
+  address="$(trim_whitespace "$address")"
+  if [[ -z "$address" ]]; then
+    echo "Error: cannot resolve receive address for main wallet '${wallet_name}'." >&2
+    return 1
+  fi
+  if ! ton_address_valid_for_network "$address" "$wallet_network"; then
+    echo "Error: resolved main-wallet address '${address}' is not valid for ${wallet_network}." >&2
+    return 1
+  fi
+
+  printf '%s' "$address"
+}
+
+collect_tonnode_wallet_in_pod() {
+  local ns="$1"
+  local pod="$2"
+  local wallet_name="$3"
+  local destination_address="$4"
+  local amount="$5"
+  local output
+  local exec_rc=0
+
+  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+    wallet_name="$1"
+    destination_address="$2"
+    amount="$3"
+    mtc_cmd="mg ${wallet_name} ${destination_address} ${amount}"
+    shopt -s expand_aliases
+    if [[ -f ~/.bashrc ]]; then
+      source ~/.bashrc >/dev/null 2>&1 || true
+    fi
+    if ! command -v mytonctrl >/dev/null 2>&1; then
+      echo "Error: mytonctrl command not found." >&2
+      exit 127
+    fi
+    set +e
+    mytonctrl --cmd "$mtc_cmd"
+    mtc_rc=$?
+    if (( mtc_rc == 2 )); then
+      printf "%s\n" "$mtc_cmd" | mytonctrl
+    else
+      exit "$mtc_rc"
+    fi
+  ' _ "$wallet_name" "$destination_address" "$amount" 2>&1)" || exec_rc=$?
+  output="$(strip_ansi_sequences "$output")"
+  if (( exec_rc != 0 )); then
+    echo "Error: mytonctrl mg failed in ${ns}/${pod} with exit code ${exec_rc}." >&2
+    if (( exec_rc == 124 )); then
+      echo "Error: command timed out after MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}." >&2
+    fi
+    echo "mytonctrl output from ${ns}/${pod}:" >&2
+    print_prefixed_lines "  ${pod}> " "$output" >&2
+    return "$exec_rc"
+  fi
+  if [[ -n "$output" ]]; then
+    echo "mytonctrl output from ${ns}/${pod}:"
+    print_prefixed_lines "  ${pod}> " "$output"
+  fi
+}
+
+run_wallet_collect() {
+  local wallet_network="$1"
+  local main_wallet_name="$2"
+  shift 2 || true
+  local target_pod_name=""
+  local source_wallet_name="validator_wallet_001"
+  local amount="alld"
+  local candidate=""
+  local main_wallet_address=""
+  local row target_ns target_pod target_node_name source_address
+  local rc=0 collected_count=0
+  local -a pod_rows=()
+  local -a table_rows=()
+
+  [[ -n "$wallet_network" && -n "$main_wallet_name" ]] || return 1
+
+  case "$#" in
+    0)
+      ;;
+    1)
+      candidate="$(trim_whitespace "$1")"
+      if [[ "$candidate" =~ ^[0-9]+([.][0-9]+)?[.]?$ || "$candidate" == "alld" ]]; then
+        amount="$candidate"
+      else
+        target_pod_name="$candidate"
+      fi
+      ;;
+    2)
+      if resolve_tonnode_pod_row_by_name "$1" >/dev/null 2>&1; then
+        target_pod_name="$(trim_whitespace "$1")"
+        candidate="$(trim_whitespace "$2")"
+        if [[ "$candidate" =~ ^[0-9]+([.][0-9]+)?[.]?$ || "$candidate" == "alld" ]]; then
+          amount="$candidate"
+        else
+          source_wallet_name="$candidate"
+        fi
+      else
+        source_wallet_name="$(trim_whitespace "$1")"
+        amount="$(trim_whitespace "$2")"
+      fi
+      ;;
+    3)
+      target_pod_name="$(trim_whitespace "$1")"
+      source_wallet_name="$(trim_whitespace "$2")"
+      amount="$(trim_whitespace "$3")"
+      ;;
+    *)
+      echo "Error: usage: kubeton wallet collect <mainnet|testnet> <main-wallet-name> [from-tonnode-name] [wallet-name] [amount]" >&2
+      return 1
+      ;;
+  esac
+
+  main_wallet_name="$(trim_whitespace "$main_wallet_name")"
+  source_wallet_name="$(trim_whitespace "$source_wallet_name")"
+  amount="$(trim_whitespace "$amount")"
+  [[ -z "$amount" ]] && amount="alld"
+  if ! [[ "$main_wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Error: invalid main wallet name '${main_wallet_name}'." >&2
+    return 1
+  fi
+  if ! [[ "$source_wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Error: invalid source wallet name '${source_wallet_name}'." >&2
+    return 1
+  fi
+  if [[ "$amount" != "alld" ]] && ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+    echo "Error: collect amount must be numeric TON amount or omitted for alld." >&2
+    return 1
+  fi
+
+  main_wallet_address="$(resolve_main_wallet_receive_address "$wallet_network" "$main_wallet_name")" || return 1
+
+  if [[ -n "$target_pod_name" ]]; then
+    row="$(resolve_tonnode_pod_row_by_name "$target_pod_name" || true)"
+    row="$(trim_whitespace "$row")"
+    if [[ -z "$row" ]]; then
+      echo "Error: TON pod '${target_pod_name}' not found." >&2
+      return 1
+    fi
+    pod_rows+=("$row")
+  else
+    mapfile -t pod_rows < <(list_ton_pods 2>/dev/null || true)
+  fi
+
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
+    [[ -z "$target_ns" || -z "$target_pod" ]] && continue
+    source_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$source_wallet_name" || true)"
+    source_address="$(trim_whitespace "$source_address")"
+    if [[ -z "$source_address" ]]; then
+      if [[ -n "$target_pod_name" ]]; then
+        echo "Error: wallet '${source_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
+        return 1
+      fi
+      echo "Warning: cannot resolve wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
+      continue
+    fi
+    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${source_wallet_name}"$'\t'"${source_address}"$'\t'"${amount}")
+  done
+
+  if [[ ${#table_rows[@]} -eq 0 ]]; then
+    echo "Error: no TON wallets resolved for wallet name '${source_wallet_name}'." >&2
+    return 1
+  fi
+
+  print_aligned_table_5col "namespace" "tonnode pod" "from-wallet" "wallet-address" "amount" "${table_rows[@]}"
+  confirm_or_exit "Collect '${amount}' from '${source_wallet_name}' on ${#table_rows[@]} TON wallet(s) to main wallet '${main_wallet_name}' (${main_wallet_address}) on ${wallet_network}?"
+
+  for row in "${table_rows[@]}"; do
+    IFS=$'\t' read -r target_ns target_pod source_wallet_name source_address amount <<<"$row"
+    echo "[wallet] Collecting ${amount} from ${source_wallet_name} in ${target_ns}/${target_pod} to ${main_wallet_address} using mytonctrl mg" >&2
+    if collect_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$source_wallet_name" "$main_wallet_address" "$amount"; then
+      ((collected_count+=1))
+    else
+      rc=1
+    fi
+  done
+
+  if (( rc != 0 )); then
+    echo "Error: collected ${collected_count}/${#table_rows[@]} wallet(s); at least one mytonctrl mg command failed." >&2
+    return 1
+  fi
+  echo "[wallet] Collected ${collected_count}/${#table_rows[@]} wallet(s) with mytonctrl mg."
+}
+
 resolve_tonnode_pod_row_by_name() {
   local target_name="$1"
   local row ns pod node_name
@@ -10399,7 +10694,7 @@ wait_main_wallet_pod_completion() {
 
 run_wallet() {
   wallet_usage() {
-    echo "Usage: kubeton wallet <create|deploy|activate|send|show> [args...]"
+    echo "Usage: kubeton wallet <create|deploy|activate|send|collect|show> [args...]"
     echo
     echo "Subcommands:"
     echo "  create [name]"
@@ -10429,14 +10724,25 @@ run_wallet() {
     echo "    Split mode: divides <amount> equally across all TON pods"
     echo "    using MAIN_WALLET_TARGET_WALLET_NAME (default: validator_wallet_001)."
     echo
+    echo "  send <mainnet|testnet> <from-wallet-name> <destination-address> <amount> [-n]"
+    echo "    Send from main wallet to an explicit TON address on the selected network."
+    echo
     echo "  send <mainnet|testnet> <from-wallet-name> <to-tonnode-name> <amount> [-n]"
     echo "    Send to default target wallet name on selected TON pod."
     echo
     echo "  send <mainnet|testnet> <from-wallet-name> <to-tonnode-name> <wallet-name> <amount> [-n]"
     echo "    Send to explicit target wallet name on selected TON pod."
     echo
+    echo "  collect <mainnet|testnet> <main-wallet-name> [amount]"
+    echo "    Collect from all TON pods using validator_wallet_001 into the named main wallet."
+    echo "    If [amount] is omitted, mytonctrl mg receives 'alld'."
+    echo
+    echo "  collect <mainnet|testnet> <main-wallet-name> <from-tonnode-name> [wallet-name] [amount]"
+    echo "    Collect from one TON pod into the named main wallet."
+    echo "    If [wallet-name] is omitted, validator_wallet_001 is used; if [amount] is omitted, 'alld' is used."
+    echo
     echo "Notes:"
-    echo "  - deploy/activate/send require an explicit network."
+    echo "  - deploy/activate/send/collect require an explicit network."
     echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
     echo "  - activate/exec-mtc timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
@@ -10459,10 +10765,14 @@ run_wallet() {
     echo "  kubeton wallet show testnet balance tonnode-0"
     echo "  kubeton wallet show testnet balance tonnode-0 validator_wallet_001"
     echo "  kubeton wallet send testnet main-wallet 10."
+    echo "  kubeton wallet send testnet main-wallet <destination-address> 10."
     echo "  kubeton wallet send testnet main-wallet tonnode-0 10."
     echo "  kubeton wallet send testnet main-wallet tonnode-0 10. -n"
     echo "  kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10."
     echo "  kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10. -n"
+    echo "  kubeton wallet collect testnet main-wallet"
+    echo "  kubeton wallet collect testnet main-wallet 10."
+    echo "  kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 alld"
   }
 
   local action="${1:-}"
@@ -10476,7 +10786,7 @@ run_wallet() {
       wallet_usage
       return 0
       ;;
-    create|deploy|activate|send|show)
+    create|deploy|activate|send|collect|show)
       ;;
     *)
       echo "Error: unknown wallet subcommand '$action'." >&2
@@ -10539,6 +10849,19 @@ run_wallet() {
       fi
       shift || true
       run_wallet_activate "$wallet_network" "${1:-}" "${2:-validator_wallet_001}"
+      return $?
+      ;;
+    collect)
+      if (( $# < 2 || $# > 5 )); then
+        echo "Error: usage: kubeton wallet collect <mainnet|testnet> <main-wallet-name> [from-tonnode-name] [wallet-name] [amount]" >&2
+        return 1
+      fi
+      if ! wallet_network="$(normalize_wallet_network "$1")"; then
+        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
+        return 1
+      fi
+      shift || true
+      run_wallet_collect "$wallet_network" "$@"
       return $?
       ;;
     show)
@@ -10619,15 +10942,43 @@ run_wallet() {
               continue
             fi
             destination_addresses+=("$destination_address")
-            table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"split:${amount}")
+            table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}")
           done < <(list_ton_pods 2>/dev/null || true)
 
           if [[ ${#table_rows[@]} -eq 0 ]]; then
             echo "Error: no TON wallets resolved for wallet name '${target_wallet_name}'." >&2
             return 1
           fi
+          local target_count total_amount_nano amount_each_nano remainder_nano amount_each
+          local -a split_table_rows=()
+          target_count="${#destination_addresses[@]}"
+          total_amount_nano="$(ton_gram_amount_to_nano "$amount" || true)"
+          total_amount_nano="$(trim_whitespace "$total_amount_nano")"
+          if ! [[ "$total_amount_nano" =~ ^[0-9]+$ ]] || (( total_amount_nano <= 0 )); then
+            echo "Error: amount '${amount}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
+            return 1
+          fi
+          amount_each_nano=$(( total_amount_nano / target_count ))
+          if (( amount_each_nano <= 0 )); then
+            echo "Error: amount '${amount}' is too low for equal distribution across ${target_count} targets." >&2
+            return 1
+          fi
+          remainder_nano=$(( total_amount_nano - (amount_each_nano * target_count) ))
+          amount_each="$(ton_nano_to_gram_amount "$amount_each_nano" || true)"
+          amount_each="$(trim_whitespace "$amount_each")"
+          if [[ -z "$amount_each" ]]; then
+            echo "Error: failed to convert equal share amount." >&2
+            return 1
+          fi
+          for row in "${table_rows[@]}"; do
+            split_table_rows+=("${row}"$'\t'"${amount_each}")
+          done
+          table_rows=("${split_table_rows[@]}")
           print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
-          confirm_or_exit "This will split '${amount}' from '${from_wallet_name}' on ${wallet_network} equally across all listed TON wallets. Continue?"
+          if (( remainder_nano > 0 )); then
+            echo "Warning: ${remainder_nano} nanoTON remainder is not sent due to equal split rounding." >&2
+          fi
+          confirm_or_exit "This will send '${amount_each}' from '${from_wallet_name}' on ${wallet_network} to each listed TON wallet (${target_count} total). Continue?"
 
           action_args=("$from_wallet_name" "$amount")
           for destination_address in "${destination_addresses[@]}"; do
@@ -10644,44 +10995,66 @@ run_wallet() {
             echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
             return 1
           fi
-          if (( ${#send_args[@]} == 3 )); then
-            target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
-            [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
+          if (( ${#send_args[@]} == 3 )) && looks_like_ton_address "$to_tonnode_name"; then
+            destination_address="$to_tonnode_name"
             amount="$(trim_whitespace "${send_args[2]}")"
+            if ! ton_address_valid_for_network "$destination_address" "$wallet_network"; then
+              echo "Error: destination address '${destination_address}' is not valid for ${wallet_network}." >&2
+              return 1
+            fi
+            if ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+              echo "Error: amount '${amount}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
+              return 1
+            fi
+
+            table_rows=("${wallet_network}"$'\t'"${from_wallet_name}"$'\t'"${destination_address}"$'\t'"${amount}"$'\t'"${send_no_bounce_flag:-default}")
+            print_aligned_table_5col "network" "from-wallet" "destination-address" "amount" "wallet.fif flag" "${table_rows[@]}"
+            confirm_or_exit "Send '${amount}' from '${from_wallet_name}' on ${wallet_network} to '${destination_address}'?"
+
+            action_args=("$from_wallet_name" "$destination_address" "$amount")
+            if [[ -n "$send_no_bounce_flag" ]]; then
+              action_args+=("$send_no_bounce_flag")
+            fi
           else
-            target_wallet_name="$(trim_whitespace "${send_args[2]}")"
-            amount="$(trim_whitespace "${send_args[3]}")"
-          fi
-          if [[ -z "$target_wallet_name" || -z "$amount" ]]; then
-            echo "Error: wallet-name and amount are required." >&2
-            return 1
-          fi
-          if ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
-            echo "Error: amount '${amount}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
-            return 1
-          fi
+            if (( ${#send_args[@]} == 3 )); then
+              target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
+              [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
+              amount="$(trim_whitespace "${send_args[2]}")"
+            else
+              target_wallet_name="$(trim_whitespace "${send_args[2]}")"
+              amount="$(trim_whitespace "${send_args[3]}")"
+            fi
+            if [[ -z "$target_wallet_name" || -z "$amount" ]]; then
+              echo "Error: wallet-name and amount are required." >&2
+              return 1
+            fi
+            if ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+              echo "Error: amount '${amount}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
+              return 1
+            fi
 
-          row="$(resolve_tonnode_pod_row_by_name "$to_tonnode_name" || true)"
-          row="$(trim_whitespace "$row")"
-          if [[ -z "$row" ]]; then
-            echo "Error: TON pod '${to_tonnode_name}' not found." >&2
-            return 1
-          fi
-          IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
-          destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
-          destination_address="$(trim_whitespace "$destination_address")"
-          if [[ -z "$destination_address" ]]; then
-            echo "Error: wallet '${target_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
-            return 1
-          fi
+            row="$(resolve_tonnode_pod_row_by_name "$to_tonnode_name" || true)"
+            row="$(trim_whitespace "$row")"
+            if [[ -z "$row" ]]; then
+              echo "Error: TON pod '${to_tonnode_name}' not found." >&2
+              return 1
+            fi
+            IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
+            destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
+            destination_address="$(trim_whitespace "$destination_address")"
+            if [[ -z "$destination_address" ]]; then
+              echo "Error: wallet '${target_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
+              return 1
+            fi
 
-          table_rows=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"${amount}")
-          print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
-          confirm_or_exit "Send '${amount}' from '${from_wallet_name}' on ${wallet_network} to '${target_wallet_name}' on ${target_ns}/${target_pod}?"
+            table_rows=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}"$'\t'"${amount}")
+            print_aligned_table_5col "namespace" "tonnode pod" "wallet-name" "wallet-address" "amount" "${table_rows[@]}"
+            confirm_or_exit "Send '${amount}' from '${from_wallet_name}' on ${wallet_network} to '${target_wallet_name}' on ${target_ns}/${target_pod}?"
 
-          action_args=("$from_wallet_name" "$destination_address" "$amount")
-          if [[ -n "$send_no_bounce_flag" ]]; then
-            action_args+=("$send_no_bounce_flag")
+            action_args=("$from_wallet_name" "$destination_address" "$amount")
+            if [[ -n "$send_no_bounce_flag" ]]; then
+              action_args+=("$send_no_bounce_flag")
+            fi
           fi
           ;;
         *)
