@@ -5860,6 +5860,88 @@ collect_tonnode_wallet_in_pod() {
     destination_address="$2"
     amount="$3"
     mtc_cmd="mg ${wallet_name} ${destination_address} ${amount}"
+    link_dir_contents() {
+      local source_dir="$1"
+      local target_dir="$2"
+      local f base target
+      [[ -d "$source_dir" ]] || return 0
+      mkdir -p "$target_dir" 2>/dev/null || return 1
+      for f in "$source_dir"/*; do
+        [[ -e "$f" ]] || continue
+        base="${f##*/}"
+        target="${target_dir}/${base}"
+        [[ "$f" == "$target" ]] && continue
+        if [[ ! -e "$target" ]]; then
+          rm -f "$target" 2>/dev/null || true
+          ln -s "$f" "$target" 2>/dev/null || cp -a "$f" "$target" 2>/dev/null || true
+        fi
+      done
+    }
+    prepare_mytonctrl_fift_env() {
+      local expected_fift_dir="/usr/src/ton/crypto/fift/lib"
+      local expected_smart_dir="/usr/src/ton/crypto/smartcont"
+      local fift_file="" wallet_fif="" fift_dir="" smart_dir="" f
+
+      for f in \
+        "${expected_fift_dir}/Fift.fif" \
+        /usr/lib/fift/Fift.fif \
+        /usr/share/ton/fift/Fift.fif \
+        /usr/share/ton/crypto/fift/lib/Fift.fif \
+        /usr/local/lib/fift/Fift.fif \
+        /usr/local/share/ton/fift/Fift.fif \
+        /opt/ton/crypto/fift/lib/Fift.fif \
+        /var/ton-work/ton/crypto/fift/lib/Fift.fif; do
+        if [[ -f "$f" ]]; then
+          fift_file="$f"
+          break
+        fi
+      done
+      if [[ -z "$fift_file" ]]; then
+        fift_file="$(find /usr /opt /var/ton-work/ton -type f -name Fift.fif -print -quit 2>/dev/null || true)"
+      fi
+
+      for f in \
+        "${expected_smart_dir}/wallet.fif" \
+        /usr/share/ton/smartcont/wallet.fif \
+        /usr/share/ton/crypto/smartcont/wallet.fif \
+        /usr/local/share/ton/smartcont/wallet.fif \
+        /opt/ton/crypto/smartcont/wallet.fif \
+        /var/ton-work/ton/crypto/smartcont/wallet.fif; do
+        if [[ -f "$f" ]]; then
+          wallet_fif="$f"
+          break
+        fi
+      done
+      if [[ -z "$wallet_fif" ]]; then
+        wallet_fif="$(find /usr /opt /var/ton-work/ton -type f -name wallet.fif -print -quit 2>/dev/null || true)"
+      fi
+
+      if [[ -z "$fift_file" ]]; then
+        echo "Error: Fift.fif was not found in the ton-node container; mytonctrl mg can not build a transfer BOC." >&2
+        return 90
+      fi
+      if [[ -z "$wallet_fif" ]]; then
+        echo "Error: wallet.fif was not found in the ton-node container; mytonctrl mg can not build a transfer BOC." >&2
+        return 90
+      fi
+
+      fift_dir="${fift_file%/*}"
+      smart_dir="${wallet_fif%/*}"
+      link_dir_contents "$fift_dir" "$expected_fift_dir" || return 90
+      link_dir_contents "$smart_dir" "$expected_smart_dir" || return 90
+
+      if [[ ! -f "${expected_fift_dir}/Fift.fif" ]]; then
+        echo "Error: found Fift.fif at ${fift_file}, but could not expose it at ${expected_fift_dir}/Fift.fif." >&2
+        return 90
+      fi
+      if [[ ! -f "${expected_smart_dir}/wallet.fif" ]]; then
+        echo "Error: found wallet.fif at ${wallet_fif}, but could not expose it at ${expected_smart_dir}/wallet.fif." >&2
+        return 90
+      fi
+
+      export FIFTPATH="${expected_fift_dir}:${expected_smart_dir}:${fift_dir}:${smart_dir}:${FIFTPATH:-}"
+      return 0
+    }
     shopt -s expand_aliases
     if [[ -f ~/.bashrc ]]; then
       source ~/.bashrc >/dev/null 2>&1 || true
@@ -5867,6 +5949,9 @@ collect_tonnode_wallet_in_pod() {
     if ! command -v mytonctrl >/dev/null 2>&1; then
       echo "Error: mytonctrl command not found." >&2
       exit 127
+    fi
+    if ! prepare_mytonctrl_fift_env; then
+      exit 90
     fi
     set +e
     mytonctrl --cmd "$mtc_cmd"
@@ -5885,6 +5970,10 @@ collect_tonnode_wallet_in_pod() {
     fi
     echo "mytonctrl output from ${ns}/${pod}:" >&2
     print_prefixed_lines "  ${pod}> " "$output" >&2
+    if (( exec_rc == 90 )) || printf '%s\n' "$output" | grep -Eq 'Fift\.fif|wallet\.fif'; then
+      echo "Hint: the ton-node image mytonctrl uses is missing or misconfiguring Fift include files; fix the image or ensure Fift.fif and wallet.fif are available in the container." >&2
+      return 90
+    fi
     return "$exec_rc"
   fi
   if [[ -n "$output" ]]; then
@@ -5904,7 +5993,7 @@ run_wallet_collect() {
   local main_wallet_address=""
   local row target_ns target_pod target_node_name wallet_row
   local wallet_name status balance version workchain source_address status_lc
-  local rc=0 collected_count=0
+  local rc=0 collected_count=0 collect_rc=0
   local -a pod_rows=()
   local -a table_rows=()
 
@@ -6027,11 +6116,17 @@ run_wallet_collect() {
 
   for row in "${table_rows[@]}"; do
     IFS=$'\t' read -r target_ns target_pod source_wallet_name status balance source_address amount <<<"$row"
+    collect_rc=0
     echo "[wallet] Collecting ${amount} from ${source_wallet_name} in ${target_ns}/${target_pod} to ${main_wallet_address} using mytonctrl mg" >&2
     if collect_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$source_wallet_name" "$main_wallet_address" "$amount"; then
       ((collected_count+=1))
     else
+      collect_rc=$?
       rc=1
+      if (( collect_rc == 90 )); then
+        echo "Error: stopping collect because mytonctrl/Fift is not usable in ${target_ns}/${target_pod}." >&2
+        break
+      fi
     fi
   done
 
