@@ -74,7 +74,7 @@ type TonNodeStorageSpec struct {
 	// +kubebuilder:default:="700Gi"
 	TonWorkSize string `json:"tonWorkSize,omitempty"`
 
-	// MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore.
+	// MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore and the /usr/local/bin/mytonctrl subPath.
 	// +kubebuilder:default:="20Gi"
 	MyTonCoreSize string `json:"myTonCoreSize,omitempty"`
 

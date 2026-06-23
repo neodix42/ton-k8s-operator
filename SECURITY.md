@@ -209,11 +209,13 @@ Exact exported files per replica (`<output-dir>/<namespace>/<statefulset>/<ordin
 - `keys.bundle.enc` decrypts to a tar archive with top-level folders:
 - `keys/` = all files from pod path `/var/ton-work/keys/**`
 - `mytoncore/` = all files from pod path `/usr/local/bin/mytoncore/**`
+- `mytonctrl/` = all files from pod path `/usr/local/bin/mytonctrl/**`
 - `tondb/` = selected TON DB key files:
 - `tondb/config.json` from pod path `/var/ton-work/db/config.json`
 - `tondb/keyring/**` from pod path `/var/ton-work/db/keyring/**`
 - common examples included from `keys/`: `client.pub`, `liteserver.pub`, `client`, `server.pub`
 - common examples included from `mytoncore/`: `wallets/validator_wallet_001.pk` (and other mytoncore files)
+- common examples included from `mytonctrl/`: files created under `/usr/local/bin/mytonctrl`
 - `keys.bundle.meta` stores metadata fields used for restore: `provider`, `wrapped_key`, `algorithm`, `created_at`
 - TON DB data outside this set (`/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`, etc.) is not included.
 - if `spec.keyManagement.encryptedBundle.fileName` / `metaFileName` are customized, backup uses those exact filenames instead of defaults.

@@ -10,6 +10,8 @@ This operator creates and manages:
   - `/var/ton-work`
   - `/usr/local/bin/mytoncore`
 - `/usr/src/ton` is persisted as a subPath on the `/var/ton-work` PVC.
+- `/usr/local/bin/mytonctrl` is persisted as a subPath on the `mytoncore` PVC.
+- `/usr/local/bin/mytoncore/mytoncore.db` is persisted on the `mytoncore` PVC.
 
 ## Behavior Implemented
 
@@ -83,6 +85,7 @@ Manual encrypted bundle backup is available with:
 - `/var/ton-work/db/systemd-units/**`
 - `/var/ton-work/db/mtc_done`
 - `/usr/local/bin/mytoncore/**` (entire folder, including wallets and mytoncore state files)
+- `/usr/local/bin/mytonctrl/**`
 - `keys.bundle.meta` contains bundle metadata: `provider`, `wrapped_key`, `algorithm`, `created_at`
 - TON DB data outside this set (for example `/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`) is not part of this key bundle backup.
 - if `spec.keyManagement.encryptedBundle.fileName` or `metaFileName` is customized, exported filenames follow those values.
@@ -258,7 +261,7 @@ non-bounceable init address printed by `wallet create`, wait until the funding
 transaction is visible on-chain, then rerun
 `kubeton wallet deploy <mainnet|testnet> <name>`.
 After topping up mytonctrl wallets inside TON pods with split mode, for example
-`kubeton wallet send testnet my-wallet 2`, activate those pod wallets with
+`kubeton wallet send testnet main-wallet 2`, activate those pod wallets with
 `kubeton wallet activate <mainnet|testnet> [tonnode-name] [wallet-name]`. The
 activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
 pod and does not send a BOC payload to the network.
@@ -816,6 +819,9 @@ Data from all TON pods is not stored in one shared place.
 
 With this operator setup:
 - Each TON pod gets its own PVCs (`ton-work-...` and `mytoncore-...`).
+- `/usr/local/bin/mytoncore` is mounted from the pod's `mytoncore` PVC; this is where `mytoncore.db` persists across pod restarts.
+- `/usr/local/bin/mytonctrl` is mounted from the pod's `mytoncore` PVC via a subPath so any MyTonCtrl files written there also persist.
+- When encrypted key management is enabled, only `/usr/local/bin/mytoncore/wallets` is overlaid with tmpfs and restored from the encrypted key bundle.
 - `/usr/src/ton` is mounted from the pod's `ton-work` PVC via a subPath so
   the TON source checkout used by MyTonCtrl/Fift survives pod recreation.
 - PVCs are `ReadWriteOnce`, so one PVC is attached to one pod.

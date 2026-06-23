@@ -668,6 +668,12 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	}
 
 	main := tpl.Spec.Containers[0]
+	if !hasMount(main.VolumeMounts, myTonCoreClaim, "/usr/local/bin/mytoncore") {
+		t.Fatalf("main container missing persistent mytoncore mount")
+	}
+	if !hasMountWithSubPath(main.VolumeMounts, myTonCoreClaim, myTonCtrlPath, myTonCtrlSubPath) {
+		t.Fatalf("main container missing persistent mytonctrl mount")
+	}
 	if !hasMountWithSubPath(main.VolumeMounts, tonWorkClaimName, tonSourcePath, tonSourceSubPath) {
 		t.Fatalf("main container missing persistent TON source mount")
 	}

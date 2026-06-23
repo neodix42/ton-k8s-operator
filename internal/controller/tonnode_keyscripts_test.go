@@ -8,9 +8,10 @@ import (
 func TestKeyRestoreScriptIncludesBootstrapArtifacts(t *testing.T) {
 	required := []string{
 		`MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"`,
+		`MYTONCTRL_DIR="/usr/local/bin/mytonctrl"`,
 		`fix_validator_ownership() {`,
 		`if ! id -u validator >/dev/null 2>&1; then`,
-		`chown -R validator:validator "$KEYS_DIR" "$WALLETS_DIR" || true`,
+		`chown -R validator:validator "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCTRL_DIR" || true`,
 		`chown validator:validator "$DB_CONFIG_FILE" "$MTC_DONE_FILE" || true`,
 		`chmod 600 "$KEYS_DIR/client" "$KEYS_DIR/client.pub" "$KEYS_DIR/server.pub" "$KEYS_DIR/liteserver.pub" 2>/dev/null || true`,
 		`fix_validator_ownership`,
@@ -18,6 +19,8 @@ func TestKeyRestoreScriptIncludesBootstrapArtifacts(t *testing.T) {
 		`dir_has_payload "$unpacked_dir/tondb/systemd-units" || return 1`,
 		`current_bootstrap_complete() {`,
 		`clear_partial_bootstrap_state() {`,
+		`find "$MYTONCTRL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true`,
+		`! -name "$MYTONCTRL_SUBPATH_NAME"`,
 		`quarantine_incomplete_bundle() {`,
 		`encrypted key bundle is incomplete (missing config.json, mtc_done, or systemd-units); quarantining and continuing without key restore`,
 		`current bootstrap state is incomplete; clearing partial bootstrap artifacts before fresh startup`,
@@ -27,6 +30,8 @@ func TestKeyRestoreScriptIncludesBootstrapArtifacts(t *testing.T) {
 		`cp -a "$work_dir/unpacked/tondb/systemd-units" "$SYSTEMD_UNITS_DIR"`,
 		`if [ -f "$work_dir/unpacked/tondb/mtc_done" ]; then`,
 		`cp -a "$work_dir/unpacked/tondb/mtc_done" "$MTC_DONE_FILE"`,
+		`if [ -d "$work_dir/unpacked/mytonctrl" ]; then`,
+		`cp -a "$work_dir/unpacked/mytonctrl/." "$MYTONCTRL_DIR/"`,
 	}
 	for _, fragment := range required {
 		if !strings.Contains(keyRestoreScript, fragment) {
@@ -39,6 +44,7 @@ func TestKeyBackupScriptIncludesBootstrapArtifacts(t *testing.T) {
 	required := []string{
 		`SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"`,
 		`MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"`,
+		`MYTONCTRL_DIR="/usr/local/bin/mytonctrl"`,
 		`AUTO_BOOTSTRAP_FLAG="${KEY_AUTO_BOOTSTRAP_BUNDLE:-true}"`,
 		`dir_has_payload() {`,
 		`key_material_present() {`,
@@ -49,6 +55,8 @@ func TestKeyBackupScriptIncludesBootstrapArtifacts(t *testing.T) {
 		`auto_backup_ready() {`,
 		`complete_bootstrap_present && key_material_present`,
 		`complete bootstrap state not present yet; backup skipped`,
+		`mkdir -p "$work_dir/stage/keys" "$work_dir/stage/mytoncore" "$work_dir/stage/mytonctrl" "$work_dir/stage/tondb"`,
+		`cp -a "$MYTONCTRL_DIR/." "$work_dir/stage/mytonctrl/"`,
 		`cp -a "$SYSTEMD_UNITS_DIR" "$work_dir/stage/tondb/systemd-units"`,
 		`cp -a "$MTC_DONE_FILE" "$work_dir/stage/tondb/mtc_done"`,
 		`echo "manual backup mode enabled"`,

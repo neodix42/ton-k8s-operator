@@ -74,6 +74,8 @@ const (
 	keyBundleClaim   = "keybundle"
 	tonSourcePath    = "/usr/src/ton"
 	tonSourceSubPath = "usr-src-ton"
+	myTonCtrlPath    = "/usr/local/bin/mytonctrl"
+	myTonCtrlSubPath = "usr-local-bin-mytonctrl"
 
 	headlessServiceSuffix    = "headless"
 	bootstrapConfigVolume    = "bootstrap-config"
@@ -611,6 +613,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
 		{Name: tonWorkClaimName, MountPath: tonSourcePath, SubPath: tonSourceSubPath},
 		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
+		{Name: myTonCoreClaim, MountPath: myTonCtrlPath, SubPath: myTonCtrlSubPath},
 	}
 	if keyManagementEnabled(tonNode) {
 		volumeMounts = append(volumeMounts,
@@ -973,6 +976,7 @@ func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
 		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
+		{Name: myTonCoreClaim, MountPath: myTonCtrlPath, SubPath: myTonCtrlSubPath},
 		{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
 		{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
 		{Name: keyBundleClaim, MountPath: keyBundleMountPath},
@@ -1010,6 +1014,8 @@ set -eu
 
 KEYS_DIR="/var/ton-work/keys"
 MYTONCORE_DIR="/usr/local/bin/mytoncore"
+MYTONCTRL_DIR="/usr/local/bin/mytonctrl"
+MYTONCTRL_SUBPATH_NAME="usr-local-bin-mytonctrl"
 WALLETS_DIR="${MYTONCORE_DIR}/wallets"
 TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
@@ -1127,7 +1133,7 @@ fix_validator_ownership() {
     return 0
   fi
 
-  chown -R validator:validator "$KEYS_DIR" "$WALLETS_DIR" || true
+  chown -R validator:validator "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCTRL_DIR" || true
   chown validator:validator "$DB_CONFIG_FILE" "$MTC_DONE_FILE" || true
   chown -R validator:validator "$DB_KEYRING_DIR" "$SYSTEMD_UNITS_DIR" || true
 }
@@ -1153,7 +1159,8 @@ current_bootstrap_complete() {
 
 clear_partial_bootstrap_state() {
   find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-  find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+  find "$MYTONCTRL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+  find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 ! -name "$MYTONCTRL_SUBPATH_NAME" -exec rm -rf {} + || true
   rm -f "$DB_CONFIG_FILE" || true
   rm -rf "$DB_KEYRING_DIR" || true
   rm -rf "$SYSTEMD_UNITS_DIR" || true
@@ -1169,7 +1176,7 @@ quarantine_incomplete_bundle() {
 need_bin tar
 need_bin openssl
 need_bin base64
-mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
+mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
 if [ ! -s "$BUNDLE_FILE" ] || [ ! -s "$META_FILE" ]; then
   echo "no encrypted key bundle found; continuing without key restore"
@@ -1218,6 +1225,9 @@ fi
 if [ -d "$work_dir/unpacked/mytoncore" ]; then
   cp -a "$work_dir/unpacked/mytoncore/." "$MYTONCORE_DIR/"
 fi
+if [ -d "$work_dir/unpacked/mytonctrl" ]; then
+  cp -a "$work_dir/unpacked/mytonctrl/." "$MYTONCTRL_DIR/"
+fi
 if [ -f "$work_dir/unpacked/tondb/config.json" ]; then
   cp -a "$work_dir/unpacked/tondb/config.json" "$DB_CONFIG_FILE"
 fi
@@ -1231,7 +1241,7 @@ if [ -f "$work_dir/unpacked/tondb/mtc_done" ]; then
   cp -a "$work_dir/unpacked/tondb/mtc_done" "$MTC_DONE_FILE"
 fi
 
-chmod 700 "$KEYS_DIR" "$MYTONCORE_DIR" "$WALLETS_DIR" || true
+chmod 700 "$KEYS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$WALLETS_DIR" || true
 chmod 700 "$DB_KEYRING_DIR" || true
 chmod 700 "$SYSTEMD_UNITS_DIR" || true
 chmod 600 "$DB_CONFIG_FILE" || true
@@ -1246,6 +1256,7 @@ set -eu
 
 KEYS_DIR="/var/ton-work/keys"
 MYTONCORE_DIR="/usr/local/bin/mytoncore"
+MYTONCTRL_DIR="/usr/local/bin/mytonctrl"
 WALLETS_DIR="${MYTONCORE_DIR}/wallets"
 TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
@@ -1412,7 +1423,7 @@ perform_backup() {
   need_bin tar
   need_bin openssl
   need_bin base64
-  mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
+  mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
 
   if ! backup_sources_present; then
     echo "complete bootstrap state not present yet; backup skipped" >&2
@@ -1421,9 +1432,10 @@ perform_backup() {
 
   work_dir="$(mktemp -d)"
 
-  mkdir -p "$work_dir/stage/keys" "$work_dir/stage/mytoncore" "$work_dir/stage/tondb"
+  mkdir -p "$work_dir/stage/keys" "$work_dir/stage/mytoncore" "$work_dir/stage/mytonctrl" "$work_dir/stage/tondb"
   cp -a "$KEYS_DIR/." "$work_dir/stage/keys/" 2>/dev/null || true
   cp -a "$MYTONCORE_DIR/." "$work_dir/stage/mytoncore/" 2>/dev/null || true
+  cp -a "$MYTONCTRL_DIR/." "$work_dir/stage/mytonctrl/" 2>/dev/null || true
   if [ -f "$DB_CONFIG_FILE" ]; then
     cp -a "$DB_CONFIG_FILE" "$work_dir/stage/tondb/config.json"
   fi

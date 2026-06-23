@@ -489,7 +489,7 @@ spec:
                     type: array
                   myTonCoreSize:
                     default: 20Gi
-                    description: MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore.
+                    description: MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore and the /usr/local/bin/mytonctrl subPath.
                     type: string
                   storageClassName:
                     description: |-
