@@ -881,63 +881,97 @@ resolve_wallet_subwallet_id_by_name() {
   printf '%s' "42"
 }
 
+liteclient_int_token_to_decimal() {
+  local token="$1"
+
+  token="$(trim_whitespace "$token")"
+  if [[ "$token" =~ ^0x[0-9A-Fa-f]+$ ]]; then
+    printf '%s' "$((16#${token:2}))"
+    return 0
+  fi
+  if [[ "$token" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$token"
+    return 0
+  fi
+  return 1
+}
+
+parse_seqno_from_runmethod_output() {
+  local output="$1"
+  local line token
+  local capture=0
+
+  while IFS= read -r line; do
+    line="${line//$'\r'/}"
+    if [[ "$line" =~ ^[[:space:]]*result:[[:space:]]*\[[[:space:]]*(0x[0-9A-Fa-f]+|[0-9]+) ]]; then
+      liteclient_int_token_to_decimal "${BASH_REMATCH[1]}"
+      return 0
+    fi
+
+    if [[ "$line" =~ ^[[:space:]]*result:[[:space:]]*\[ ]]; then
+      capture=1
+      line="${line#*[[]}"
+    fi
+
+    if (( capture )); then
+      if [[ "$line" =~ (0x[0-9A-Fa-f]+|[0-9]+) ]]; then
+        token="${BASH_REMATCH[1]}"
+        liteclient_int_token_to_decimal "$token"
+        return 0
+      fi
+      if [[ "$line" == *"]"* ]]; then
+        capture=0
+      fi
+    fi
+  done <<<"$output"
+
+  return 1
+}
+
+parse_seqno_from_account_output() {
+  local output="$1"
+  local line seq_hex
+  local in_data=0
+
+  while IFS= read -r line; do
+    line="${line//$'\r'/}"
+
+    if [[ "$line" =~ data:[[:space:]]*x\{([0-9A-Fa-f]{8,}) ]]; then
+      seq_hex="${BASH_REMATCH[1]:0:8}"
+      printf '%d' "$((16#$seq_hex))"
+      return 0
+    fi
+
+    if [[ "$line" =~ data:[[:space:]]*\(just|data:[[:space:]]*x\{ ]]; then
+      in_data=1
+    fi
+
+    if (( in_data )); then
+      if [[ "$line" =~ x\{([0-9A-Fa-f]{8,}) ]]; then
+        seq_hex="${BASH_REMATCH[1]:0:8}"
+        printf '%d' "$((16#$seq_hex))"
+        return 0
+      fi
+      if [[ "$line" =~ library: ]]; then
+        in_data=0
+      fi
+    fi
+  done <<<"$output"
+
+  return 1
+}
+
 wallet_seqno_decimal() {
   local wallet_address="$1"
-  local output seq_hex seq_dec seq_token attempts delay attempt
+  local output seq_dec attempts delay attempt
 
   attempts="$(main_wallet_send_retry_attempts)"
   delay="$(main_wallet_send_retry_delay_seconds)"
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null || true)"
-    seq_token="$(printf '%s\n' "$output" | awk '
-      function parse_token(line, work, parts, count) {
-        if (match(line, /0x[0-9A-Fa-f]+/)) {
-          print substr(line, RSTART, RLENGTH)
-          return 1
-        }
-        # Decimal token bounded by non-word chars to avoid grabbing address/hash fragments.
-        work=line
-        gsub(/[^0-9]+/, " ", work)
-        sub(/^[[:space:]]+/, "", work)
-        sub(/[[:space:]]+$/, "", work)
-        count=split(work, parts, /[[:space:]]+/)
-        if (count > 0 && parts[1] ~ /^[0-9]+$/) {
-          print parts[1]
-          return 1
-        }
-        return 0
-      }
-      {
-        line=$0
-        if (!capture && line ~ /result:[[:space:]]*\[/) {
-          capture=1
-          sub(/.*result:[[:space:]]*\[/, "", line)
-          if (parse_token(line)) {
-            exit
-          }
-          if (line ~ /\]/) {
-            capture=0
-          }
-          next
-        }
-        if (capture) {
-          if (parse_token(line)) {
-            exit
-          }
-          if (line ~ /\]/) {
-            capture=0
-          }
-        }
-      }
-    ')"
-    seq_token="$(trim_whitespace "$seq_token")"
-    seq_dec=""
-    if [[ "$seq_token" =~ ^0x[0-9A-Fa-f]+$ ]]; then
-      seq_dec="$((16#${seq_token:2}))"
-    elif [[ "$seq_token" =~ ^[0-9]+$ ]]; then
-      seq_dec="$seq_token"
-    fi
+    seq_dec="$(parse_seqno_from_runmethod_output "$output" || true)"
+    seq_dec="$(trim_whitespace "$seq_dec")"
     if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
       printf '%s' "$seq_dec"
       return 0
@@ -951,46 +985,10 @@ wallet_seqno_decimal() {
       return 0
     fi
 
-    # Parse first 32 bits from account data cell: data: x{<seqno><...>}
-    # Keep parsing scoped to "data: x{...}" region only.
-    seq_hex="$(printf '%s\n' "$output" | awk '
-      /data:[[:space:]]*x\{/ {
-        capture=1
-        line=$0
-        sub(/.*data:[[:space:]]*x\{/, "", line)
-        buffer=buffer line
-        if (index(line, "}") > 0) {
-          gsub(/[^0-9A-Fa-f]/, "", buffer)
-          if (length(buffer) >= 8) {
-            print substr(buffer, 1, 8)
-          }
-          exit
-        }
-        next
-      }
-      capture {
-        line=$0
-        buffer=buffer line
-        if (index(line, "}") > 0) {
-          gsub(/[^0-9A-Fa-f]/, "", buffer)
-          if (length(buffer) >= 8) {
-            print substr(buffer, 1, 8)
-          }
-          exit
-        }
-      }
-      END {
-        if (capture && length(buffer) > 0) {
-          gsub(/[^0-9A-Fa-f]/, "", buffer)
-          if (length(buffer) >= 8) {
-            print substr(buffer, 1, 8)
-          }
-        }
-      }
-    ')"
-    seq_hex="$(trim_whitespace "$seq_hex")"
-    if [[ -n "$seq_hex" ]]; then
-      printf '%d' "$((16#$seq_hex))"
+    seq_dec="$(parse_seqno_from_account_output "$output" || true)"
+    seq_dec="$(trim_whitespace "$seq_dec")"
+    if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$seq_dec"
       return 0
     fi
 
