@@ -1706,7 +1706,7 @@ func (r *TonNodeReconciler) eligibleStickyNodeHostnames(
 
 func hasActivePods(pods []corev1.Pod) bool {
 	for i := range pods {
-		if pods[i].DeletionTimestamp == nil {
+		if pods[i].DeletionTimestamp == nil && strings.TrimSpace(pods[i].Spec.NodeName) != "" {
 			return true
 		}
 	}

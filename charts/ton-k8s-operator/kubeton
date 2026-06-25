@@ -6800,6 +6800,23 @@ append_unique_item() {
   values_ref+=("$item")
 }
 
+max_positive_replicas() {
+  local result=""
+  local candidate
+
+  for candidate in "$@"; do
+    candidate="$(trim_whitespace "${candidate:-}")"
+    if ! [[ "$candidate" =~ ^[1-9][0-9]*$ ]]; then
+      continue
+    fi
+    if [[ -z "$result" ]] || (( candidate > result )); then
+      result="$candidate"
+    fi
+  done
+
+  printf '%s' "$result"
+}
+
 build_sts_ordinal_node_map() {
   local ns="$1"
   local sts="$2"
@@ -6816,12 +6833,12 @@ build_sts_ordinal_node_map() {
     node_name="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
     node_name="$(trim_whitespace "$node_name")"
     if [[ -z "$node_name" ]]; then
-      continue
+      return 0
     fi
     pairs+=("${ordinal}=${node_name}")
   done
 
-  if [[ ${#pairs[@]} -eq 0 ]]; then
+  if [[ ${#pairs[@]} -ne "$replicas" ]]; then
     return 0
   fi
 
@@ -6903,6 +6920,40 @@ patch_statefulset_hostname_affinity() {
     -p "{\"spec\":{\"template\":{\"spec\":{\"affinity\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchExpressions\":[{\"key\":\"kubernetes.io/hostname\",\"operator\":\"In\",\"values\":${hostnames_json}}]}]}}}}}}}" >/dev/null
 }
 
+delete_unscheduled_statefulset_pods_for_start() {
+  local ns="$1"
+  local sts="$2"
+  local pod phase node_name deletion_ts ordinal
+
+  while IFS=$'\t' read -r pod phase node_name deletion_ts; do
+    pod="$(trim_whitespace "$pod")"
+    phase="$(trim_whitespace "$phase")"
+    node_name="$(trim_whitespace "$node_name")"
+    deletion_ts="$(trim_whitespace "$deletion_ts")"
+    [[ -n "$pod" ]] || continue
+    [[ "$pod" == "${sts}-"* ]] || continue
+    ordinal="${pod#"${sts}-"}"
+    [[ "$ordinal" =~ ^[0-9]+$ ]] || continue
+    [[ "$phase" == "Pending" && -z "$node_name" && -z "$deletion_ts" ]] || continue
+
+    echo "[start] Deleting unscheduled Pending pod ${ns}/${pod} so it can be recreated with current StatefulSet placement."
+    kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done < <(
+    kubectl -n "$ns" get pods \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.nodeName}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true
+  )
+}
+
+clear_statefulset_sticky_placement_for_start() {
+  local ns="$1"
+  local sts="$2"
+
+  patch_statefulset_hostname_affinity "$ns" "$sts" >/dev/null 2>&1 || true
+  kubectl -n "$ns" patch statefulset "$sts" --type=merge \
+    -p "{\"metadata\":{\"annotations\":{\"${STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+  delete_unscheduled_statefulset_pods_for_start "$ns" "$sts" || true
+}
+
 ensure_statefulset_parallel_pod_management_for_start() {
   local ns="$1"
   local sts="$2"
@@ -6954,14 +7005,17 @@ preapply_stopped_node_mapping_for_statefulset() {
   node_map="$(get_stopped_node_map_annotation "$ns" "$sts")"
   node_map="$(trim_whitespace "$node_map")"
   if [[ -z "$node_map" ]]; then
+    clear_statefulset_sticky_placement_for_start "$ns" "$sts"
     return 0
   fi
   if ! parse_ordinal_node_map "$node_map" expected_nodes; then
     echo "Warning: invalid ${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY} on ${ns}/${sts}; cannot preapply stopped placement." >&2
+    clear_statefulset_sticky_placement_for_start "$ns" "$sts"
     return 0
   fi
   if (( ${#expected_nodes[@]} < target_replicas )); then
     echo "Warning: ${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY} has ${#expected_nodes[@]} entries but target replicas=${target_replicas} on ${ns}/${sts}; cannot preapply stopped placement." >&2
+    clear_statefulset_sticky_placement_for_start "$ns" "$sts"
     return 0
   fi
 
@@ -7519,6 +7573,21 @@ scale_statefulset_rows_to_zero() {
   done
 }
 
+clear_stopped_metadata_for_statefulset_rows() {
+  local -n sts_rows_ref="$1"
+  local row ns sts
+
+  for row in "${sts_rows_ref[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts _ <<<"$row"
+    [[ -z "$ns" || -z "$sts" ]] && continue
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge \
+      -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null,\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+    kubectl -n "$ns" patch statefulset "$sts" --type=merge \
+      -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null,\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":null,\"${STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+  done
+}
+
 wait_statefulset_rows_pods_gone() {
   local -n sts_rows_ref="$1"
   local row ns sts
@@ -7553,6 +7622,7 @@ stop_ton_for_destructive_cleanup() {
     echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing with direct TonNode/StatefulSet cleanup." >&2
   fi
 
+  clear_stopped_metadata_for_statefulset_rows "$sts_rows_name"
   kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found || true
 
   # If the operator or Helm path is unhealthy, scaling the captured StatefulSets
@@ -9064,6 +9134,8 @@ run_stop_fleet() {
     node_map_patch="\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":null"
     if [[ -n "$node_map_annotation" ]]; then
       node_map_patch="\"${KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY}\":\"${node_map_annotation}\""
+    elif (( replicas > 0 )); then
+      echo "Warning: not saving stopped ordinal node map for ${ns}/${sts}; at least one replica is not scheduled." >&2
     fi
 
     tonnode_exists=0
@@ -9073,7 +9145,9 @@ run_stop_fleet() {
     else
       existing_pause_annotation="$(get_annotation_value statefulset "$ns" "$sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
     fi
-    if [[ "$existing_pause_annotation" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+      pause_annotation="$replicas"
+    elif [[ "$existing_pause_annotation" =~ ^[1-9][0-9]*$ ]]; then
       pause_annotation="$existing_pause_annotation"
     else
       pause_annotation="$replicas"
@@ -9142,19 +9216,17 @@ run_start_stopped_fleet() {
         pause_annotation="$(get_annotation_value statefulset "$row_ns" "$row_sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
       fi
       if [[ "$pause_annotation" =~ ^[0-9]+$ ]]; then
-        if (( pause_annotation > row_replicas )); then
+        target_replicas="$(max_positive_replicas "$pause_annotation" "$tonnode_spec_replicas" "$KUBETON_TARGET_TON_REPLICAS")"
+        if [[ -z "$target_replicas" ]]; then
           target_replicas="$pause_annotation"
+        fi
+        if [[ "$target_replicas" != "$pause_annotation" ]]; then
+          echo "[start] Restoring ${row_ns}/${row_sts} to ${target_replicas} replicas (pause metadata=${pause_annotation}, requested/spec=${tonnode_spec_replicas:-unknown})."
+        fi
+        if (( target_replicas > row_replicas )); then
           preapply_stopped_node_mapping_for_statefulset "$row_ns" "$row_sts" "$target_replicas" || true
           kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
             -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null
-          clear_statefulset_pause_annotation "$row_ns" "$row_sts"
-          ((resumed_tonnodes+=1))
-        elif (( row_replicas == 0 )) && [[ "$tonnode_spec_replicas" =~ ^[1-9][0-9]*$ ]]; then
-          target_replicas="$tonnode_spec_replicas"
-          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on TonNode ${row_ns}/${row_sts}; restoring using TonNode spec.replicas=${target_replicas}."
-          preapply_stopped_node_mapping_for_statefulset "$row_ns" "$row_sts" "$target_replicas" || true
-          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
-            -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null 2>&1 || true
           clear_statefulset_pause_annotation "$row_ns" "$row_sts"
           ((resumed_tonnodes+=1))
         else
@@ -9184,24 +9256,21 @@ run_start_stopped_fleet() {
 
     pause_annotation="$(get_annotation_value statefulset "$row_ns" "$row_sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
     if [[ "$pause_annotation" =~ ^[0-9]+$ ]]; then
-      if (( pause_annotation > row_replicas )); then
+      fallback_replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
+      if ! [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
+        fallback_replicas="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
+      fi
+      target_replicas="$(max_positive_replicas "$pause_annotation" "$fallback_replicas" "$KUBETON_TARGET_TON_REPLICAS")"
+      if [[ -z "$target_replicas" ]]; then
         target_replicas="$pause_annotation"
+      fi
+      if [[ "$target_replicas" != "$pause_annotation" ]]; then
+        echo "[start] Restoring ${row_ns}/${row_sts} to ${target_replicas} replicas (pause metadata=${pause_annotation}, values=${fallback_replicas:-unknown})."
+      fi
+      if (( target_replicas > row_replicas )); then
         preapply_stopped_node_mapping_for_statefulset "$row_ns" "$row_sts" "$target_replicas" || true
         set_ton_replicas "$row_ns" "$row_sts" "$target_replicas"
         ((resumed_statefulsets+=1))
-      elif (( row_replicas == 0 )); then
-        fallback_replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
-        if ! [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
-          fallback_replicas="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
-        fi
-        if [[ "$fallback_replicas" =~ ^[1-9][0-9]*$ ]]; then
-          echo "Warning: ${KUBETON_PAUSE_ANNOTATION_KEY}=${pause_annotation} on StatefulSet ${row_ns}/${row_sts}; restoring using values replicas=${fallback_replicas}."
-          preapply_stopped_node_mapping_for_statefulset "$row_ns" "$row_sts" "$fallback_replicas" || true
-          set_ton_replicas "$row_ns" "$row_sts" "$fallback_replicas"
-          ((resumed_statefulsets+=1))
-        else
-          ((skipped+=1))
-        fi
       else
         ((skipped+=1))
       fi

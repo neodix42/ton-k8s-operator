@@ -727,6 +727,7 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 				Namespace: "default",
 				Labels:    labels,
 			},
+			Spec: corev1.PodSpec{NodeName: testK8sNodeName0},
 		}
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
@@ -1043,6 +1044,86 @@ func TestDesiredStickyNodeHostnames(t *testing.T) {
 		}
 		if got != nil {
 			t.Fatalf("sticky hostnames = %#v, want nil", got)
+		}
+	})
+
+	t.Run("refreshes sticky hostnames when existing pods are pending", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+			Spec: tonv1alpha1.TonNodeSpec{
+				Replicas: ptr.To[int32](2),
+			},
+		}
+		labels := labelsForTonNode(tonNode)
+		node0 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testK8sNodeName0,
+				Labels: map[string]string{
+					corev1.LabelHostname: testHostName0,
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		node1 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testK8sNodeName1,
+				Labels: map[string]string{
+					corev1.LabelHostname: testHostName1,
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		pendingPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "tonnode-0",
+				Namespace: "default",
+				Labels:    labels,
+			},
+		}
+		existingAffinity := &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "kubernetes.io/hostname",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{testHostName0},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(node0, node1, pendingPod).
+			Build()
+		reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
+
+		got, err := reconciler.desiredStickyNodeHostnames(
+			context.Background(),
+			tonNode,
+			existingAffinity,
+			labels,
+			nil,
+			int(desiredReplicas(tonNode)),
+		)
+		if err != nil {
+			t.Fatalf("desiredStickyNodeHostnames() unexpected error: %v", err)
+		}
+		if len(got) != 2 || got[0] != testHostName0 || got[1] != testHostName1 {
+			t.Fatalf("sticky hostnames = %#v, want [%s %s]", got, testHostName0, testHostName1)
 		}
 	})
 
