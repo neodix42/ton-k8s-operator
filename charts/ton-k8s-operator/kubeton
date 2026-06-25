@@ -52,6 +52,7 @@ KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE="${KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE:-}"
 KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS="${KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS:-180}"
 KUBETON_LOCAL_PATH_PATTERN_CLEANUP="${KUBETON_LOCAL_PATH_PATTERN_CLEANUP:-false}"
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-false}"
+KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START="${KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS:-900}"
 KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY="${KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY:-true}"
@@ -3478,7 +3479,7 @@ EOF
 build_longhorn_selector_values_file() {
   local selector="$1"
   local -a selector_pairs=()
-  local setting_value values_file
+  local values_file
 
   parse_selector_pairs "$selector" selector_pairs || return 1
   if [[ ${#selector_pairs[@]} -eq 0 ]]; then
@@ -3486,7 +3487,6 @@ build_longhorn_selector_values_file() {
     return 1
   fi
 
-  setting_value="$(selector_pairs_to_longhorn_setting selector_pairs)"
   values_file="$(mktemp -t kubeton-longhorn-selector.XXXXXX.yaml)"
   {
     echo "global:"
@@ -3501,8 +3501,6 @@ build_longhorn_selector_values_file() {
     echo "longhornUI:"
     echo "  nodeSelector:"
     write_yaml_map_from_pairs selector_pairs 4
-    echo "defaultSettings:"
-    echo "  systemManagedComponentsNodeSelector: $(yaml_quote "$setting_value")"
   } >"$values_file"
 
   printf '%s' "$values_file"
@@ -4195,6 +4193,89 @@ wait_longhorn_storage_ready() {
   return 1
 }
 
+longhorn_setting_value_matches() {
+  local current_value="$1"
+  local desired_value="$2"
+  local compact_current
+
+  current_value="$(trim_whitespace "$current_value")"
+  desired_value="$(trim_whitespace "$desired_value")"
+  if [[ "$current_value" == "$desired_value" ]]; then
+    return 0
+  fi
+
+  # Longhorn 1.10 can normalize some numeric settings into a v1/v2 JSON string,
+  # for example default-replica-count: {"v1":"3","v2":"3"}.
+  if [[ "$desired_value" =~ ^[0-9]+$ ]]; then
+    compact_current="${current_value//[[:space:]]/}"
+    if [[ "$compact_current" == "{\"v1\":\"${desired_value}\",\"v2\":\"${desired_value}\"}" ]] \
+      || [[ "$compact_current" == "{\"v2\":\"${desired_value}\",\"v1\":\"${desired_value}\"}" ]] \
+      || [[ "$compact_current" == "{\"v1\":${desired_value},\"v2\":${desired_value}}" ]] \
+      || [[ "$compact_current" == "{\"v2\":${desired_value},\"v1\":${desired_value}}" ]]; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+apply_longhorn_setting_value() {
+  local setting_name="$1"
+  local desired_value="$2"
+  local timeout_seconds="${3:-120}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local current_value escaped_desired
+
+  setting_name="$(trim_whitespace "$setting_name")"
+  desired_value="$(trim_whitespace "$desired_value")"
+  if [[ -z "$setting_name" ]]; then
+    echo "Error: internal Longhorn setting name is empty." >&2
+    return 1
+  fi
+
+  while (( $(date +%s) < deadline )); do
+    current_value="$(kubectl -n "$LONGHORN_NAMESPACE" get settings.longhorn.io "$setting_name" -o jsonpath='{.value}' 2>/dev/null || true)"
+    current_value="$(trim_whitespace "$current_value")"
+    if longhorn_setting_value_matches "$current_value" "$desired_value"; then
+      return 0
+    fi
+
+    escaped_desired="$(json_escape_string "$desired_value")"
+    if kubectl -n "$LONGHORN_NAMESPACE" patch settings.longhorn.io "$setting_name" --type=merge \
+      -p "{\"value\":\"${escaped_desired}\"}" >/dev/null 2>&1; then
+      current_value="$(kubectl -n "$LONGHORN_NAMESPACE" get settings.longhorn.io "$setting_name" -o jsonpath='{.value}' 2>/dev/null || true)"
+      current_value="$(trim_whitespace "$current_value")"
+      if longhorn_setting_value_matches "$current_value" "$desired_value"; then
+        return 0
+      fi
+    else
+      sleep 2
+      continue
+    fi
+    sleep 2
+  done
+
+  current_value="$(kubectl -n "$LONGHORN_NAMESPACE" get settings.longhorn.io "$setting_name" -o jsonpath='{.value}' 2>/dev/null || true)"
+  current_value="$(trim_whitespace "$current_value")"
+  echo "Error: timeout setting Longhorn ${setting_name}=${desired_value}; current value is '${current_value:-unknown}'." >&2
+  return 1
+}
+
+apply_longhorn_post_start_settings() {
+  local system_managed_selector_value="${1:-}"
+
+  if [[ "$LONGHORN_DEFAULT_REPLICA_COUNT" =~ ^[0-9]+$ ]]; then
+    echo "[baremetal] Setting Longhorn default-replica-count=${LONGHORN_DEFAULT_REPLICA_COUNT} after manager startup ..."
+    apply_longhorn_setting_value "default-replica-count" "$LONGHORN_DEFAULT_REPLICA_COUNT" || return 1
+  fi
+
+  system_managed_selector_value="$(trim_whitespace "$system_managed_selector_value")"
+  if [[ -n "$system_managed_selector_value" ]]; then
+    echo "[baremetal] Setting Longhorn system-managed-components-node-selector after manager startup ..."
+    apply_longhorn_setting_value "system-managed-components-node-selector" "$system_managed_selector_value" || return 1
+  fi
+}
+
 verify_longhorn_multipathd_safe() {
   if ! is_true "$KUBETON_FAIL_ON_LONGHORN_MULTIPATHD"; then
     return 0
@@ -4351,7 +4432,20 @@ ensure_longhorn_installed() {
     ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
   fi
 
+  local -a longhorn_selector_pairs=()
+  local longhorn_system_managed_selector_setting=""
+  if [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
+    parse_selector_pairs "$LONGHORN_NODE_SELECTOR" longhorn_selector_pairs || return 1
+    if [[ ${#longhorn_selector_pairs[@]} -eq 0 ]]; then
+      echo "Error: LONGHORN_NODE_SELECTOR is set but has no valid key=value pairs." >&2
+      return 1
+    fi
+    longhorn_system_managed_selector_setting="$(selector_pairs_to_longhorn_setting longhorn_selector_pairs)"
+  fi
+
   if [[ "$lh_status" == "deployed" ]] && is_true "$KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY" && longhorn_storage_ready_quick "longhorn"; then
+    apply_longhorn_post_start_settings "$longhorn_system_managed_selector_setting" || return 1
+    wait_longhorn_storage_ready "longhorn"
     verify_longhorn_multipathd_safe
     echo "[baremetal] Longhorn is already deployed and CSI/storage are Ready; skipping Helm upgrade."
     return 0
@@ -4363,14 +4457,12 @@ ensure_longhorn_installed() {
   local longhorn_selector_values_file=""
   local -a longhorn_extra_args=()
   if [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
-    local -a selector_pairs=()
     local kubectl_selector=""
     local pair
     local matched_nodes=0
     local desired_nodes=0
 
-    parse_selector_pairs "$LONGHORN_NODE_SELECTOR" selector_pairs || return 1
-    for pair in "${selector_pairs[@]}"; do
+    for pair in "${longhorn_selector_pairs[@]}"; do
       if [[ -n "$kubectl_selector" ]]; then
         kubectl_selector+=","
       fi
@@ -4407,13 +4499,15 @@ ensure_longhorn_installed() {
   echo "[baremetal] Installing/ensuring Longhorn ${LONGHORN_CHART_VERSION} ..."
   echo "[baremetal] Waiting for Longhorn components to become Ready (timeout 40m) ..."
   local install_rc=0
+  # Longhorn managers apply defaultSettings during daemon startup. Passing those
+  # through Helm makes every manager race on the same Setting objects.
   run_with_namespace_progress "longhorn" "$LONGHORN_NAMESPACE" \
     helm upgrade --install "$LONGHORN_RELEASE_NAME" "$LONGHORN_CHART" \
     "${longhorn_extra_args[@]}" \
     --version "$LONGHORN_CHART_VERSION" \
     -n "$LONGHORN_NAMESPACE" \
     --create-namespace \
-    --set-string "defaultSettings.defaultReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
+    --reset-values \
     --set "persistence.defaultClassReplicaCount=${LONGHORN_DEFAULT_REPLICA_COUNT}" \
     --disable-openapi-validation \
     --wait \
@@ -4426,6 +4520,8 @@ ensure_longhorn_installed() {
     return "$install_rc"
   fi
 
+  wait_longhorn_storage_ready "longhorn"
+  apply_longhorn_post_start_settings "$longhorn_system_managed_selector_setting"
   wait_longhorn_storage_ready "longhorn"
 }
 
@@ -5010,9 +5106,37 @@ append_ton_storage_overrides() {
   echo "[start] Using TON data StorageClass '${storage_class}' for /var/ton-work and /var/ton-work/db." >&2
 }
 
+ton_storage_class_requires_sequential_start() {
+  local storage_class
+  local provisioner
+
+  if ton_storage_class_auto; then
+    return 1
+  fi
+
+  storage_class="$(ton_storage_class_name)"
+  storage_class="$(trim_whitespace "$storage_class")"
+  [[ -n "$storage_class" ]] || return 1
+
+  provisioner="$(storage_class_provisioner "$storage_class")"
+  provisioner="$(trim_whitespace "$provisioner")"
+
+  [[ "$storage_class" == "local-path" ]] && return 0
+  [[ "$provisioner" == "rancher.io/local-path" ]] && return 0
+  [[ "$provisioner" == *"local-path"* ]]
+}
+
 list_ton_pods() {
   kubectl get pods -A -l "$TON_POD_LABEL" \
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+}
+
+fleet_has_running_ton_pods() {
+  local marker
+
+  marker="$(kubectl get pods -A -l "$TON_POD_LABEL" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}x{"\n"}{end}' 2>/dev/null || true)"
+  [[ -n "$(trim_whitespace "$marker")" ]]
 }
 
 list_ton_statefulsets() {
@@ -6920,6 +7044,169 @@ patch_statefulset_hostname_affinity() {
     -p "{\"spec\":{\"template\":{\"spec\":{\"affinity\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchExpressions\":[{\"key\":\"kubernetes.io/hostname\",\"operator\":\"In\",\"values\":${hostnames_json}}]}]}}}}}}}" >/dev/null
 }
 
+node_hostname_value() {
+  local node="$1"
+  local hostname
+
+  node="$(trim_whitespace "$node")"
+  [[ -n "$node" ]] || return 1
+  hostname="$(kubectl get node "$node" -o go-template='{{ index .metadata.labels "kubernetes.io/hostname" }}' 2>/dev/null || true)"
+  hostname="$(trim_whitespace "$hostname")"
+  [[ -n "$hostname" ]] || hostname="$node"
+  printf '%s' "$hostname"
+}
+
+statefulset_template_hostname_affinity_values() {
+  local ns="$1"
+  local sts="$2"
+
+  kubectl -n "$ns" get statefulset "$sts" \
+    -o jsonpath='{range .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[*].matchExpressions[?(@.key=="kubernetes.io/hostname")].values[*]}{.}{"\n"}{end}' 2>/dev/null \
+    | awk 'NF' \
+    | sort -u
+}
+
+statefulset_node_selector_string() {
+  local ns="$1"
+  local sts="$2"
+  local selector=""
+  local pair
+
+  while IFS= read -r pair; do
+    pair="$(trim_whitespace "$pair")"
+    [[ -z "$pair" ]] && continue
+    if [[ -n "$selector" ]]; then
+      selector+=","
+    fi
+    selector+="$pair"
+  done < <(
+    kubectl -n "$ns" get statefulset "$sts" \
+      -o go-template='{{range $k,$v := .spec.template.spec.nodeSelector}}{{printf "%s=%s\n" $k $v}}{{end}}' 2>/dev/null || true
+  )
+
+  printf '%s' "$selector"
+}
+
+list_schedulable_nodes_for_statefulset() {
+  local ns="$1"
+  local sts="$2"
+  local selector
+
+  selector="$(statefulset_node_selector_string "$ns" "$sts")"
+  selector="$(trim_whitespace "$selector")"
+  if [[ -n "$selector" ]]; then
+    list_schedulable_nodes_by_selector "$selector"
+    return 0
+  fi
+
+  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.unschedulable}{"\n"}{end}' 2>/dev/null \
+    | awk -F'\t' '$2!="true"{print $1}' \
+    | awk 'NF' \
+    | sort -u
+}
+
+node_matches_statefulset_selector() {
+  local node="$1"
+  local ns="$2"
+  local sts="$3"
+  local selector
+
+  node="$(trim_whitespace "$node")"
+  [[ -n "$node" ]] || return 1
+  selector="$(statefulset_node_selector_string "$ns" "$sts")"
+  selector="$(trim_whitespace "$selector")"
+  if [[ -z "$selector" ]]; then
+    return 0
+  fi
+  kubectl get node "$node" -l "$selector" >/dev/null 2>&1
+}
+
+collect_pv_hostname_affinity_nodes() {
+  local pv="$1"
+  local -n nodes_ref="$2"
+  local node resolved_node
+
+  pv="$(trim_whitespace "$pv")"
+  [[ -n "$pv" ]] || return 0
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -z "$node" ]] && continue
+    resolved_node="$(resolve_node_name_for_hostname_value "$node" || true)"
+    resolved_node="$(trim_whitespace "$resolved_node")"
+    [[ -z "$resolved_node" ]] && continue
+    append_unique_item "$resolved_node" nodes_ref
+  done < <(
+    kubectl get pv "$pv" \
+      -o jsonpath='{range .spec.nodeAffinity.required.nodeSelectorTerms[*].matchExpressions[?(@.key=="kubernetes.io/hostname")].values[*]}{.}{"\n"}{end}' 2>/dev/null || true
+  )
+}
+
+diagnose_pending_ton_local_pvc_conflicts() {
+  local ns="$1"
+  local sts="$2"
+  local -n pending_ordinals_ref="$3"
+  local -A running_pods_by_node=()
+  local -a ordinal_pv_nodes=()
+  local other_ns other_pod phase node ordinal claim_prefix pvc pv pv_node selector occupied
+  local failed=0
+
+  while IFS=$'\t' read -r other_ns other_pod phase node; do
+    other_ns="$(trim_whitespace "$other_ns")"
+    other_pod="$(trim_whitespace "$other_pod")"
+    phase="$(trim_whitespace "$phase")"
+    node="$(trim_whitespace "$node")"
+    [[ -n "$other_ns" && -n "$other_pod" && "$phase" == "Running" && -n "$node" ]] || continue
+    running_pods_by_node["$node"]="${running_pods_by_node[$node]:-}${other_ns}/${other_pod} "
+  done < <(
+    kubectl get pods -A -l "$TON_POD_LABEL" \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.nodeName}{"\n"}{end}' 2>/dev/null || true
+  )
+
+  for ordinal in "${pending_ordinals_ref[@]}"; do
+    ordinal="$(trim_whitespace "$ordinal")"
+    [[ "$ordinal" =~ ^[0-9]+$ ]] || continue
+    ordinal_pv_nodes=()
+
+    for claim_prefix in ton-work mytoncore keybundle; do
+      pvc="${claim_prefix}-${sts}-${ordinal}"
+      pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+      pv="$(trim_whitespace "$pv")"
+      [[ -n "$pv" ]] || continue
+      collect_pv_hostname_affinity_nodes "$pv" ordinal_pv_nodes
+    done
+
+    if (( ${#ordinal_pv_nodes[@]} > 1 )); then
+      echo "Error: ${ns}/${sts}-${ordinal} has local PVCs pinned to different nodes: ${ordinal_pv_nodes[*]}." >&2
+      echo "Kubernetes cannot schedule this pod until the PVCs are recreated or data is migrated to one node." >&2
+      failed=1
+      continue
+    fi
+
+    for pv_node in "${ordinal_pv_nodes[@]}"; do
+      pv_node="$(trim_whitespace "$pv_node")"
+      [[ -n "$pv_node" ]] || continue
+      if ! node_matches_statefulset_selector "$pv_node" "$ns" "$sts"; then
+        selector="$(statefulset_node_selector_string "$ns" "$sts")"
+        echo "Error: ${ns}/${sts}-${ordinal} has a local PVC pinned to node ${pv_node}, but the StatefulSet nodeSelector '${selector:-<none>}' excludes that node." >&2
+        echo "Fix by adding the required label to ${pv_node}, changing the TonNode nodeSelector, or recreating/migrating that PVC." >&2
+        failed=1
+      fi
+
+      occupied="$(trim_whitespace "${running_pods_by_node[$pv_node]:-}")"
+      if [[ -n "$occupied" ]]; then
+        echo "Error: ${ns}/${sts}-${ordinal} has local-path PVC(s) pinned to ${pv_node}, but TON pod(s) already run there: ${occupied}." >&2
+        echo "Because TON pods use hostPorts, Kubernetes cannot place another TON pod on that node." >&2
+        echo "If ${ns}/${sts}-${ordinal} never started and has no data, keep keybundle-${sts}-${ordinal} and recreate only its local-path PVCs:" >&2
+        echo "  kubectl -n ${ns} delete pod ${sts}-${ordinal} --ignore-not-found --wait=false" >&2
+        echo "  kubectl -n ${ns} delete pvc ton-work-${sts}-${ordinal} mytoncore-${sts}-${ordinal} --wait=false" >&2
+        failed=1
+      fi
+    done
+  done
+
+  (( failed == 0 ))
+}
+
 delete_unscheduled_statefulset_pods_for_start() {
   local ns="$1"
   local sts="$2"
@@ -6942,6 +7229,171 @@ delete_unscheduled_statefulset_pods_for_start() {
     kubectl -n "$ns" get pods \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.nodeName}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true
   )
+}
+
+repair_pending_ton_placement_after_start() {
+  local -a sts_rows=()
+  local -a operator_deploy_names=()
+  local -a operator_deploy_replicas=()
+  local operator_paused=0
+  local row ns sts replicas pod phase node_name deletion_ts ordinal
+  local pv pvc claim_prefix pv_node hostname node selector
+  local repaired=0
+  local skipped=0
+  local failed=0
+  local current_count
+  local sts_failed
+  local -a pending_ordinals=()
+  local -a current_hostnames=()
+  local -a final_hostnames=()
+  local -a eligible_nodes=()
+  local -a pv_nodes=()
+  local -a ordinal_pv_nodes=()
+
+  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+  if [[ ${#sts_rows[@]} -eq 0 || -z "${sts_rows[0]:-}" ]]; then
+    return 0
+  fi
+
+  for row in "${sts_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts replicas <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    sts="$(trim_whitespace "$sts")"
+    replicas="$(trim_whitespace "${replicas:-0}")"
+    [[ -n "$ns" && -n "$sts" ]] || continue
+    if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+      continue
+    fi
+
+    pending_ordinals=()
+    while IFS=$'\t' read -r pod phase node_name deletion_ts; do
+      pod="$(trim_whitespace "$pod")"
+      phase="$(trim_whitespace "$phase")"
+      node_name="$(trim_whitespace "$node_name")"
+      deletion_ts="$(trim_whitespace "$deletion_ts")"
+      [[ "$pod" == "${sts}-"* ]] || continue
+      ordinal="${pod#"${sts}-"}"
+      [[ "$ordinal" =~ ^[0-9]+$ ]] || continue
+      [[ "$phase" == "Pending" && -z "$node_name" && -z "$deletion_ts" ]] || continue
+      pending_ordinals+=("$ordinal")
+    done < <(
+      kubectl -n "$ns" get pods \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.nodeName}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true
+    )
+
+    if (( ${#pending_ordinals[@]} == 0 )); then
+      continue
+    fi
+    if ! diagnose_pending_ton_local_pvc_conflicts "$ns" "$sts" pending_ordinals; then
+      ((failed+=1))
+      continue
+    fi
+
+    mapfile -t current_hostnames < <(statefulset_template_hostname_affinity_values "$ns" "$sts")
+    current_count="${#current_hostnames[@]}"
+    if (( current_count == 0 )); then
+      ((skipped+=1))
+      continue
+    fi
+    if (( current_count >= replicas )); then
+      ((skipped+=1))
+      continue
+    fi
+
+    final_hostnames=()
+    sts_failed=0
+    for hostname in "${current_hostnames[@]}"; do
+      hostname="$(trim_whitespace "$hostname")"
+      [[ -z "$hostname" ]] && continue
+      append_unique_item "$hostname" final_hostnames
+    done
+
+    pv_nodes=()
+    for ordinal in "${pending_ordinals[@]}"; do
+      ordinal_pv_nodes=()
+      for claim_prefix in ton-work mytoncore keybundle; do
+        pvc="${claim_prefix}-${sts}-${ordinal}"
+        pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+        pv="$(trim_whitespace "$pv")"
+        [[ -n "$pv" ]] || continue
+        collect_pv_hostname_affinity_nodes "$pv" ordinal_pv_nodes
+      done
+
+      if (( ${#ordinal_pv_nodes[@]} > 1 )); then
+        echo "Error: ${ns}/${sts}-${ordinal} has local PVCs pinned to different nodes: ${ordinal_pv_nodes[*]}. Kubernetes cannot schedule this pod until the PVCs are recreated or data is migrated to one node." >&2
+        sts_failed=1
+        continue
+      fi
+
+      for pv_node in "${ordinal_pv_nodes[@]}"; do
+        pv_node="$(trim_whitespace "$pv_node")"
+        [[ -n "$pv_node" ]] || continue
+        if ! node_matches_statefulset_selector "$pv_node" "$ns" "$sts"; then
+          selector="$(statefulset_node_selector_string "$ns" "$sts")"
+          echo "Error: ${ns}/${sts}-${ordinal} has a local PVC pinned to node ${pv_node}, but the StatefulSet nodeSelector '${selector:-<none>}' excludes that node." >&2
+          echo "Fix by adding the required label to ${pv_node}, changing the TonNode nodeSelector, or recreating/migrating that PVC." >&2
+          sts_failed=1
+          continue
+        fi
+        append_unique_item "$pv_node" pv_nodes
+        hostname="$(node_hostname_value "$pv_node" || true)"
+        hostname="$(trim_whitespace "$hostname")"
+        [[ -n "$hostname" ]] && append_unique_item "$hostname" final_hostnames
+      done
+    done
+
+    if (( sts_failed > 0 )); then
+      ((failed+=1))
+      continue
+    fi
+
+    mapfile -t eligible_nodes < <(list_schedulable_nodes_for_statefulset "$ns" "$sts")
+    for node in "${eligible_nodes[@]}"; do
+      node="$(trim_whitespace "$node")"
+      [[ -n "$node" ]] || continue
+      hostname="$(node_hostname_value "$node" || true)"
+      hostname="$(trim_whitespace "$hostname")"
+      [[ -n "$hostname" ]] && append_unique_item "$hostname" final_hostnames
+    done
+
+    if (( ${#final_hostnames[@]} <= current_count )); then
+      echo "Warning: ${ns}/${sts} has ${#pending_ordinals[@]} unscheduled Pending pod(s), but kubeton could not expand stale node affinity." >&2
+      ((skipped+=1))
+      continue
+    fi
+
+    if (( operator_paused == 0 )); then
+      pause_operator_reconcile operator_deploy_names operator_deploy_replicas
+      operator_paused=1
+    fi
+
+    echo "[start] Expanding stale TON node affinity for ${ns}/${sts} from ${current_count} to ${#final_hostnames[@]} host(s); recreating unscheduled Pending pod(s): ${pending_ordinals[*]}."
+    set_statefulset_update_strategy "$ns" "$sts" "OnDelete" || {
+      ((failed+=1))
+      continue
+    }
+    patch_statefulset_hostname_affinity "$ns" "$sts" "${final_hostnames[@]}" || {
+      ((failed+=1))
+      continue
+    }
+    kubectl -n "$ns" patch statefulset "$sts" --type=merge \
+      -p "{\"metadata\":{\"annotations\":{\"${STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY}\":null}}}" >/dev/null 2>&1 || true
+    delete_unscheduled_statefulset_pods_for_start "$ns" "$sts" || true
+    ((repaired+=1))
+  done
+
+  if (( operator_paused == 1 )); then
+    resume_operator_reconcile operator_deploy_names operator_deploy_replicas
+  fi
+
+  if (( repaired > 0 || skipped > 0 || failed > 0 )); then
+    echo "Pending TON placement repair summary: repaired=${repaired}, skipped=${skipped}, failed=${failed}"
+  fi
+  if (( failed > 0 )); then
+    return 1
+  fi
+  return 0
 }
 
 clear_statefulset_sticky_placement_for_start() {
@@ -7679,6 +8131,35 @@ set_tonnode_or_statefulset_replicas() {
   fi
 
   set_ton_replicas "$ns" "$name" "$replicas"
+}
+
+should_use_sequential_ton_start() {
+  local target_replicas="$1"
+  local restore_from_stop_metadata="$2"
+
+  if ! [[ "$target_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  if (( target_replicas <= 1 || restore_from_stop_metadata != 0 )); then
+    return 1
+  fi
+
+  if fleet_has_running_ton_pods; then
+    if is_true "$KUBETON_SEQUENTIAL_TON_START"; then
+      echo "Warning: KUBETON_SEQUENTIAL_TON_START=true ignored because TON pods are already Running; sequential staging would scale the fleet down during start." >&2
+    fi
+    return 1
+  fi
+
+  if is_true "$KUBETON_SEQUENTIAL_TON_START"; then
+    return 0
+  fi
+
+  if is_true "$KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START" && ton_storage_class_requires_sequential_start; then
+    return 0
+  fi
+
+  return 1
 }
 
 sequential_start_ton_fleet() {
@@ -8512,15 +8993,15 @@ run_start() {
     restore_from_stop_metadata=1
     echo "[start] Detected stopped TON fleet metadata; applying chart update before restoring previous replicas."
   fi
-  if (( restore_from_stop_metadata == 0 )) \
-    && is_true "$KUBETON_SEQUENTIAL_TON_START" \
-    && [[ "$desired_replicas_for_start" =~ ^[0-9]+$ ]] \
-    && (( desired_replicas_for_start > 1 )); then
-    sequential_start=1
-  fi
 
   ensure_ton_storage_class_available
   append_ton_storage_overrides extra_overrides
+  if should_use_sequential_ton_start "$desired_replicas_for_start" "$restore_from_stop_metadata"; then
+    sequential_start=1
+    if ! is_true "$KUBETON_SEQUENTIAL_TON_START"; then
+      echo "[start] Local-path TON storage detected; staging fresh TON replicas sequentially to prevent PVC/node drift."
+    fi
+  fi
 
   if should_bootstrap_baremetal; then
     ensure_auto_bootstrap_stack
@@ -8583,6 +9064,8 @@ run_start() {
     fi
     run_start_stopped_fleet
   fi
+
+  repair_pending_ton_placement_after_start
 }
 
 run_backup_keys() {
