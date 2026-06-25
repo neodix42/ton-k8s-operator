@@ -310,6 +310,11 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 		if err != nil {
 			return err
 		}
+		effectiveOrdinalNodeMap = completeOrdinalNodeMapFromStickyHostnames(
+			effectiveOrdinalNodeMap,
+			stickyNodeHostnames,
+			mapReplicas,
+		)
 
 		sts.Labels = labels
 		sts.Annotations = setAnnotationValue(
@@ -320,7 +325,9 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 		sts.Spec.Replicas = ptr.To(replicas)
 		sts.Spec.ServiceName = serviceName
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
-		sts.Spec.PodManagementPolicy = appsv1.OrderedReadyPodManagement
+		if sts.Spec.PodManagementPolicy == "" {
+			sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
+		}
 		sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType}
 		sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP, stickyNodeHostnames)
 		sts.Spec.VolumeClaimTemplates = desiredVolumeClaims(tonNode, storageClassName)
@@ -488,6 +495,9 @@ func (r *TonNodeReconciler) updateStatefulSetStickyStep(
 		return err
 	}
 
+	if sts.Spec.PodManagementPolicy == "" {
+		sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
+	}
 	sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: strategy}
 	sts.Spec.Replicas = ptr.To(replicas)
 	sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP, stickyHostnames)
@@ -1926,6 +1936,52 @@ func mergeOrdinalNodeMaps(existing map[int]string, current map[int]string, targe
 			out[ordinal] = nodeName
 		}
 	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func completeOrdinalNodeMapFromStickyHostnames(
+	ordinalNodeMap map[int]string,
+	stickyNodeHostnames []string,
+	targetReplicas int,
+) map[int]string {
+	if targetReplicas < 1 {
+		return nil
+	}
+	out := make(map[int]string, targetReplicas)
+	used := make(map[string]struct{}, targetReplicas)
+
+	for ordinal := 0; ordinal < targetReplicas; ordinal++ {
+		nodeName := strings.TrimSpace(ordinalNodeMap[ordinal])
+		if nodeName == "" {
+			continue
+		}
+		out[ordinal] = nodeName
+		used[nodeName] = struct{}{}
+	}
+
+	nextHostname := 0
+	for ordinal := 0; ordinal < targetReplicas; ordinal++ {
+		if strings.TrimSpace(out[ordinal]) != "" {
+			continue
+		}
+		for nextHostname < len(stickyNodeHostnames) {
+			candidate := strings.TrimSpace(stickyNodeHostnames[nextHostname])
+			nextHostname++
+			if candidate == "" {
+				continue
+			}
+			if _, ok := used[candidate]; ok {
+				continue
+			}
+			out[ordinal] = candidate
+			used[candidate] = struct{}{}
+			break
+		}
+	}
+
 	if len(out) == 0 {
 		return nil
 	}

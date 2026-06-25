@@ -72,6 +72,7 @@ Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
 - `./kubeton stop` scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
 - `./kubeton start` restores TON replicas from stop metadata (and also performs normal start/upgrade flow when no stop metadata exists)
+- TON StatefulSets are created with parallel pod management; `kubeton start` restores stopped replicas in parallel after preapplying saved node placement metadata. Set `KUBETON_SEQUENTIAL_TON_START=true` only as a compatibility fallback.
 - stop-time backup is skipped by default; enable it with: `SKIP_STOP_KEY_BACKUP=false ./kubeton stop`
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
 - per replica (default names):
@@ -394,6 +395,7 @@ VAULT_TOKEN_PERIOD
 NAMESPACE_DELETE_PROGRESS_TIMEOUT
 KUBETON_PAUSE_ANNOTATION_KEY
 KUBETON_PAUSE_NODEMAP_ANNOTATION_KEY
+STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY
 KUBETON_DEBUG_POD_CLEANUP_ON_UNINSTALL
 KUBETON_DEBUG_POD_PREFIX
 KUBETON_LOCAL_PATH_CLEANUP
@@ -805,6 +807,7 @@ Run them from repo root:
 - `PUBLIC_IP`: by default, for `replicas=1`, operator tries node `ExternalIP`, then falls back to node host IP. For multi-replica or private/NAT workers, set `spec.network.publicIP`.
 - `hostPortsEnabled`: default is `true`. This is required for direct TON reachability on bare-metal/public-node setups (`validatorPort`, `quicPort`, `liteServerPort`).
 - When `spec.network.publicIP` is empty, operator pins replicas to a preselected worker hostname set before first launch to avoid advertised-IP drift after pod restarts.
+- New TON StatefulSets use Kubernetes `Parallel` pod management so all replicas can start at once. If `kubeton start` finds an older stopped StatefulSet using immutable `OrderedReady` policy, it recreates that StatefulSet while replicas are `0`; PVCs are retained and reused.
 - Private cloud workers (no public node IP): provide per-node/per-replica public forwarding; one shared LB endpoint/port pair is not sufficient for many TON replicas.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
 - Bare metal: `kubeton start` sets TON data storage to `TON_STORAGE_CLASS_NAME` by default (`local-path`); set `TON_STORAGE_CLASS_NAME=<class>` to use another local class or `TON_STORAGE_CLASS_NAME=auto` to use operator auto-detection.

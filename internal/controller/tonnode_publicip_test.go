@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tonv1alpha1 "github.com/neodix/ton-k8s-operator/api/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1106,6 +1107,57 @@ func TestOrdinalNodeMapAnnotationHelpers(t *testing.T) {
 			t.Fatalf("merged map drifted from stored assignments: %#v", merged)
 		}
 	})
+
+	t.Run("complete fills missing ordinals from sticky hostnames", func(t *testing.T) {
+		existing := map[int]string{
+			1: testHostName1,
+		}
+		completed := completeOrdinalNodeMapFromStickyHostnames(
+			existing,
+			[]string{testHostName0, testHostName1, testHostName2},
+			3,
+		)
+
+		if completed[0] != testHostName0 || completed[1] != testHostName1 || completed[2] != testHostName2 {
+			t.Fatalf("completed map = %#v, want 0=%s, 1=%s, 2=%s", completed, testHostName0, testHostName1, testHostName2)
+		}
+	})
+}
+
+func TestReconcileStatefulSetCreatesParallelStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add apps scheme: %v", err)
+	}
+	if err := tonv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add ton scheme: %v", err)
+	}
+
+	tonNode := &tonv1alpha1.TonNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "tonnode", Namespace: "default"},
+		Spec: tonv1alpha1.TonNodeSpec{
+			Replicas: ptr.To[int32](3),
+			Network: tonv1alpha1.TonNodeNetworkSpec{
+				PublicIP: "203.0.113.10",
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tonNode).
+		Build()
+	reconciler := &TonNodeReconciler{Client: fakeClient, Scheme: scheme}
+
+	sts, err := reconciler.reconcileStatefulSet(context.Background(), tonNode, "tonnode-headless", nil)
+	if err != nil {
+		t.Fatalf("reconcileStatefulSet() unexpected error: %v", err)
+	}
+	if sts.Spec.PodManagementPolicy != appsv1.ParallelPodManagement {
+		t.Fatalf("podManagementPolicy = %q, want %q", sts.Spec.PodManagementPolicy, appsv1.ParallelPodManagement)
+	}
 }
 
 func TestDesiredVolumeClaimsWithKeyManagement(t *testing.T) {
