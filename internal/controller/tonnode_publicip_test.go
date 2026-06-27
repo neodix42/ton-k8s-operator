@@ -658,11 +658,20 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	if len(tpl.Spec.Containers) != 2 {
 		t.Fatalf("expected two containers (ton + sidecar), got %d", len(tpl.Spec.Containers))
 	}
-	if len(tpl.Spec.InitContainers) != 1 {
-		t.Fatalf("expected one init container (key-restore), got %d", len(tpl.Spec.InitContainers))
+	if len(tpl.Spec.InitContainers) != 2 {
+		t.Fatalf("expected two init containers (persistent layout + key-restore), got %d", len(tpl.Spec.InitContainers))
 	}
-	if tpl.Spec.InitContainers[0].Name != "key-restore" {
-		t.Fatalf("expected init container key-restore, got %q", tpl.Spec.InitContainers[0].Name)
+	if tpl.Spec.InitContainers[0].Name != persistentLayoutInitName {
+		t.Fatalf("expected first init container %q, got %q", persistentLayoutInitName, tpl.Spec.InitContainers[0].Name)
+	}
+	if !hasMount(tpl.Spec.InitContainers[0].VolumeMounts, tonWorkClaimName, "/mnt/ton-work") {
+		t.Fatalf("persistent layout init missing ton-work mount")
+	}
+	if !hasMount(tpl.Spec.InitContainers[0].VolumeMounts, myTonCoreClaim, "/mnt/mytoncore") {
+		t.Fatalf("persistent layout init missing mytoncore mount")
+	}
+	if tpl.Spec.InitContainers[1].Name != "key-restore" {
+		t.Fatalf("expected init container key-restore, got %q", tpl.Spec.InitContainers[1].Name)
 	}
 	if tpl.Spec.Containers[1].Name != "key-backup" {
 		t.Fatalf("expected sidecar key-backup, got %q", tpl.Spec.Containers[1].Name)
@@ -686,6 +695,9 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	}
 	if !hasMount(main.VolumeMounts, keyBundleClaim, keyBundleMountPath) {
 		t.Fatalf("main container missing key bundle mount")
+	}
+	if !hasEnv(main.Env, "GIT_CONFIG_KEY_0", "safe.directory") || !hasEnv(main.Env, "GIT_CONFIG_VALUE_0", tonSourcePath) {
+		t.Fatalf("main container missing git safe.directory env for persisted TON source")
 	}
 
 	if !hasMemoryVolume(tpl.Spec.Volumes, keysTmpfsVolume) {

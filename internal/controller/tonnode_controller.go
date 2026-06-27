@@ -84,6 +84,7 @@ const (
 	keysTmpfsVolume          = "ton-keys-tmpfs"
 	walletsTmpfsVolume       = "wallets-tmpfs"
 	keyBundleMountPath       = "/var/ton-key-bundle"
+	persistentLayoutInitName = "prepare-persistent-layout"
 
 	readyConditionType = "Ready"
 
@@ -648,9 +649,10 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	}
 
 	podSpec := corev1.PodSpec{
-		NodeSelector: desiredNodeSelector(tonNode),
-		Affinity:     requiredPodAntiAffinity(labels, stickyNodeHostnames),
-		Containers:   []corev1.Container{container},
+		NodeSelector:   desiredNodeSelector(tonNode),
+		Affinity:       requiredPodAntiAffinity(labels, stickyNodeHostnames),
+		InitContainers: []corev1.Container{desiredPersistentLayoutInitContainer(tonNode)},
+		Containers:     []corev1.Container{container},
 	}
 	if keyManagementEnabled(tonNode) {
 		podSpec.Volumes = append(podSpec.Volumes,
@@ -990,6 +992,25 @@ func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
 		{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
 		{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
 		{Name: keyBundleClaim, MountPath: keyBundleMountPath},
+	}
+}
+
+func desiredPersistentLayoutInitContainer(tonNode *tonv1alpha1.TonNode) corev1.Container {
+	return corev1.Container{
+		Name:            persistentLayoutInitName,
+		Image:           desiredImage(tonNode),
+		ImagePullPolicy: desiredImagePullPolicy(tonNode),
+		Command: []string{
+			"sh",
+			"-ec",
+			`mkdir -p /mnt/ton-work/usr-src-ton /mnt/mytoncore/usr-local-bin-mytonctrl
+chmod 755 /mnt/ton-work/usr-src-ton /mnt/mytoncore/usr-local-bin-mytonctrl || true`,
+		},
+		Resources: desiredKeyAgentResources(tonNode),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: tonWorkClaimName, MountPath: "/mnt/ton-work"},
+			{Name: myTonCoreClaim, MountPath: "/mnt/mytoncore"},
+		},
 	}
 }
 
@@ -2323,6 +2344,9 @@ func defaultTonEnv(tonNode *tonv1alpha1.TonNode, publicIP corev1.EnvVar) []corev
 		{Name: "VALIDATOR_CONSOLE_PORT", Value: strconv.Itoa(int(desiredConsolePort(tonNode)))},
 		// Default to true for local/dev clusters; override through spec.env for prod.
 		{Name: "IGNORE_MINIMAL_REQS", Value: "true"},
+		{Name: "GIT_CONFIG_COUNT", Value: "1"},
+		{Name: "GIT_CONFIG_KEY_0", Value: "safe.directory"},
+		{Name: "GIT_CONFIG_VALUE_0", Value: tonSourcePath},
 	}
 }
 
