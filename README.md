@@ -6,11 +6,11 @@ This operator creates and manages:
 - `TonNode` custom resources (`ton.ton.org/v1alpha1`)
 - A headless `Service` per `TonNode`
 - A `StatefulSet` per `TonNode`
-- Two PVC templates per replica:
+- Four data PVC templates per replica:
   - `/var/ton-work`
+  - `/usr/src/ton`
   - `/usr/local/bin/mytoncore`
-- `/usr/src/ton` is persisted as a subPath on the `/var/ton-work` PVC.
-- `/usr/local/bin/mytonctrl` is persisted as a subPath on the `mytoncore` PVC.
+  - `/usr/local/bin/mytonctrl`
 - `/usr/local/bin/mytoncore/mytoncore.db` is persisted on the `mytoncore` PVC.
 
 ## Behavior Implemented
@@ -821,14 +821,13 @@ Run them from repo root:
 Data from all TON pods is not stored in one shared place.
 
 With this operator setup:
-- Each TON pod gets its own PVCs (`ton-work-...` and `mytoncore-...`).
+- Each TON pod gets its own data PVCs (`ton-work-...`, `ton-src-...`, `mytoncore-...`, and `mytonctrl-...`).
 - `/usr/local/bin/mytoncore` is mounted from the pod's `mytoncore` PVC; this is where `mytoncore.db` persists across pod restarts.
-- `/usr/local/bin/mytonctrl` is mounted from the pod's `mytoncore` PVC via a subPath so any MyTonCtrl files written there also persist.
+- `/usr/local/bin/mytonctrl` is mounted from the pod's `mytonctrl` PVC so any MyTonCtrl files written there also persist.
 - When encrypted key management is enabled, only `/usr/local/bin/mytoncore/wallets` is overlaid with tmpfs and restored from the encrypted key bundle.
-- `/usr/src/ton` is mounted from the pod's `ton-work` PVC via a subPath so
-  the TON source checkout used by MyTonCtrl/Fift survives pod recreation.
+- `/usr/src/ton` is mounted from the pod's `ton-src` PVC so the TON source checkout used by MyTonCtrl/Fift survives pod recreation.
 - PVCs are `ReadWriteOnce`, so one PVC is attached to one pod.
-- For 20 replicas, the total PVC count is 40.
+- For 20 replicas with encrypted key management enabled, the total PVC count is 100.
 - `tonWorkSize` defaults to `700Gi` because dump bootstrap keeps the compressed dump and extracted DB on `/var/ton-work` at the same time.
 
 If you use `local-path` StorageClass:

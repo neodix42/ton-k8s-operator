@@ -5658,7 +5658,7 @@ delete_pvc_rows_and_backing_volumes() {
 collect_expected_ton_pvc_rows_from_values() {
   local -n rows_ref="$1"
   local ns sts replicas claim_prefix ordinal pvc_name
-  local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
+  local -a claim_prefixes=("ton-work" "ton-src" "mytoncore" "mytonctrl" "keybundle")
 
   ns="$(resolve_tonnode_namespace_from_values)"
   sts="$(resolve_tonnode_name_from_values)"
@@ -5682,7 +5682,7 @@ collect_expected_ton_pvc_rows_from_values() {
     append_unique_item "$ns"$'\t'"$pvc_name" rows_ref
   done < <(
     kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-      | grep -E "^(ton-work|mytoncore|keybundle)-${sts}-" || true
+      | grep -E "^(ton-work|ton-src|mytoncore|mytonctrl|keybundle)-${sts}-" || true
   )
 }
 
@@ -6380,7 +6380,7 @@ delete_ton_pvcs_for_statefulsets() {
       append_unique_item "$ns"$'\t'"$pvc_name" candidate_rows
     done < <(
       kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-        | grep -E "^(ton-work|mytoncore|keybundle)-${sts}-" || true
+        | grep -E "^(ton-work|ton-src|mytoncore|mytonctrl|keybundle)-${sts}-" || true
     )
   done
 
@@ -7178,7 +7178,7 @@ diagnose_pending_ton_local_pvc_conflicts() {
     [[ "$ordinal" =~ ^[0-9]+$ ]] || continue
     ordinal_pv_nodes=()
 
-    for claim_prefix in ton-work mytoncore keybundle; do
+    for claim_prefix in ton-work ton-src mytoncore mytonctrl keybundle; do
       pvc="${claim_prefix}-${sts}-${ordinal}"
       pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
       pv="$(trim_whitespace "$pv")"
@@ -7209,7 +7209,7 @@ diagnose_pending_ton_local_pvc_conflicts() {
         echo "Because TON pods use hostPorts, Kubernetes cannot place another TON pod on that node." >&2
         echo "If ${ns}/${sts}-${ordinal} never started and has no data, keep keybundle-${sts}-${ordinal} and recreate only its local-path PVCs:" >&2
         echo "  kubectl -n ${ns} delete pod ${sts}-${ordinal} --ignore-not-found --wait=false" >&2
-        echo "  kubectl -n ${ns} delete pvc ton-work-${sts}-${ordinal} mytoncore-${sts}-${ordinal} --wait=false" >&2
+        echo "  kubectl -n ${ns} delete pvc ton-work-${sts}-${ordinal} ton-src-${sts}-${ordinal} mytoncore-${sts}-${ordinal} mytonctrl-${sts}-${ordinal} --wait=false" >&2
         failed=1
       fi
     done
@@ -7323,7 +7323,7 @@ repair_pending_ton_placement_after_start() {
     pv_nodes=()
     for ordinal in "${pending_ordinals[@]}"; do
       ordinal_pv_nodes=()
-      for claim_prefix in ton-work mytoncore keybundle; do
+      for claim_prefix in ton-work ton-src mytoncore mytonctrl keybundle; do
         pvc="${claim_prefix}-${sts}-${ordinal}"
         pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
         pv="$(trim_whitespace "$pv")"
@@ -7450,6 +7450,53 @@ ensure_statefulset_parallel_pod_management_for_start() {
   new_policy="$(trim_whitespace "$new_policy")"
   if [[ "$new_policy" != "Parallel" ]]; then
     echo "Warning: recreated StatefulSet ${ns}/${sts} still uses podManagementPolicy=${new_policy:-unknown}; ensure the running operator image includes Parallel StatefulSet support." >&2
+  fi
+}
+
+statefulset_has_claim_template() {
+  local ns="$1"
+  local sts="$2"
+  local claim_name="$3"
+
+  kubectl -n "$ns" get statefulset "$sts" \
+    -o jsonpath='{range .spec.volumeClaimTemplates[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+    | grep -Fxq "$claim_name"
+}
+
+recreate_stopped_statefulsets_missing_dedicated_pvcs() {
+  local -a sts_rows=()
+  local row ns sts replicas
+  local recreated=0
+  local skipped=0
+
+  mapfile -t sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+  for row in "${sts_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns sts replicas <<<"$row"
+    [[ -n "$ns" && -n "$sts" ]] || continue
+    if statefulset_has_claim_template "$ns" "$sts" "ton-src" && statefulset_has_claim_template "$ns" "$sts" "mytonctrl"; then
+      continue
+    fi
+    replicas="$(trim_whitespace "${replicas:-}")"
+    if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
+      echo "Warning: StatefulSet ${ns}/${sts} is missing dedicated ton-src/mytonctrl PVC templates, but kubeton cannot read replicas; leaving it unchanged." >&2
+      ((skipped+=1))
+      continue
+    fi
+    if (( replicas != 0 )); then
+      echo "Warning: StatefulSet ${ns}/${sts} is missing dedicated ton-src/mytonctrl PVC templates, but replicas=${replicas}; it can only be recreated while stopped." >&2
+      ((skipped+=1))
+      continue
+    fi
+
+    echo "[start] Recreating stopped StatefulSet ${ns}/${sts} to add dedicated ton-src and mytonctrl PVC templates."
+    kubectl -n "$ns" delete statefulset "$sts" --cascade=orphan --wait=true --timeout=120s >/dev/null || return 1
+    wait_statefulset_present "$ns" "$sts" 300 || return 1
+    ((recreated+=1))
+  done
+
+  if (( recreated > 0 || skipped > 0 )); then
+    echo "[start] Dedicated PVC template migration summary: recreated=${recreated}, skipped=${skipped}"
   fi
 }
 
@@ -7679,7 +7726,7 @@ run_add() {
   local ns="" sts="" replicas=""
   local new_ordinal new_replicas
   local new_pod node_name target_pvc
-  local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
+  local -a claim_prefixes=("ton-work" "ton-src" "mytoncore" "mytonctrl" "keybundle")
   local -a prepared_pvcs=()
   local claim_prefix pvc pv
 
@@ -7770,7 +7817,7 @@ run_del() {
   fi
 
   local ns sts replicas ordinal pod
-  local -a claim_prefixes=("ton-work" "mytoncore" "keybundle")
+  local -a claim_prefixes=("ton-work" "ton-src" "mytoncore" "mytonctrl" "keybundle")
   local -a pvc_names=()
   local -a pv_names=()
   local claim_prefix pvc pv
@@ -7838,8 +7885,8 @@ run_recreate() {
   local input_dir="$2"
   local ns="" pod="" sts="" ordinal=""
   local replicas=""
-  local pvc_ton_work pvc_mytoncore pvc_keybundle
-  local pv_ton_work="" pv_mytoncore=""
+  local pvc_ton_work pvc_ton_src pvc_mytoncore pvc_mytonctrl pvc_keybundle
+  local pv_ton_work="" pv_ton_src="" pv_mytoncore="" pv_mytonctrl=""
   local item_dir bundle_dir
   local phase=""
   local remaining=180
@@ -7868,7 +7915,9 @@ run_recreate() {
   fi
 
   pvc_ton_work="ton-work-${sts}-${ordinal}"
+  pvc_ton_src="ton-src-${sts}-${ordinal}"
   pvc_mytoncore="mytoncore-${sts}-${ordinal}"
+  pvc_mytonctrl="mytonctrl-${sts}-${ordinal}"
   pvc_keybundle="keybundle-${sts}-${ordinal}"
   item_dir="${input_dir}/${ns}/${sts}/${ordinal}"
   bundle_dir="${item_dir}/bundle"
@@ -7895,28 +7944,40 @@ run_recreate() {
     exit 1
   fi
 
-  confirm_or_exit "This will recreate ${ns}/${pod}: delete PVCs ${pvc_ton_work} and ${pvc_mytoncore}, let pod run for 3 minutes, inject backup bundle from ${item_dir}, then restart pod. Continue?"
+  confirm_or_exit "This will recreate ${ns}/${pod}: delete PVCs ${pvc_ton_work}, ${pvc_ton_src}, ${pvc_mytoncore}, and ${pvc_mytonctrl}, let pod run for 3 minutes, inject backup bundle from ${item_dir}, then restart pod. Continue?"
 
   pv_ton_work="$(kubectl -n "$ns" get pvc "$pvc_ton_work" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+  pv_ton_src="$(kubectl -n "$ns" get pvc "$pvc_ton_src" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
   pv_mytoncore="$(kubectl -n "$ns" get pvc "$pvc_mytoncore" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+  pv_mytonctrl="$(kubectl -n "$ns" get pvc "$pvc_mytonctrl" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
 
   echo "Deleting corrupted data PVCs for ${ns}/${pod} ..."
   kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  kubectl -n "$ns" delete pvc "$pvc_ton_work" "$pvc_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete pvc "$pvc_ton_work" "$pvc_ton_src" "$pvc_mytoncore" "$pvc_mytonctrl" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
   # Best-effort cleanup of previous backing volumes helps avoid stuck Terminating PVCs on bare-metal.
   if [[ -n "$pv_ton_work" ]]; then
     kubectl delete pv "$pv_ton_work" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv_ton_work" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n "$pv_ton_src" ]]; then
+    kubectl delete pv "$pv_ton_src" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv_ton_src" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   if [[ -n "$pv_mytoncore" ]]; then
     kubectl delete pv "$pv_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv_mytoncore" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n "$pv_mytonctrl" ]]; then
+    kubectl delete pv "$pv_mytonctrl" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv_mytonctrl" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
 
   echo "Waiting for fresh PVCs to become Bound ..."
   wait_pvc_bound "$ns" "$pvc_ton_work" 1800
+  wait_pvc_bound "$ns" "$pvc_ton_src" 1800
   wait_pvc_bound "$ns" "$pvc_mytoncore" 1800
+  wait_pvc_bound "$ns" "$pvc_mytonctrl" 1800
 
   echo "Waiting for initial startup of ${ns}/${pod} ..."
   wait_pod_ready "$ns" "$pod" 1800
@@ -9079,6 +9140,7 @@ run_start() {
     if ! kubectl -n "$OP_NAMESPACE" rollout status "deployment/${OP_CONTROLLER_DEPLOYMENT}" --timeout=300s >/dev/null 2>&1; then
       echo "Warning: operator deployment ${OP_NAMESPACE}/${OP_CONTROLLER_DEPLOYMENT} did not report Ready before TON restore; continuing." >&2
     fi
+    recreate_stopped_statefulsets_missing_dedicated_pvcs
     run_start_stopped_fleet
   fi
 

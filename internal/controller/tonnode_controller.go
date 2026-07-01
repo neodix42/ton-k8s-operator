@@ -48,7 +48,9 @@ const (
 	defaultImage                       = "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
 	defaultReplicas              int32 = 1
 	defaultTonWorkSize                 = "700Gi"
+	defaultTonSourceSize               = "20Gi"
 	defaultMyTonCoreSize               = "20Gi"
+	defaultMyTonCtrlSize               = "20Gi"
 	defaultCPURequest                  = "16000m"
 	defaultMemoryRequest               = "64Gi"
 	defaultCPULimit                    = "128000m"
@@ -70,12 +72,12 @@ const (
 
 	tonContainerName = "ton-node"
 	tonWorkClaimName = "ton-work"
+	tonSourceClaim   = "ton-src"
 	myTonCoreClaim   = "mytoncore"
+	myTonCtrlClaim   = "mytonctrl"
 	keyBundleClaim   = "keybundle"
 	tonSourcePath    = "/usr/src/ton"
-	tonSourceSubPath = "usr-src-ton"
 	myTonCtrlPath    = "/usr/local/bin/mytonctrl"
-	myTonCtrlSubPath = "usr-local-bin-mytonctrl"
 
 	headlessServiceSuffix    = "headless"
 	bootstrapConfigVolume    = "bootstrap-config"
@@ -622,9 +624,9 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
-		{Name: tonWorkClaimName, MountPath: tonSourcePath, SubPath: tonSourceSubPath},
+		{Name: tonSourceClaim, MountPath: tonSourcePath},
 		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
-		{Name: myTonCoreClaim, MountPath: myTonCtrlPath, SubPath: myTonCtrlSubPath},
+		{Name: myTonCtrlClaim, MountPath: myTonCtrlPath},
 	}
 	if keyManagementEnabled(tonNode) {
 		volumeMounts = append(volumeMounts,
@@ -725,7 +727,9 @@ func desiredVolumeClaims(
 	}
 
 	tonWorkSize := parseQuantityOrDefault(tonNode.Spec.Storage.TonWorkSize, defaultTonWorkSize)
+	tonSourceSize := parseQuantityOrDefault(tonNode.Spec.Storage.TonSourceSize, defaultTonSourceSize)
 	myTonCoreSize := parseQuantityOrDefault(tonNode.Spec.Storage.MyTonCoreSize, defaultMyTonCoreSize)
+	myTonCtrlSize := parseQuantityOrDefault(tonNode.Spec.Storage.MyTonCtrlSize, defaultMyTonCtrlSize)
 
 	claims := []corev1.PersistentVolumeClaim{
 		{
@@ -741,6 +745,18 @@ func desiredVolumeClaims(
 			},
 		},
 		{
+			ObjectMeta: metav1.ObjectMeta{Name: tonSourceClaim, Labels: labels},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      accessModes,
+				StorageClassName: storageClassName,
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: tonSourceSize,
+					},
+				},
+			},
+		},
+		{
 			ObjectMeta: metav1.ObjectMeta{Name: myTonCoreClaim, Labels: labels},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes:      accessModes,
@@ -748,6 +764,18 @@ func desiredVolumeClaims(
 				Resources: corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceStorage: myTonCoreSize,
+					},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: myTonCtrlClaim, Labels: labels},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      accessModes,
+				StorageClassName: storageClassName,
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: myTonCtrlSize,
 					},
 				},
 			},
@@ -987,8 +1015,9 @@ func desiredKeyAgentEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
 func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
+		{Name: tonSourceClaim, MountPath: tonSourcePath},
 		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
-		{Name: myTonCoreClaim, MountPath: myTonCtrlPath, SubPath: myTonCtrlSubPath},
+		{Name: myTonCtrlClaim, MountPath: myTonCtrlPath},
 		{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
 		{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
 		{Name: keyBundleClaim, MountPath: keyBundleMountPath},
@@ -1003,13 +1032,21 @@ func desiredPersistentLayoutInitContainer(tonNode *tonv1alpha1.TonNode) corev1.C
 		Command: []string{
 			"sh",
 			"-ec",
-			`mkdir -p /mnt/ton-work/usr-src-ton /mnt/mytoncore/usr-local-bin-mytonctrl
-chmod 755 /mnt/ton-work/usr-src-ton /mnt/mytoncore/usr-local-bin-mytonctrl || true`,
+			`mkdir -p /mnt/ton-src /mnt/mytonctrl
+if [ -d /mnt/ton-work/usr-src-ton ] && [ -z "$(ls -A /mnt/ton-src 2>/dev/null)" ]; then
+  cp -a /mnt/ton-work/usr-src-ton/. /mnt/ton-src/
+fi
+if [ -d /mnt/mytoncore/usr-local-bin-mytonctrl ] && [ -z "$(ls -A /mnt/mytonctrl 2>/dev/null)" ]; then
+  cp -a /mnt/mytoncore/usr-local-bin-mytonctrl/. /mnt/mytonctrl/
+fi
+chmod 755 /mnt/ton-src /mnt/mytonctrl || true`,
 		},
 		Resources: desiredKeyAgentResources(tonNode),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: tonWorkClaimName, MountPath: "/mnt/ton-work"},
+			{Name: tonSourceClaim, MountPath: "/mnt/ton-src"},
 			{Name: myTonCoreClaim, MountPath: "/mnt/mytoncore"},
+			{Name: myTonCtrlClaim, MountPath: "/mnt/mytonctrl"},
 		},
 	}
 }
@@ -1046,7 +1083,6 @@ set -eu
 KEYS_DIR="/var/ton-work/keys"
 MYTONCORE_DIR="/usr/local/bin/mytoncore"
 MYTONCTRL_DIR="/usr/local/bin/mytonctrl"
-MYTONCTRL_SUBPATH_NAME="usr-local-bin-mytonctrl"
 WALLETS_DIR="${MYTONCORE_DIR}/wallets"
 TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
@@ -1191,7 +1227,7 @@ current_bootstrap_complete() {
 clear_partial_bootstrap_state() {
   find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
   find "$MYTONCTRL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-  find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 ! -name "$MYTONCTRL_SUBPATH_NAME" -exec rm -rf {} + || true
+  find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
   rm -f "$DB_CONFIG_FILE" || true
   rm -rf "$DB_KEYRING_DIR" || true
   rm -rf "$SYSTEMD_UNITS_DIR" || true

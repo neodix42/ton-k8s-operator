@@ -14,7 +14,9 @@ spec:
   replicas: {{ .Values.tonNode.replicas }}
   storage:
     tonWorkSize: {{ .Values.tonNode.storage.tonWorkSize }}
+    tonSourceSize: {{ .Values.tonNode.storage.tonSourceSize }}
     myTonCoreSize: {{ .Values.tonNode.storage.myTonCoreSize }}
+    myTonCtrlSize: {{ .Values.tonNode.storage.myTonCtrlSize }}
     {{- with .Values.tonNode.storage.storageClassName }}
     storageClassName: {{ . }}
     {{- end }}

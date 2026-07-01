@@ -681,10 +681,10 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	if !hasMount(main.VolumeMounts, myTonCoreClaim, "/usr/local/bin/mytoncore") {
 		t.Fatalf("main container missing persistent mytoncore mount")
 	}
-	if !hasMountWithSubPath(main.VolumeMounts, myTonCoreClaim, myTonCtrlPath, myTonCtrlSubPath) {
+	if !hasMount(main.VolumeMounts, myTonCtrlClaim, myTonCtrlPath) {
 		t.Fatalf("main container missing persistent mytonctrl mount")
 	}
-	if !hasMountWithSubPath(main.VolumeMounts, tonWorkClaimName, tonSourcePath, tonSourceSubPath) {
+	if !hasMount(main.VolumeMounts, tonSourceClaim, tonSourcePath) {
 		t.Fatalf("main container missing persistent TON source mount")
 	}
 	if !hasMount(main.VolumeMounts, keysTmpfsVolume, "/var/ton-work/keys") {
@@ -1272,8 +1272,8 @@ func TestDesiredVolumeClaimsWithKeyManagement(t *testing.T) {
 
 	defaultSC := "default-sc"
 	claims := desiredVolumeClaims(tonNode, &defaultSC)
-	if len(claims) != 3 {
-		t.Fatalf("expected 3 PVC templates with key management, got %d", len(claims))
+	if len(claims) != 5 {
+		t.Fatalf("expected 5 PVC templates with key management, got %d", len(claims))
 	}
 
 	var keyClaim *corev1.PersistentVolumeClaim
@@ -1323,15 +1323,6 @@ func assertQuantityEqual(t *testing.T, actual resource.Quantity, expected string
 func hasMount(mounts []corev1.VolumeMount, name string, path string) bool {
 	for _, mount := range mounts {
 		if mount.Name == name && mount.MountPath == path {
-			return true
-		}
-	}
-	return false
-}
-
-func hasMountWithSubPath(mounts []corev1.VolumeMount, name string, path string, subPath string) bool {
-	for _, mount := range mounts {
-		if mount.Name == name && mount.MountPath == path && mount.SubPath == subPath {
 			return true
 		}
 	}

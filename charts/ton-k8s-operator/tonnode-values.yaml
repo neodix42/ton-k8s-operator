@@ -6,7 +6,9 @@ tonNode:
   replicas: 3
   storage:
     tonWorkSize: 700Gi
+    tonSourceSize: 20Gi
     myTonCoreSize: 20Gi
+    myTonCtrlSize: 20Gi
     storageClassName: local-path
     accessModes:
       - ReadWriteOnce

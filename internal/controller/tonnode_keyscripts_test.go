@@ -20,7 +20,7 @@ func TestKeyRestoreScriptIncludesBootstrapArtifacts(t *testing.T) {
 		`current_bootstrap_complete() {`,
 		`clear_partial_bootstrap_state() {`,
 		`find "$MYTONCTRL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true`,
-		`! -name "$MYTONCTRL_SUBPATH_NAME"`,
+		`find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true`,
 		`quarantine_incomplete_bundle() {`,
 		`encrypted key bundle is incomplete (missing config.json, mtc_done, or systemd-units); quarantining and continuing without key restore`,
 		`current bootstrap state is incomplete; clearing partial bootstrap artifacts before fresh startup`,

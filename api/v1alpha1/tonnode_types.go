@@ -74,9 +74,17 @@ type TonNodeStorageSpec struct {
 	// +kubebuilder:default:="700Gi"
 	TonWorkSize string `json:"tonWorkSize,omitempty"`
 
-	// MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore and the /usr/local/bin/mytonctrl subPath.
+	// TonSourceSize is the PVC size for /usr/src/ton.
+	// +kubebuilder:default:="20Gi"
+	TonSourceSize string `json:"tonSourceSize,omitempty"`
+
+	// MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore.
 	// +kubebuilder:default:="20Gi"
 	MyTonCoreSize string `json:"myTonCoreSize,omitempty"`
+
+	// MyTonCtrlSize is the PVC size for /usr/local/bin/mytonctrl.
+	// +kubebuilder:default:="20Gi"
+	MyTonCtrlSize string `json:"myTonCtrlSize,omitempty"`
 
 	// StorageClassName explicitly selects the StorageClass.
 	// If not set, the operator prefers known local classes, then Longhorn, then default StorageClass.

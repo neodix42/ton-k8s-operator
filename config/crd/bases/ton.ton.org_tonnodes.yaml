@@ -491,10 +491,18 @@ spec:
                     default: 20Gi
                     description: MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore.
                     type: string
+                  myTonCtrlSize:
+                    default: 20Gi
+                    description: MyTonCtrlSize is the PVC size for /usr/local/bin/mytonctrl.
+                    type: string
                   storageClassName:
                     description: |-
                       StorageClassName explicitly selects the StorageClass.
                       If not set, the operator prefers known local classes, then Longhorn, then default StorageClass.
+                    type: string
+                  tonSourceSize:
+                    default: 20Gi
+                    description: TonSourceSize is the PVC size for /usr/src/ton.
                     type: string
                   tonWorkSize:
                     default: 700Gi

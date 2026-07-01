@@ -10,7 +10,9 @@ spec:
   replicas: 3
   storage:
     tonWorkSize: 700Gi
+    tonSourceSize: 20Gi
     myTonCoreSize: 20Gi
+    myTonCtrlSize: 20Gi
   network:
     validatorPort: 30001
     quicPort: 31001
