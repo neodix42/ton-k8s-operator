@@ -250,6 +250,9 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet show balance
 ./kubeton wallet show balance tonnode-0
 ./kubeton wallet show balance tonnode-0 validator_wallet_001
+./kubeton wallet export
+./kubeton wallet export main-wallet
+./kubeton wallet export tonnode-0 validator_wallet_001
 ./kubeton verify
 ./kubeton status
 ./kubeton exec "sync"
@@ -277,6 +280,10 @@ default wallet BOC sending uses
 attempts.
 `kubeton wallet activate ...` and `kubeton wallet show balance ...` run against
 `mytonctrl` inside TON pods; `mytonctrl` already has the network configured.
+`kubeton wallet export` prints private key material to stdout after confirmation:
+with no arguments it exports all pod wallet `.pk` files, with one argument it
+exports the named main wallet from the encrypted main-wallet bundle, and with
+`<pod-name> <wallet-name>` it exports one pod wallet.
 
 # install TON k8s operator only
 ./kubeton install

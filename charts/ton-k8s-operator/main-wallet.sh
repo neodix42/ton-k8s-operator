@@ -26,7 +26,8 @@ Usage:
   main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]
   main-wallet.sh send [from-wallet-name] [amount] [to-address...] [-n]
   main-wallet.sh show [wallet-name]
-  main-wallet.sh run <create|deploy|send|show> [args...]
+  main-wallet.sh export <wallet-name>
+  main-wallet.sh run <create|deploy|send|show|export> [args...]
 
 Required env for deploy:
   MODE=auto|liteserver|toncenter
@@ -112,6 +113,55 @@ read_meta_value() {
 extract_json_string() {
   local key="$1"
   sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n1
+}
+
+file_bytes_to_hex() {
+  local file="$1"
+  if [[ ! -r "$file" ]]; then
+    return 1
+  fi
+  if ! command -v od >/dev/null 2>&1; then
+    return 1
+  fi
+  LC_ALL=C od -An -tx1 -v "$file" | tr -d ' \n'
+}
+
+ton_address_to_hex() {
+  local address normalized decoded_hex wc_hex wc_dec account_hex
+
+  address="$(trim_whitespace "${1:-}")"
+  if [[ "$address" =~ ^(-?[0-9]+):([0-9A-Fa-f]{64})$ ]]; then
+    printf '%s:%s' "${BASH_REMATCH[1]}" "$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+    return 0
+  fi
+  if ! [[ "$address" =~ ^[A-Za-z0-9_-]{48}$ ]]; then
+    return 1
+  fi
+  if ! command -v base64 >/dev/null 2>&1 || ! command -v od >/dev/null 2>&1; then
+    return 1
+  fi
+
+  normalized="${address//-/+}"
+  normalized="${normalized//_/\/}"
+  while (( ${#normalized} % 4 != 0 )); do
+    normalized="${normalized}="
+  done
+
+  decoded_hex="$(printf '%s' "$normalized" | base64 -d 2>/dev/null | od -An -tx1 -v 2>/dev/null | tr -d ' \n')" || return 1
+  if [[ ${#decoded_hex} -ne 72 ]]; then
+    return 1
+  fi
+  wc_hex="${decoded_hex:2:2}"
+  account_hex="${decoded_hex:4:64}"
+  if ! [[ "$wc_hex" =~ ^[0-9A-Fa-f]{2}$ && "$account_hex" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    return 1
+  fi
+
+  wc_dec=$((16#$wc_hex))
+  if (( wc_dec >= 128 )); then
+    wc_dec=$((wc_dec - 256))
+  fi
+  printf '%s:%s' "$wc_dec" "$account_hex"
 }
 
 vault_encrypt_data_key() {
@@ -783,6 +833,96 @@ main_wallet_show() {
   '
 }
 
+main_wallet_export() {
+  local wallet_name="${1:-}"
+  local pk_file addr_file meta_file candidate address address_hex private_key_hex
+  local -a candidates=()
+
+  if (( $# != 1 )); then
+    echo "Error: usage: main-wallet.sh export <wallet-name>" >&2
+    return 1
+  fi
+  wallet_name="$(trim_whitespace "$wallet_name")"
+  if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Error: invalid wallet name '${wallet_name}'." >&2
+    return 1
+  fi
+
+  pk_file="${MAIN_WALLET_DIR}/${wallet_name}.pk"
+  addr_file="${MAIN_WALLET_DIR}/${wallet_name}.addr"
+  meta_file="${MAIN_WALLET_DIR}/${wallet_name}.wallet.meta"
+  if [[ ! -r "$pk_file" ]]; then
+    echo "Error: private key file not found or not readable for '${wallet_name}' (expected ${pk_file})." >&2
+    return 1
+  fi
+
+  if [[ -s "$addr_file" ]]; then
+    candidate="$(LC_ALL=C tr -cd '[:print:]\n' < "$addr_file" | head -n1 | tr -d '\r\n')"
+    candidate="$(trim_whitespace "$candidate")"
+    [[ -n "$candidate" ]] && candidates+=("$candidate")
+  fi
+  if [[ -s "$meta_file" ]]; then
+    candidate="$(trim_whitespace "$(read_meta_value wallet_address "$meta_file")")"
+    [[ -n "$candidate" ]] && candidates+=("$candidate")
+    candidate="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
+    [[ -n "$candidate" ]] && candidates+=("$candidate")
+    candidate="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
+    [[ -n "$candidate" ]] && candidates+=("$candidate")
+  fi
+
+  address="unknown"
+  address_hex="unknown"
+  for candidate in "${candidates[@]}"; do
+    candidate="$(trim_whitespace "$candidate")"
+    [[ -z "$candidate" || "$candidate" == "unknown" ]] && continue
+    if address_hex="$(ton_address_to_hex "$candidate" || true)"; then
+      address_hex="$(trim_whitespace "$address_hex")"
+      if [[ -n "$address_hex" ]]; then
+        address="$candidate"
+        break
+      fi
+    fi
+  done
+  if [[ "$address" == "unknown" && ${#candidates[@]} -gt 0 ]]; then
+    address="$(trim_whitespace "${candidates[0]}")"
+    [[ -z "$address" ]] && address="unknown"
+  fi
+
+  private_key_hex="$(file_bytes_to_hex "$pk_file" || true)"
+  private_key_hex="$(trim_whitespace "$private_key_hex")"
+  if ! [[ "$private_key_hex" =~ ^[0-9A-Fa-f]+$ ]]; then
+    echo "Error: failed to export private key hex for '${wallet_name}'." >&2
+    return 1
+  fi
+  private_key_hex="$(printf '%s' "$private_key_hex" | tr '[:upper:]' '[:lower:]')"
+
+  {
+    echo -e "wallet-name\twallet-address\taddress-hex\tprivate-key-hex"
+    printf '%s\t%s\t%s\t%s\n' "$wallet_name" "$address" "$address_hex" "$private_key_hex"
+  } | awk -F'\t' '
+    {
+      if (NF > max_nf) max_nf = NF
+      for (i = 1; i <= NF; i++) {
+        cell[NR, i] = $i
+        if (length($i) > width[i]) width[i] = length($i)
+      }
+      rows = NR
+    }
+    END {
+      for (r = 1; r <= rows; r++) {
+        line = ""
+        for (i = 1; i <= max_nf; i++) {
+          val = cell[r, i]
+          fmt = "%-" width[i] "s"
+          if (i == 1) line = sprintf(fmt, val)
+          else line = line "  " sprintf(fmt, val)
+        }
+        print line
+      }
+    }
+  '
+}
+
 main_wallet_deploy() {
   local wallet_name="${1:-}"
   local boc_file
@@ -1303,6 +1443,9 @@ run_action() {
     show)
       main_wallet_show "$@"
       ;;
+    export)
+      main_wallet_export "$@"
+      ;;
     ""|help|-h|--help)
       usage
       ;;
@@ -1326,7 +1469,7 @@ run_with_persistence() {
   else
     action_rc=$?
   fi
-  if [[ "$action" == "show" ]]; then
+  if [[ "$action" == "show" || "$action" == "export" ]]; then
     return "$action_rc"
   fi
   if backup_bundle; then
@@ -1350,12 +1493,12 @@ main() {
   case "$command" in
     run)
       if [[ $# -lt 1 ]]; then
-        echo "Error: usage: main-wallet.sh run <create|deploy|send|show> [args...]" >&2
+        echo "Error: usage: main-wallet.sh run <create|deploy|send|show|export> [args...]" >&2
         return 1
       fi
       run_with_persistence "$@"
       ;;
-    create|deploy|send|show)
+    create|deploy|send|show|export)
       run_action "$command" "$@"
       ;;
     help|-h|--help)

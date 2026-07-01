@@ -168,7 +168,7 @@ Commands:
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
-  wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|collect|show> [args...]
+  wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|collect|show|export> [args...]
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Full best-effort cleanup of kubeton-managed resources (with confirmation; keeps TonNode CRD).
@@ -898,6 +898,44 @@ ton_address_valid_for_network() {
       return 1
       ;;
   esac
+}
+
+ton_address_to_hex() {
+  local address normalized decoded_hex wc_hex wc_dec account_hex
+
+  address="$(trim_whitespace "${1:-}")"
+  if [[ "$address" =~ ^(-?[0-9]+):([0-9A-Fa-f]{64})$ ]]; then
+    printf '%s:%s' "${BASH_REMATCH[1]}" "$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+    return 0
+  fi
+  if ! [[ "$address" =~ ^[A-Za-z0-9_-]{48}$ ]]; then
+    return 1
+  fi
+  if ! command -v base64 >/dev/null 2>&1 || ! command -v od >/dev/null 2>&1; then
+    return 1
+  fi
+
+  normalized="${address//-/+}"
+  normalized="${normalized//_/\/}"
+  while (( ${#normalized} % 4 != 0 )); do
+    normalized="${normalized}="
+  done
+
+  decoded_hex="$(printf '%s' "$normalized" | base64 -d 2>/dev/null | od -An -tx1 -v 2>/dev/null | tr -d ' \n')" || return 1
+  if [[ ${#decoded_hex} -ne 72 ]]; then
+    return 1
+  fi
+  wc_hex="${decoded_hex:2:2}"
+  account_hex="${decoded_hex:4:64}"
+  if ! [[ "$wc_hex" =~ ^[0-9A-Fa-f]{2}$ && "$account_hex" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    return 1
+  fi
+
+  wc_dec=$((16#$wc_hex))
+  if (( wc_dec >= 128 )); then
+    wc_dec=$((wc_dec - 256))
+  fi
+  printf '%s:%s' "$wc_dec" "$account_hex"
 }
 
 extract_image_tag() {
@@ -5812,6 +5850,204 @@ resolve_tonnode_wallet_row_from_pod() {
     return 1
   fi
   printf '%s' "$row"
+}
+
+list_tonnode_wallet_names_from_pod() {
+  local ns="$1"
+  local pod="$2"
+  local output
+
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+    wallet_dir="/usr/local/bin/mytoncore/wallets"
+    [[ -d "$wallet_dir" ]] || exit 0
+    shopt -s nullglob
+    for f in "$wallet_dir"/*.pk; do
+      base="${f##*/}"
+      printf "%s\n" "${base%.pk}"
+    done | sort -u
+  ' 2>/dev/null || true)"
+  output="$(strip_ansi_sequences "$output")"
+  printf '%s\n' "$output" | awk 'NF'
+}
+
+read_tonnode_wallet_address_file_from_pod() {
+  local ns="$1"
+  local pod="$2"
+  local wallet_name="$3"
+  local output
+
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+    wallet_name="$1"
+    wallet_dir="/usr/local/bin/mytoncore/wallets"
+    if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      exit 2
+    fi
+    addr_file="${wallet_dir}/${wallet_name}.addr"
+    [[ -r "$addr_file" ]] || exit 1
+    LC_ALL=C tr -cd "[:print:]\n" < "$addr_file" | head -n1 | tr -d "\r\n"
+  ' _ "$wallet_name" 2>/dev/null || true)"
+  output="$(strip_ansi_sequences "$output")"
+  output="$(trim_whitespace "$output")"
+  [[ -n "$output" ]] || return 1
+  printf '%s' "$output"
+}
+
+read_tonnode_wallet_private_key_hex_from_pod() {
+  local ns="$1"
+  local pod="$2"
+  local wallet_name="$3"
+  local output
+  local exec_rc=0
+
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+    wallet_name="$1"
+    wallet_dir="/usr/local/bin/mytoncore/wallets"
+    if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "Error: invalid wallet name ${wallet_name}." >&2
+      exit 2
+    fi
+    pk_file="${wallet_dir}/${wallet_name}.pk"
+    if [[ ! -r "$pk_file" ]]; then
+      echo "Error: private key file not found or not readable: ${pk_file}" >&2
+      exit 1
+    fi
+    if ! command -v od >/dev/null 2>&1; then
+      echo "Error: od command not found." >&2
+      exit 127
+    fi
+    LC_ALL=C od -An -tx1 -v "$pk_file" | tr -d " \n"
+    printf "\n"
+  ' _ "$wallet_name" 2>&1)" || exec_rc=$?
+  output="$(strip_ansi_sequences "$output")"
+  output="$(trim_whitespace "$output")"
+  if (( exec_rc != 0 )); then
+    echo "Error: failed to read private key for '${wallet_name}' in ${ns}/${pod} (exit ${exec_rc})." >&2
+    if [[ -n "$output" ]]; then
+      print_prefixed_lines "  ${pod}> " "$output" >&2
+    fi
+    return "$exec_rc"
+  fi
+  if ! [[ "$output" =~ ^[0-9A-Fa-f]+$ ]]; then
+    echo "Error: private key output for '${wallet_name}' in ${ns}/${pod} was not hex." >&2
+    return 1
+  fi
+  printf '%s' "$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
+}
+
+run_wallet_export_tonnode() {
+  local target_pod_name="${1:-}"
+  local target_wallet_name="${2:-}"
+  local row target_ns target_pod target_node_name wallet_name wallet_row
+  local status balance version workchain address address_hex private_key_hex
+  local rc=0
+  local -a pod_rows=()
+  local -a wallet_names=()
+  local -a candidate_rows=()
+  local -a table_rows=()
+
+  target_pod_name="$(trim_whitespace "$target_pod_name")"
+  target_wallet_name="$(trim_whitespace "$target_wallet_name")"
+  if [[ -n "$target_wallet_name" ]] && ! [[ "$target_wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Error: invalid wallet name '${target_wallet_name}'." >&2
+    return 1
+  fi
+
+  if [[ -n "$target_pod_name" ]]; then
+    row="$(resolve_tonnode_pod_row_by_name "$target_pod_name" || true)"
+    row="$(trim_whitespace "$row")"
+    if [[ -z "$row" ]]; then
+      echo "Error: TON pod '${target_pod_name}' not found." >&2
+      return 1
+    fi
+    pod_rows+=("$row")
+  else
+    mapfile -t pod_rows < <(list_ton_pods 2>/dev/null || true)
+  fi
+
+  for row in "${pod_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
+    [[ -z "$target_ns" || -z "$target_pod" ]] && continue
+    if [[ -z "$(trim_whitespace "$target_node_name")" ]]; then
+      if [[ -n "$target_pod_name" ]]; then
+        echo "Error: pod ${target_ns}/${target_pod} does not have a host assigned; cannot exec into it." >&2
+        return 1
+      fi
+      echo "Warning: pod ${target_ns}/${target_pod} does not have a host assigned; skipping." >&2
+      continue
+    fi
+
+    wallet_names=()
+    if [[ -n "$target_wallet_name" ]]; then
+      wallet_names+=("$target_wallet_name")
+    else
+      mapfile -t wallet_names < <(list_tonnode_wallet_names_from_pod "$target_ns" "$target_pod" || true)
+    fi
+    if [[ ${#wallet_names[@]} -eq 0 ]]; then
+      echo "Warning: no wallet private key files found in ${target_ns}/${target_pod}." >&2
+      continue
+    fi
+
+    for wallet_name in "${wallet_names[@]}"; do
+      wallet_name="$(trim_whitespace "$wallet_name")"
+      [[ -z "$wallet_name" ]] && continue
+      if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "Warning: invalid wallet name '${wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
+        continue
+      fi
+
+      address=""
+      wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$wallet_name" || true)"
+      wallet_row="$(trim_whitespace "$wallet_row")"
+      if [[ -n "$wallet_row" ]]; then
+        IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
+      fi
+      address="$(trim_whitespace "$address")"
+      if [[ -z "$address" ]]; then
+        address="$(read_tonnode_wallet_address_file_from_pod "$target_ns" "$target_pod" "$wallet_name" || true)"
+        address="$(trim_whitespace "$address")"
+      fi
+      if [[ -z "$address" ]]; then
+        address="unknown"
+        address_hex="unknown"
+        echo "Warning: cannot resolve wallet address for '${wallet_name}' in ${target_ns}/${target_pod}; exporting private key with unknown address." >&2
+      else
+        address_hex="$(ton_address_to_hex "$address" || true)"
+        address_hex="$(trim_whitespace "$address_hex")"
+        [[ -z "$address_hex" ]] && address_hex="unknown"
+      fi
+      candidate_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${address}"$'\t'"${address_hex}")
+    done
+  done
+
+  if [[ ${#candidate_rows[@]} -eq 0 ]]; then
+    echo "Error: no TON pod wallets found to export." >&2
+    return 1
+  fi
+
+  if [[ -n "$target_pod_name" ]]; then
+    confirm_or_exit "This will print private key hex for wallet '${target_wallet_name}' in '${target_pod_name}'. Continue?"
+  else
+    confirm_or_exit "This will print private key hex for ${#candidate_rows[@]} wallet(s) from all TON pods. Continue?"
+  fi
+
+  for row in "${candidate_rows[@]}"; do
+    IFS=$'\t' read -r target_ns target_pod wallet_name address address_hex <<<"$row"
+    private_key_hex="$(read_tonnode_wallet_private_key_hex_from_pod "$target_ns" "$target_pod" "$wallet_name" || true)"
+    private_key_hex="$(trim_whitespace "$private_key_hex")"
+    if [[ -z "$private_key_hex" ]]; then
+      rc=1
+      continue
+    fi
+    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${address}"$'\t'"${address_hex}"$'\t'"${private_key_hex}")
+  done
+
+  if [[ ${#table_rows[@]} -eq 0 ]]; then
+    echo "Error: no private keys were exported." >&2
+    return 1
+  fi
+  print_aligned_table_6col "namespace" "tonnode pod" "wallet-name" "wallet-address" "address-hex" "private-key-hex" "${table_rows[@]}"
+  return "$rc"
 }
 
 run_wallet_balance_show() {
@@ -11618,7 +11854,7 @@ wait_main_wallet_pod_completion() {
 
 run_wallet() {
   wallet_usage() {
-    echo "Usage: kubeton wallet <create|deploy|activate|send|collect|show> [args...]"
+    echo "Usage: kubeton wallet <create|deploy|activate|send|collect|show|export> [args...]"
     echo
     echo "Subcommands:"
     echo "  create [name]"
@@ -11643,6 +11879,15 @@ run_wallet() {
     echo "  show balance [to-tonnode-name] [wallet-name]"
     echo "    Show mytonctrl wallet balance inside one TON pod, or all TON pods if omitted."
     echo "    If [wallet-name] is omitted, validator_wallet_001 is used."
+    echo
+    echo "  export"
+    echo "    Export all mytonctrl wallet addresses and private keys from all TON pods."
+    echo
+    echo "  export <main-wallet-name>"
+    echo "    Export one kubeton main-wallet address and private key from the encrypted bundle."
+    echo
+    echo "  export <to-tonnode-name> <wallet-name>"
+    echo "    Export one mytonctrl wallet address and private key from the selected TON pod."
     echo
     echo "  send <mainnet|testnet> <from-wallet-name> <amount> [-n]"
     echo "    Split mode: divides <amount> equally across all TON pods"
@@ -11670,6 +11915,7 @@ run_wallet() {
     echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
     echo "  - activate/show balance use mytonctrl inside TON pods; mytonctrl already has its network configured."
+    echo "  - export prints private key material to stdout; treat the output as a secret."
     echo "  - collect only runs mytonctrl mg for source wallets reported as active by mytonctrl wl."
     echo "  - activate/exec-mtc timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
@@ -11690,6 +11936,9 @@ run_wallet() {
     echo "  kubeton wallet show balance"
     echo "  kubeton wallet show balance tonnode-0"
     echo "  kubeton wallet show balance tonnode-0 validator_wallet_001"
+    echo "  kubeton wallet export"
+    echo "  kubeton wallet export main-wallet"
+    echo "  kubeton wallet export tonnode-0 validator_wallet_001"
     echo "  kubeton wallet send testnet main-wallet 10."
     echo "  kubeton wallet send testnet main-wallet <destination-address> 10."
     echo "  kubeton wallet send testnet main-wallet tonnode-0 10."
@@ -11712,7 +11961,7 @@ run_wallet() {
       wallet_usage
       return 0
       ;;
-    create|deploy|activate|send|collect|show)
+    create|deploy|activate|send|collect|show|export)
       ;;
     *)
       echo "Error: unknown wallet subcommand '$action'." >&2
@@ -11811,6 +12060,31 @@ run_wallet() {
         echo "Error: usage: kubeton wallet show [name]" >&2
         return 1
       fi
+      ;;
+    export)
+      case "$#" in
+        0)
+          run_wallet_export_tonnode "" ""
+          return $?
+          ;;
+        1)
+          if ! [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Error: invalid main wallet name '$1'." >&2
+            return 1
+          fi
+          action_args=("$1")
+          confirm_or_exit "This will restore the encrypted main-wallet bundle and print private key hex for '$1'. Continue?"
+          ;;
+        2)
+          run_wallet_export_tonnode "$1" "$2"
+          return $?
+          ;;
+        *)
+          echo "Error: usage: kubeton wallet export [main-wallet-name]" >&2
+          echo "       usage: kubeton wallet export <to-tonnode-name> <wallet-name>" >&2
+          return 1
+          ;;
+      esac
       ;;
     send)
       local send_no_bounce_flag=""
