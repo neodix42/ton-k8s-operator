@@ -191,6 +191,21 @@ require_bin() {
   fi
 }
 
+helm_upgrade_supports_force_conflicts() {
+  local help_output
+
+  help_output="$(helm upgrade --help 2>/dev/null || true)"
+  grep -q -- '--force-conflicts' <<<"$help_output"
+}
+
+append_helm_force_conflicts_if_supported() {
+  local -n helm_cmd_ref="$1"
+
+  if helm_upgrade_supports_force_conflicts; then
+    helm_cmd_ref+=(--force-conflicts)
+  fi
+}
+
 sanitize_compact() {
   # Keep printable token/key characters only and remove all control/whitespace noise.
   printf '%s' "${1:-}" | tr -d '\000-\037\177' | tr -d '[:space:]'
@@ -987,7 +1002,7 @@ enable_tonnode_host_ports() {
   if tonnode_host_ports_enabled "$ns" "$tonnode_name"; then
     return 1
   fi
-  if ! kubectl -n "$ns" patch tonnodes.ton.ton.org "$tonnode_name" --type=merge \
+  if ! kubectl -n "$ns" patch tonnodes.ton.ton.org "$tonnode_name" --field-manager=helm --type=merge \
     -p '{"spec":{"network":{"hostPortsEnabled":true}}}' >/dev/null 2>&1; then
     echo "Warning: failed to patch ${ns}/${tonnode_name} spec.network.hostPortsEnabled=true." >&2
     return 2
@@ -7732,7 +7747,7 @@ run_add() {
 
   echo "Scaling ${ns}/${sts} from ${replicas} to ${new_replicas} ..."
   if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
-    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge -p "{\"spec\":{\"replicas\":${new_replicas}}}" >/dev/null
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --field-manager=helm --type=merge -p "{\"spec\":{\"replicas\":${new_replicas}}}" >/dev/null
   else
     set_ton_replicas "$ns" "$sts" "$new_replicas"
   fi
@@ -7788,7 +7803,7 @@ run_del() {
 
   echo "Scaling ${ns}/${sts} from ${replicas} to $((replicas - 1)) ..."
   if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
-    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge -p "{\"spec\":{\"replicas\":$((replicas - 1))}}" >/dev/null
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --field-manager=helm --type=merge -p "{\"spec\":{\"replicas\":$((replicas - 1))}}" >/dev/null
   else
     set_ton_replicas "$ns" "$sts" "$((replicas - 1))"
   fi
@@ -8121,7 +8136,7 @@ set_tonnode_or_statefulset_replicas() {
   local replicas="$3"
 
   if kubectl -n "$ns" get tonnodes.ton.ton.org "$name" >/dev/null 2>&1; then
-    kubectl -n "$ns" patch tonnodes.ton.ton.org "$name" --type=merge \
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$name" --field-manager=helm --type=merge \
       -p "{\"spec\":{\"replicas\":${replicas}}}" >/dev/null
     return 0
   fi
@@ -8915,6 +8930,7 @@ run_install() {
     fi
   fi
 
+  append_helm_force_conflicts_if_supported helm_cmd
   "${helm_cmd[@]}"
 }
 
@@ -9025,6 +9041,7 @@ run_start() {
   if (( sequential_start == 1 )); then
     helm_cmd+=(--set tonNode.replicas=1)
   fi
+  append_helm_force_conflicts_if_supported helm_cmd
 
   "${helm_cmd[@]}" || helm_rc=$?
 
@@ -9041,12 +9058,16 @@ run_start() {
       fi
       return 1
     }
-    helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
-      -n "$OP_NAMESPACE" \
-      -f "$OP_VALUES_FILE" \
-      -f "$TON_VALUES_FILE" \
-      "${extra_overrides[@]}" \
-      --set "tonNode.replicas=${desired_replicas_for_start}" >/dev/null || helm_rc=$?
+    helm_cmd=(
+      helm upgrade "$RELEASE_NAME" "$CHART_DIR"
+      -n "$OP_NAMESPACE"
+      -f "$OP_VALUES_FILE"
+      -f "$TON_VALUES_FILE"
+    )
+    helm_cmd+=("${extra_overrides[@]}")
+    helm_cmd+=(--set "tonNode.replicas=${desired_replicas_for_start}")
+    append_helm_force_conflicts_if_supported helm_cmd
+    "${helm_cmd[@]}" >/dev/null || helm_rc=$?
   fi
   if [[ -n "$ton_selector_values_file" ]]; then
     rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
@@ -9512,10 +9533,15 @@ run_restore_keys() {
 
 run_stop_without_backup() {
   require_bin helm
-  helm upgrade "$RELEASE_NAME" "$CHART_DIR" \
-    -n "$OP_NAMESPACE" \
-    -f "$OP_VALUES_FILE" \
+  local -a helm_cmd=(
+    helm upgrade "$RELEASE_NAME" "$CHART_DIR"
+    -n "$OP_NAMESPACE"
+    -f "$OP_VALUES_FILE"
     --set tonNode.enabled=false
+  )
+
+  append_helm_force_conflicts_if_supported helm_cmd
+  "${helm_cmd[@]}"
 }
 
 run_stop_backup() {
@@ -9704,7 +9730,7 @@ run_start_stopped_fleet() {
         fi
         if (( target_replicas > row_replicas )); then
           preapply_stopped_node_mapping_for_statefulset "$row_ns" "$row_sts" "$target_replicas" || true
-          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
+          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --field-manager=helm --type=merge \
             -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null
           clear_statefulset_pause_annotation "$row_ns" "$row_sts"
           ((resumed_tonnodes+=1))
@@ -9719,7 +9745,7 @@ run_start_stopped_fleet() {
           target_replicas="$tonnode_spec_replicas"
           echo "Warning: missing ${KUBETON_PAUSE_ANNOTATION_KEY} on TonNode ${row_ns}/${row_sts}; restoring from TonNode spec.replicas=${target_replicas}."
           preapply_stopped_node_mapping_for_statefulset "$row_ns" "$row_sts" "$target_replicas" || true
-          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --type=merge \
+          kubectl -n "$row_ns" patch tonnodes.ton.ton.org "$row_sts" --field-manager=helm --type=merge \
             -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":null}},\"spec\":{\"replicas\":${target_replicas}}}" >/dev/null 2>&1 || true
           clear_statefulset_pause_annotation "$row_ns" "$row_sts"
           ((resumed_tonnodes+=1))
