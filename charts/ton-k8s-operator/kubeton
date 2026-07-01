@@ -5800,15 +5800,13 @@ resolve_tonnode_wallet_row_from_pod() {
 }
 
 run_wallet_balance_show() {
-  local wallet_network="$1"
-  local target_pod_name="${2:-}"
-  local target_wallet_name="${3:-validator_wallet_001}"
+  local target_pod_name="${1:-}"
+  local target_wallet_name="${2:-validator_wallet_001}"
   local row target_ns target_pod target_node_name wallet_row
   local wallet_name status balance version workchain address
   local -a pod_rows=()
   local -a table_rows=()
 
-  [[ -n "$wallet_network" ]] || return 1
   target_wallet_name="$(trim_whitespace "$target_wallet_name")"
   [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
 
@@ -5889,9 +5887,8 @@ activate_tonnode_wallet_in_pod() {
 }
 
 run_wallet_activate() {
-  local wallet_network="$1"
-  local target_pod_name="${2:-}"
-  local target_wallet_name="${3:-validator_wallet_001}"
+  local target_pod_name="${1:-}"
+  local target_wallet_name="${2:-validator_wallet_001}"
   local row target_ns target_pod target_node_name wallet_row
   local wallet_name status balance version workchain address
   local rc=0
@@ -5902,7 +5899,6 @@ run_wallet_activate() {
   local -a pod_rows=()
   local -a table_rows=()
 
-  [[ -n "$wallet_network" ]] || return 1
   target_wallet_name="$(trim_whitespace "$target_wallet_name")"
   [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
   if ! [[ "$target_wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -6257,11 +6253,11 @@ run_wallet_collect() {
     if [[ "$status_lc" != "active" ]]; then
       if [[ -n "$target_pod_name" ]]; then
         echo "Error: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active." >&2
-        echo "Hint: after funding it, run: ./kubeton wallet activate ${wallet_network} ${target_pod} ${source_wallet_name}" >&2
+        echo "Hint: after funding it, run: ./kubeton wallet activate ${target_pod} ${source_wallet_name}" >&2
         return 1
       fi
       echo "Warning: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active; skipping." >&2
-      echo "Warning: after funding it, run: ./kubeton wallet activate ${wallet_network} ${target_pod} ${source_wallet_name}" >&2
+      echo "Warning: after funding it, run: ./kubeton wallet activate ${target_pod} ${source_wallet_name}" >&2
       continue
     fi
     if [[ -z "$source_address" ]]; then
@@ -6277,7 +6273,7 @@ run_wallet_collect() {
 
   if [[ ${#table_rows[@]} -eq 0 ]]; then
     echo "Error: no active TON wallets resolved for wallet name '${source_wallet_name}'." >&2
-    echo "Hint: check source status with './kubeton wallet show ${wallet_network} balance' and activate funded wallets with './kubeton wallet activate ${wallet_network} [tonnode-name] ${source_wallet_name}'." >&2
+    echo "Hint: check source status with './kubeton wallet show balance' and activate funded wallets with './kubeton wallet activate [tonnode-name] ${source_wallet_name}'." >&2
     return 1
   fi
 
@@ -11548,7 +11544,7 @@ run_wallet() {
     echo "    Deploy one main wallet by sending its generated BOC."
     echo "    If [name] is omitted, deploys all wallet BOCs after confirmation."
     echo
-    echo "  activate <mainnet|testnet> [to-tonnode-name] [wallet-name]"
+    echo "  activate [to-tonnode-name] [wallet-name]"
     echo "    Activate mytonctrl wallet(s) inside TON pod(s) using: aw <wallet-name>."
     echo "    If [to-tonnode-name] is omitted, activates the wallet in all TON pods."
     echo "    If [wallet-name] is omitted, validator_wallet_001 is used."
@@ -11556,7 +11552,7 @@ run_wallet() {
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
     echo
-    echo "  show <mainnet|testnet> balance [to-tonnode-name] [wallet-name]"
+    echo "  show balance [to-tonnode-name] [wallet-name]"
     echo "    Show mytonctrl wallet balance inside one TON pod, or all TON pods if omitted."
     echo "    If [wallet-name] is omitted, validator_wallet_001 is used."
     echo
@@ -11582,9 +11578,10 @@ run_wallet() {
     echo "    If [wallet-name] is omitted, validator_wallet_001 is used; if [amount] is omitted, 'alld' is used."
     echo
     echo "Notes:"
-    echo "  - deploy/activate/send/collect require an explicit network."
+    echo "  - deploy/send/collect require an explicit network."
     echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
+    echo "  - activate/show balance use mytonctrl inside TON pods; mytonctrl already has its network configured."
     echo "  - collect only runs mytonctrl mg for source wallets reported as active by mytonctrl wl."
     echo "  - activate/exec-mtc timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
@@ -11597,14 +11594,14 @@ run_wallet() {
     echo "  kubeton wallet create 0 42 my-wallet"
     echo "  kubeton wallet deploy testnet"
     echo "  kubeton wallet deploy testnet my-wallet"
-    echo "  kubeton wallet activate testnet"
-    echo "  kubeton wallet activate testnet tonnode-0"
-    echo "  kubeton wallet activate testnet tonnode-0 validator_wallet_001"
+    echo "  kubeton wallet activate"
+    echo "  kubeton wallet activate tonnode-0"
+    echo "  kubeton wallet activate tonnode-0 validator_wallet_001"
     echo "  kubeton wallet show"
     echo "  kubeton wallet show my-wallet"
-    echo "  kubeton wallet show testnet balance"
-    echo "  kubeton wallet show testnet balance tonnode-0"
-    echo "  kubeton wallet show testnet balance tonnode-0 validator_wallet_001"
+    echo "  kubeton wallet show balance"
+    echo "  kubeton wallet show balance tonnode-0"
+    echo "  kubeton wallet show balance tonnode-0 validator_wallet_001"
     echo "  kubeton wallet send testnet main-wallet 10."
     echo "  kubeton wallet send testnet main-wallet <destination-address> 10."
     echo "  kubeton wallet send testnet main-wallet tonnode-0 10."
@@ -11680,16 +11677,16 @@ run_wallet() {
       fi
       ;;
     activate)
-      if (( $# < 1 || $# > 3 )); then
-        echo "Error: usage: kubeton wallet activate <mainnet|testnet> [to-tonnode-name] [wallet-name]" >&2
+      if (( $# > 2 )); then
+        echo "Error: usage: kubeton wallet activate [to-tonnode-name] [wallet-name]" >&2
         return 1
       fi
-      if ! wallet_network="$(normalize_wallet_network "$1")"; then
-        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
+      if (( $# >= 1 )) && normalize_wallet_network "$1" >/dev/null 2>&1; then
+        echo "Error: wallet activate no longer accepts a network argument." >&2
+        echo "       usage: kubeton wallet activate [to-tonnode-name] [wallet-name]" >&2
         return 1
       fi
-      shift || true
-      run_wallet_activate "$wallet_network" "${1:-}" "${2:-validator_wallet_001}"
+      run_wallet_activate "${1:-}" "${2:-validator_wallet_001}"
       return $?
       ;;
     collect)
@@ -11706,18 +11703,18 @@ run_wallet() {
       return $?
       ;;
     show)
-      if (( $# >= 1 )) && wallet_network="$(normalize_wallet_network "$1")"; then
-        shift || true
-        if [[ "$(trim_whitespace "${1:-}")" != "balance" ]]; then
-          echo "Error: usage: kubeton wallet show <mainnet|testnet> balance [to-tonnode-name] [wallet-name]" >&2
-          return 1
-        fi
+      if (( $# >= 1 )) && normalize_wallet_network "$1" >/dev/null 2>&1; then
+        echo "Error: wallet show balance no longer accepts a network argument." >&2
+        echo "       usage: kubeton wallet show balance [to-tonnode-name] [wallet-name]" >&2
+        return 1
+      fi
+      if [[ "$(trim_whitespace "${1:-}")" == "balance" ]]; then
         shift || true
         if (( $# > 2 )); then
-          echo "Error: usage: kubeton wallet show <mainnet|testnet> balance [to-tonnode-name] [wallet-name]" >&2
+          echo "Error: usage: kubeton wallet show balance [to-tonnode-name] [wallet-name]" >&2
           return 1
         fi
-        run_wallet_balance_show "$wallet_network" "${1:-}" "${2:-validator_wallet_001}"
+        run_wallet_balance_show "${1:-}" "${2:-validator_wallet_001}"
         return $?
       fi
       if (( $# <= 1 )); then

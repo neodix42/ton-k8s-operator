@@ -242,14 +242,14 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet collect testnet main-wallet tonnode-0
 ./kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 10.
 ./kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 alld
-./kubeton wallet activate testnet
-./kubeton wallet activate testnet tonnode-0
-./kubeton wallet activate testnet tonnode-0 validator_wallet_001
+./kubeton wallet activate
+./kubeton wallet activate tonnode-0
+./kubeton wallet activate tonnode-0 validator_wallet_001
 ./kubeton wallet show
 ./kubeton wallet show main-wallet
-./kubeton wallet show testnet balance
-./kubeton wallet show testnet balance tonnode-0
-./kubeton wallet show testnet balance tonnode-0 validator_wallet_001
+./kubeton wallet show balance
+./kubeton wallet show balance tonnode-0
+./kubeton wallet show balance tonnode-0 validator_wallet_001
 ./kubeton verify
 ./kubeton status
 ./kubeton exec "sync"
@@ -263,20 +263,20 @@ transaction is visible on-chain, then rerun
 `kubeton wallet deploy <mainnet|testnet> <name>`.
 After topping up mytonctrl wallets inside TON pods with split mode, for example
 `kubeton wallet send testnet main-wallet 2`, activate those pod wallets with
-`kubeton wallet activate <mainnet|testnet> [tonnode-name] [wallet-name]`. The
+`kubeton wallet activate [tonnode-name] [wallet-name]`. The
 activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
 pod and does not send a BOC payload to the network.
 `kubeton wallet collect` reads the same `mytonctrl wl` status and only runs
 `mg` for source wallets that are already `active`; activate funded pod wallets
 before collecting from them.
-`kubeton wallet deploy`, `kubeton wallet activate`, `kubeton wallet send`, and `kubeton wallet collect`
+`kubeton wallet deploy`, `kubeton wallet send`, and `kubeton wallet collect`
 require an explicit `mainnet` or `testnet` argument. For deploy/send that
 argument selects both the lite-server global config and TONCenter endpoint. By
 default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
-`kubeton wallet show <mainnet|testnet> balance ...` reads balances from
-`mytonctrl wl` inside TON pods.
+`kubeton wallet activate ...` and `kubeton wallet show balance ...` run against
+`mytonctrl` inside TON pods; `mytonctrl` already has the network configured.
 
 # install TON k8s operator only
 ./kubeton install
