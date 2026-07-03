@@ -282,8 +282,9 @@ attempts.
 `mytonctrl` inside TON pods; `mytonctrl` already has the network configured.
 `kubeton wallet export` prints private key material to stdout after confirmation:
 with no arguments it exports all pod wallet `.pk` files, with one argument it
-exports the named main wallet from the encrypted main-wallet bundle, and with
-`<pod-name> <wallet-name>` it exports one pod wallet.
+exports the named main wallet, including its subwallet id, from the encrypted
+main-wallet bundle, and with `<pod-name> <wallet-name>` it exports one pod
+wallet.
 
 # install TON k8s operator only
 ./kubeton install

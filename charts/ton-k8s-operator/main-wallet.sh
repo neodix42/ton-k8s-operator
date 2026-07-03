@@ -836,6 +836,7 @@ main_wallet_show() {
 main_wallet_export() {
   local wallet_name="${1:-}"
   local pk_file addr_file meta_file candidate address address_hex private_key_hex
+  local subwallet_id
   local -a candidates=()
 
   if (( $# != 1 )); then
@@ -895,10 +896,13 @@ main_wallet_export() {
     return 1
   fi
   private_key_hex="$(printf '%s' "$private_key_hex" | tr '[:upper:]' '[:lower:]')"
+  subwallet_id="$(resolve_wallet_subwallet_id_by_name "$wallet_name" || true)"
+  subwallet_id="$(trim_whitespace "$subwallet_id")"
+  [[ -z "$subwallet_id" ]] && subwallet_id="unknown"
 
   {
-    echo -e "wallet-name\twallet-address\taddress-hex\tprivate-key-hex"
-    printf '%s\t%s\t%s\t%s\n' "$wallet_name" "$address" "$address_hex" "$private_key_hex"
+    echo -e "wallet-name\tsubwallet-id\twallet-address\taddress-hex\tprivate-key-hex"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$wallet_name" "$subwallet_id" "$address" "$address_hex" "$private_key_hex"
   } | awk -F'\t' '
     {
       if (NF > max_nf) max_nf = NF
