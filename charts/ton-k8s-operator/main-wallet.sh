@@ -2,9 +2,12 @@
 set -euo pipefail
 
 MODE="${MODE:-auto}"
+WALLET_NETWORK="${WALLET_NETWORK:-}"
 GLOBAL_CONFIG_URL="${GLOBAL_CONFIG_URL:-https://ton.org/global.config.json}"
 TONCENTER_URL="${TONCENTER_URL:-https://testnet.toncenter.com}"
 TONCENTER_API_KEY="${TONCENTER_API_KEY:-}"
+MAIN_WALLET_MAINNET_GLOBAL_CONFIG_URL="${MAIN_WALLET_MAINNET_GLOBAL_CONFIG_URL:-https://ton.org/global.config.json}"
+MAIN_WALLET_TESTNET_GLOBAL_CONFIG_URL="${MAIN_WALLET_TESTNET_GLOBAL_CONFIG_URL:-https://ton.org/testnet-global.config.json}"
 
 MAIN_WALLET_DIR="${MAIN_WALLET_DIR:-/var/main-wallet/runtime}"
 MAIN_WALLET_BUNDLE_DIR="${MAIN_WALLET_BUNDLE_DIR:-/var/main-wallet/bundle}"
@@ -108,6 +111,92 @@ read_meta_value() {
   local key="$1"
   local meta_file="$2"
   awk -F= -v wanted="$key" '$1 == wanted {print substr($0, index($0, "=") + 1); exit}' "$meta_file"
+}
+
+write_meta_value() {
+  local key="$1"
+  local value="$2"
+  local meta_file="$3"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
+  if [[ -f "$meta_file" ]]; then
+    awk -F= -v wanted="$key" -v replacement="$value" '
+      $1 == wanted {
+        if (!updated) {
+          print wanted "=" replacement
+          updated = 1
+        }
+        next
+      }
+      { print }
+      END {
+        if (!updated) {
+          print wanted "=" replacement
+        }
+      }
+    ' "$meta_file" > "$tmp_file"
+  else
+    printf '%s=%s\n' "$key" "$value" > "$tmp_file"
+  fi
+  mv -f "$tmp_file" "$meta_file"
+  chmod 600 "$meta_file"
+}
+
+normalize_wallet_network_name() {
+  local raw
+
+  raw="$(trim_whitespace "${1:-}")"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    mainnet|main)
+      printf '%s' "mainnet"
+      ;;
+    testnet|test)
+      printf '%s' "testnet"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+wallet_network_global_config_url() {
+  local network="$1"
+
+  case "$network" in
+    mainnet)
+      printf '%s' "$MAIN_WALLET_MAINNET_GLOBAL_CONFIG_URL"
+      ;;
+    testnet)
+      printf '%s' "$MAIN_WALLET_TESTNET_GLOBAL_CONFIG_URL"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_current_wallet_network() {
+  local network combined
+
+  network="$(normalize_wallet_network_name "${WALLET_NETWORK:-}" 2>/dev/null || true)"
+  network="$(trim_whitespace "$network")"
+  if [[ -n "$network" ]]; then
+    printf '%s' "$network"
+    return 0
+  fi
+
+  combined="$(printf '%s %s' "${GLOBAL_CONFIG_URL:-}" "${TONCENTER_URL:-}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$combined" == *testnet* ]]; then
+    printf '%s' "testnet"
+    return 0
+  fi
+  if [[ "$combined" == *"toncenter.com"* || "$combined" == *"ton.org/global.config.json"* ]]; then
+    printf '%s' "mainnet"
+    return 0
+  fi
+  return 1
 }
 
 extract_json_string() {
@@ -676,6 +765,26 @@ deploy_boc_with_mode() {
   return 0
 }
 
+record_wallet_deploy_network() {
+  local wallet_name="$1"
+  local meta_file="${MAIN_WALLET_DIR}/${wallet_name}.wallet.meta"
+  local network
+
+  if [[ ! -f "$meta_file" ]]; then
+    echo "Warning: wallet metadata file not found for '${wallet_name}'; cannot record deployment network." >&2
+    return 0
+  fi
+
+  network="$(resolve_current_wallet_network || true)"
+  network="$(trim_whitespace "$network")"
+  if [[ -z "$network" ]]; then
+    echo "Warning: cannot infer deployment network for '${wallet_name}'; wallet show will not query balance/seqno." >&2
+    return 0
+  fi
+
+  write_meta_value network "$network" "$meta_file"
+}
+
 main_wallet_create() {
   local workchain="${1:-0}"
   local subwallet_id="${2:-42}"
@@ -733,6 +842,54 @@ main_wallet_create() {
   chmod 600 "$meta_file"
 }
 
+wallet_show_chain_state() {
+  local wallet_name="$1"
+  local wallet_address="$2"
+  local wallet_network="$3"
+  local old_global_config_url config_url query_address balance_nano balance seqno
+
+  balance="unknown"
+  seqno="unknown"
+  wallet_network="$(normalize_wallet_network_name "$wallet_network" 2>/dev/null || true)"
+  wallet_network="$(trim_whitespace "$wallet_network")"
+  query_address="$(ton_address_to_hex "$wallet_address" 2>/dev/null || true)"
+  query_address="$(trim_whitespace "$query_address")"
+  if [[ -z "$wallet_network" || ! "$query_address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]]; then
+    printf '%s\t%s' "$balance" "$seqno"
+    return 0
+  fi
+
+  config_url="$(wallet_network_global_config_url "$wallet_network" || true)"
+  config_url="$(trim_whitespace "$config_url")"
+  if [[ -z "$config_url" ]]; then
+    printf '%s\t%s' "$balance" "$seqno"
+    return 0
+  fi
+
+  old_global_config_url="${GLOBAL_CONFIG_URL:-}"
+  GLOBAL_CONFIG_URL="$config_url"
+
+  balance_nano="$(wallet_balance_nano "$query_address" 2>/dev/null || true)"
+  balance_nano="$(trim_whitespace "$balance_nano")"
+  if [[ "$balance_nano" =~ ^[0-9]+$ ]]; then
+    balance="$(nano_to_gram_amount "$balance_nano" || true)"
+    balance="$(trim_whitespace "$balance")"
+    [[ -z "$balance" ]] && balance="unknown"
+  else
+    echo "Warning: failed to resolve balance for wallet '${wallet_name}' on ${wallet_network}; showing unknown." >&2
+  fi
+
+  seqno="$(wallet_seqno_decimal "$query_address" 2>/dev/null || true)"
+  seqno="$(trim_whitespace "$seqno")"
+  if ! [[ "$seqno" =~ ^[0-9]+$ ]]; then
+    echo "Warning: failed to resolve seqno for wallet '${wallet_name}' on ${wallet_network}; showing unknown." >&2
+    seqno="unknown"
+  fi
+
+  GLOBAL_CONFIG_URL="$old_global_config_url"
+  printf '%s\t%s' "$balance" "$seqno"
+}
+
 main_wallet_show() {
   local filter_wallet_name="${1:-}"
   if (( $# > 1 )); then
@@ -743,7 +900,7 @@ main_wallet_show() {
 
   local -a rows=()
   local meta_file addr_file wallet_name
-  local workchain wallet_id wallet_address non_bounceable bounceable
+  local workchain wallet_id wallet_address non_bounceable bounceable network balance seqno chain_state
 
   mkdir -p "$MAIN_WALLET_DIR"
 
@@ -764,14 +921,22 @@ main_wallet_show() {
     wallet_address="$(trim_whitespace "$(read_meta_value wallet_address "$meta_file")")"
     non_bounceable="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
     bounceable="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
+    network="$(normalize_wallet_network_name "$(read_meta_value network "$meta_file")" 2>/dev/null || true)"
+    network="$(trim_whitespace "$network")"
 
     [[ -z "$workchain" ]] && workchain="unknown"
     [[ -z "$wallet_id" ]] && wallet_id="unknown"
     [[ -z "$wallet_address" ]] && wallet_address="unknown"
     [[ -z "$non_bounceable" ]] && non_bounceable="unknown"
     [[ -z "$bounceable" ]] && bounceable="unknown"
+    [[ -z "$network" ]] && network="unknown"
 
-    rows+=("${workchain}"$'\t'"${wallet_id}"$'\t'"${wallet_name}"$'\t'"${wallet_address}"$'\t'"${non_bounceable}"$'\t'"${bounceable}")
+    chain_state="$(wallet_show_chain_state "$wallet_name" "$wallet_address" "$network" || true)"
+    IFS=$'\t' read -r balance seqno <<<"$chain_state"
+    [[ -z "$balance" ]] && balance="unknown"
+    [[ -z "$seqno" ]] && seqno="unknown"
+
+    rows+=("${workchain}"$'\t'"${wallet_id}"$'\t'"${wallet_name}"$'\t'"${network}"$'\t'"${balance}"$'\t'"${seqno}"$'\t'"${wallet_address}"$'\t'"${non_bounceable}"$'\t'"${bounceable}")
   done
 
   for addr_file in "$MAIN_WALLET_DIR"/*.addr; do
@@ -793,7 +958,7 @@ main_wallet_show() {
       workchain="$(trim_whitespace "${wallet_address%%:*}")"
       [[ -z "$workchain" ]] && workchain="unknown"
     fi
-    rows+=("${workchain}"$'\t'"unknown"$'\t'"${wallet_name}"$'\t'"${wallet_address:-unknown}"$'\t'"unknown"$'\t'"unknown")
+    rows+=("${workchain}"$'\t'"unknown"$'\t'"${wallet_name}"$'\t'"unknown"$'\t'"unknown"$'\t'"unknown"$'\t'"${wallet_address:-unknown}"$'\t'"unknown"$'\t'"unknown")
   done
   shopt -u nullglob
 
@@ -807,7 +972,7 @@ main_wallet_show() {
   fi
 
   {
-    echo -e "workchain\twallet-id\twallet-name\twallet-address\tnon-bounceable\tbounceable"
+    echo -e "workchain\twallet-id\twallet-name\tnetwork\tbalance\tseqno\twallet-address\tnon-bounceable\tbounceable"
     printf '%s\n' "${rows[@]}" | sort
   } | awk -F'\t' '
     {
@@ -948,8 +1113,9 @@ main_wallet_deploy() {
       echo "Error: missing BOC file ${boc_file}. Run create first." >&2
       return 1
     fi
-    deploy_boc_with_mode "$wallet_name" "$boc_file" "$normalized_mode"
-    return $?
+    deploy_boc_with_mode "$wallet_name" "$boc_file" "$normalized_mode" || return $?
+    record_wallet_deploy_network "$wallet_name"
+    return 0
   fi
 
   shopt -s nullglob
@@ -968,7 +1134,9 @@ main_wallet_deploy() {
   for file in "${boc_files[@]}"; do
     base="${file##*/}"
     wallet_name="${base%-query.boc}"
-    if ! deploy_boc_with_mode "$wallet_name" "$file" "$normalized_mode"; then
+    if deploy_boc_with_mode "$wallet_name" "$file" "$normalized_mode"; then
+      record_wallet_deploy_network "$wallet_name"
+    else
       failed_wallets+=("$wallet_name")
     fi
   done
@@ -1164,6 +1332,10 @@ wallet_balance_nano() {
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
+    if printf '%s\n' "$output" | grep -Eiq 'state:[[:space:]]*(account_none|none|nonexist)|account_none\$0'; then
+      printf '%s' "0"
+      return 0
+    fi
     balance="$(printf '%s\n' "$output" | awk '
       /balance:/ {in_balance=1}
       in_balance && match($0, /value:[[:space:]]*[0-9]+/) {

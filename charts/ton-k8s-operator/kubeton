@@ -11875,6 +11875,7 @@ run_wallet() {
     echo
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
+    echo "    After deploy, also shows balance and seqno using the saved wallet network."
     echo
     echo "  show balance [to-tonnode-name] [wallet-name]"
     echo "    Show mytonctrl wallet balance inside one TON pod, or all TON pods if omitted."
@@ -11913,6 +11914,7 @@ run_wallet() {
     echo "Notes:"
     echo "  - deploy/send/collect require an explicit network."
     echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
+    echo "  - deploy records the wallet network so show can query balance and seqno later."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
     echo "  - activate/show balance use mytonctrl inside TON pods; mytonctrl already has its network configured."
     echo "  - export prints private key material to stdout; treat the output as a secret."
@@ -12344,6 +12346,8 @@ run_wallet() {
     printf '          value: %s\n' "$(yaml_quote "$VAULT_TRANSIT_KEY")"
     echo "        - name: MODE"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_MODE")"
+    echo "        - name: WALLET_NETWORK"
+    printf '          value: %s\n' "$(yaml_quote "$wallet_network")"
     echo "        - name: GLOBAL_CONFIG_URL"
     printf '          value: %s\n' "$(yaml_quote "$global_config_url")"
     echo "        - name: TONCENTER_URL"

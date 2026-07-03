@@ -278,6 +278,9 @@ argument selects both the lite-server global config and TONCenter endpoint. By
 default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
+After a successful `kubeton wallet deploy <mainnet|testnet> <name>`, kubeton
+stores the wallet network in the encrypted main-wallet metadata, and
+`kubeton wallet show [name]` also prints balance and seqno from that network.
 `kubeton wallet activate ...` and `kubeton wallet show balance ...` run against
 `mytonctrl` inside TON pods; `mytonctrl` already has the network configured.
 `kubeton wallet export` prints private key material to stdout after confirmation:
