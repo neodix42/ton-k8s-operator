@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CHART_VERSION="0.1.94"
+CHART_VERSION="0.1.95"
 CHART_REF="${CHART_REF:-oci://ghcr.io/neodix42/charts/ton-k8s-operator}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD/ton-k8s-operator-$CHART_VERSION}"
 
@@ -70,7 +70,8 @@ a) Review default values files:
    # helper script for common TON fleet operations
    ./kubeton help
 
-b) Install operator:
+b) Check node prerequisites, then install the operator:
+   ./kubeton check
    ./kubeton install
 
 c) Start TON nodes (replica count is taken from tonnode-values.yaml):

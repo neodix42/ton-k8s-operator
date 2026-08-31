@@ -162,7 +162,7 @@ Bare-metal/local-dev default setup is automated by `kubeton`:
 - on bare-metal, TON data PVCs (`/var/ton-work`, including `/var/ton-work/db`) use `TON_STORAGE_CLASS_NAME` by default (`local-path`) so dump download writes to node-local storage instead of Longhorn
 - on bare-metal, `kubeton start` aligns TON pod placement with `LONGHORN_NODE_SELECTOR` by setting `tonNode.nodeSelector` automatically
 - on bare-metal, Vault server pod is also constrained to `LONGHORN_NODE_SELECTOR` so its PVC can attach only on nodes with Longhorn CSI
-- with default `LONGHORN_NODE_SELECTOR=node.longhorn.io/create-default-disk=true`: if there are not enough labeled nodes, `kubeton start` auto-labels only the required number of nodes (based on requested TON replicas)
+- with default `LONGHORN_NODE_SELECTOR=node.longhorn.io/create-default-disk=true`: `kubeton` selects only nodes that pass its resource/disk preflight, then labels the required number of them for Longhorn
 - on local k3d: skips Longhorn install and creates `encrypted-sc` from an existing local StorageClass (`LOCALDEV_BASE_SC`, default `local-path`) for dev convenience
 - installs Vault (`VAULT_CHART_VERSION`, default `0.30.0`)
 - initializes/unseals Vault and configures Transit key `ton-validator`
@@ -180,6 +180,61 @@ You can run bootstrap explicitly:
 ```
 
 Or just run `./kubeton start`; it bootstraps automatically before TON deployment on bare-metal and local k3d clusters.
+
+### Node preflight: `kubeton check`
+
+Run this before installing or starting a fleet:
+
+```bash
+./kubeton check
+```
+
+`kubeton` reads the effective TON settings from `TON_VALUES_FILE` (by default
+`tonnode-values.yaml`); it does not source a `.env` file. With the defaults,
+each TON replica needs `760Gi` of data PVC capacity:
+
+```yaml
+tonWorkSize: 700Gi
+tonSourceSize: 20Gi
+myTonCoreSize: 20Gi
+myTonCtrlSize: 20Gi
+```
+
+The check adds `20Gi` disk headroom by default, and requires at least 16 vCPU
+and 64Gi memory per TON pod (or a larger `tonNode.resources.requests` value).
+It rejects NotReady/cordoned nodes, `DiskPressure`, `MemoryPressure`,
+`PIDPressure`, hard taints, insufficient allocatable CPU or memory after
+assigned pod requests, and insufficient free node filesystem space. Free disk
+comes from the kubelet Summary API (`nodes/proxy` RBAC is required), rather
+than `ephemeral-storage` allocatable capacity.
+
+The command prints every node, but succeeds when there are enough compatible
+target nodes for the configured replica count. TON uses hostname anti-affinity,
+so replicas need distinct nodes. When Longhorn is present or will be
+bootstrapped, it instead requires `max(tonNode.replicas,
+LONGHORN_DEFAULT_REPLICA_COUNT)` compatible nodes. This means an unhealthy node
+such as a `DiskPressure` node is reported and excluded when other compatible
+nodes exist.
+
+`kubeton install` runs the same read-only gate before Helm is invoked.
+`kubeton start` and `kubeton bootstrap-baremetal` run it before Longhorn is
+installed. For a fresh Longhorn install using the default selector, kubeton
+marks only selected compatible nodes with its managed
+`ton.ton.org/kubeton-prereq=ready` label and adds that label to the Longhorn and
+TON selectors. This prevents a Longhorn DaemonSet from being sent to a known
+`DiskPressure` node. Existing Longhorn installations are not automatically
+reselected because that could disrupt mounted volumes; both the Longhorn manager
+and CSI DaemonSet selectors are checked and the command fails with affected
+nodes instead. Existing TON resources using local-path are also left on their
+current node selector rather than being relabelled onto a new node.
+
+For a separate filesystem mounted at `LOCAL_PATH_PROVISIONER_ROOT`, the kubelet
+node filesystem statistic is only a safety signal, not an authoritative free
+space measurement for that mount. Use a host-level disk monitor/probe as well.
+Useful overrides are `KUBETON_CHECK_MIN_CPU`,
+`KUBETON_CHECK_MIN_MEMORY`, and `KUBETON_CHECK_DISK_HEADROOM`; set
+`KUBETON_SKIP_NODE_PREREQ_CHECK=true` only when intentionally bypassing the
+gate.
 
 Security note:
 - bootstrap stores Vault init material in `vault/ton-vault-bootstrap`; rotate/restrict access after bootstrap.
@@ -199,7 +254,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.94/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.95/install.sh" | bash
 ```
 
 The script:
@@ -223,6 +278,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 
 # helper script for common fleet operations
 ./kubeton help
+./kubeton check
 ./kubeton install
 ./kubeton bootstrap-baremetal
 ./kubeton start
@@ -290,6 +346,7 @@ main-wallet bundle, and with `<pod-name> <wallet-name>` it exports one pod
 wallet.
 
 # install TON k8s operator only
+./kubeton check
 ./kubeton install
 
 # start TON nodes (replicas from tonnode-values.yaml)
@@ -377,6 +434,12 @@ MAIN_WALLET_RUNTIME_TMPFS_SIZE
 AUTO_BAREMETAL_BOOTSTRAP
 FORCE_BAREMETAL_BOOTSTRAP
 SKIP_KEY_PREREQ_CHECK
+KUBETON_SKIP_NODE_PREREQ_CHECK
+KUBETON_CHECK_MIN_CPU
+KUBETON_CHECK_MIN_MEMORY
+KUBETON_CHECK_DISK_HEADROOM
+KUBETON_NODE_PREREQ_LABEL_KEY
+KUBETON_NODE_PREREQ_LABEL_VALUE
 
 LONGHORN_RELEASE_NAME
 LONGHORN_NAMESPACE
@@ -646,7 +709,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.94/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.1.95/install.sh" | bash
 cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade
@@ -900,6 +963,7 @@ Deploy operator and TON nodes:
 cd charts/ton-k8s-operator
 
 # operator only
+./kubeton check
 ./kubeton install
 
 # operator + TON nodes (uses tonnode-values.yaml defaults)

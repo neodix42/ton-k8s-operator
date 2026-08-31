@@ -13,6 +13,12 @@ TON_STORAGE_CLASS_NAME="${TON_STORAGE_CLASS_NAME:-local-path}"
 AUTO_BAREMETAL_BOOTSTRAP="${AUTO_BAREMETAL_BOOTSTRAP:-true}"
 FORCE_BAREMETAL_BOOTSTRAP="${FORCE_BAREMETAL_BOOTSTRAP:-false}"
 SKIP_KEY_PREREQ_CHECK="${SKIP_KEY_PREREQ_CHECK:-false}"
+KUBETON_SKIP_NODE_PREREQ_CHECK="${KUBETON_SKIP_NODE_PREREQ_CHECK:-false}"
+KUBETON_CHECK_MIN_CPU="${KUBETON_CHECK_MIN_CPU:-16}"
+KUBETON_CHECK_MIN_MEMORY="${KUBETON_CHECK_MIN_MEMORY:-64Gi}"
+KUBETON_CHECK_DISK_HEADROOM="${KUBETON_CHECK_DISK_HEADROOM:-20Gi}"
+KUBETON_NODE_PREREQ_LABEL_KEY="${KUBETON_NODE_PREREQ_LABEL_KEY:-ton.ton.org/kubeton-prereq}"
+KUBETON_NODE_PREREQ_LABEL_VALUE="${KUBETON_NODE_PREREQ_LABEL_VALUE:-ready}"
 
 LONGHORN_RELEASE_NAME="${LONGHORN_RELEASE_NAME:-longhorn}"
 LONGHORN_NAMESPACE="${LONGHORN_NAMESPACE:-longhorn-system}"
@@ -148,12 +154,31 @@ MAIN_WALLET_TARGET_WALLET_NAME="${MAIN_WALLET_TARGET_WALLET_NAME:-validator_wall
 MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-900s}"
 MAIN_WALLET_RUNTIME_TMPFS_SIZE="${MAIN_WALLET_RUNTIME_TMPFS_SIZE:-512Mi}"
 
+declare -a KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
+declare -a KUBETON_NODE_CHECK_SCOPE_NODES=()
+declare -A KUBETON_NODE_CHECK_RESULT=()
+declare -A KUBETON_NODE_CHECK_REASON=()
+declare -A KUBETON_NODE_CHECK_FREE_CPU_MILLI=()
+declare -A KUBETON_NODE_CHECK_FREE_MEMORY_BYTES=()
+declare -A KUBETON_NODE_CHECK_FREE_DISK_BYTES=()
+declare -A KUBETON_NODE_CHECK_USED_CPU_MILLI=()
+declare -A KUBETON_NODE_CHECK_USED_MEMORY_BYTES=()
+declare -a KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS=()
+declare -A KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR=()
+KUBETON_NODE_CHECK_TON_SELECTOR=""
+KUBETON_NODE_CHECK_TON_VALUES_SELECTOR=""
+KUBETON_NODE_CHECK_SCOPE_SELECTOR=""
+KUBETON_NODE_CHECK_REQUIRED_NODES=0
+KUBETON_NODE_CHECK_EXISTING_LONGHORN=0
+KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR=""
+
 usage() {
   cat <<'EOF'
 Usage:
   kubeton <command>
 
 Commands:
+  check                Check schedulable nodes against TON CPU, memory, disk, and pressure prerequisites.
   install              Install or upgrade operator only (Helm upgrade --install with operator-values.yaml).
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
   start                Start TON fleet.
@@ -427,6 +452,928 @@ resolve_ton_replicas_from_values_file() {
     return 0
   fi
   return 1
+}
+
+# Read one scalar from a nested tonNode value path without requiring yq. Values
+# files are deliberately kept simple, and this also lets kubeton work from a
+# downloaded chart directory with only standard shell tools available.
+resolve_tonnode_path_scalar_from_values_file() {
+  local values_file="$1"
+  local target_path="$2"
+  local value=""
+
+  [[ -f "$values_file" ]] || return 1
+  value="$(awk -v target_path="$target_path" '
+    function trim(value) {
+      sub(/^[ \t]+/, "", value)
+      sub(/[ \t]+$/, "", value)
+      return value
+    }
+    function leading_indent(value) {
+      match(value, /^[ \t]*/)
+      return RLENGTH
+    }
+    {
+      line=$0
+      if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) next
+
+      indent=leading_indent(line)
+      body=substr(line, indent + 1)
+      if (body !~ /^[^:#][^:]*:/) next
+
+      colon=index(body, ":")
+      key=trim(substr(body, 1, colon - 1))
+      raw_value=trim(substr(body, colon + 1))
+      sub(/[ \t]+#.*/, "", raw_value)
+      raw_value=trim(raw_value)
+
+      if (!inside_ton) {
+        if (indent == 0 && key == "tonNode" && raw_value == "") {
+          inside_ton=1
+          ton_indent=indent
+          depth=0
+        }
+        next
+      }
+
+      if (indent <= ton_indent) exit
+      while (depth > 0 && indent <= stack_indent[depth]) depth--
+
+      if (raw_value == "") {
+        depth++
+        stack_indent[depth]=indent
+        stack_key[depth]=key
+        next
+      }
+
+      path=""
+      for (i=1; i<=depth; i++) {
+        path=path (path == "" ? "" : ".") stack_key[i]
+      }
+      path=path (path == "" ? "" : ".") key
+      if (path == target_path) {
+        print raw_value
+        exit
+      }
+    }
+  ' "$values_file" 2>/dev/null || true)"
+
+  value="$(trim_whitespace "$value")"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  [[ -n "$value" ]] || return 1
+  printf '%s' "$value"
+}
+
+resolve_effective_tonnode_path_scalar() {
+  local target_path="$1"
+  local values_file value
+
+  for values_file in "$TON_VALUES_FILE" "$CHART_DIR/values.yaml"; do
+    value="$(resolve_tonnode_path_scalar_from_values_file "$values_file" "$target_path" || true)"
+    value="$(trim_whitespace "$value")"
+    if [[ -n "$value" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_tonnode_node_selector_from_values_file() {
+  local values_file="$1"
+  local selector_rows=""
+
+  [[ -f "$values_file" ]] || return 1
+  selector_rows="$(awk '
+    function trim(value) {
+      sub(/^[ \t]+/, "", value)
+      sub(/[ \t]+$/, "", value)
+      return value
+    }
+    function leading_indent(value) {
+      match(value, /^[ \t]*/)
+      return RLENGTH
+    }
+    {
+      line=$0
+      if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) next
+
+      indent=leading_indent(line)
+      body=substr(line, indent + 1)
+      if (body !~ /^[^:#][^:]*:/) next
+
+      colon=index(body, ":")
+      key=trim(substr(body, 1, colon - 1))
+      raw_value=trim(substr(body, colon + 1))
+      sub(/[ \t]+#.*/, "", raw_value)
+      raw_value=trim(raw_value)
+
+      if (!inside_ton) {
+        if (indent == 0 && key == "tonNode" && raw_value == "") {
+          inside_ton=1
+          ton_indent=indent
+        }
+        next
+      }
+      if (indent <= ton_indent) exit
+
+      if (!inside_selector) {
+        if (key == "nodeSelector") {
+          if (raw_value == "") {
+            inside_selector=1
+            selector_indent=indent
+          } else if (raw_value == "{}") {
+            exit
+          } else if (raw_value ~ /^\{.*\}$/) {
+            inline_selector=raw_value
+            sub(/^\{[ \t]*/, "", inline_selector)
+            sub(/[ \t]*\}$/, "", inline_selector)
+            inline_count=split(inline_selector, inline_items, ",")
+            for (inline_i=1; inline_i<=inline_count; inline_i++) {
+              inline_item=trim(inline_items[inline_i])
+              inline_colon=index(inline_item, ":")
+              if (inline_colon < 2) continue
+              inline_key=trim(substr(inline_item, 1, inline_colon - 1))
+              inline_value=trim(substr(inline_item, inline_colon + 1))
+              gsub(/^\"/, "", inline_key)
+              gsub(/\"$/, "", inline_key)
+              gsub(/^\047/, "", inline_key)
+              gsub(/\047$/, "", inline_key)
+              gsub(/^\"/, "", inline_value)
+              gsub(/\"$/, "", inline_value)
+              gsub(/^\047/, "", inline_value)
+              gsub(/\047$/, "", inline_value)
+              if (inline_key != "" && inline_value != "") print inline_key "=" inline_value
+            }
+            exit
+          }
+        }
+        next
+      }
+      if (indent <= selector_indent) exit
+      if (key ~ /^-/ || raw_value == "") next
+      gsub(/^\"/, "", raw_value)
+      gsub(/\"$/, "", raw_value)
+      gsub(/^\047/, "", raw_value)
+      gsub(/\047$/, "", raw_value)
+      print key "=" raw_value
+    }
+  ' "$values_file" 2>/dev/null || true)"
+
+  selector_rows="$(printf '%s\n' "$selector_rows" | awk 'NF' | sort -u)"
+  [[ -n "$selector_rows" ]] || return 1
+  printf '%s\n' "$selector_rows"
+}
+
+resolve_effective_tonnode_node_selector() {
+  local values_file rows selector="" pair
+
+  for values_file in "$TON_VALUES_FILE" "$CHART_DIR/values.yaml"; do
+    rows="$(resolve_tonnode_node_selector_from_values_file "$values_file" || true)"
+    rows="$(trim_whitespace "$rows")"
+    [[ -n "$rows" ]] || continue
+    while IFS= read -r pair; do
+      pair="$(trim_whitespace "$pair")"
+      [[ -n "$pair" ]] || continue
+      [[ -n "$selector" ]] && selector+=","
+      selector+="$pair"
+    done <<<"$rows"
+    break
+  done
+
+  printf '%s' "$selector"
+}
+
+quantity_to_millicores() {
+  local quantity number suffix factor result
+
+  quantity="$(trim_whitespace "${1:-}")"
+  [[ "$quantity" == "<no value>" ]] && quantity=""
+  [[ -z "$quantity" ]] && {
+    printf '0'
+    return 0
+  }
+  if ! [[ "$quantity" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)(n|u|m)?$ ]]; then
+    return 1
+  fi
+  number="${BASH_REMATCH[1]}"
+  suffix="${BASH_REMATCH[3]:-}"
+  case "$suffix" in
+    n) factor="0.000001" ;;
+    u) factor="0.001" ;;
+    m) factor="1" ;;
+    "") factor="1000" ;;
+    *) return 1 ;;
+  esac
+  result="$(awk -v number="$number" -v factor="$factor" 'BEGIN {
+    value=number*factor
+    rounded=int(value)
+    if (rounded < value) rounded++
+    printf "%.0f", rounded
+  }')"
+  [[ "$result" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$result"
+}
+
+quantity_to_bytes() {
+  local quantity number suffix factor result
+
+  quantity="$(trim_whitespace "${1:-}")"
+  [[ "$quantity" == "<no value>" ]] && quantity=""
+  [[ -z "$quantity" ]] && {
+    printf '0'
+    return 0
+  }
+  if ! [[ "$quantity" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)(Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E|m)?$ ]]; then
+    return 1
+  fi
+  number="${BASH_REMATCH[1]}"
+  suffix="${BASH_REMATCH[3]:-}"
+  case "$suffix" in
+    Ki) factor="1024" ;;
+    Mi) factor="$((1024 ** 2))" ;;
+    Gi) factor="$((1024 ** 3))" ;;
+    Ti) factor="$((1024 ** 4))" ;;
+    Pi) factor="$((1024 ** 5))" ;;
+    Ei) factor="$((1024 ** 6))" ;;
+    K) factor="1000" ;;
+    M) factor="1000000" ;;
+    G) factor="1000000000" ;;
+    T) factor="1000000000000" ;;
+    P) factor="1000000000000000" ;;
+    E) factor="1000000000000000000" ;;
+    m) factor="0.001" ;;
+    "") factor="1" ;;
+    *) return 1 ;;
+  esac
+  result="$(awk -v number="$number" -v factor="$factor" 'BEGIN {
+    value=number*factor
+    rounded=int(value)
+    if (rounded < value) rounded++
+    printf "%.0f", rounded
+  }')"
+  [[ "$result" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$result"
+}
+
+node_check_format_cpu() {
+  local millicores="$1"
+  [[ "$millicores" =~ ^[0-9]+$ ]] || {
+    printf 'N/A'
+    return
+  }
+  awk -v millicores="$millicores" 'BEGIN { printf "%.2f", millicores / 1000 }'
+}
+
+node_check_format_bytes() {
+  local bytes="$1"
+  [[ "$bytes" =~ ^[0-9]+$ ]] || {
+    printf 'N/A'
+    return
+  }
+  awk -v bytes="$bytes" 'BEGIN {
+    if (bytes >= 1024*1024*1024*1024) {
+      printf "%.2f Ti", bytes / 1024 / 1024 / 1024 / 1024
+    } else if (bytes >= 1024*1024*1024) {
+      printf "%.2f Gi", bytes / 1024 / 1024 / 1024
+    } else if (bytes >= 1024*1024) {
+      printf "%.2f Mi", bytes / 1024 / 1024
+    } else {
+      printf "%.0f B", bytes
+    }
+  }'
+}
+
+node_check_selector_join() {
+  local selector="" item
+  for item in "$@"; do
+    item="$(trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    [[ -n "$selector" ]] && selector+=","
+    selector+="$item"
+  done
+  printf '%s' "$selector"
+}
+
+node_check_prereq_label_selector() {
+  printf '%s=%s' "$KUBETON_NODE_PREREQ_LABEL_KEY" "$KUBETON_NODE_PREREQ_LABEL_VALUE"
+}
+
+resolve_ton_replicas_for_node_check() {
+  local replicas=""
+  replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
+  if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    replicas="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
+  fi
+  [[ "$replicas" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s' "$replicas"
+}
+
+resolve_node_check_requirements() {
+  local ton_cpu ton_memory min_cpu min_memory work source core ctrl headroom
+  local ton_cpu_milli ton_memory_bytes min_cpu_milli min_memory_bytes
+  local work_bytes source_bytes core_bytes ctrl_bytes headroom_bytes
+
+  ton_cpu="$(resolve_effective_tonnode_path_scalar "resources.requests.cpu" || true)"
+  ton_memory="$(resolve_effective_tonnode_path_scalar "resources.requests.memory" || true)"
+  min_cpu="$(trim_whitespace "$KUBETON_CHECK_MIN_CPU")"
+  min_memory="$(trim_whitespace "$KUBETON_CHECK_MIN_MEMORY")"
+  work="$(resolve_effective_tonnode_path_scalar "storage.tonWorkSize" || true)"
+  source="$(resolve_effective_tonnode_path_scalar "storage.tonSourceSize" || true)"
+  core="$(resolve_effective_tonnode_path_scalar "storage.myTonCoreSize" || true)"
+  ctrl="$(resolve_effective_tonnode_path_scalar "storage.myTonCtrlSize" || true)"
+  headroom="$(trim_whitespace "$KUBETON_CHECK_DISK_HEADROOM")"
+
+  ton_cpu_milli="$(quantity_to_millicores "$ton_cpu" || true)"
+  ton_memory_bytes="$(quantity_to_bytes "$ton_memory" || true)"
+  min_cpu_milli="$(quantity_to_millicores "$min_cpu" || true)"
+  min_memory_bytes="$(quantity_to_bytes "$min_memory" || true)"
+  work_bytes="$(quantity_to_bytes "$work" || true)"
+  source_bytes="$(quantity_to_bytes "$source" || true)"
+  core_bytes="$(quantity_to_bytes "$core" || true)"
+  ctrl_bytes="$(quantity_to_bytes "$ctrl" || true)"
+  headroom_bytes="$(quantity_to_bytes "$headroom" || true)"
+
+  if ! [[ "$ton_cpu_milli" =~ ^[0-9]+$ && "$ton_memory_bytes" =~ ^[0-9]+$ \
+    && "$min_cpu_milli" =~ ^[0-9]+$ && "$min_memory_bytes" =~ ^[0-9]+$ \
+    && "$work_bytes" =~ ^[0-9]+$ && "$source_bytes" =~ ^[0-9]+$ \
+    && "$core_bytes" =~ ^[0-9]+$ && "$ctrl_bytes" =~ ^[0-9]+$ \
+    && "$headroom_bytes" =~ ^[0-9]+$ ]]; then
+    echo "Error: unable to parse TON node prerequisite quantities from ${TON_VALUES_FILE}." >&2
+    echo "Check tonNode.resources.requests, tonNode.storage, and KUBETON_CHECK_* overrides." >&2
+    return 1
+  fi
+
+  KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI="$ton_cpu_milli"
+  if (( min_cpu_milli > KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI )); then
+    KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI="$min_cpu_milli"
+  fi
+  KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES="$ton_memory_bytes"
+  if (( min_memory_bytes > KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES )); then
+    KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES="$min_memory_bytes"
+  fi
+  KUBETON_NODE_CHECK_TON_DATA_BYTES=$((work_bytes + source_bytes + core_bytes + ctrl_bytes))
+  KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES="$headroom_bytes"
+  KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=$((KUBETON_NODE_CHECK_TON_DATA_BYTES + headroom_bytes))
+}
+
+node_filesystem_available_bytes() {
+  local node="$1"
+  local summary bytes
+
+  if ! summary="$(kubectl get --raw "/api/v1/nodes/${node}/proxy/stats/summary" 2>/dev/null)"; then
+    return 1
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    bytes="$(printf '%s' "$summary" | jq -r '.node.fs.availableBytes // empty' 2>/dev/null || true)"
+  else
+    bytes="$(printf '%s' "$summary" | tr '\n' ' ' | sed -nE 's/.*"fs"[[:space:]]*:[[:space:]]*\\{[^}]*"availableBytes"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -n1)"
+  fi
+  bytes="$(trim_whitespace "$bytes")"
+  [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$bytes"
+}
+
+node_check_resource_pair() {
+  local pair="$1"
+  local -n cpu_ref="$2"
+  local -n memory_ref="$3"
+  local raw_cpu raw_memory parsed_cpu parsed_memory
+
+  IFS=',' read -r raw_cpu raw_memory <<<"$pair"
+  raw_cpu="$(trim_whitespace "${raw_cpu:-}")"
+  raw_memory="$(trim_whitespace "${raw_memory:-}")"
+  parsed_cpu="$(quantity_to_millicores "$raw_cpu" || true)"
+  parsed_memory="$(quantity_to_bytes "$raw_memory" || true)"
+  if ! [[ "$parsed_cpu" =~ ^[0-9]+$ && "$parsed_memory" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  cpu_ref="$parsed_cpu"
+  memory_ref="$parsed_memory"
+}
+
+collect_node_requested_resources() {
+  local pod_rows row node phase ton_pod_label init_resources app_resources
+  local pair cpu memory app_cpu app_memory init_cpu init_memory max_init_cpu max_init_memory
+
+  KUBETON_NODE_CHECK_USED_CPU_MILLI=()
+  KUBETON_NODE_CHECK_USED_MEMORY_BYTES=()
+  # Use a non-whitespace separator. Bash collapses adjacent whitespace IFS
+  # characters, which would otherwise shift empty labels/request columns and
+  # could make an unlabelled pod's requests disappear from the calculation.
+  if ! pod_rows="$(kubectl get pods -A -o go-template='{{range .items}}{{if .spec.nodeName}}{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/name"}}{{end}}{{"\x1f"}}{{range .spec.initContainers}}{{.resources.requests.cpu}}{{","}}{{.resources.requests.memory}}{{";"}}{{end}}{{"\x1f"}}{{range .spec.containers}}{{.resources.requests.cpu}}{{","}}{{.resources.requests.memory}}{{";"}}{{end}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot list assigned pod resource requests for node preflight." >&2
+    return 1
+  fi
+
+  while IFS=$'\x1f' read -r node phase ton_pod_label init_resources app_resources; do
+    node="$(trim_whitespace "$node")"
+    phase="$(trim_whitespace "$phase")"
+    ton_pod_label="$(trim_whitespace "${ton_pod_label:-}")"
+    [[ -n "$node" ]] || continue
+    case "$phase" in
+      Succeeded|Failed) continue ;;
+    esac
+    # Existing TON pods are treated as replaceable fleet members. Their own
+    # requests must not make an in-place start/upgrade fail the preflight;
+    # all other assigned pod requests remain reserved.
+    [[ "$ton_pod_label" == "ton-node" ]] && continue
+
+    app_cpu=0
+    app_memory=0
+    IFS=';' read -r -a resource_pairs <<<"${app_resources:-}"
+    for pair in "${resource_pairs[@]}"; do
+      [[ -n "$pair" ]] || continue
+      if ! node_check_resource_pair "$pair" cpu memory; then
+        echo "Error: cannot parse resource request '${pair}' on a pod assigned to ${node}." >&2
+        return 1
+      fi
+      app_cpu=$((app_cpu + cpu))
+      app_memory=$((app_memory + memory))
+    done
+
+    max_init_cpu=0
+    max_init_memory=0
+    IFS=';' read -r -a resource_pairs <<<"${init_resources:-}"
+    for pair in "${resource_pairs[@]}"; do
+      [[ -n "$pair" ]] || continue
+      if ! node_check_resource_pair "$pair" init_cpu init_memory; then
+        echo "Error: cannot parse init-container resource request '${pair}' on a pod assigned to ${node}." >&2
+        return 1
+      fi
+      (( init_cpu > max_init_cpu )) && max_init_cpu="$init_cpu"
+      (( init_memory > max_init_memory )) && max_init_memory="$init_memory"
+    done
+
+    (( max_init_cpu > app_cpu )) && app_cpu="$max_init_cpu"
+    (( max_init_memory > app_memory )) && app_memory="$max_init_memory"
+    KUBETON_NODE_CHECK_USED_CPU_MILLI["$node"]=$(( ${KUBETON_NODE_CHECK_USED_CPU_MILLI[$node]:-0} + app_cpu ))
+    KUBETON_NODE_CHECK_USED_MEMORY_BYTES["$node"]=$(( ${KUBETON_NODE_CHECK_USED_MEMORY_BYTES[$node]:-0} + app_memory ))
+  done <<<"$pod_rows"
+}
+
+node_check_list_selector_nodes() {
+  local selector="$1"
+  local rows
+
+  if [[ -n "$selector" ]]; then
+    kubectl get nodes -l "$selector" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+  else
+    kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+  fi
+}
+
+node_check_scope_nodes() {
+  local selector="$1"
+  local rows node
+  local -a nodes=()
+
+  if ! rows="$(node_check_list_selector_nodes "$selector")"; then
+    if [[ -n "$selector" ]]; then
+      echo "Error: cannot resolve node selector '${selector}' for node preflight." >&2
+    else
+      echo "Error: cannot list Kubernetes nodes for node preflight." >&2
+    fi
+    return 1
+  fi
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] && nodes+=("$node")
+  done <<<"$rows"
+  mapfile -t KUBETON_NODE_CHECK_SCOPE_NODES < <(printf '%s\n' "${nodes[@]}" | awk 'NF' | sort -u)
+}
+
+node_check_scope_contains() {
+  local node="$1"
+  local scope_node
+  for scope_node in "${KUBETON_NODE_CHECK_SCOPE_NODES[@]}"; do
+    [[ "$scope_node" == "$node" ]] && return 0
+  done
+  return 1
+}
+
+node_check_selector_is_all_compatible() {
+  local selector="$1"
+  local selector_rows node
+
+  if ! selector_rows="$(node_check_list_selector_nodes "$selector")"; then
+    echo "Error: cannot inspect nodes selected by '${selector:-all nodes}'." >&2
+    return 1
+  fi
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] || continue
+    [[ "${KUBETON_NODE_CHECK_RESULT[$node]:-FAIL}" == "PASS" ]] || return 1
+  done <<<"$selector_rows"
+  return 0
+}
+
+run_node_prerequisite_check() {
+  local required_nodes="$1"
+  local selector="${2:-}"
+  local node_rows row node unschedulable alloc_cpu alloc_memory conditions taints
+  local basic_reason reason disk_bytes alloc_cpu_milli alloc_memory_bytes used_cpu used_memory free_cpu free_memory
+  local target result cpu_display memory_display disk_display
+
+  [[ "$required_nodes" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: invalid required TON node count '${required_nodes}'." >&2
+    return 1
+  }
+  resolve_node_check_requirements || return 1
+  node_check_scope_nodes "$selector" || return 1
+  collect_node_requested_resources || return 1
+
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
+  KUBETON_NODE_CHECK_RESULT=()
+  KUBETON_NODE_CHECK_REASON=()
+  KUBETON_NODE_CHECK_FREE_CPU_MILLI=()
+  KUBETON_NODE_CHECK_FREE_MEMORY_BYTES=()
+  KUBETON_NODE_CHECK_FREE_DISK_BYTES=()
+
+  if ! node_rows="$(kubectl get nodes -o go-template='{{range .items}}{{.metadata.name}}{{"\t"}}{{.spec.unschedulable}}{{"\t"}}{{.status.allocatable.cpu}}{{"\t"}}{{.status.allocatable.memory}}{{"\t"}}{{range .status.conditions}}{{.type}}{{"="}}{{.status}}{{","}}{{end}}{{"\t"}}{{range .spec.taints}}{{.key}}{{"="}}{{.effect}}{{","}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot read Kubernetes node status for node preflight." >&2
+    return 1
+  fi
+  if [[ -z "$(trim_whitespace "$node_rows")" ]]; then
+    echo "Error: node preflight found no Kubernetes nodes." >&2
+    return 1
+  fi
+
+  echo "Node prerequisites from ${TON_VALUES_FILE}:"
+  echo "  per TON pod: cpu >= $(node_check_format_cpu "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI") cores, memory >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES")"
+  echo "  local TON data: $(node_check_format_bytes "$KUBETON_NODE_CHECK_TON_DATA_BYTES") (tonWork + tonSource + myTonCore + myTonCtrl) + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom"
+  echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES"); disk data comes from the kubelet summary API"
+  [[ -n "$selector" ]] && echo "  placement selector: ${selector}"
+  printf '%-36s %-7s %-18s %-20s %-20s %s\n' "node" "target" "cpu free / need" "memory free / need" "node fs free / need" "result"
+
+  while IFS=$'\t' read -r node unschedulable alloc_cpu alloc_memory conditions taints; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] || continue
+    basic_reason=""
+    if [[ "$unschedulable" == "true" ]]; then
+      basic_reason="unschedulable"
+    fi
+    if [[ "$conditions" != *"Ready=True"* ]]; then
+      basic_reason="${basic_reason:+${basic_reason}, }NotReady"
+    fi
+    for condition in DiskPressure MemoryPressure PIDPressure NetworkUnavailable; do
+      if [[ "$conditions" == *"${condition}=True"* || "$conditions" == *"${condition}=Unknown"* ]]; then
+        basic_reason="${basic_reason:+${basic_reason}, }${condition}"
+      fi
+    done
+    if [[ "$taints" == *"=NoSchedule"* || "$taints" == *"=NoExecute"* ]]; then
+      basic_reason="${basic_reason:+${basic_reason}, }hard taint"
+    fi
+
+    alloc_cpu_milli="$(quantity_to_millicores "$alloc_cpu" || true)"
+    alloc_memory_bytes="$(quantity_to_bytes "$alloc_memory" || true)"
+    used_cpu="${KUBETON_NODE_CHECK_USED_CPU_MILLI[$node]:-0}"
+    used_memory="${KUBETON_NODE_CHECK_USED_MEMORY_BYTES[$node]:-0}"
+    free_cpu=0
+    free_memory=0
+    if [[ "$alloc_cpu_milli" =~ ^[0-9]+$ ]]; then
+      free_cpu=$((alloc_cpu_milli - used_cpu))
+      (( free_cpu < 0 )) && free_cpu=0
+    else
+      basic_reason="${basic_reason:+${basic_reason}, }unreadable allocatable CPU"
+    fi
+    if [[ "$alloc_memory_bytes" =~ ^[0-9]+$ ]]; then
+      free_memory=$((alloc_memory_bytes - used_memory))
+      (( free_memory < 0 )) && free_memory=0
+    else
+      basic_reason="${basic_reason:+${basic_reason}, }unreadable allocatable memory"
+    fi
+
+    disk_bytes="$(node_filesystem_available_bytes "$node" || true)"
+    if ! [[ "$disk_bytes" =~ ^[0-9]+$ ]]; then
+      basic_reason="${basic_reason:+${basic_reason}, }unreadable node filesystem"
+    fi
+    if (( free_cpu < KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI )); then
+      basic_reason="${basic_reason:+${basic_reason}, }insufficient CPU"
+    fi
+    if (( free_memory < KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES )); then
+      basic_reason="${basic_reason:+${basic_reason}, }insufficient memory"
+    fi
+    if [[ "$disk_bytes" =~ ^[0-9]+$ ]] && (( disk_bytes < KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES )); then
+      basic_reason="${basic_reason:+${basic_reason}, }insufficient disk"
+    fi
+
+    KUBETON_NODE_CHECK_FREE_CPU_MILLI["$node"]="$free_cpu"
+    KUBETON_NODE_CHECK_FREE_MEMORY_BYTES["$node"]="$free_memory"
+    KUBETON_NODE_CHECK_FREE_DISK_BYTES["$node"]="${disk_bytes:-0}"
+    target="no"
+    node_check_scope_contains "$node" && target="yes"
+    cpu_display="$(node_check_format_cpu "$free_cpu") / $(node_check_format_cpu "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI")"
+    memory_display="$(node_check_format_bytes "$free_memory") / $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES")"
+    disk_display="$(node_check_format_bytes "$disk_bytes") / $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES")"
+
+    if [[ -z "$basic_reason" ]]; then
+      result="PASS"
+      KUBETON_NODE_CHECK_RESULT["$node"]="PASS"
+      if [[ "$target" == "yes" ]]; then
+        KUBETON_NODE_CHECK_COMPATIBLE_NODES+=("$node")
+      fi
+    else
+      result="FAIL: ${basic_reason}"
+      KUBETON_NODE_CHECK_RESULT["$node"]="FAIL"
+      KUBETON_NODE_CHECK_REASON["$node"]="$basic_reason"
+    fi
+    printf '%-36s %-7s %-18s %-20s %-20s %s\n' "$node" "$target" "$cpu_display" "$memory_display" "$disk_display" "$result"
+  done <<<"$node_rows"
+
+  mapfile -t KUBETON_NODE_CHECK_COMPATIBLE_NODES < <(printf '%s\n' "${KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]}" | awk 'NF' | sort -u)
+  echo "Compatible target nodes: ${#KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]}/${required_nodes} required."
+  if (( ${#KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]} < required_nodes )); then
+    echo "Error: not enough compatible nodes for ${required_nodes} TON replica(s)." >&2
+    echo "Each TON replica requires a distinct node because TON pods use required hostname anti-affinity." >&2
+    return 1
+  fi
+  return 0
+}
+
+node_check_choose_compatible_nodes() {
+  local required_nodes="$1"
+  local -n selected_nodes_ref="$2"
+  local node
+
+  selected_nodes_ref=()
+  for node in "${KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]}"; do
+    [[ -n "$node" ]] || continue
+    selected_nodes_ref+=("$node")
+    (( ${#selected_nodes_ref[@]} >= required_nodes )) && break
+  done
+  (( ${#selected_nodes_ref[@]} >= required_nodes ))
+}
+
+node_check_apply_managed_label() {
+  local selected_nodes_name="$1"
+  local -n selected_nodes_ref="$selected_nodes_name"
+  local existing_rows node
+  local -A selected=()
+
+  for node in "${selected_nodes_ref[@]}"; do
+    [[ -n "$node" ]] && selected["$node"]=1
+  done
+  if ! existing_rows="$(kubectl get nodes -l "${KUBETON_NODE_PREREQ_LABEL_KEY}=${KUBETON_NODE_PREREQ_LABEL_VALUE}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: cannot inspect existing kubeton prerequisite node labels." >&2
+    return 1
+  fi
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" && -z "${selected[$node]:-}" ]] || continue
+    if ! kubectl label node "$node" "${KUBETON_NODE_PREREQ_LABEL_KEY}-" >/dev/null; then
+      echo "Error: cannot remove stale kubeton prerequisite label from node ${node}." >&2
+      return 1
+    fi
+  done <<<"$existing_rows"
+  for node in "${selected_nodes_ref[@]}"; do
+    if ! kubectl label node "$node" "${KUBETON_NODE_PREREQ_LABEL_KEY}=${KUBETON_NODE_PREREQ_LABEL_VALUE}" --overwrite >/dev/null; then
+      echo "Error: cannot label compatible node ${node} for kubeton placement." >&2
+      return 1
+    fi
+  done
+}
+
+node_check_apply_default_longhorn_label() {
+  local selected_nodes_name="$1"
+  local -n selected_nodes_ref="$selected_nodes_name"
+  local -a selector_pairs=()
+  local node pair
+
+  parse_selector_pairs "$LONGHORN_NODE_SELECTOR" selector_pairs || return 1
+  for node in "${selected_nodes_ref[@]}"; do
+    for pair in "${selector_pairs[@]}"; do
+      if ! kubectl label node "$node" "$pair" --overwrite >/dev/null; then
+        echo "Error: cannot label compatible node ${node} for default Longhorn storage." >&2
+        return 1
+      fi
+    done
+  done
+}
+
+longhorn_daemonset_exists() {
+  local daemonset="$1"
+  kubectl -n "$LONGHORN_NAMESPACE" get daemonset "$daemonset" >/dev/null 2>&1
+}
+
+longhorn_manager_exists() {
+  longhorn_daemonset_exists longhorn-manager
+}
+
+longhorn_daemonset_node_selector() {
+  local daemonset="$1"
+  local rows selector="" pair
+
+  if ! rows="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset "$daemonset" \
+    -o go-template='{{range $key,$value := .spec.template.spec.nodeSelector}}{{printf "%s=%s\n" $key $value}}{{end}}' 2>/dev/null)"; then
+    return 1
+  fi
+  while IFS= read -r pair; do
+    pair="$(trim_whitespace "$pair")"
+    [[ -n "$pair" ]] || continue
+    [[ -n "$selector" ]] && selector+=","
+    selector+="$pair"
+  done <<<"$rows"
+  printf '%s' "$selector"
+}
+
+longhorn_manager_node_selector() {
+  longhorn_daemonset_node_selector longhorn-manager
+}
+
+resolve_existing_longhorn_daemonset_selectors() {
+  local names_name="$1"
+  local selectors_name="$2"
+  local -n names_ref="$names_name"
+  local -n selectors_ref="$selectors_name"
+  local daemonset selector
+
+  names_ref=()
+  selectors_ref=()
+  for daemonset in longhorn-manager longhorn-csi-plugin; do
+    if ! longhorn_daemonset_exists "$daemonset"; then
+      echo "Error: existing Longhorn installation is missing daemonset ${LONGHORN_NAMESPACE}/${daemonset}." >&2
+      return 1
+    fi
+    if ! selector="$(longhorn_daemonset_node_selector "$daemonset")"; then
+      echo "Error: cannot read the node selector from existing Longhorn daemonset ${LONGHORN_NAMESPACE}/${daemonset}." >&2
+      return 1
+    fi
+    names_ref+=("$daemonset")
+    selectors_ref["$daemonset"]="$selector"
+  done
+}
+
+node_check_print_failed_selector_nodes() {
+  local selector="$1"
+  local node
+
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] || continue
+    [[ "${KUBETON_NODE_CHECK_RESULT[$node]:-FAIL}" == "PASS" ]] && continue
+    echo "  - ${node}: ${KUBETON_NODE_CHECK_REASON[$node]:-failed node preflight}" >&2
+  done < <(node_check_list_selector_nodes "$selector" || true)
+}
+
+node_check_verify_existing_longhorn_daemonsets() {
+  local daemonset selector display_name
+
+  for daemonset in "${KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS[@]}"; do
+    selector="${KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR[$daemonset]:-}"
+    if ! node_check_selector_is_all_compatible "$selector"; then
+      case "$daemonset" in
+        longhorn-manager) display_name="manager" ;;
+        longhorn-csi-plugin) display_name="CSI plugin" ;;
+        *) display_name="$daemonset" ;;
+      esac
+      echo "Error: an existing Longhorn ${display_name} targets node(s) that do not meet kubeton prerequisites." >&2
+      node_check_print_failed_selector_nodes "$selector"
+      echo "Refusing to change an existing Longhorn DaemonSet selector automatically; remediate or remove the failing node from its selector first." >&2
+      return 1
+    fi
+  done
+}
+
+node_check_required_longhorn_nodes() {
+  local replicas="$1"
+  local longhorn_replicas="$LONGHORN_DEFAULT_REPLICA_COUNT"
+
+  if ! [[ "$longhorn_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    longhorn_replicas=1
+  fi
+  if (( longhorn_replicas > replicas )); then
+    printf '%s' "$longhorn_replicas"
+  else
+    printf '%s' "$replicas"
+  fi
+}
+
+resolve_workload_node_prerequisite_scope() {
+  local replicas="$1"
+  local use_longhorn="${2:-false}"
+  local daemonset selector
+
+  KUBETON_NODE_CHECK_TON_VALUES_SELECTOR="$(resolve_effective_tonnode_node_selector)"
+  KUBETON_NODE_CHECK_SCOPE_SELECTOR="$KUBETON_NODE_CHECK_TON_VALUES_SELECTOR"
+  KUBETON_NODE_CHECK_REQUIRED_NODES="$replicas"
+  KUBETON_NODE_CHECK_EXISTING_LONGHORN=0
+  KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR=""
+  KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS=()
+  KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR=()
+
+  if ! is_true "$use_longhorn"; then
+    return 0
+  fi
+
+  KUBETON_NODE_CHECK_REQUIRED_NODES="$(node_check_required_longhorn_nodes "$replicas")"
+  if longhorn_manager_exists; then
+    KUBETON_NODE_CHECK_EXISTING_LONGHORN=1
+    resolve_existing_longhorn_daemonset_selectors \
+      KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS \
+      KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR || return 1
+    KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR="${KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR[longhorn-manager]:-}"
+    for daemonset in "${KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS[@]}"; do
+      selector="${KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR[$daemonset]:-}"
+      KUBETON_NODE_CHECK_SCOPE_SELECTOR="$(node_check_selector_join "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" "$selector")"
+    done
+  elif ! is_default_longhorn_node_selector "$LONGHORN_NODE_SELECTOR"; then
+    KUBETON_NODE_CHECK_SCOPE_SELECTOR="$(node_check_selector_join "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" "$LONGHORN_NODE_SELECTOR")"
+  fi
+}
+
+node_check_should_use_longhorn() {
+  if longhorn_manager_exists; then
+    return 0
+  fi
+  if should_bootstrap_baremetal && ! cluster_is_k3d; then
+    return 0
+  fi
+  return 1
+}
+
+run_node_prerequisite_check_readonly() {
+  local replicas use_longhorn="false"
+
+  replicas="$(resolve_ton_replicas_for_node_check || true)"
+  if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: cannot resolve tonNode.replicas from ${TON_VALUES_FILE}." >&2
+    return 1
+  fi
+  if node_check_should_use_longhorn; then
+    use_longhorn="true"
+  fi
+  resolve_workload_node_prerequisite_scope "$replicas" "$use_longhorn" || return 1
+  run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" || return 1
+  if (( KUBETON_NODE_CHECK_EXISTING_LONGHORN == 1 )); then
+    node_check_verify_existing_longhorn_daemonsets || return 1
+  fi
+}
+
+prepare_node_prerequisites_for_workload() {
+  local replicas="$1"
+  local use_longhorn="${2:-false}"
+  local ton_selector prereq_selector
+  local -a selected_nodes=()
+
+  KUBETON_NODE_CHECK_TON_SELECTOR=""
+  if is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
+    echo "[check] KUBETON_SKIP_NODE_PREREQ_CHECK=true; skipping node resource and disk preflight." >&2
+    return 0
+  fi
+  if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: invalid TON replica count '${replicas}' for node preflight." >&2
+    return 1
+  fi
+
+  resolve_workload_node_prerequisite_scope "$replicas" "$use_longhorn" || return 1
+  run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" || return 1
+
+  if (( KUBETON_NODE_CHECK_EXISTING_LONGHORN == 1 )); then
+    node_check_verify_existing_longhorn_daemonsets || return 1
+    LONGHORN_NODE_SELECTOR="$KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR"
+    KUBETON_NODE_CHECK_TON_SELECTOR="$KUBETON_NODE_CHECK_SCOPE_SELECTOR"
+    echo "[check] Existing Longhorn is already constrained to compatible node(s); leaving its placement unchanged."
+    return 0
+  fi
+
+  ton_selector="$KUBETON_NODE_CHECK_TON_VALUES_SELECTOR"
+  if ! is_true "$use_longhorn" && ton_fleet_resources_exist; then
+    echo "[check] Existing TON resources found; preserving their current node selector and local-path placement."
+    return 0
+  fi
+
+  node_check_choose_compatible_nodes "$KUBETON_NODE_CHECK_REQUIRED_NODES" selected_nodes || {
+    echo "Error: could not select ${KUBETON_NODE_CHECK_REQUIRED_NODES} compatible node(s)." >&2
+    return 1
+  }
+  node_check_apply_managed_label selected_nodes || return 1
+  prereq_selector="$(node_check_prereq_label_selector)"
+
+  if is_true "$use_longhorn"; then
+    if is_default_longhorn_node_selector "$LONGHORN_NODE_SELECTOR"; then
+      node_check_apply_default_longhorn_label selected_nodes || return 1
+    fi
+    LONGHORN_NODE_SELECTOR="$(node_check_selector_join "$LONGHORN_NODE_SELECTOR" "$prereq_selector")"
+    KUBETON_NODE_CHECK_TON_SELECTOR="$LONGHORN_NODE_SELECTOR"
+  else
+    KUBETON_NODE_CHECK_TON_SELECTOR="$(node_check_selector_join "$ton_selector" "$prereq_selector")"
+  fi
+
+  echo "[check] Selected compatible node(s): ${selected_nodes[*]}"
+  echo "[check] TON placement will use: ${KUBETON_NODE_CHECK_TON_SELECTOR}"
+}
+
+run_check() {
+  require_bin kubectl
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton check" >&2
+    return 1
+  fi
+  run_node_prerequisite_check_readonly
 }
 
 resolve_tonnode_scalar_from_values_file() {
@@ -9203,6 +10150,13 @@ status_collect_row() {
 
 run_install() {
   require_bin helm
+  require_bin kubectl
+  if is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
+    echo "[check] KUBETON_SKIP_NODE_PREREQ_CHECK=true; skipping install-time node preflight." >&2
+  else
+    run_node_prerequisite_check_readonly || return 1
+  fi
+
   local release_exists=0
   local -a helm_cmd=()
 
@@ -9264,11 +10218,26 @@ fleet_has_stop_annotations() {
 run_bootstrap_baremetal() {
   require_bin kubectl
   require_bin helm
+  local replicas=""
+  local bootstrap_uses_longhorn="true"
+
   if ! cluster_is_baremetal && ! cluster_is_k3d && ! is_true "$FORCE_BAREMETAL_BOOTSTRAP"; then
     echo "Cluster looks like cloud/managed (not bare-metal/local k3d)."
     echo "Use FORCE_BAREMETAL_BOOTSTRAP=true if you really want to bootstrap Longhorn+Vault here."
     exit 1
   fi
+
+  replicas="$(resolve_ton_replicas_for_node_check || true)"
+  if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: cannot resolve tonNode.replicas from ${TON_VALUES_FILE}." >&2
+    return 1
+  fi
+  KUBETON_TARGET_TON_REPLICAS="$replicas"
+  if cluster_is_k3d; then
+    bootstrap_uses_longhorn="false"
+  fi
+  prepare_node_prerequisites_for_workload "$replicas" "$bootstrap_uses_longhorn" || return 1
+
   ensure_auto_bootstrap_stack
   echo "[bootstrap] Completed."
 }
@@ -9289,13 +10258,33 @@ run_start() {
   local -a helm_cmd=()
   local helm_rc=0
   local sequential_start=0
+  local bootstrap_required=0
+  local preflight_uses_longhorn="false"
 
   desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
   if ! [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
     desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$CHART_DIR/values.yaml" || true)"
   fi
-  if [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
-    KUBETON_TARGET_TON_REPLICAS="$desired_replicas_for_start"
+  if ! [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: cannot resolve tonNode.replicas from ${TON_VALUES_FILE}." >&2
+    return 1
+  fi
+  KUBETON_TARGET_TON_REPLICAS="$desired_replicas_for_start"
+
+  if should_bootstrap_baremetal; then
+    bootstrap_required=1
+  fi
+  if (( bootstrap_required == 1 )) || longhorn_manager_exists; then
+    preflight_uses_longhorn="true"
+  fi
+  if is_true "$preflight_uses_longhorn"; then
+    prepare_node_prerequisites_for_workload "$desired_replicas_for_start" true || return 1
+  else
+    prepare_node_prerequisites_for_workload "$desired_replicas_for_start" false || return 1
+  fi
+  if [[ -n "$KUBETON_NODE_CHECK_TON_SELECTOR" ]]; then
+    ton_selector_values_file="$(build_ton_node_selector_values_file "$KUBETON_NODE_CHECK_TON_SELECTOR")" || return 1
+    extra_overrides+=(-f "$ton_selector_values_file")
   fi
 
   if fleet_has_stop_annotations; then
@@ -9312,10 +10301,10 @@ run_start() {
     fi
   fi
 
-  if should_bootstrap_baremetal; then
+  if (( bootstrap_required == 1 )); then
     ensure_auto_bootstrap_stack
     append_baremetal_key_overrides extra_overrides
-    if ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
+    if [[ -z "$ton_selector_values_file" ]] && ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
       ton_selector_values_file="$(build_ton_node_selector_values_file "$LONGHORN_NODE_SELECTOR")"
       extra_overrides+=(-f "$ton_selector_values_file")
     fi
@@ -12497,6 +13486,9 @@ main() {
   shift || true
 
   case "$command" in
+    check)
+      run_check "$@"
+      ;;
     install)
       run_install
       ;;
@@ -12572,4 +13564,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
