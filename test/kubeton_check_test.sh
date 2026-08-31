@@ -36,7 +36,7 @@ fi
 
 if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "daemonset" ]]; then
   # Preflight tests model either a fresh or existing Longhorn deployment.
-  if [[ "$mode" == "existing" || "$mode" == "existing-csi" ]]; then
+  if [[ "$mode" == "existing" || "$mode" == "existing-csi" || "$mode" == "existing-empty" ]]; then
     if [[ "$mode" == "existing-csi" && "$args" == *"go-template="* ]]; then
       case "$args" in
         *"longhorn-manager"*) printf '%s\n' 'storage=manager' ;;
@@ -45,6 +45,13 @@ if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "daemonset" ]]; then
     fi
     exit 0
   fi
+  exit 1
+fi
+
+if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "volumes.longhorn.io" ]]; then
+  # A failed first Longhorn install has no user volumes, so it is safe to
+  # reconfigure its selectors rather than preserve the bad broad placement.
+  [[ "$mode" == "existing-empty" ]] && exit 0
   exit 1
 fi
 
@@ -216,6 +223,14 @@ if [[ -s "$test_dir/labels.log" ]]; then
   exit 1
 fi
 
+repair_output="$test_dir/repair.out"
+: >"$test_dir/labels.log"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=existing-empty KUBETON_TEST_HELM_LOG="$test_dir/helm.log" KUBETON_TEST_LABEL_LOG="$test_dir/labels.log" \
+  bash -c 'source "$1"; prepare_node_prerequisites_for_workload 3 true; printf "%s\n" "$LONGHORN_NODE_SELECTOR"' _ "$kubeton" >"$repair_output" 2>&1
+assert_contains "Existing Longhorn has no volumes; safely rebuilding" "$repair_output"
+assert_contains "node.longhorn.io/create-default-disk=true,ton.ton.org/kubeton-prereq=ready" "$repair_output"
+assert_contains "label node node-good-1 ton.ton.org/kubeton-prereq=ready --overwrite" "$test_dir/labels.log"
+
 csi_output="$test_dir/csi.out"
 if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=existing-csi KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
   "$kubeton" check >"$csi_output" 2>&1; then
@@ -233,5 +248,14 @@ EOF
 inline_output="$test_dir/inline.out"
 PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_effective_tonnode_node_selector' _ "$kubeton" "$inline_values" >"$inline_output"
 assert_contains "topology.kubernetes.io/zone=a,workload=ton" "$inline_output"
+
+# longhorn-csi-plugin is system-managed and is not rendered by Helm. Its first
+# pod is safe only when the selector reaches Longhorn's default-settings
+# ConfigMap before the manager creates that DaemonSet.
+longhorn_values_output="$test_dir/longhorn-selector-values.out"
+TMPDIR="$test_dir" PATH="$fake_bin:$PATH" bash -c 'source "$1"; selector_file="$(build_longhorn_selector_values_file "$2")"; sed -n "1,120p" "$selector_file"' _ \
+  "$kubeton" 'node.longhorn.io/create-default-disk=true,ton.ton.org/kubeton-prereq=ready' >"$longhorn_values_output"
+assert_contains "defaultSettings:" "$longhorn_values_output"
+assert_contains 'systemManagedComponentsNodeSelector: "node.longhorn.io/create-default-disk:true;ton.ton.org/kubeton-prereq:ready"' "$longhorn_values_output"
 
 echo "kubeton node prerequisite checks: PASS"

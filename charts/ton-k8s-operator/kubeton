@@ -171,6 +171,7 @@ KUBETON_NODE_CHECK_SCOPE_SELECTOR=""
 KUBETON_NODE_CHECK_REQUIRED_NODES=0
 KUBETON_NODE_CHECK_EXISTING_LONGHORN=0
 KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR=""
+KUBETON_LONGHORN_PLACEMENT_RECONFIGURE=0
 
 usage() {
   cat <<'EOF'
@@ -758,6 +759,28 @@ node_check_selector_join() {
   printf '%s' "$selector"
 }
 
+selector_contains_selector_pairs() {
+  local actual_selector="$1"
+  local required_selector="$2"
+  local -a actual_pairs=()
+  local -a required_pairs=()
+  local required_pair actual_pair found
+
+  parse_selector_pairs "$actual_selector" actual_pairs || return 1
+  parse_selector_pairs "$required_selector" required_pairs || return 1
+  for required_pair in "${required_pairs[@]}"; do
+    found=0
+    for actual_pair in "${actual_pairs[@]}"; do
+      if [[ "$actual_pair" == "$required_pair" ]]; then
+        found=1
+        break
+      fi
+    done
+    (( found == 1 )) || return 1
+  done
+  return 0
+}
+
 node_check_prereq_label_selector() {
   printf '%s=%s' "$KUBETON_NODE_PREREQ_LABEL_KEY" "$KUBETON_NODE_PREREQ_LABEL_VALUE"
 }
@@ -1238,6 +1261,24 @@ node_check_verify_existing_longhorn_daemonsets() {
   done
 }
 
+node_check_existing_longhorn_daemonsets_are_compatible() {
+  local daemonset selector
+
+  for daemonset in "${KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS[@]}"; do
+    selector="${KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR[$daemonset]:-}"
+    node_check_selector_is_all_compatible "$selector" || return 1
+  done
+}
+
+longhorn_placement_may_be_reconfigured() {
+  local volume_rows
+
+  if ! volume_rows="$(kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io -o name 2>/dev/null)"; then
+    return 1
+  fi
+  [[ -z "$(trim_whitespace "$volume_rows")" ]]
+}
+
 node_check_required_longhorn_nodes() {
   local replicas="$1"
   local longhorn_replicas="$LONGHORN_DEFAULT_REPLICA_COUNT"
@@ -1255,6 +1296,7 @@ node_check_required_longhorn_nodes() {
 resolve_workload_node_prerequisite_scope() {
   local replicas="$1"
   local use_longhorn="${2:-false}"
+  local force_new_longhorn_placement="${3:-false}"
   local daemonset selector
 
   KUBETON_NODE_CHECK_TON_VALUES_SELECTOR="$(resolve_effective_tonnode_node_selector)"
@@ -1270,7 +1312,7 @@ resolve_workload_node_prerequisite_scope() {
   fi
 
   KUBETON_NODE_CHECK_REQUIRED_NODES="$(node_check_required_longhorn_nodes "$replicas")"
-  if longhorn_manager_exists; then
+  if longhorn_manager_exists && ! is_true "$force_new_longhorn_placement"; then
     KUBETON_NODE_CHECK_EXISTING_LONGHORN=1
     resolve_existing_longhorn_daemonset_selectors \
       KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS \
@@ -1283,6 +1325,18 @@ resolve_workload_node_prerequisite_scope() {
   elif ! is_default_longhorn_node_selector "$LONGHORN_NODE_SELECTOR"; then
     KUBETON_NODE_CHECK_SCOPE_SELECTOR="$(node_check_selector_join "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" "$LONGHORN_NODE_SELECTOR")"
   fi
+}
+
+reselect_empty_longhorn_placement() {
+  local replicas="$1"
+
+  if ! longhorn_placement_may_be_reconfigured; then
+    return 1
+  fi
+  echo "[check] Existing Longhorn has no volumes; safely rebuilding its placement on compatible nodes."
+  KUBETON_LONGHORN_PLACEMENT_RECONFIGURE=1
+  resolve_workload_node_prerequisite_scope "$replicas" true true || return 1
+  run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_SCOPE_SELECTOR"
 }
 
 node_check_should_use_longhorn() {
@@ -1320,6 +1374,7 @@ prepare_node_prerequisites_for_workload() {
   local -a selected_nodes=()
 
   KUBETON_NODE_CHECK_TON_SELECTOR=""
+  KUBETON_LONGHORN_PLACEMENT_RECONFIGURE=0
   if is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
     echo "[check] KUBETON_SKIP_NODE_PREREQ_CHECK=true; skipping node resource and disk preflight." >&2
     return 0
@@ -1330,14 +1385,24 @@ prepare_node_prerequisites_for_workload() {
   fi
 
   resolve_workload_node_prerequisite_scope "$replicas" "$use_longhorn" || return 1
-  run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" || return 1
+  if ! run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_SCOPE_SELECTOR"; then
+    if (( KUBETON_NODE_CHECK_EXISTING_LONGHORN == 1 )) && reselect_empty_longhorn_placement "$replicas"; then
+      :
+    else
+      return 1
+    fi
+  fi
 
   if (( KUBETON_NODE_CHECK_EXISTING_LONGHORN == 1 )); then
-    node_check_verify_existing_longhorn_daemonsets || return 1
-    LONGHORN_NODE_SELECTOR="$KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR"
-    KUBETON_NODE_CHECK_TON_SELECTOR="$KUBETON_NODE_CHECK_SCOPE_SELECTOR"
-    echo "[check] Existing Longhorn is already constrained to compatible node(s); leaving its placement unchanged."
-    return 0
+    if node_check_existing_longhorn_daemonsets_are_compatible; then
+      LONGHORN_NODE_SELECTOR="$KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR"
+      KUBETON_NODE_CHECK_TON_SELECTOR="$KUBETON_NODE_CHECK_SCOPE_SELECTOR"
+      echo "[check] Existing Longhorn is already constrained to compatible node(s); leaving its placement unchanged."
+      return 0
+    fi
+    if ! reselect_empty_longhorn_placement "$replicas"; then
+      node_check_verify_existing_longhorn_daemonsets || return 1
+    fi
   fi
 
   ton_selector="$KUBETON_NODE_CHECK_TON_VALUES_SELECTOR"
@@ -4479,13 +4544,14 @@ EOF
 build_longhorn_selector_values_file() {
   local selector="$1"
   local -a selector_pairs=()
-  local values_file
+  local values_file system_managed_selector
 
   parse_selector_pairs "$selector" selector_pairs || return 1
   if [[ ${#selector_pairs[@]} -eq 0 ]]; then
     echo "Error: LONGHORN_NODE_SELECTOR is set but has no valid key=value pairs." >&2
     return 1
   fi
+  system_managed_selector="$(selector_pairs_to_longhorn_setting selector_pairs)"
 
   values_file="$(mktemp -t kubeton-longhorn-selector.XXXXXX.yaml)"
   {
@@ -4501,6 +4567,12 @@ build_longhorn_selector_values_file() {
     echo "longhornUI:"
     echo "  nodeSelector:"
     write_yaml_map_from_pairs selector_pairs 4
+    # longhorn-csi-plugin is created dynamically by Longhorn rather than by a
+    # Helm template. This setting must be present in the initial ConfigMap so
+    # the manager creates CSI only on the selected nodes; applying it after
+    # Longhorn is ready is too late to prevent a DiskPressure eviction.
+    echo "defaultSettings:"
+    echo "  systemManagedComponentsNodeSelector: $(yaml_quote "$system_managed_selector")"
   } >"$values_file"
 
   printf '%s' "$values_file"
@@ -5276,6 +5348,82 @@ apply_longhorn_post_start_settings() {
   fi
 }
 
+selector_pairs_to_json_object() {
+  local selector="$1"
+  local -a selector_pairs=()
+  local pair key value json_object="" first=1
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  [[ ${#selector_pairs[@]} -gt 0 ]] || return 1
+  json_object="{"
+  for pair in "${selector_pairs[@]}"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    (( first == 1 )) || json_object+=","
+    json_object+="$(json_quote "$key"):$(json_quote "$value")"
+    first=0
+  done
+  json_object+="}"
+  printf '%s' "$json_object"
+}
+
+patch_longhorn_daemonset_node_selector() {
+  local daemonset="$1"
+  local selector="$2"
+  local selector_json patch
+
+  selector_json="$(selector_pairs_to_json_object "$selector")" || return 1
+  patch="{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":${selector_json}}}}}"
+  kubectl -n "$LONGHORN_NAMESPACE" patch daemonset "$daemonset" --type=merge -p "$patch" >/dev/null
+}
+
+ensure_longhorn_daemonsets_constrained() {
+  local selector="$1"
+  local timeout_seconds="${2:-180}"
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+  local daemonset actual_selector all_constrained mismatch_since=0 now
+  local -a selector_validation_pairs=()
+  local -A patched=()
+
+  selector="$(trim_whitespace "$selector")"
+  [[ -n "$selector" ]] || return 0
+  parse_selector_pairs "$selector" selector_validation_pairs || return 1
+
+  while (( $(date +%s) < deadline )); do
+    all_constrained=1
+    for daemonset in longhorn-manager longhorn-csi-plugin; do
+      if ! longhorn_daemonset_exists "$daemonset"; then
+        all_constrained=0
+        continue
+      fi
+      actual_selector="$(longhorn_daemonset_node_selector "$daemonset" || true)"
+      if selector_contains_selector_pairs "$actual_selector" "$selector"; then
+        continue
+      fi
+      all_constrained=0
+      now="$(date +%s)"
+      if (( mismatch_since == 0 )); then
+        mismatch_since="$now"
+      fi
+      # Let Longhorn reconcile the Setting first. A direct DaemonSet patch is
+      # only a no-volume recovery fallback for a previously failed install.
+      if (( now - mismatch_since >= 15 )) \
+        && [[ -z "${patched[$daemonset]:-}" ]] \
+        && longhorn_placement_may_be_reconfigured; then
+        echo "[baremetal] Repairing Longhorn ${daemonset} placement selector before storage readiness ..."
+        patch_longhorn_daemonset_node_selector "$daemonset" "$selector" || return 1
+        patched["$daemonset"]=1
+      fi
+    done
+    (( all_constrained == 1 )) && return 0
+    sleep 2
+  done
+
+  echo "Error: Longhorn manager/CSI DaemonSets did not adopt LONGHORN_NODE_SELECTOR='${selector}'." >&2
+  echo "Refusing to wait for CSI on nodes excluded by the kubeton preflight." >&2
+  return 1
+}
+
 verify_longhorn_multipathd_safe() {
   if ! is_true "$KUBETON_FAIL_ON_LONGHORN_MULTIPATHD"; then
     return 0
@@ -5443,8 +5591,12 @@ ensure_longhorn_installed() {
     longhorn_system_managed_selector_setting="$(selector_pairs_to_longhorn_setting longhorn_selector_pairs)"
   fi
 
-  if [[ "$lh_status" == "deployed" ]] && is_true "$KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY" && longhorn_storage_ready_quick "longhorn"; then
+  if [[ "$lh_status" == "deployed" ]] \
+    && ! is_true "$KUBETON_LONGHORN_PLACEMENT_RECONFIGURE" \
+    && is_true "$KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY" \
+    && longhorn_storage_ready_quick "longhorn"; then
     apply_longhorn_post_start_settings "$longhorn_system_managed_selector_setting" || return 1
+    ensure_longhorn_daemonsets_constrained "$LONGHORN_NODE_SELECTOR" || return 1
     wait_longhorn_storage_ready "longhorn"
     verify_longhorn_multipathd_safe
     echo "[baremetal] Longhorn is already deployed and CSI/storage are Ready; skipping Helm upgrade."
@@ -5520,8 +5672,8 @@ ensure_longhorn_installed() {
     return "$install_rc"
   fi
 
-  wait_longhorn_storage_ready "longhorn"
-  apply_longhorn_post_start_settings "$longhorn_system_managed_selector_setting"
+  apply_longhorn_post_start_settings "$longhorn_system_managed_selector_setting" || return 1
+  ensure_longhorn_daemonsets_constrained "$LONGHORN_NODE_SELECTOR" || return 1
   wait_longhorn_storage_ready "longhorn"
 }
 

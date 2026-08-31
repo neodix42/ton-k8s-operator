@@ -221,12 +221,15 @@ nodes exist.
 installed. For a fresh Longhorn install using the default selector, kubeton
 marks only selected compatible nodes with its managed
 `ton.ton.org/kubeton-prereq=ready` label and adds that label to the Longhorn and
-TON selectors. This prevents a Longhorn DaemonSet from being sent to a known
-`DiskPressure` node. Existing Longhorn installations are not automatically
+TON selectors, including Longhorn's system-managed CSI DaemonSet selector. This
+prevents a Longhorn DaemonSet from being sent to a known `DiskPressure` node.
+Existing Longhorn installations are not automatically
 reselected because that could disrupt mounted volumes; both the Longhorn manager
 and CSI DaemonSet selectors are checked and the command fails with affected
-nodes instead. Existing TON resources using local-path are also left on their
-current node selector rather than being relabelled onto a new node.
+nodes instead. The exception is a previously failed Longhorn install with no
+Longhorn volumes: kubeton safely rebuilds its placement on compatible nodes.
+Existing TON resources using local-path are also left on their current node
+selector rather than being relabelled onto a new node.
 
 For a separate filesystem mounted at `LOCAL_PATH_PROVISIONER_ROOT`, the kubelet
 node filesystem statistic is only a safety signal, not an authoritative free
