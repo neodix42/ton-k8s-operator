@@ -20,6 +20,17 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local needle="$1"
+  local file="$2"
+  [[ -e "$file" ]] || return 0
+  if grep -Fq -- "$needle" "$file"; then
+    echo "expected output not to contain: $needle" >&2
+    sed -n '1,200p' "$file" >&2
+    exit 1
+  fi
+}
+
 assert_order() {
   local first="$1"
   local second="$2"
@@ -1102,6 +1113,316 @@ if [[ -s "$longhorn_gate_events" ]]; then
   cat "$longhorn_gate_events" >&2
   exit 1
 fi
+
+# An explicit TON uninstall may remove a stuck PVC whose local-path owner
+# cannot be proven, but only after its generic PV/PVC identity is persisted.
+# The unresolved target must stay out of wildcard/host cleanup and cause a
+# non-zero result so the durable ledger is retained for manual reconciliation.
+unresolved_local_force_events="$test_dir/unresolved-local-force-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"get pvc ton-work-tonnode-0"*"spec.volumeName"*) printf "pv-unresolved" ;;
+      *"get pvc ton-work-tonnode-0"*"metadata.deletionTimestamp"*) printf "pvc-uid\t2026-09-01T12:00:00Z" ;;
+      *"get pvc ton-work-tonnode-0"*"metadata.uid"*) printf "pvc-uid" ;;
+      *"patch pvc ton-work-tonnode-0"*) printf "patch-pvc-finalizers %s\n" "$*" >>"$event_log" ;;
+      *"delete pvc ton-work-tonnode-0"*) printf "delete-pvc\n" >>"$event_log" ;;
+    esac
+  }
+  append_pv_cleanup_ledger_row_for_pv() {
+    local -n out="$3"
+    printf -v row "pv-unresolved\tdefault/ton-work-tonnode-0\tpv-uid\tpvc-uid\tDelete\t\t\t"
+    out+=("$row")
+    printf "generic-ledger\n" >>"$event_log"
+  }
+  append_local_path_exact_cleanup_rows_for_pv() {
+    printf "exact-local-unresolved\n" >>"$event_log"
+    return 2
+  }
+  record_local_path_cleanup_ledger() {
+    local -n exact_rows="$1"
+    local -n pv_rows="$2"
+    printf "record-ledger exact=%s pv=%s\n" "${#exact_rows[@]}" "${#pv_rows[@]}" >>"$event_log"
+  }
+  collect_local_path_pattern_cleanup_rows_for_pvcs() {
+    local -n rows="$1"
+    printf "pattern-input=%s\n" "${#rows[@]}" >>"$event_log"
+  }
+  verify_no_pod_references_for_pvc() {
+    printf "verify-no-pod-reference\n" >>"$event_log"
+  }
+  wait_calls=0
+  wait_pvc_gone() {
+    wait_calls=$((wait_calls + 1))
+    if [[ "$wait_calls" -eq 1 ]]; then
+      printf "wait-normal-delete\n" >>"$event_log"
+      return 1
+    fi
+    printf "wait-after-finalizer-patch\n" >>"$event_log"
+  }
+  cleanup_recorded_local_path_data() {
+    printf "retain-unresolved-ledger\n" >>"$event_log"
+    return 1
+  }
+  cleanup_local_path_provisioner_data() {
+    printf "host-cleanup\n" >>"$event_log"
+  }
+  rows=($'"'"'default\tton-work-tonnode-0'"'"')
+  delete_pvc_rows_and_backing_volumes rows uninstall true
+' _ "$kubeton" "$unresolved_local_force_events"; then
+  echo "expected unresolved local-path storage to retain a non-zero uninstall result" >&2
+  exit 1
+fi
+assert_order "generic-ledger" "record-ledger exact=0 pv=1" "$unresolved_local_force_events"
+assert_order "record-ledger exact=0 pv=1" "delete-pvc" "$unresolved_local_force_events"
+assert_order "delete-pvc" "verify-no-pod-reference" "$unresolved_local_force_events"
+assert_order "verify-no-pod-reference" "patch-pvc-finalizers" "$unresolved_local_force_events"
+assert_contains "--type=json" "$unresolved_local_force_events"
+assert_contains "/metadata/uid" "$unresolved_local_force_events"
+assert_contains "pattern-input=0" "$unresolved_local_force_events"
+assert_contains "retain-unresolved-ledger" "$unresolved_local_force_events"
+assert_not_contains "host-cleanup" "$unresolved_local_force_events"
+
+# The guarded force helper must never strip finalizers while a Pod still
+# references the claim, even in explicit uninstall/drop mode.
+unresolved_local_pod_reference_events="$test_dir/unresolved-local-pod-reference-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"get pvc ton-work-tonnode-0"*"metadata.deletionTimestamp"*) printf "pvc-uid\t2026-09-01T12:00:00Z" ;;
+      *"get pvc ton-work-tonnode-0"*"metadata.uid"*) printf "pvc-uid" ;;
+      *"patch pvc ton-work-tonnode-0"*) printf "UNSAFE patch-pvc-finalizers\n" >>"$event_log" ;;
+      *"delete pvc ton-work-tonnode-0"*) printf "normal-delete-pvc\n" >>"$event_log" ;;
+    esac
+  }
+  wait_pvc_gone() { return 1; }
+  verify_no_pod_references_for_pvc() {
+    printf "pod-reference-remains\n" >>"$event_log"
+    return 1
+  }
+  force_delete_unmounted_pvc_after_unresolved_local_inventory default ton-work-tonnode-0 pvc-uid 1
+' _ "$kubeton" "$unresolved_local_pod_reference_events"; then
+  echo "expected an active PVC reference to block finalizer removal" >&2
+  exit 1
+fi
+assert_contains "pod-reference-remains" "$unresolved_local_pod_reference_events"
+assert_order "normal-delete-pvc" "pod-reference-remains" "$unresolved_local_pod_reference_events"
+assert_not_contains "UNSAFE patch-pvc-finalizers" "$unresolved_local_pod_reference_events"
+
+# A same-name PVC recreated after inventory must not inherit the old claim's
+# destructive finalizer recovery authorization.
+unresolved_local_uid_change_events="$test_dir/unresolved-local-uid-change-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"get pvc ton-work-tonnode-0"*"metadata.uid"*) printf "new-pvc-uid" ;;
+      *"patch pvc ton-work-tonnode-0"*) printf "UNSAFE patch-pvc-finalizers\n" >>"$event_log" ;;
+      *"delete pvc ton-work-tonnode-0"*) printf "UNSAFE delete-pvc\n" >>"$event_log" ;;
+    esac
+  }
+  verify_no_pod_references_for_pvc() {
+    printf "UNSAFE verify-no-pod-reference\n" >>"$event_log"
+  }
+  force_delete_unmounted_pvc_after_unresolved_local_inventory default ton-work-tonnode-0 old-pvc-uid 1
+' _ "$kubeton" "$unresolved_local_uid_change_events"; then
+  echo "expected a recreated PVC UID to block finalizer removal" >&2
+  exit 1
+fi
+assert_not_contains "UNSAFE verify-no-pod-reference" "$unresolved_local_uid_change_events"
+assert_not_contains "UNSAFE patch-pvc-finalizers" "$unresolved_local_uid_change_events"
+assert_not_contains "UNSAFE delete-pvc" "$unresolved_local_uid_change_events"
+
+# A missing generic PV identity is a hard block. In particular, an exact path
+# must not even be inventoried/persisted after generic identity collection
+# fails, otherwise an unbound host path could be cleaned on a later retry.
+generic_ledger_failure_events="$test_dir/generic-ledger-failure-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"get pvc ton-work-tonnode-0"*"spec.volumeName"*) printf "pv-unresolved" ;;
+      *"patch pvc ton-work-tonnode-0"*) printf "UNSAFE patch-pvc-finalizers\n" >>"$event_log" ;;
+      *"delete pvc ton-work-tonnode-0"*) printf "UNSAFE delete-pvc\n" >>"$event_log" ;;
+    esac
+  }
+  append_pv_cleanup_ledger_row_for_pv() {
+    printf "generic-ledger-failed\n" >>"$event_log"
+    return 1
+  }
+  append_local_path_exact_cleanup_rows_for_pv() {
+    printf "UNSAFE exact-local-inventory\n" >>"$event_log"
+  }
+  record_local_path_cleanup_ledger() {
+    local -n exact_rows="$1"
+    local -n pv_rows="$2"
+    printf "record-ledger exact=%s pv=%s\n" "${#exact_rows[@]}" "${#pv_rows[@]}" >>"$event_log"
+  }
+  collect_local_path_pattern_cleanup_rows_for_pvcs() {
+    local -n rows="$1"
+    printf "pattern-input=%s\n" "${#rows[@]}" >>"$event_log"
+  }
+  cleanup_recorded_local_path_data() { :; }
+  cleanup_local_path_provisioner_data() {
+    local -n exact_rows="$1"
+    local -n pattern_rows="$2"
+    printf "host-cleanup exact=%s patterns=%s\n" "${#exact_rows[@]}" "${#pattern_rows[@]}" >>"$event_log"
+  }
+  rows=($'"'"'default\tton-work-tonnode-0'"'"')
+  delete_pvc_rows_and_backing_volumes rows uninstall true
+' _ "$kubeton" "$generic_ledger_failure_events"; then
+  echo "expected a missing generic PV identity to block PVC cleanup" >&2
+  exit 1
+fi
+assert_contains "generic-ledger-failed" "$generic_ledger_failure_events"
+assert_contains "record-ledger exact=0 pv=0" "$generic_ledger_failure_events"
+assert_contains "host-cleanup exact=0 patterns=0" "$generic_ledger_failure_events"
+assert_not_contains "UNSAFE exact-local-inventory" "$generic_ledger_failure_events"
+assert_not_contains "UNSAFE patch-pvc-finalizers" "$generic_ledger_failure_events"
+assert_not_contains "UNSAFE delete-pvc" "$generic_ledger_failure_events"
+
+# Only the narrow “owner node cannot resolve” exact-inventory result is
+# eligible for guarded PVC removal. A malformed path, claim mismatch, or
+# untrusted provisioner returns the ordinary failure status and must leave the
+# PVC intact even during explicit uninstall/drop.
+unsafe_exact_inventory_events="$test_dir/unsafe-exact-inventory-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"get pvc ton-work-tonnode-0"*"spec.volumeName"*) printf "pv-unresolved" ;;
+      *"patch pvc ton-work-tonnode-0"*) printf "UNSAFE patch-pvc-finalizers\n" >>"$event_log" ;;
+      *"delete pvc ton-work-tonnode-0"*) printf "UNSAFE delete-pvc\n" >>"$event_log" ;;
+    esac
+  }
+  append_pv_cleanup_ledger_row_for_pv() {
+    local -n out="$3"
+    printf -v row "pv-unresolved\tdefault/ton-work-tonnode-0\tpv-uid\tpvc-uid\tDelete\t\t\t"
+    out+=("$row")
+    printf "generic-ledger\n" >>"$event_log"
+  }
+  append_local_path_exact_cleanup_rows_for_pv() {
+    printf "unsafe-exact-inventory\n" >>"$event_log"
+    return 1
+  }
+  record_local_path_cleanup_ledger() {
+    local -n exact_rows="$1"
+    local -n pv_rows="$2"
+    printf "record-ledger exact=%s pv=%s\n" "${#exact_rows[@]}" "${#pv_rows[@]}" >>"$event_log"
+  }
+  collect_local_path_pattern_cleanup_rows_for_pvcs() {
+    local -n rows="$1"
+    printf "pattern-input=%s\n" "${#rows[@]}" >>"$event_log"
+  }
+  verify_no_pod_references_for_pvc() {
+    printf "UNSAFE verify-no-pod-reference\n" >>"$event_log"
+  }
+  cleanup_recorded_local_path_data() {
+    printf "retain-ledger\n" >>"$event_log"
+    return 1
+  }
+  cleanup_local_path_provisioner_data() {
+    printf "UNSAFE host-cleanup\n" >>"$event_log"
+  }
+  rows=($'"'"'default\tton-work-tonnode-0'"'"')
+  delete_pvc_rows_and_backing_volumes rows uninstall true
+' _ "$kubeton" "$unsafe_exact_inventory_events"; then
+  echo "expected an unsafe exact local-path inventory failure to block force deletion" >&2
+  exit 1
+fi
+assert_order "generic-ledger" "unsafe-exact-inventory" "$unsafe_exact_inventory_events"
+assert_contains "record-ledger exact=0 pv=1" "$unsafe_exact_inventory_events"
+assert_contains "pattern-input=0" "$unsafe_exact_inventory_events"
+assert_not_contains "UNSAFE verify-no-pod-reference" "$unsafe_exact_inventory_events"
+assert_not_contains "UNSAFE patch-pvc-finalizers" "$unsafe_exact_inventory_events"
+assert_not_contains "UNSAFE delete-pvc" "$unsafe_exact_inventory_events"
+assert_not_contains "UNSAFE host-cleanup" "$unsafe_exact_inventory_events"
+
+# Persisting the generic ledger is the final authorization point. A failed
+# write leaves even a known, unmounted PVC untouched.
+unresolved_ledger_persist_failure_events="$test_dir/unresolved-ledger-persist-failure-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"get pvc ton-work-tonnode-0"*"spec.volumeName"*) printf "pv-unresolved" ;;
+      *"get pvc ton-work-tonnode-0"*"metadata.uid"*) printf "pvc-uid" ;;
+      *"patch pvc ton-work-tonnode-0"*) printf "UNSAFE patch-pvc-finalizers\n" >>"$event_log" ;;
+      *"delete pvc ton-work-tonnode-0"*) printf "UNSAFE delete-pvc\n" >>"$event_log" ;;
+    esac
+  }
+  append_pv_cleanup_ledger_row_for_pv() {
+    local -n out="$3"
+    printf -v row "pv-unresolved\tdefault/ton-work-tonnode-0\tpv-uid\tpvc-uid\tDelete\t\t\t"
+    out+=("$row")
+    printf "generic-ledger\n" >>"$event_log"
+  }
+  append_local_path_exact_cleanup_rows_for_pv() {
+    printf "exact-local-unresolved\n" >>"$event_log"
+    return 2
+  }
+  record_local_path_cleanup_ledger() {
+    printf "ledger-persist-failed\n" >>"$event_log"
+    return 1
+  }
+  collect_local_path_pattern_cleanup_rows_for_pvcs() {
+    printf "UNSAFE pattern-cleanup-input\n" >>"$event_log"
+  }
+  verify_no_pod_references_for_pvc() {
+    printf "UNSAFE verify-no-pod-reference\n" >>"$event_log"
+  }
+  cleanup_recorded_local_path_data() {
+    printf "UNSAFE recorded-cleanup\n" >>"$event_log"
+  }
+  rows=($'"'"'default\tton-work-tonnode-0'"'"')
+  delete_pvc_rows_and_backing_volumes rows uninstall true
+' _ "$kubeton" "$unresolved_ledger_persist_failure_events"; then
+  echo "expected a failed cleanup-ledger write to block PVC force deletion" >&2
+  exit 1
+fi
+assert_order "generic-ledger" "ledger-persist-failed" "$unresolved_ledger_persist_failure_events"
+assert_not_contains "UNSAFE patch-pvc-finalizers" "$unresolved_ledger_persist_failure_events"
+assert_not_contains "UNSAFE delete-pvc" "$unresolved_ledger_persist_failure_events"
+assert_not_contains "UNSAFE pattern-cleanup-input" "$unresolved_ledger_persist_failure_events"
+assert_not_contains "UNSAFE verify-no-pod-reference" "$unresolved_ledger_persist_failure_events"
+assert_not_contains "UNSAFE recorded-cleanup" "$unresolved_ledger_persist_failure_events"
+
+# The extra force authorization is wired only through destructive TON
+# commands. Ordinary cleanup/start callers retain the original fail-closed
+# behavior when exact local-path provenance is missing.
+ton_force_mode_events="$test_dir/ton-force-mode-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  collect_expected_ton_pvc_rows_from_values() {
+    local -n out="$1"
+    out+=($'"'"'default\tton-work-tonnode-0'"'"')
+  }
+  collect_labeled_ton_pvc_rows() { :; }
+  collect_existing_kubeton_pvc_rows() {
+    local -n out="$2"
+    out+=($'"'"'default\tton-work-tonnode-0'"'"')
+  }
+  list_ton_pods() { :; }
+  delete_pvc_rows_and_backing_volumes() {
+    printf "%s force=%s\n" "$2" "$3" >>"$event_log"
+  }
+  sts_rows=()
+  delete_ton_pvcs_for_statefulsets sts_rows uninstall
+  delete_ton_pvcs_for_statefulsets sts_rows drop
+  delete_ton_pvcs_for_statefulsets sts_rows start
+' _ "$kubeton" "$ton_force_mode_events"
+assert_contains "uninstall force=true" "$ton_force_mode_events"
+assert_contains "drop force=true" "$ton_force_mode_events"
+assert_contains "start force=false" "$ton_force_mode_events"
 
 # A recorded teardown error must make uninstall non-successful even when the
 # generic Kubernetes leftover sweep happens to be empty.

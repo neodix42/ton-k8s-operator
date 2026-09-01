@@ -6933,11 +6933,15 @@ append_local_path_exact_cleanup_rows_for_pv() {
   fi
 
   if ! collect_local_path_nodes_for_pv "$pv" nodes; then
-    return 1
+    # The PV, claim, provisioner, and host path were all verified above; only
+    # its owner node is unresolved. Callers that are explicitly tearing down
+    # TON may retain the UID-bound record and force-remove the unmounted PVC
+    # object, but must never host-clean this path.
+    return 2
   fi
   if [[ ${#nodes[@]} -ne 1 ]]; then
     echo "Error: refusing local-path host cleanup for PV ${pv}: exactly one owning node is required." >&2
-    return 1
+    return 2
   fi
   IFS=/ read -r pvc_ns pvc_name <<<"$pvc_ref"
   pv_uid="$(kubectl get pv "$pv" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
@@ -8329,43 +8333,105 @@ collect_local_path_cleanup_ledger_leftovers() {
 delete_pvc_rows_and_backing_volumes() {
   local pvc_rows_name="$1"
   local label="${2:-cleanup}"
+  # A missing local-path owner is normally a hard stop: deleting a PVC can
+  # make its provisioner remove the backing directory before kubeton can
+  # verify it.  Explicit TON drop/uninstall may opt into removing *only* the
+  # PVC object after a UID-bound PV ledger was persisted and no pod references
+  # the claim.  The unresolved storage record remains in that ledger.
+  local force_unresolved_local_pvcs="${3:-false}"
   local -n pvc_rows_ref="$pvc_rows_name"
   local -a local_path_exact_rows=()
   local -a recorded_pv_rows=()
   local -a local_path_pattern_rows=()
   local -a empty_local_path_exact_rows=()
+  local -a normally_deletable_pvc_rows=()
+  local -a unresolved_local_pvc_rows=()
   local -a failed_pvc_rows=()
-  local row ns pvc_name volume failed_row
+  local row ns pvc_name volume failed_row ledger_row ledger_pvc_ref ledger_pvc_uid expected_pvc_uid recorded_pvc_matches
   local -a wait_pids=()
   local -a wait_rows=()
-  local i inventory_rc=0 delete_rc=0
+  local i exact_inventory_rc=0 generic_inventory_rc=0 hard_inventory_rc=0 unresolved_local_rc=0 delete_rc=0 cleanup_rc=0
 
   if [[ ${#pvc_rows_ref[@]} -eq 0 ]]; then
     return 0
   fi
-
-  collect_local_path_pattern_cleanup_rows_for_pvcs "$pvc_rows_name" local_path_pattern_rows
 
   for row in "${pvc_rows_ref[@]}"; do
     IFS=$'\t' read -r ns pvc_name <<<"$row"
     [[ -z "$ns" || -z "$pvc_name" ]] && continue
     if ! volume="$(kubectl -n "$ns" get pvc "$pvc_name" --ignore-not-found -o jsonpath='{.spec.volumeName}' 2>/dev/null)"; then
       echo "Error: could not inspect PVC ${ns}/${pvc_name} before deleting backing storage." >&2
-      inventory_rc=1
+      hard_inventory_rc=1
       continue
     fi
     volume="$(trim_whitespace "$volume")"
-    if [[ -n "$volume" ]]; then
-      if ! append_local_path_exact_cleanup_rows_for_pv "$volume" "${ns}/${pvc_name}" local_path_exact_rows; then
-        inventory_rc=1
+    if [[ -z "$volume" ]]; then
+      append_unique_item "$ns"$'\t'"$pvc_name" normally_deletable_pvc_rows
+      continue
+    fi
+
+    exact_inventory_rc=0
+    generic_inventory_rc=0
+    # Record the UID-bound PV/PVC identity first. If this fails, do not even
+    # retain an exact path row: it would be unsafe to reconcile a host path
+    # without the immutable ownership record that binds it to this PVC.
+    if ! append_pv_cleanup_ledger_row_for_pv "$volume" "${ns}/${pvc_name}" recorded_pv_rows; then
+      generic_inventory_rc=1
+    fi
+
+    # Without an immutable PV/PVC record, no later retry can establish that a
+    # reused PV belongs to this claim.  Keep this PVC intact rather than
+    # forcing its finalizers away.
+    if (( generic_inventory_rc != 0 )); then
+      echo "Error: could not record verified backing-storage cleanup state for PVC ${ns}/${pvc_name}; leaving that PVC intact." >&2
+      hard_inventory_rc=1
+      continue
+    fi
+
+    # Carry the recorded PVC UID into the force-only path. A same-name PVC
+    # may be recreated between inventory and finalizer removal; never remove
+    # finalizers from that different claim.
+    expected_pvc_uid=""
+    recorded_pvc_matches=0
+    for ledger_row in "${recorded_pv_rows[@]}"; do
+      [[ -n "$ledger_row" ]] || continue
+      IFS=$'\t' read -r _ ledger_pvc_ref _ ledger_pvc_uid _ <<<"$ledger_row"
+      if [[ "$ledger_pvc_ref" == "${ns}/${pvc_name}" ]]; then
+        expected_pvc_uid="$(trim_whitespace "$ledger_pvc_uid")"
+        ((recorded_pvc_matches+=1))
       fi
-      if ! append_pv_cleanup_ledger_row_for_pv "$volume" "${ns}/${pvc_name}" recorded_pv_rows; then
-        inventory_rc=1
+    done
+    if [[ -z "$expected_pvc_uid" || "$recorded_pvc_matches" != "1" ]]; then
+      echo "Error: could not recover the recorded PVC identity for ${ns}/${pvc_name}; leaving that PVC intact." >&2
+      hard_inventory_rc=1
+      continue
+    fi
+
+    if append_local_path_exact_cleanup_rows_for_pv "$volume" "${ns}/${pvc_name}" local_path_exact_rows; then
+      exact_inventory_rc=0
+    else
+      exact_inventory_rc=$?
+    fi
+
+    if (( exact_inventory_rc != 0 )); then
+      if (( exact_inventory_rc == 2 )) && is_true "$force_unresolved_local_pvcs"; then
+        echo "Warning: exact local-path ownership for PVC ${ns}/${pvc_name} could not be proven. Its UID-bound storage record will be retained; uninstall may remove only the unmounted PVC object." >&2
+        append_unique_item "$ns"$'\t'"$pvc_name"$'\t'"$expected_pvc_uid" unresolved_local_pvc_rows
+        unresolved_local_rc=1
+      else
+        echo "Error: exact local-path safety checks failed for PVC ${ns}/${pvc_name}; leaving that PVC intact." >&2
+        hard_inventory_rc=1
+        continue
       fi
+    else
+      append_unique_item "$ns"$'\t'"$pvc_name" normally_deletable_pvc_rows
     fi
   done
 
-  if (( inventory_rc != 0 )); then
+  # Keep the non-destructive start/cleanup behavior unchanged: it must not
+  # alter any PVC when a local backing directory cannot be proven. Explicit
+  # TON uninstall/drop continues per PVC after the durable ledger is written.
+  if (( hard_inventory_rc != 0 || unresolved_local_rc != 0 )) && ! is_true "$force_unresolved_local_pvcs"; then
     echo "Error: could not safely inventory all local-path backing directories; leaving PVCs intact." >&2
     return 1
   fi
@@ -8373,14 +8439,21 @@ delete_pvc_rows_and_backing_volumes() {
     return 1
   fi
 
-  echo "[${label}] Deleting PVCs ..."
-  for row in "${pvc_rows_ref[@]}"; do
+  # Pattern cleanup is intentionally limited to fully verified PVCs. A
+  # wildcard match must never compensate for missing exact host-path
+  # provenance on an unresolved local-path record.
+  collect_local_path_pattern_cleanup_rows_for_pvcs normally_deletable_pvc_rows local_path_pattern_rows
+
+  if [[ ${#normally_deletable_pvc_rows[@]} -gt 0 ]]; then
+    echo "[${label}] Deleting PVCs ..."
+  fi
+  for row in "${normally_deletable_pvc_rows[@]}"; do
     IFS=$'\t' read -r ns pvc_name <<<"$row"
     [[ -z "$ns" || -z "$pvc_name" ]] && continue
     kubectl -n "$ns" delete pvc "$pvc_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done
 
-  for row in "${pvc_rows_ref[@]}"; do
+  for row in "${normally_deletable_pvc_rows[@]}"; do
     IFS=$'\t' read -r ns pvc_name <<<"$row"
     [[ -z "$ns" || -z "$pvc_name" ]] && continue
     wait_pvc_gone "$ns" "$pvc_name" 120 &
@@ -8403,20 +8476,35 @@ delete_pvc_rows_and_backing_volumes() {
       delete_rc=1
     fi
   done
-  if (( delete_rc != 0 )); then
-    return 1
-  fi
+
+  # The exact host directory is unknown for these claims, but their generic
+  # PV/PVC identity is now durable.  Remove a stuck PVC only after proving it
+  # is not mounted.  The subsequent ledger reconciliation deliberately
+  # refuses to guess at a host path or strip a PV finalizer.
+  for row in "${unresolved_local_pvc_rows[@]}"; do
+    IFS=$'\t' read -r ns pvc_name expected_pvc_uid <<<"$row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    if ! force_delete_unmounted_pvc_after_unresolved_local_inventory "$ns" "$pvc_name" "$expected_pvc_uid" 60; then
+      delete_rc=1
+    fi
+  done
 
   # The PVC is gone now, so no Kubernetes pod can still mount its RWO
   # filesystem.  The persisted ledger makes this retryable if the privileged
   # cleanup pod cannot remove the host directory on this attempt.
   if ! cleanup_recorded_local_path_data "$label"; then
-    return 1
+    cleanup_rc=1
   fi
-  if ! cleanup_local_path_provisioner_data empty_local_path_exact_rows local_path_pattern_rows "$label"; then
-    return 1
+  if (( cleanup_rc == 0 )) && ! cleanup_local_path_provisioner_data empty_local_path_exact_rows local_path_pattern_rows "$label"; then
+    cleanup_rc=1
   fi
-  return 0
+  if (( hard_inventory_rc != 0 )); then
+    echo "Error: one or more PVCs were retained because their backing storage could not be safely inventoried." >&2
+  fi
+  if (( unresolved_local_rc != 0 )); then
+    echo "Warning: one or more unmounted PVC objects were force-deleted, but their unverified local-path storage records remain for manual reconciliation." >&2
+  fi
+  (( hard_inventory_rc == 0 && unresolved_local_rc == 0 && delete_rc == 0 && cleanup_rc == 0 ))
 }
 
 collect_expected_ton_pvc_rows_from_values() {
@@ -9373,6 +9461,7 @@ resolve_tonnode_pod_row_by_name() {
 delete_ton_pvcs_for_statefulsets() {
   local -n sts_rows_ref="$1"
   local label="${2:-cleanup}"
+  local force_unresolved_local_pvcs=false
   local row ns sts
   local -a candidate_rows=()
   local -a trusted_sts_claim_rows=()
@@ -9421,7 +9510,15 @@ delete_ton_pvcs_for_statefulsets() {
     return 1
   fi
 
-  delete_pvc_rows_and_backing_volumes pvc_rows "$label"
+  # Only the explicitly destructive TON commands may remove a PVC object
+  # whose exact local-path owner cannot be proven. The generic helper still
+  # requires a durable UID-bound PV ledger and an unmounted claim.
+  case "$label" in
+    uninstall|drop)
+      force_unresolved_local_pvcs=true
+      ;;
+  esac
+  delete_pvc_rows_and_backing_volumes pvc_rows "$label" "$force_unresolved_local_pvcs"
 }
 
 ton_fleet_resources_exist() {
@@ -9705,6 +9802,111 @@ delete_pvc_and_wait_for_gone() {
   fi
 
   echo "Error: PVC ${ns}/${pvc} still exists after destructive finalizer recovery." >&2
+  return 1
+}
+
+# Used only by the explicit TON drop/uninstall path after a UID-bound PV/PVC
+# ledger entry was stored, but the node-local host path could not be proven.
+# Do not call this as a generic replacement for storage inventory: removing a
+# PVC can cause a Delete-policy provisioner to reclaim its data.  The caller
+# intentionally retains the unresolved PV in the durable ledger and reports a
+# non-zero result for manual reconciliation.
+force_delete_unmounted_pvc_after_unresolved_local_inventory() {
+  local ns="$1"
+  local pvc="$2"
+  local expected_pvc_uid="$3"
+  local timeout_seconds="${4:-60}"
+  local pvc_uid pvc_deletion_timestamp pvc_identity wait_rc=0
+
+  if ! [[ "$expected_pvc_uid" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    echo "Error: refusing destructive finalizer recovery for PVC ${ns}/${pvc} without its recorded UID." >&2
+    return 1
+  fi
+
+  if ! pvc_uid="$(kubectl -n "$ns" get pvc "$pvc" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not recheck PVC ${ns}/${pvc} before destructive finalizer recovery." >&2
+    return 1
+  fi
+  pvc_uid="$(trim_whitespace "$pvc_uid")"
+  [[ -n "$pvc_uid" ]] || return 0
+  if [[ "$pvc_uid" != "$expected_pvc_uid" ]]; then
+    echo "Error: refusing destructive finalizer recovery for PVC ${ns}/${pvc}: its UID changed after storage inventory." >&2
+    return 1
+  fi
+
+  # Always request normal deletion first. A non-terminating PVC can still
+  # acquire a pod reference; finalizers are only an escape hatch once the
+  # expected claim is already terminating and proven unmounted.
+  if ! kubectl -n "$ns" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1; then
+    echo "Error: could not request deletion of PVC ${ns}/${pvc} before finalizer recovery." >&2
+    return 1
+  fi
+  if wait_pvc_gone "$ns" "$pvc" 5; then
+    return 0
+  else
+    wait_rc=$?
+  fi
+  if (( wait_rc == 2 )); then
+    echo "Error: could not verify PVC ${ns}/${pvc} after requesting deletion." >&2
+    return 1
+  fi
+
+  if ! pvc_identity="$(kubectl -n "$ns" get pvc "$pvc" --ignore-not-found -o jsonpath='{.metadata.uid}{"\t"}{.metadata.deletionTimestamp}' 2>/dev/null)"; then
+    echo "Error: could not recheck PVC ${ns}/${pvc} before finalizer recovery." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r pvc_uid pvc_deletion_timestamp <<<"$pvc_identity"
+  pvc_uid="$(trim_whitespace "$pvc_uid")"
+  pvc_deletion_timestamp="$(trim_whitespace "$pvc_deletion_timestamp")"
+  [[ -n "$pvc_uid" ]] || return 0
+  if [[ "$pvc_uid" != "$expected_pvc_uid" ]]; then
+    echo "Error: refusing destructive finalizer recovery for PVC ${ns}/${pvc}: its UID changed after deletion was requested." >&2
+    return 1
+  fi
+  if [[ -z "$pvc_deletion_timestamp" ]]; then
+    echo "Error: PVC ${ns}/${pvc} did not enter termination after its delete request; refusing to clear finalizers." >&2
+    return 1
+  fi
+
+  if ! verify_no_pod_references_for_pvc "$ns" "$pvc"; then
+    echo "Error: PVC ${ns}/${pvc} is still referenced by a pod; refusing to clear its finalizers after unresolved local-path inventory." >&2
+    return 1
+  fi
+
+  # Re-read immediately before the destructive patch. This avoids acting on a
+  # same-name PVC that was recreated while pod references were inspected.
+  if ! pvc_identity="$(kubectl -n "$ns" get pvc "$pvc" --ignore-not-found -o jsonpath='{.metadata.uid}{"\t"}{.metadata.deletionTimestamp}' 2>/dev/null)"; then
+    echo "Error: could not recheck PVC ${ns}/${pvc} immediately before destructive finalizer recovery." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r pvc_uid pvc_deletion_timestamp <<<"$pvc_identity"
+  pvc_uid="$(trim_whitespace "$pvc_uid")"
+  pvc_deletion_timestamp="$(trim_whitespace "$pvc_deletion_timestamp")"
+  [[ -n "$pvc_uid" ]] || return 0
+  if [[ "$pvc_uid" != "$expected_pvc_uid" || -z "$pvc_deletion_timestamp" ]]; then
+    echo "Error: refusing destructive finalizer recovery for PVC ${ns}/${pvc}: its UID changed immediately before cleanup." >&2
+    return 1
+  fi
+
+  echo "Warning: clearing finalizers and force-deleting unmounted PVC ${ns}/${pvc}; its local backing path could not be proven and its storage record remains in the cleanup ledger for manual reconciliation." >&2
+  # The JSON Patch `test` makes the final mutation conditional on the exact
+  # UID captured in the ledger, closing the remaining same-name replacement
+  # race between the recheck and patch.
+  if ! kubectl -n "$ns" patch pvc "$pvc" --type=json \
+    -p "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"${expected_pvc_uid}\"},{\"op\":\"add\",\"path\":\"/metadata/finalizers\",\"value\":[]}]" >/dev/null 2>&1; then
+    # A concurrent controller may have completed deletion after the recheck.
+    # Verify that outcome instead of treating every patch failure as success.
+    if wait_pvc_gone "$ns" "$pvc" 5; then
+      return 0
+    fi
+    echo "Error: could not clear finalizers on PVC ${ns}/${pvc}." >&2
+    return 1
+  fi
+  if wait_pvc_gone "$ns" "$pvc" "$timeout_seconds"; then
+    return 0
+  fi
+
+  echo "Error: PVC ${ns}/${pvc} still exists after guarded destructive finalizer recovery." >&2
   return 1
 }
 
