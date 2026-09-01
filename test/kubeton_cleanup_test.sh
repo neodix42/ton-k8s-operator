@@ -272,6 +272,155 @@ if bash -c '
   exit 1
 fi
 
+# Rancher local-path stores the real provisioning node in a PV annotation.
+# Some older hostPath PVs lack the default hostname affinity (or use a custom
+# nodeAffinityKey), so that annotation is a safe one-node fallback when the
+# node still exists. This is the path used by stale-PVC cleanup before it may
+# delete a PVC.
+selected_node_append_output="$test_dir/selected-node-append.out"
+bash -c '
+  source "$1"
+  local_path_pv_host_path() { printf "%s" "/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-2"; }
+  local_path_pv_matches_claim() { return 0; }
+  local_path_pv_is_provisioned_by_local_path() { return 0; }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-legacy --ignore-not-found"*nodeAffinity*) : ;;
+      *"get pv pv-legacy --ignore-not-found"*selected-node*) printf "devnet-04" ;;
+      "get node devnet-04") return 0 ;;
+      *"get pv pv-legacy"*metadata.uid*) printf "pv-legacy-uid" ;;
+      *"-n default get pvc ton-work-tonnode-2"*metadata.uid*) printf "pvc-legacy-uid" ;;
+    esac
+  }
+  rows=()
+  append_local_path_exact_cleanup_rows_for_pv pv-legacy default/ton-work-tonnode-2 rows
+  printf "%s\n" "${rows[@]}"
+' _ "$kubeton" >"$selected_node_append_output"
+assert_contains $'devnet-04\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-2\tpv-legacy\tdefault/ton-work-tonnode-2\tpv-legacy-uid\tpvc-legacy-uid' "$selected_node_append_output"
+
+# Ambiguous provenance must remain fail-closed: a PV whose hostname affinity
+# and Rancher selected-node annotation disagree is not safe to clean.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      *"get pv pv-conflict --ignore-not-found"*nodeAffinity*) printf "In\tdevnet-04|\n__KUBETON_TERM_END__\n" ;;
+      *"get pv pv-conflict --ignore-not-found"*selected-node*) printf "devnet-05" ;;
+      "get nodes -l kubernetes.io/hostname=devnet-04"*) printf "devnet-04\n" ;;
+      "get node devnet-05") return 0 ;;
+    esac
+  }
+  nodes=()
+  collect_local_path_nodes_for_pv pv-conflict nodes
+' _ "$kubeton"; then
+  echo "expected conflicting local-path affinity and selected-node provenance to block cleanup" >&2
+  exit 1
+fi
+
+# A deleted node is not interchangeable with a node that merely shares a
+# hostname label. Do not host-clean an old PV when its annotated owner is gone.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      *"get pv pv-gone --ignore-not-found"*nodeAffinity*) : ;;
+      *"get pv pv-gone --ignore-not-found"*selected-node*) printf "gone-node" ;;
+      "get node gone-node") return 1 ;;
+    esac
+  }
+  nodes=()
+  collect_local_path_nodes_for_pv pv-gone nodes
+' _ "$kubeton"; then
+  echo "expected a missing selected-node to block local-path cleanup" >&2
+  exit 1
+fi
+
+# No node source at all is still a hard stop; do not turn the annotation
+# fallback into a guessed/all-node cleanup path.
+if bash -c '
+  source "$1"
+  kubectl() { :; }
+  nodes=()
+  collect_local_path_nodes_for_pv pv-unattributed nodes
+' _ "$kubeton"; then
+  echo "expected unattributed local-path PV to block cleanup" >&2
+  exit 1
+fi
+
+# Existing hostname-affinity-only PVs retain their original behavior even if
+# they predate Rancher selected-node annotations.
+affinity_only_output="$test_dir/affinity-only.out"
+bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      *"get pv pv-affinity --ignore-not-found"*nodeAffinity*) printf "In\tdevnet-03|\n__KUBETON_TERM_END__\n" ;;
+      *"get pv pv-affinity --ignore-not-found"*selected-node*) : ;;
+      "get nodes -l kubernetes.io/hostname=devnet-03"*) printf "devnet-03\n" ;;
+    esac
+  }
+  nodes=()
+  collect_local_path_nodes_for_pv pv-affinity nodes
+  printf "%s\n" "${nodes[@]}"
+' _ "$kubeton" >"$affinity_only_output"
+assert_contains "devnet-03" "$affinity_only_output"
+
+# The hostname value is a label value, not necessarily a Kubernetes node
+# name. Resolve it through the label and never shortcut to an equal node name.
+hostname_label_output="$test_dir/hostname-label.out"
+bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      "get nodes -l kubernetes.io/hostname=legacy-host"*) printf "actual-node\n" ;;
+      "get node legacy-host")
+        echo "unsafe direct node-name lookup" >&2
+        return 1
+        ;;
+    esac
+  }
+  resolve_node_name_for_hostname_value legacy-host
+' _ "$kubeton" >"$hostname_label_output"
+assert_contains "actual-node" "$hostname_label_output"
+
+# A hostname `NotIn` (or any other non-In) requirement describes an exclusion,
+# not one owning node. It must never turn into a host-path delete target.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      *"get pv pv-notin --ignore-not-found"*nodeAffinity*) printf "NotIn\tdevnet-04|\n__KUBETON_TERM_END__\n" ;;
+      *"get pv pv-notin --ignore-not-found"*selected-node*) : ;;
+    esac
+  }
+  nodes=()
+  collect_local_path_nodes_for_pv pv-notin nodes
+' _ "$kubeton"; then
+  echo "expected non-In hostname affinity to block local-path cleanup" >&2
+  exit 1
+fi
+
+# NodeSelectorTerms are alternatives.  A hostname-constrained term plus an
+# alternate term with no hostname cannot prove a unique host unless Rancher
+# recorded the provisioned node.  Do not delete based on the partial affinity.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      *"get pv pv-or-ambiguous --ignore-not-found"*nodeAffinity*)
+        printf "In\tdevnet-04|\n__KUBETON_TERM_END__\n__KUBETON_TERM_END__\n"
+        ;;
+      *"get pv pv-or-ambiguous --ignore-not-found"*selected-node*) : ;;
+      "get nodes -l kubernetes.io/hostname=devnet-04"*) printf "devnet-04\n" ;;
+    esac
+  }
+  nodes=()
+  collect_local_path_nodes_for_pv pv-or-ambiguous nodes
+' _ "$kubeton"; then
+  echo "expected alternate unconstrained nodeSelectorTerm to block cleanup" >&2
+  exit 1
+fi
+
 # If an old local-path PV is gone but a new PV now points at the same host
 # directory, the old ledger must not remove that directory.
 if bash -c '

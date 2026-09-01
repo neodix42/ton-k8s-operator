@@ -164,7 +164,7 @@ Bare-metal/local-dev default setup is automated by `kubeton`:
 - on bare-metal, TON data PVCs (`/var/ton-work`, including `/var/ton-work/db`) use `TON_STORAGE_CLASS_NAME` by default (`local-path`) so dump download writes to node-local storage instead of Longhorn
 - on bare-metal, `kubeton start` aligns TON pod placement with `LONGHORN_NODE_SELECTOR` by setting `tonNode.nodeSelector` automatically
 - on bare-metal, Vault server pod is also constrained to `LONGHORN_NODE_SELECTOR` so its PVC can attach only on nodes with Longhorn CSI
-- with default `LONGHORN_NODE_SELECTOR=node.longhorn.io/create-default-disk=true`: `kubeton` selects only nodes that pass its resource/disk preflight, then labels the required number of them for Longhorn
+- with default `LONGHORN_NODE_SELECTOR=node.longhorn.io/create-default-disk=true`: `kubeton` selects only nodes that pass its resource/disk preflight, including the current dump bootstrap peak when `DUMP=true`, then labels the required number of them for Longhorn
 - on local k3d: skips Longhorn install and creates `encrypted-sc` from an existing local StorageClass (`LOCALDEV_BASE_SC`, default `local-path`) for dev convenience
 - installs Vault (`VAULT_CHART_VERSION`, default `0.30.0`)
 - initializes/unseals Vault and configures Transit key `ton-validator`
@@ -193,7 +193,7 @@ Run this before installing or starting a fleet:
 
 `kubeton` reads the effective TON settings from `TON_VALUES_FILE` (by default
 `tonnode-values.yaml`); it does not source a `.env` file. With the defaults,
-each TON replica needs `760Gi` of data PVC capacity:
+each TON replica requests `760Gi` of data PVC capacity:
 
 ```yaml
 tonWorkSize: 700Gi
@@ -202,8 +202,19 @@ myTonCoreSize: 20Gi
 myTonCtrlSize: 20Gi
 ```
 
-The check adds `20Gi` disk headroom by default, and requires at least 16 vCPU
-and 64Gi memory per TON pod (or a larger `tonNode.resources.requests` value).
+When `DUMP=true` and `DUMP_CACHE_DIR` is under `/var/ton-work` (the default),
+the check reads the current named dump metadata from `dump.ton.org`. It requires
+the compressed archive and extracted database to fit concurrently, plus the
+other three TON PVCs and `KUBETON_CHECK_DISK_HEADROOM` (default `20Gi`). This
+is a runtime peak calculation rather than just the PVC request; the dump grows
+over time. A larger configured PVC capacity remains a minimum node-space
+requirement. If metadata cannot be read, the check fails before labels,
+Longhorn/Vault bootstrap, or Helm can create a TON pod. Air-gapped control
+hosts can set both `KUBETON_DUMP_ARCHIVE_BYTES` and
+`KUBETON_DUMP_EXTRACTED_DB_BYTES` to current verified byte counts instead.
+
+The check requires at least 16 vCPU and 64Gi memory per TON pod (or a larger
+`tonNode.resources.requests` value).
 It rejects NotReady/cordoned nodes, `DiskPressure`, `MemoryPressure`,
 `PIDPressure`, hard taints, insufficient allocatable CPU or memory after
 assigned pod requests, and insufficient free node filesystem space. Free disk
@@ -225,6 +236,9 @@ marks only selected compatible nodes with its managed
 `ton.ton.org/kubeton-prereq=ready` label and adds that label to the Longhorn and
 TON selectors, including Longhorn's system-managed CSI DaemonSet selector. This
 prevents a Longhorn DaemonSet from being sent to a known `DiskPressure` node.
+`kubeton start` refreshes the selected-node check after Longhorn/Vault
+bootstrap and before stale-PVC cleanup or Helm, so bootstrap activity cannot
+turn a previously safe node into an initial TON bootstrap target.
 Existing Longhorn installations are not automatically
 reselected because that could disrupt mounted volumes; both the Longhorn manager
 and CSI DaemonSet selectors are checked and the command fails with affected
@@ -237,7 +251,8 @@ For a separate filesystem mounted at `LOCAL_PATH_PROVISIONER_ROOT`, the kubelet
 node filesystem statistic is only a safety signal, not an authoritative free
 space measurement for that mount. Use a host-level disk monitor/probe as well.
 Useful overrides are `KUBETON_CHECK_MIN_CPU`,
-`KUBETON_CHECK_MIN_MEMORY`, and `KUBETON_CHECK_DISK_HEADROOM`; set
+`KUBETON_CHECK_MIN_MEMORY`, `KUBETON_CHECK_DISK_HEADROOM`,
+`KUBETON_DUMP_ARCHIVE_BYTES`, and `KUBETON_DUMP_EXTRACTED_DB_BYTES`; set
 `KUBETON_SKIP_NODE_PREREQ_CHECK=true` only when intentionally bypassing the
 gate.
 
@@ -443,6 +458,8 @@ KUBETON_SKIP_NODE_PREREQ_CHECK
 KUBETON_CHECK_MIN_CPU
 KUBETON_CHECK_MIN_MEMORY
 KUBETON_CHECK_DISK_HEADROOM
+KUBETON_DUMP_ARCHIVE_BYTES
+KUBETON_DUMP_EXTRACTED_DB_BYTES
 KUBETON_NODE_PREREQ_LABEL_KEY
 KUBETON_NODE_PREREQ_LABEL_VALUE
 
@@ -912,13 +929,14 @@ With this operator setup:
 - `/usr/src/ton` is mounted from the pod's `ton-src` PVC so the TON source checkout used by MyTonCtrl/Fift survives pod recreation.
 - PVCs are `ReadWriteOnce`, so one PVC is attached to one pod.
 - For 20 replicas with encrypted key management enabled, the total PVC count is 100.
-- `tonWorkSize` defaults to `700Gi` because dump bootstrap keeps the compressed dump and extracted DB on `/var/ton-work` at the same time.
+- `tonWorkSize` defaults to `700Gi` for the local-path lab setup. Dump bootstrap may require substantially more at runtime; `kubeton check` compares the live dump peak with node free space. For a capacity-enforcing StorageClass, increase `tonWorkSize` to at least the reported archive-plus-extracted-DB total before starting.
 
 If you use `local-path` StorageClass:
 - Data is written to the local disk on the node where that pod volume is provisioned.
 - Storage is distributed across nodes/pods, not centralized.
 - If a node is lost, data tied to that node-local volume is also lost (unless you use replicated storage such as Longhorn).
 - `kubeton drop` and `kubeton uninstall` purge exact, verified local-path backing directories for the PVCs they remove. This works with a custom local-path root such as `/home/danklishch/state-200gb-b5`; it is not limited to `/opt/local-path-provisioner`.
+- For Rancher local-path PVCs from older provisioner/controller versions, cleanup can safely use the PV's `local.path.provisioner/selected-node` provenance when hostname affinity is absent or does not uniquely resolve every selector term. It still requires that exact node to exist and rejects a fully-resolved affinity/provenance disagreement; it never guesses from a filesystem path or fans cleanup out across nodes.
 - before PVC deletion, a cleanup-ledger ConfigMap records the PV/PVC UIDs, exact local host path when applicable, and Longhorn's CSI volume handle/UID when applicable. The ledger is deleted only after the host path and supported backing volume are verified gone. If cleanup cannot run, `kubeton uninstall` returns non-zero and a rerun uses the ledger without needing the original PVC/PV.
 - `LOCAL_PATH_PROVISIONER_ROOT` is only needed for the optional wildcard fallback. `KUBETON_LOCAL_PATH_PATTERN_CLEANUP=true` may remove old, untracked directories by PVC-name pattern and is appropriate only in an isolated kubeton-owned cluster. Unknown historical directories without a PVC/PV or cleanup ledger cannot be safely attributed by default.
 - set `KUBETON_LOCAL_PATH_CLEANUP=false` to opt out of host cleanup. Local-path PVs then remain as an unresolved ledger item (and uninstall exits non-zero) rather than silently deleting unverified host data; CSI PV retry records are still retained. The ledger is stored in `kube-system` by default, because it is an authorization boundary for privileged node cleanup. The invoking identity needs read/write/delete access to that ConfigMap. Use `KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME` and `KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE` only when you need fixed ConfigMap placement for auditing or RBAC; choose an existing admin-only namespace that `kubeton uninstall` does not remove.
