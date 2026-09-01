@@ -1,0 +1,868 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+kubeton="$repo_root/charts/ton-k8s-operator/kubeton"
+test_dir="$(mktemp -d)"
+
+cleanup() {
+  rm -rf "$test_dir"
+}
+trap cleanup EXIT
+
+assert_contains() {
+  local needle="$1"
+  local file="$2"
+  if ! grep -Fq -- "$needle" "$file"; then
+    echo "expected output to contain: $needle" >&2
+    sed -n '1,200p' "$file" >&2
+    exit 1
+  fi
+}
+
+assert_order() {
+  local first="$1"
+  local second="$2"
+  local file="$3"
+  local first_line second_line
+  first_line="$(grep -n -F -- "$first" "$file" | head -n1 | cut -d: -f1 || true)"
+  second_line="$(grep -n -F -- "$second" "$file" | head -n1 | cut -d: -f1 || true)"
+  if [[ -z "$first_line" || -z "$second_line" || "$first_line" -ge "$second_line" ]]; then
+    echo "expected '$first' before '$second'" >&2
+    sed -n '1,200p' "$file" >&2
+    exit 1
+  fi
+}
+
+# The exact PV host path must be usable even when a Rancher local-path
+# provisioner uses a custom root rather than /opt/local-path-provisioner.
+script_output="$test_dir/exact-path-script.out"
+bash -c '
+  source "$1"
+  printf -v row "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+  exact=("$row")
+  patterns=()
+  build_local_path_cleanup_script devnet-03 /opt/local-path-provisioner exact patterns
+' _ "$kubeton" >"$script_output"
+assert_contains "target=\"\$host_root\"'/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1'" "$script_output"
+
+# Host-root cleanup paths must not contain traversal or duplicate-slash forms
+# that can resolve outside the intended target after the /host prefix is
+# applied by the privileged cleanup Pod.
+if ! bash -c '
+  source "$1"
+  unsafe_tab_path="$(printf "/var/lib\\tkubelet")"
+  for unsafe_path in /../etc /..//host/etc /./etc /var/lib//kubelet "$unsafe_tab_path"; do
+    if local_path_absolute_target "$unsafe_path" >/dev/null; then
+      echo "accepted unsafe path: $unsafe_path" >&2
+      exit 1
+    fi
+  done
+' _ "$kubeton"; then
+  echo "expected traversal-like local-path targets to be rejected" >&2
+  exit 1
+fi
+
+append_output="$test_dir/append-exact.out"
+bash -c '
+  source "$1"
+  local_path_pv_host_path() { printf "%s" "/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1"; }
+  local_path_pv_matches_claim() { return 0; }
+  local_path_pv_is_provisioned_by_local_path() { return 0; }
+  collect_local_path_nodes_for_pv() { local -n out="$2"; out+=("devnet-03"); }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-ton"*"metadata.uid"*) printf "pv-uid" ;;
+      *"-n default get pvc ton-work-tonnode-1"*"metadata.uid"*) printf "pvc-uid" ;;
+    esac
+  }
+  rows=()
+  append_local_path_exact_cleanup_rows_for_pv pv-ton default/ton-work-tonnode-1 rows
+  printf "%s\n" "${rows[@]}"
+' _ "$kubeton" >"$append_output"
+assert_contains $'devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid' "$append_output"
+
+# Privileged Pods are commonly rejected in application namespaces.  A failed
+# first choice must retry an eligible fallback (typically kube-system) rather
+# than leaving a perfectly valid exact local-path target behind.
+cleanup_namespace_fallback_events="$test_dir/cleanup-namespace-fallback-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  run_local_path_cleanup_pod_for_node() {
+    printf "try-namespace %s\n" "$1" >>"$event_log"
+    [[ "$1" == "kube-system" ]]
+  }
+  namespaces=(default kube-system)
+  exact=()
+  patterns=()
+  run_local_path_cleanup_pod_for_node_with_fallback namespaces devnet-03 "" uninstall exact patterns
+' _ "$kubeton" "$cleanup_namespace_fallback_events"
+assert_order "try-namespace default" "try-namespace kube-system" "$cleanup_namespace_fallback_events"
+
+# Disabling privileged host-path cleanup must not make ordinary CSI PV cleanup
+# non-retryable. The generic PV record is always captured before PVC deletion.
+generic_append_output="$test_dir/append-generic-pv.out"
+bash -c '
+  source "$1"
+  KUBETON_LOCAL_PATH_CLEANUP=false
+  kubectl() {
+    case "$*" in
+      *"get pv pv-keybundle"*) printf "pv-uid\tdefault\tkeybundle-tonnode-1\tpvc-uid\tDelete\tcsi.example.io\tvolume-handle" ;;
+      *"-n default get pvc keybundle-tonnode-1"*) printf "pvc-uid" ;;
+    esac
+  }
+  rows=()
+  append_pv_cleanup_ledger_row_for_pv pv-keybundle default/keybundle-tonnode-1 rows
+  printf "%s\n" "${rows[@]}"
+' _ "$kubeton" >"$generic_append_output"
+assert_contains $'pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tcsi.example.io\tvolume-handle\t' "$generic_append_output"
+
+# A present local-path PV follows the verified path through its final delete;
+# this guards the fresh-UID check from becoming an unbound-variable failure.
+present_local_events="$test_dir/present-local-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  local_path_recorded_pv_can_be_deleted() { :; }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-local"*"metadata.uid"*) printf "pv-uid" ;;
+    esac
+  }
+  ensure_volume_attachments_gone_for_pv() { :; }
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s finalizer=%s\n" "$1" "${4:-true}" >>"$event_log"; }
+  printf -v row "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-local\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+  rows=("$row")
+  delete_recorded_local_path_pvs rows uninstall
+' _ "$kubeton" "$present_local_events"
+assert_contains "delete-pv pv-local finalizer=true" "$present_local_events"
+
+# Exact host cleanup must never fan out to every node when the PV does not
+# identify its owner through node affinity.
+if bash -c '
+  source "$1"
+  local_path_pv_host_path() { printf "%s" "/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1"; }
+  local_path_pv_matches_claim() { return 0; }
+  local_path_pv_is_provisioned_by_local_path() { return 0; }
+  collect_local_path_nodes_for_pv() { return 1; }
+  rows=()
+  append_local_path_exact_cleanup_rows_for_pv pv-ton default/ton-work-tonnode-1 rows
+' _ "$kubeton"; then
+  echo "expected missing PV node affinity to block exact host cleanup" >&2
+  exit 1
+fi
+
+# If an old local-path PV is gone but a new PV now points at the same host
+# directory, the old ledger must not remove that directory.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      "get pv pv-old --ignore-not-found"*) : ;;
+      "get pv -o jsonpath="*) printf "pv-rebound\n" ;;
+      "get pv pv-rebound --ignore-not-found"*"metadata.uid"*) printf "new-pv-uid" ;;
+      "get pv pv-rebound --ignore-not-found"*"hostPath.path"*) printf "/home/danklishch/state-200gb-b5/pvc-old" ;;
+    esac
+  }
+  local_path_recorded_pv_can_be_deleted pv-old /home/danklishch/state-200gb-b5/pvc-old default/ton-work-tonnode-1 old-pv-uid old-pvc-uid devnet-03
+' _ "$kubeton"; then
+  echo "expected a rebound local-path target to block host cleanup" >&2
+  exit 1
+fi
+
+# The same directory cannot be removed merely because the recorded PV still
+# exists: a second current hostPath/local PV may have rebound to it.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      "get pv -o jsonpath="*) printf "pv-old\npv-other\n" ;;
+      "get pv pv-old --ignore-not-found"*"metadata.uid"*) printf "old-pv-uid" ;;
+      "get pv pv-other --ignore-not-found"*"metadata.uid"*) printf "other-pv-uid" ;;
+    esac
+  }
+  local_path_pv_host_path() { printf "%s" "/home/danklishch/state-200gb-b5/pvc-shared"; }
+  local_path_target_is_exclusive_to_recorded_pv /home/danklishch/state-200gb-b5/pvc-shared pv-old old-pv-uid
+' _ "$kubeton"; then
+  echo "expected a shared live local-path target to block host cleanup" >&2
+  exit 1
+fi
+
+# Deletion records the exact location before deleting its PVC, and does not
+# continue to PV deletion if the post-PVC host cleanup cannot be verified.
+delete_events="$test_dir/delete-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    printf "kubectl %s\n" "$*" >>"$event_log"
+    case "$*" in
+      *"get pvc ton-work-tonnode-1"*) printf "pv-ton" ;;
+    esac
+  }
+  collect_local_path_pattern_cleanup_rows_for_pvcs() { :; }
+  append_local_path_exact_cleanup_rows_for_pv() {
+    local -n out="$3"
+    local row
+    printf -v row "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+    out+=("$row")
+  }
+  append_pv_cleanup_ledger_row_for_pv() {
+    local -n out="$3"
+    local row
+    printf -v row "pv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+    out+=("$row")
+  }
+  record_local_path_cleanup_ledger() { printf "record-ledger\n" >>"$event_log"; }
+  wait_pvc_gone() { return 0; }
+  cleanup_recorded_local_path_data() { printf "cleanup-ledger\ndelete-pv pv-ton\n" >>"$event_log"; }
+  cleanup_local_path_provisioner_data() { printf "cleanup-patterns\n" >>"$event_log"; }
+  wait_volume_attachments_gone() { return 0; }
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+  wait_longhorn_volume_gone() { return 0; }
+  printf -v row "default\tton-work-tonnode-1"
+  rows=("$row")
+  delete_pvc_rows_and_backing_volumes rows uninstall
+' _ "$kubeton" "$delete_events"
+assert_order "record-ledger" "kubectl -n default delete pvc ton-work-tonnode-1" "$delete_events"
+assert_order "kubectl -n default delete pvc ton-work-tonnode-1" "cleanup-ledger" "$delete_events"
+assert_order "cleanup-ledger" "delete-pv pv-ton" "$delete_events"
+
+failed_cleanup_events="$test_dir/failed-cleanup-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    printf "kubectl %s\n" "$*" >>"$event_log"
+    case "$*" in
+      *"get pvc ton-work-tonnode-1"*) printf "pv-ton" ;;
+    esac
+  }
+  collect_local_path_pattern_cleanup_rows_for_pvcs() { :; }
+  append_local_path_exact_cleanup_rows_for_pv() {
+    local -n out="$3"
+    local row
+    printf -v row "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+    out+=("$row")
+  }
+  append_pv_cleanup_ledger_row_for_pv() {
+    local -n out="$3"
+    local row
+    printf -v row "pv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+    out+=("$row")
+  }
+  record_local_path_cleanup_ledger() { printf "record-ledger\n" >>"$event_log"; }
+  wait_pvc_gone() { return 0; }
+  cleanup_recorded_local_path_data() { printf "cleanup-ledger-failed\n" >>"$event_log"; return 1; }
+  printf -v row "default\tton-work-tonnode-1"
+  rows=("$row")
+  delete_pvc_rows_and_backing_volumes rows uninstall
+' _ "$kubeton" "$failed_cleanup_events"; then
+  echo "expected host-cleanup failure to fail PVC/PV cleanup" >&2
+  exit 1
+fi
+assert_contains "record-ledger" "$failed_cleanup_events"
+assert_contains "cleanup-ledger-failed" "$failed_cleanup_events"
+if grep -Fq "delete-pv" "$failed_cleanup_events"; then
+  echo "PV deletion ran after an unverified host cleanup" >&2
+  cat "$failed_cleanup_events" >&2
+  exit 1
+fi
+
+# A ledger is a real durable record, not just an in-memory cleanup list. Its
+# parser retains the node, path, PV/PVC names, and both UIDs for a retry after
+# Kubernetes has already removed the PVC object.
+ledger_rows_output="$test_dir/ledger-rows.out"
+bash -c '
+  source "$1"
+  list_local_path_cleanup_ledger_locations() { printf "default\tkubeton-local-path-cleanup-test\n"; }
+  kubectl() {
+    case "$*" in
+      *"get configmap kubeton-local-path-cleanup-test"*".data.targets"*)
+        printf "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+        ;;
+    esac
+  }
+  rows=()
+  collect_local_path_cleanup_ledger_rows rows
+  printf "%s\n" "${rows[@]}"
+' _ "$kubeton" >"$ledger_rows_output"
+assert_contains $'devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid' "$ledger_rows_output"
+
+# The same durable ConfigMap also retains every CSI PV using immutable PV/PVC
+# identities and the Longhorn CSI volume handle (not the PV name).
+pv_ledger_rows_output="$test_dir/pv-ledger-rows.out"
+bash -c '
+  source "$1"
+  list_local_path_cleanup_ledger_locations() { printf "kube-system\tkubeton-local-path-cleanup-test\n"; }
+  kubectl() {
+    case "$*" in
+      *"get configmap kubeton-local-path-cleanup-test"*".data.pv-targets"*)
+        printf "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+        ;;
+    esac
+  }
+  rows=()
+  collect_pv_cleanup_ledger_rows rows
+  printf "%s\n" "${rows[@]}"
+' _ "$kubeton" >"$pv_ledger_rows_output"
+assert_contains $'pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid' "$pv_ledger_rows_output"
+
+# A ledger-only retry must delete the exact Longhorn CSI handle only after the
+# attachment check succeeds, then delete the matching PV. This remains possible
+# even after the PVC object has already disappeared.
+generic_retry_events="$test_dir/generic-retry-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  recorded_pv_matches_cleanup_ledger() { printf "verify-pv\n" >>"$event_log"; }
+  ensure_volume_attachments_gone_for_pv() { printf "verify-attachment\n" >>"$event_log"; }
+  recorded_longhorn_volume_matches_cleanup_ledger() { printf "verify-longhorn\n" >>"$event_log"; }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-keybundle"*"metadata.uid"*) printf "pv-uid" ;;
+      *"get namespace longhorn-system"*"metadata.uid"*) printf "longhorn-namespace-uid" ;;
+      *"get volumes.longhorn.io volume-handle"*"metadata.uid"*) printf "longhorn-uid" ;;
+      *"delete volumes.longhorn.io volume-handle"*) printf "delete-longhorn\n" >>"$event_log" ;;
+    esac
+  }
+  wait_longhorn_volume_gone() { printf "wait-longhorn\n" >>"$event_log"; }
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+  printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+  rows=("$row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$generic_retry_events"
+assert_order "verify-attachment" "delete-longhorn" "$generic_retry_events"
+assert_order "delete-longhorn" "wait-longhorn" "$generic_retry_events"
+assert_order "wait-longhorn" "delete-pv pv-keybundle" "$generic_retry_events"
+
+# Generic CSI PVs use normal CSI deletion only; they never get finalizers
+# stripped, which could orphan a cloud disk.
+generic_csi_events="$test_dir/generic-csi-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  recorded_pv_matches_cleanup_ledger() { :; }
+  ensure_volume_attachments_gone_for_pv() { :; }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-csi"*"metadata.uid"*) printf "pv-uid" ;;
+    esac
+  }
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s finalizer=%s\n" "$1" "$4" >>"$event_log"; }
+  printf -v row "pv-csi\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tcsi.example.io\tvolume-handle\t"
+  rows=("$row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$generic_csi_events"
+assert_contains "delete-pv pv-csi finalizer=false" "$generic_csi_events"
+
+# A reused PV name/UID mismatch must retain the ledger and must not delete the
+# PV or Longhorn Volume CR.
+generic_uid_mismatch_events="$test_dir/generic-uid-mismatch-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  recorded_pv_matches_cleanup_ledger() { return 1; }
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+  kubectl() { printf "delete-longhorn\n" >>"$event_log"; }
+  printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+  rows=("$row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$generic_uid_mismatch_events"; then
+  echo "expected a reused PV UID to retain the cleanup ledger" >&2
+  exit 1
+fi
+if [[ -s "$generic_uid_mismatch_events" ]]; then
+  echo "a reused PV triggered destructive cleanup" >&2
+  cat "$generic_uid_mismatch_events" >&2
+  exit 1
+fi
+
+# Recheck the PV identity immediately before delete; a PV recreated between
+# validation and deletion must not be removed by name alone.
+fresh_pv_mismatch_events="$test_dir/fresh-pv-mismatch-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  recorded_pv_matches_cleanup_ledger() { :; }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-keybundle"*"metadata.uid"*) printf "new-pv-uid" ;;
+      *"delete pv pv-keybundle"*) printf "delete-pv\n" >>"$event_log" ;;
+    esac
+  }
+  delete_pv_and_wait_for_gone() { printf "delete-pv-helper\n" >>"$event_log"; }
+  printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tcsi.example.io\tvolume-handle\t"
+  rows=("$row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$fresh_pv_mismatch_events"; then
+  echo "expected a fresh PV UID mismatch to block cleanup" >&2
+  exit 1
+fi
+if [[ -s "$fresh_pv_mismatch_events" ]]; then
+  echo "a PV recreated after validation was deleted" >&2
+  cat "$fresh_pv_mismatch_events" >&2
+  exit 1
+fi
+
+# An absent old PV is not enough to authorize Longhorn deletion: a new PV may
+# have rebound the same CSI volume handle.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      "get pv -o jsonpath="*) printf "pv-rebound\tnew-pv-uid\tdriver.longhorn.io\tvolume-handle\n" ;;
+    esac
+  }
+  longhorn_volume_handle_is_exclusive_to_recorded_pv pv-keybundle pv-uid volume-handle
+' _ "$kubeton"; then
+  echo "expected a rebound Longhorn volume handle to block cleanup" >&2
+  exit 1
+fi
+
+# Generic CSI drivers need the identical live-PV handle guard. Otherwise a
+# Delete-policy PV could make its controller delete storage still referenced
+# by a static/rebound PV with the same backend handle.
+if bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      "get pv -o jsonpath="*) printf "pv-rebound\tnew-pv-uid\tcsi.example.io\tvolume-handle\n" ;;
+    esac
+  }
+  csi_volume_handle_is_exclusive_to_recorded_pv pv-keybundle pv-uid csi.example.io volume-handle pv-uid
+' _ "$kubeton"; then
+  echo "expected a rebound generic CSI volume handle to block cleanup" >&2
+  exit 1
+fi
+
+# Recheck the Longhorn UID immediately before delete as well; matching an
+# earlier read is not enough if the CR was recreated in between.
+fresh_longhorn_mismatch_events="$test_dir/fresh-longhorn-mismatch-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  recorded_pv_matches_cleanup_ledger() { :; }
+  ensure_volume_attachments_gone_for_pv() { :; }
+  longhorn_volume_handle_is_exclusive_to_recorded_pv() { :; }
+  recorded_longhorn_volume_matches_cleanup_ledger() { :; }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-keybundle"*"metadata.uid"*) printf "pv-uid" ;;
+      *"get namespace longhorn-system"*"metadata.uid"*) printf "longhorn-namespace-uid" ;;
+      *"get volumes.longhorn.io volume-handle"*"metadata.uid"*) printf "new-longhorn-uid" ;;
+      *"delete volumes.longhorn.io volume-handle"*) printf "delete-longhorn\n" >>"$event_log" ;;
+    esac
+  }
+  printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+  rows=("$row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$fresh_longhorn_mismatch_events"; then
+  echo "expected a fresh Longhorn UID mismatch to block cleanup" >&2
+  exit 1
+fi
+if [[ -s "$fresh_longhorn_mismatch_events" ]]; then
+  echo "a recreated Longhorn Volume CR was deleted" >&2
+  cat "$fresh_longhorn_mismatch_events" >&2
+  exit 1
+fi
+
+# If Longhorn has already been removed, its Volume CR is necessarily absent.
+# A matching ledger can still finish PV deletion rather than being stuck on a
+# lookup in a namespace that no longer exists.
+absent_longhorn_namespace_events="$test_dir/absent-longhorn-namespace-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  recorded_pv_matches_cleanup_ledger() { :; }
+  ensure_volume_attachments_gone_for_pv() { :; }
+  longhorn_volume_handle_is_exclusive_to_recorded_pv() { :; }
+  recorded_longhorn_volume_matches_cleanup_ledger() { :; }
+  kubectl() {
+    case "$*" in
+      *"get pv pv-keybundle"*"metadata.uid"*) printf "pv-uid" ;;
+      *"delete volumes.longhorn.io"*) printf "delete-longhorn\n" >>"$event_log" ;;
+    esac
+  }
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+  printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+  rows=("$row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$absent_longhorn_namespace_events"
+assert_contains "delete-pv pv-keybundle" "$absent_longhorn_namespace_events"
+if grep -Fq "delete-longhorn" "$absent_longhorn_namespace_events"; then
+  echo "attempted to delete a Longhorn Volume CR after its namespace was gone" >&2
+  cat "$absent_longhorn_namespace_events" >&2
+  exit 1
+fi
+
+# Two UID/handle records for a reused PV name are ambiguous. The reconciler
+# must retain the ledger rather than delete one backend and silently skip the
+# other.
+generic_conflict_events="$test_dir/generic-conflict-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+  kubectl() { printf "delete-longhorn\n" >>"$event_log"; }
+  printf -v old_row "pv-reused\tdefault/keybundle-tonnode-1\told-pv-uid\told-pvc-uid\tDelete\tdriver.longhorn.io\told-handle\told-longhorn-uid"
+  printf -v new_row "pv-reused\tdefault/keybundle-tonnode-1\tnew-pv-uid\tnew-pvc-uid\tDelete\tdriver.longhorn.io\tnew-handle\tnew-longhorn-uid"
+  rows=("$old_row" "$new_row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$generic_conflict_events"; then
+  echo "expected conflicting reused-PV ledger rows to block cleanup" >&2
+  exit 1
+fi
+if [[ -s "$generic_conflict_events" ]]; then
+  echo "a conflicting reused-PV ledger deleted storage" >&2
+  cat "$generic_conflict_events" >&2
+  exit 1
+fi
+
+# A CSI volume handle can be rebound under a different PV name.  Detect that
+# conflict before processing either row: otherwise the first Delete-policy PV
+# could let its CSI controller delete storage that a later Retain row protects.
+shared_csi_handle_events="$test_dir/shared-csi-handle-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+  kubectl() { printf "delete-longhorn\n" >>"$event_log"; }
+  printf -v delete_row "pv-old\tdefault/keybundle-tonnode-1\told-pv-uid\told-pvc-uid\tDelete\tcsi.example.io\tshared-handle\t"
+  printf -v retain_row "pv-new\tdefault/keybundle-tonnode-1\tnew-pv-uid\tnew-pvc-uid\tRetain\tcsi.example.io\tshared-handle\t"
+  rows=("$delete_row" "$retain_row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$shared_csi_handle_events"; then
+  echo "expected a shared generic CSI handle to block cleanup" >&2
+  exit 1
+fi
+if [[ -s "$shared_csi_handle_events" ]]; then
+  echo "a shared generic CSI handle triggered destructive cleanup" >&2
+  cat "$shared_csi_handle_events" >&2
+  exit 1
+fi
+
+# The same conflict rule applies to Longhorn handles.  Both backend Volume CR
+# deletion and PV deletion must be blocked before the first row is processed.
+shared_longhorn_handle_events="$test_dir/shared-longhorn-handle-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+  kubectl() { printf "delete-longhorn\n" >>"$event_log"; }
+  printf -v delete_row "pv-old\tdefault/keybundle-tonnode-1\told-pv-uid\told-pvc-uid\tDelete\tdriver.longhorn.io\tshared-handle\told-longhorn-uid"
+  printf -v retain_row "pv-new\tdefault/keybundle-tonnode-1\tnew-pv-uid\tnew-pvc-uid\tRetain\tdriver.longhorn.io\tshared-handle\tnew-longhorn-uid"
+  rows=("$delete_row" "$retain_row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$shared_longhorn_handle_events"; then
+  echo "expected a shared Longhorn handle to block cleanup" >&2
+  exit 1
+fi
+if [[ -s "$shared_longhorn_handle_events" ]]; then
+  echo "a shared Longhorn handle triggered destructive cleanup" >&2
+  cat "$shared_longhorn_handle_events" >&2
+  exit 1
+fi
+
+# With no remaining PVCs or local-path rows, the combined ledger reconciler
+# still processes a persisted CSI PV target before it clears the ConfigMap.
+storage_ledger_events="$test_dir/storage-ledger-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  collect_local_path_cleanup_ledger_rows() { :; }
+  collect_pv_cleanup_ledger_rows() {
+    local -n out="$1"
+    local row
+    printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+    out+=("$row")
+  }
+  delete_recorded_pv_cleanup_targets() { printf "delete-recorded-csi-pv\n" >>"$event_log"; }
+  clear_local_path_cleanup_ledgers() { printf "clear-ledger\n" >>"$event_log"; }
+  cleanup_recorded_local_path_data uninstall
+' _ "$kubeton" "$storage_ledger_events"
+assert_order "delete-recorded-csi-pv" "clear-ledger" "$storage_ledger_events"
+
+# The real no-PVC branch used by a second `kubeton uninstall` must reconcile
+# the durable ledger, not merely return success because discovery is empty.
+no_pvc_retry_events="$test_dir/no-pvc-retry-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  ton_fleet_resources_exist() { return 1; }
+  collect_expected_ton_pvc_rows_from_values() { :; }
+  collect_labeled_ton_pvc_rows() { :; }
+  collect_existing_kubeton_pvc_rows() { :; }
+  collect_local_path_cleanup_ledger_rows() { :; }
+  collect_pv_cleanup_ledger_rows() {
+    local -n out="$1"
+    local row
+    printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+    out+=("$row")
+  }
+  delete_recorded_pv_cleanup_targets() { printf "delete-recorded-csi-pv\n" >>"$event_log"; }
+  clear_local_path_cleanup_ledgers() { printf "clear-ledger\n" >>"$event_log"; }
+  delete_stale_ton_pvcs_without_fleet uninstall true
+' _ "$kubeton" "$no_pvc_retry_events"
+assert_order "delete-recorded-csi-pv" "clear-ledger" "$no_pvc_retry_events"
+
+# A local-path PV with Retain must never reach host deletion, PV deletion, or
+# ledger clearing. Retain is a deliberate manual-storage policy.
+retain_local_events="$test_dir/retain-local-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  collect_local_path_cleanup_ledger_rows() {
+    local -n out="$1"
+    local row
+    printf -v row "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-retain\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+    out+=("$row")
+  }
+  collect_pv_cleanup_ledger_rows() {
+    local -n out="$1"
+    local row
+    printf -v row "pv-retain\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid\tRetain\t\t\t"
+    out+=("$row")
+  }
+  cleanup_local_path_provisioner_data() { printf "delete-host-path\n" >>"$event_log"; }
+  delete_recorded_local_path_pvs() { printf "delete-pv\n" >>"$event_log"; }
+  clear_local_path_cleanup_ledgers() { printf "clear-ledger\n" >>"$event_log"; }
+  cleanup_recorded_local_path_data uninstall
+' _ "$kubeton" "$retain_local_events"; then
+  echo "expected a Retain local-path target to block cleanup" >&2
+  exit 1
+fi
+if [[ -s "$retain_local_events" ]]; then
+  echo "Retain local-path data was destructively cleaned" >&2
+  cat "$retain_local_events" >&2
+  exit 1
+fi
+
+# A reused PV name with two ledger lifetimes is ambiguous even if one record is
+# Delete. No host path may be removed before a human resolves the conflict.
+local_reuse_events="$test_dir/local-reuse-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  collect_local_path_cleanup_ledger_rows() {
+    local -n out="$1"
+    local old_row new_row
+    printf -v old_row "devnet-03\t/home/danklishch/old\tpv-reused\tdefault/ton-work-tonnode-1\told-pv-uid\told-pvc-uid"
+    printf -v new_row "devnet-03\t/home/danklishch/new\tpv-reused\tdefault/ton-work-tonnode-1\tnew-pv-uid\tnew-pvc-uid"
+    out+=("$old_row" "$new_row")
+  }
+  collect_pv_cleanup_ledger_rows() {
+    local -n out="$1"
+    local old_row new_row
+    printf -v old_row "pv-reused\tdefault/ton-work-tonnode-1\told-pv-uid\told-pvc-uid\tDelete\t\t\t"
+    printf -v new_row "pv-reused\tdefault/ton-work-tonnode-1\tnew-pv-uid\tnew-pvc-uid\tRetain\t\t\t"
+    out+=("$old_row" "$new_row")
+  }
+  cleanup_local_path_provisioner_data() { printf "delete-host-path\n" >>"$event_log"; }
+  clear_local_path_cleanup_ledgers() { printf "clear-ledger\n" >>"$event_log"; }
+  cleanup_recorded_local_path_data uninstall
+' _ "$kubeton" "$local_reuse_events"; then
+  echo "expected a reused local PV ledger to block cleanup" >&2
+  exit 1
+fi
+if [[ -s "$local_reuse_events" ]]; then
+  echo "a reused local PV ledger deleted host data" >&2
+  cat "$local_reuse_events" >&2
+  exit 1
+fi
+
+# On a ledger-only retry, host cleanup is followed by deletion of the exact
+# recorded PV. The ledger is cleared only after both operations succeed.
+retry_events="$test_dir/retry-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  collect_local_path_cleanup_ledger_rows() {
+    local -n out="$1"
+    local row
+    printf -v row "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+    out+=("$row")
+  }
+  collect_pv_cleanup_ledger_rows() { :; }
+  verify_recorded_local_path_targets_use_delete_reclaim_policy() { :; }
+  verify_recorded_local_path_targets_safe_for_host_cleanup() { :; }
+  cleanup_local_path_provisioner_data() { printf "cleanup-host-path\n" >>"$event_log"; }
+  delete_recorded_local_path_pvs() { printf "delete-recorded-pv\n" >>"$event_log"; }
+  clear_local_path_cleanup_ledgers() { printf "clear-ledger\n" >>"$event_log"; }
+  cleanup_recorded_local_path_data uninstall
+' _ "$kubeton" "$retry_events"
+assert_order "cleanup-host-path" "delete-recorded-pv" "$retry_events"
+assert_order "delete-recorded-pv" "clear-ledger" "$retry_events"
+
+retry_failure_events="$test_dir/retry-failure-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  collect_local_path_cleanup_ledger_rows() {
+    local -n out="$1"
+    local row
+    printf -v row "devnet-03\t/home/danklishch/state-200gb-b5/pvc-pvc-uid_default_ton-work-tonnode-1\tpv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid"
+    out+=("$row")
+  }
+  collect_pv_cleanup_ledger_rows() { :; }
+  verify_recorded_local_path_targets_use_delete_reclaim_policy() { :; }
+  verify_recorded_local_path_targets_safe_for_host_cleanup() { :; }
+  cleanup_local_path_provisioner_data() { printf "cleanup-host-path\n" >>"$event_log"; }
+  delete_recorded_local_path_pvs() { printf "delete-recorded-pv-failed\n" >>"$event_log"; return 1; }
+  clear_local_path_cleanup_ledgers() { printf "clear-ledger\n" >>"$event_log"; }
+  cleanup_recorded_local_path_data uninstall
+' _ "$kubeton" "$retry_failure_events" >"$test_dir/retry-failure-command.out" 2>&1; then
+  echo "expected unresolved recorded PV to retain the cleanup ledger" >&2
+  exit 1
+fi
+assert_contains "delete-recorded-pv-failed" "$retry_failure_events"
+if grep -Fq "clear-ledger" "$retry_failure_events"; then
+  echo "cleanup ledger was cleared before its recorded PV was gone" >&2
+  cat "$retry_failure_events" >&2
+  exit 1
+fi
+
+# A ledger-only drop/uninstall retry must propagate an unresolved cleanup, even
+# after the PVC/PV objects have disappeared from the usual discovery paths.
+if bash -c '
+  source "$1"
+  ton_fleet_resources_exist() { return 1; }
+  collect_expected_ton_pvc_rows_from_values() { :; }
+  collect_labeled_ton_pvc_rows() { :; }
+  collect_existing_kubeton_pvc_rows() { :; }
+  cleanup_recorded_local_path_data() { return 1; }
+  delete_stale_ton_pvcs_without_fleet uninstall true
+' _ "$kubeton"; then
+  echo "expected ledger-only retry failure to propagate from drop/uninstall" >&2
+  exit 1
+fi
+
+# API/RBAC errors are not the same as a deleted resource. A failed PV lookup
+# must not trigger finalizer removal or allow the ledger to be cleared.
+pv_lookup_events="$test_dir/pv-lookup-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() { printf "kubectl %s\n" "$*" >>"$event_log"; }
+  wait_pv_gone() { return 2; }
+  delete_pv_and_wait_for_gone pv-ton 1 1
+' _ "$kubeton" "$pv_lookup_events"; then
+  echo "expected PV lookup failure to fail cleanup" >&2
+  exit 1
+fi
+if grep -Fq "patch pv/pv-ton" "$pv_lookup_events"; then
+  echo "PV finalizers were cleared after an API/RBAC lookup failure" >&2
+  cat "$pv_lookup_events" >&2
+  exit 1
+fi
+
+# A VolumeAttachment API/RBAC failure or a timeout is not evidence that the
+# volume is detached.  Neither case may reach PV deletion/finalizer recovery.
+for attachment_result in 2 1; do
+  attachment_events="$test_dir/attachment-${attachment_result}-events.out"
+  if bash -c '
+    source "$1"
+    event_log="$2"
+    attachment_result="$3"
+    kubectl() {
+      printf "kubectl %s\n" "$*" >>"$event_log"
+      case "$*" in
+        *"get pv pv-ton"*"metadata.uid"*) printf "pv-uid" ;;
+      esac
+    }
+    recorded_pv_matches_cleanup_ledger() { :; }
+    ensure_volume_attachments_gone_for_pv() { return "$attachment_result"; }
+    delete_pv_and_wait_for_gone() { printf "delete-pv %s\n" "$1" >>"$event_log"; }
+    printf -v row "pv-ton\tdefault/ton-work-tonnode-1\tpv-uid\tpvc-uid\tDelete\tcsi.example.io\tvolume-handle\t"
+    rows=("$row")
+    delete_recorded_pv_cleanup_targets rows uninstall
+  ' _ "$kubeton" "$attachment_events" "$attachment_result"; then
+    echo "expected unresolved VolumeAttachment state to fail cleanup" >&2
+    exit 1
+  fi
+if grep -Fq "delete-pv" "$attachment_events"; then
+    echo "PV deletion ran without a verified detached VolumeAttachment" >&2
+    cat "$attachment_events" >&2
+    exit 1
+  fi
+done
+
+# A stale attachment can outlive the PV object itself. A ledger-only Longhorn
+# retry must still verify attachments before it deletes the backend Volume CR.
+absent_pv_attachment_events="$test_dir/absent-pv-attachment-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  recorded_pv_matches_cleanup_ledger() { :; }
+  kubectl() {
+    case "$*" in
+      *"delete volumes.longhorn.io"*) printf "delete-longhorn\n" >>"$event_log" ;;
+    esac
+  }
+  ensure_volume_attachments_gone_for_pv() { return 1; }
+  printf -v row "pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tdriver.longhorn.io\tvolume-handle\tlonghorn-uid"
+  rows=("$row")
+  delete_recorded_pv_cleanup_targets rows uninstall
+' _ "$kubeton" "$absent_pv_attachment_events"; then
+  echo "expected stale attachment to block a ledger-only Longhorn cleanup" >&2
+  exit 1
+fi
+if [[ -s "$absent_pv_attachment_events" ]]; then
+  echo "Longhorn backend deletion ran while a stale attachment was unresolved" >&2
+  cat "$absent_pv_attachment_events" >&2
+  exit 1
+fi
+
+# Do not tear down Longhorn while its recorded cleanup target remains: a retry
+# needs the Longhorn API to prove and remove the exact backend volume.
+longhorn_gate_events="$test_dir/longhorn-gate-events.out"
+if bash -c '
+  source "$1"
+  event_log="$2"
+  storage_cleanup_ledger_has_pending_longhorn_targets() { return 0; }
+  uninstall_longhorn() { printf "uninstall-longhorn\n" >>"$event_log"; }
+  cleanup_longhorn_force() { printf "force-longhorn\n" >>"$event_log"; }
+  delete_namespace_with_progress() { printf "delete-longhorn-namespace\n" >>"$event_log"; }
+  cleanup_longhorn_release
+' _ "$kubeton" "$longhorn_gate_events"; then
+  echo "expected a pending Longhorn ledger to block Longhorn uninstall" >&2
+  exit 1
+fi
+if [[ -s "$longhorn_gate_events" ]]; then
+  echo "Longhorn teardown ran while a cleanup ledger was pending" >&2
+  cat "$longhorn_gate_events" >&2
+  exit 1
+fi
+
+# A recorded teardown error must make uninstall non-successful even when the
+# generic Kubernetes leftover sweep happens to be empty.
+uninstall_output="$test_dir/uninstall-failure.out"
+if bash -c '
+  source "$1"
+  list_ton_statefulsets() { :; }
+  stop_ton_for_destructive_cleanup() { :; }
+  delete_ton_pvcs_for_statefulsets() { return 1; }
+  cleanup_kubectl_debug_pods() { :; }
+  cleanup_observability_resources() { :; }
+  cleanup_operator_release() { :; }
+  cleanup_vault_release() { :; }
+  cleanup_encrypted_storage_class() { :; }
+  cleanup_longhorn_release() { :; }
+  delete_stale_ton_pvcs_without_fleet() { :; }
+  cleanup_kubeton_managed_labeled_resources() { :; }
+  verify_uninstall_leftovers() { :; }
+  run_uninstall_core
+' _ "$kubeton" >"$uninstall_output" 2>&1; then
+  echo "expected uninstall to fail after a teardown step failure" >&2
+  cat "$uninstall_output" >&2
+  exit 1
+fi
+assert_contains "Uninstall is not marked complete" "$uninstall_output"
+if grep -Fq "[uninstall] Uninstall complete." "$uninstall_output"; then
+  echo "uninstall falsely reported completion after a teardown failure" >&2
+  cat "$uninstall_output" >&2
+  exit 1
+fi
+
+echo "kubeton cleanup checks: PASS"

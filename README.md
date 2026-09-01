@@ -104,9 +104,10 @@ Restore prerequisites:
 - encrypted bundles can be decrypted only if the same root-of-trust is still available:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
-- `kubeton drop` removes TON resources/PVCs, backing Longhorn volume artifacts (PVs/attachments), and kubeton TON directories left under the local-path provisioner root.
-- `kubeton uninstall` is a full best-effort cleanup: it removes TON resources/PVCs, kubeton local-path volume directories, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, main-wallet/debug helper resources, operator release/namespace, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
-- if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and asks you to rerun `./kubeton uninstall`.
+- `kubeton drop` removes TON resources/PVCs, verified local-path backing directories, and supported CSI/Longhorn backing volumes.
+- `kubeton uninstall` is a full cleanup: it removes TON resources/PVCs, verified local-path backing directories, supported CSI/Longhorn backing volumes, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, main-wallet/debug helper resources, operator release/namespace, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- before deleting a PVC, `kubeton` stores the bound PV/PVC UIDs; local-path host paths and Longhorn CSI volume handles are recorded as well. A later `./kubeton uninstall` can therefore retry storage cleanup even after Kubernetes has deleted the PVC object.
+- if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and exits non-zero rather than claiming completion while a cleanup ledger remains. `Retain`, static, or unknown backing storage is intentionally left in the ledger for manual removal rather than being force-deleted. Rerun `./kubeton uninstall` after resolving the reported issue.
 - `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
@@ -481,6 +482,8 @@ KUBETON_LOCAL_PATH_CLEANUP_IMAGE
 KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE
 KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS
 KUBETON_LOCAL_PATH_PATTERN_CLEANUP
+KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME
+KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE
 KUBETON_SEQUENTIAL_TON_START
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS
@@ -673,7 +676,7 @@ Main environment overrides:
 
 For AWS/GCP/AliCloud, you can use any of these install paths:
 
-- Cloud Shell (fastest): run the same release-pinned command above from AWS CloudShell, GCP Cloud Shell, or Alibaba Cloud Cloud Shell.
+- Cloud Shell (fastest): run the same release-pinned command above from AWS CloudShell, GCP Cloud Shell, or Alibaba Cloud Shell.
 - CI/CD or bastion host: run `helm install/upgrade` from your deployment runner against the target kube-context.
 - GitOps (recommended for production): use Argo CD or Flux with this chart and versioned values files.
 - Terraform: use `helm_release` to install/upgrade declaratively.
@@ -838,6 +841,9 @@ kubectl delete crd tonnodes.ton.ton.org
 ```
 
 Note: CRDs installed from Helm `crds/` are not removed by `helm uninstall`.
+Raw `helm uninstall` also cannot run kubeton's retryable PVC/PV cleanup or its
+privileged node-local storage cleanup. Use `./kubeton uninstall` when TON
+storage must be removed.
 If you want to remove CRD too (destructive, removes `TonNode` objects):
 
 ```bash
@@ -911,10 +917,10 @@ If you use `local-path` StorageClass:
 - Data is written to the local disk on the node where that pod volume is provisioned.
 - Storage is distributed across nodes/pods, not centralized.
 - If a node is lost, data tied to that node-local volume is also lost (unless you use replicated storage such as Longhorn).
-- `kubeton drop` purges kubeton TON volume directories under `/opt/local-path-provisioner` by default.
-- `kubeton uninstall` also purges known kubeton-managed local-path volume directories, including TON, Vault, VictoriaLogs, and main-wallet PVC backing directories when those PVCs use local-path storage.
-- local-path host cleanup uses exact PV paths captured from live PVC/PV objects by default; wildcard cleanup by PVC name is disabled because it cannot prove ownership of stale directories.
-- override `LOCAL_PATH_PROVISIONER_ROOT` if your provisioner uses another root, set `KUBETON_LOCAL_PATH_CLEANUP=false` to disable host cleanup, or set `KUBETON_LOCAL_PATH_PATTERN_CLEANUP=true` only in isolated kubeton-owned clusters where wildcard stale-directory cleanup is acceptable.
+- `kubeton drop` and `kubeton uninstall` purge exact, verified local-path backing directories for the PVCs they remove. This works with a custom local-path root such as `/home/danklishch/state-200gb-b5`; it is not limited to `/opt/local-path-provisioner`.
+- before PVC deletion, a cleanup-ledger ConfigMap records the PV/PVC UIDs, exact local host path when applicable, and Longhorn's CSI volume handle/UID when applicable. The ledger is deleted only after the host path and supported backing volume are verified gone. If cleanup cannot run, `kubeton uninstall` returns non-zero and a rerun uses the ledger without needing the original PVC/PV.
+- `LOCAL_PATH_PROVISIONER_ROOT` is only needed for the optional wildcard fallback. `KUBETON_LOCAL_PATH_PATTERN_CLEANUP=true` may remove old, untracked directories by PVC-name pattern and is appropriate only in an isolated kubeton-owned cluster. Unknown historical directories without a PVC/PV or cleanup ledger cannot be safely attributed by default.
+- set `KUBETON_LOCAL_PATH_CLEANUP=false` to opt out of host cleanup. Local-path PVs then remain as an unresolved ledger item (and uninstall exits non-zero) rather than silently deleting unverified host data; CSI PV retry records are still retained. The ledger is stored in `kube-system` by default, because it is an authorization boundary for privileged node cleanup. The invoking identity needs read/write/delete access to that ConfigMap. Use `KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME` and `KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE` only when you need fixed ConfigMap placement for auditing or RBAC; choose an existing admin-only namespace that `kubeton uninstall` does not remove.
 
 ## Local Development and Testing (k3d)
 

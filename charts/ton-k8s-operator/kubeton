@@ -57,6 +57,8 @@ KUBETON_LOCAL_PATH_CLEANUP_IMAGE="${KUBETON_LOCAL_PATH_CLEANUP_IMAGE:-busybox:1.
 KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE="${KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE:-}"
 KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS="${KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS:-180}"
 KUBETON_LOCAL_PATH_PATTERN_CLEANUP="${KUBETON_LOCAL_PATH_PATTERN_CLEANUP:-false}"
+KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME="${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME:-}"
+KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE="${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE:-}"
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-false}"
 KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START="${KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
@@ -4915,82 +4917,32 @@ delete_volume_attachments_for_pv() {
 
 delete_vault_pvcs_and_backing_volumes() {
   local -a pvc_rows=()
-  local -a pvc_ref_rows=()
-  local -a pv_rows=()
-  local -a local_path_exact_rows=()
-  local -a local_path_pattern_rows=()
-  local row pvc pv
+  local namespace_marker pvc_rows_output pvc
 
-  if ! kubectl get namespace "$VAULT_NAMESPACE" >/dev/null 2>&1; then
+  if ! namespace_marker="$(kubectl get namespace "$VAULT_NAMESPACE" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not inspect Vault namespace ${VAULT_NAMESPACE} before storage cleanup." >&2
+    return 1
+  fi
+  namespace_marker="$(trim_whitespace "$namespace_marker")"
+  if [[ -z "$namespace_marker" ]]; then
     return 0
   fi
 
-  while IFS=$'\t' read -r pvc pv; do
+  if ! pvc_rows_output="$(kubectl -n "$VAULT_NAMESPACE" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: could not list Vault PVCs in ${VAULT_NAMESPACE}." >&2
+    return 1
+  fi
+  while IFS= read -r pvc; do
     pvc="$(trim_whitespace "$pvc")"
-    pv="$(trim_whitespace "$pv")"
     [[ -z "$pvc" ]] && continue
-    pvc_rows+=("$pvc")
-    pvc_ref_rows+=("$VAULT_NAMESPACE"$'\t'"$pvc")
-    if [[ -n "$pv" ]]; then
-      append_unique_item "$pv" pv_rows
-      append_local_path_exact_cleanup_rows_for_pv "$pv" "${VAULT_NAMESPACE}/${pvc}" local_path_exact_rows
-    fi
-  done < <(
-    kubectl -n "$VAULT_NAMESPACE" get pvc \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.volumeName}{"\n"}{end}' 2>/dev/null || true
-  )
+    append_unique_item "$VAULT_NAMESPACE"$'\t'"$pvc" pvc_rows
+  done <<<"$pvc_rows_output"
 
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
   fi
 
-  collect_local_path_pattern_cleanup_rows_for_pvcs pvc_ref_rows local_path_pattern_rows
-
-  echo "[cleanup] Deleting Vault PVCs ..."
-  for pvc in "${pvc_rows[@]}"; do
-    [[ -z "$pvc" ]] && continue
-    kubectl -n "$VAULT_NAMESPACE" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done
-
-  for pvc in "${pvc_rows[@]}"; do
-    [[ -z "$pvc" ]] && continue
-    if ! wait_pvc_gone "$VAULT_NAMESPACE" "$pvc" 180; then
-      echo "Warning: Vault PVC ${VAULT_NAMESPACE}/${pvc} did not delete normally; clearing finalizers." >&2
-      kubectl -n "$VAULT_NAMESPACE" patch pvc "$pvc" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-      kubectl -n "$VAULT_NAMESPACE" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-      wait_pvc_gone "$VAULT_NAMESPACE" "$pvc" 60 || true
-    fi
-  done
-
-  cleanup_local_path_provisioner_data local_path_exact_rows local_path_pattern_rows "cleanup" || true
-
-  for pv in "${pv_rows[@]}"; do
-    [[ -z "$pv" ]] && continue
-    if ! wait_volume_attachments_gone "$pv" 180; then
-      delete_volume_attachments_for_pv "$pv"
-      wait_volume_attachments_gone "$pv" 60 || true
-    fi
-  done
-
-  for pv in "${pv_rows[@]}"; do
-    [[ -z "$pv" ]] && continue
-    if kubectl get pv "$pv" >/dev/null 2>&1; then
-      echo "[cleanup] Deleting Vault PV ${pv} ..."
-      kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-      if ! wait_pv_gone "$pv" 180; then
-        echo "Warning: Vault PV ${pv} did not delete normally; clearing finalizers." >&2
-        kubectl patch "pv/${pv}" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-        kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-        wait_pv_gone "$pv" 60 || true
-      fi
-    fi
-
-    if kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
-      echo "[cleanup] Deleting Vault Longhorn volume ${pv} ..."
-      kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-      wait_longhorn_volume_gone "$pv" 300 || true
-    fi
-  done
+  delete_pvc_rows_and_backing_volumes pvc_rows "cleanup"
 }
 
 cleanup_vault_force() {
@@ -5003,7 +4955,10 @@ cleanup_vault_force() {
   # Ensure workload references are gone so pvc-protection can clear.
   kubectl -n "$VAULT_NAMESPACE" delete statefulset vault --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl -n "$VAULT_NAMESPACE" delete pod --all --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
-  delete_vault_pvcs_and_backing_volumes
+  if ! delete_vault_pvcs_and_backing_volumes; then
+    echo "Error: Vault backing storage cleanup did not complete; keeping ${VAULT_NAMESPACE} for a safe retry." >&2
+    return 1
+  fi
 
   local resource
   for resource in $(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null || true); do
@@ -6329,24 +6284,61 @@ local_path_relative_target() {
   printf '%s' "$rel"
 }
 
+# Exact PV paths are authoritative for a bound local-path PV.  Unlike the
+# optional orphan-pattern fallback below, they do not depend on the configured
+# local-path provisioner root: clusters commonly use a custom root.
+local_path_absolute_target() {
+  local path="$1"
+
+  path="$(trim_whitespace "$path")"
+  case "$path" in
+    *//*|*$'\t'*|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  path="${path%/}"
+  case "$path" in
+    ""|/|/..|/../*|*/..|*/../*|/.|/./*|*/.|*/./*) return 1 ;;
+  esac
+  [[ "$path" == /* ]] || return 1
+  printf '%s' "$path"
+}
+
 local_path_safe_name_component() {
   [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]
 }
 
-local_path_cleanup_namespace() {
+local_path_cleanup_namespaces() {
   local ns phase
+  local -a seen=()
+
+  # A privileged host-root cleanup Pod is often rejected in an application
+  # namespace by Pod Security admission, while kube-system is allowed.  Keep
+  # an explicit choice first, but emit every usable fallback so the caller can
+  # retry if creation is denied in the first namespace.
   for ns in "$KUBETON_LOCAL_PATH_CLEANUP_NAMESPACE" kube-system "$TON_NAMESPACE" default; do
     ns="$(trim_whitespace "$ns")"
     [[ -z "$ns" ]] && continue
+    if [[ " ${seen[*]} " == *" ${ns} "* ]]; then
+      continue
+    fi
+    seen+=("$ns")
     if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
       continue
     fi
     phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     if [[ "$phase" != "Terminating" ]]; then
-      printf '%s' "$ns"
-      return 0
+      printf '%s\n' "$ns"
     fi
   done
+}
+
+local_path_cleanup_namespace() {
+  local -a namespaces=()
+
+  mapfile -t namespaces < <(local_path_cleanup_namespaces)
+  if [[ ${#namespaces[@]} -gt 0 ]]; then
+    printf '%s' "${namespaces[0]}"
+    return 0
+  fi
   echo "Error: no usable namespace found for local-path cleanup pod." >&2
   return 1
 }
@@ -6354,13 +6346,52 @@ local_path_cleanup_namespace() {
 local_path_pv_host_path() {
   local pv="$1"
   local path
-  path="$(kubectl get pv "$pv" -o jsonpath='{.spec.hostPath.path}' 2>/dev/null || true)"
+  if ! path="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.spec.hostPath.path}' 2>/dev/null)"; then
+    echo "Error: could not inspect host path for PV ${pv}." >&2
+    return 1
+  fi
   path="$(trim_whitespace "$path")"
   if [[ -z "$path" ]]; then
-    path="$(kubectl get pv "$pv" -o jsonpath='{.spec.local.path}' 2>/dev/null || true)"
+    if ! path="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.spec.local.path}' 2>/dev/null)"; then
+      echo "Error: could not inspect local path for PV ${pv}." >&2
+      return 1
+    fi
     path="$(trim_whitespace "$path")"
   fi
   printf '%s' "$path"
+}
+
+local_path_pv_matches_claim() {
+  local pv="$1"
+  local pvc_ref="$2"
+  local expected_ns expected_pvc expected_uid actual_ns actual_pvc actual_uid
+
+  IFS=/ read -r expected_ns expected_pvc <<<"$pvc_ref"
+  [[ -n "$expected_ns" && -n "$expected_pvc" ]] || return 1
+  actual_ns="$(kubectl get pv "$pv" -o jsonpath='{.spec.claimRef.namespace}' 2>/dev/null || true)"
+  actual_pvc="$(kubectl get pv "$pv" -o jsonpath='{.spec.claimRef.name}' 2>/dev/null || true)"
+  expected_uid="$(kubectl -n "$expected_ns" get pvc "$expected_pvc" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  actual_uid="$(kubectl get pv "$pv" -o jsonpath='{.spec.claimRef.uid}' 2>/dev/null || true)"
+  actual_ns="$(trim_whitespace "$actual_ns")"
+  actual_pvc="$(trim_whitespace "$actual_pvc")"
+  expected_uid="$(trim_whitespace "$expected_uid")"
+  actual_uid="$(trim_whitespace "$actual_uid")"
+  [[ "$actual_ns" == "$expected_ns" && "$actual_pvc" == "$expected_pvc" ]] || return 1
+  [[ -n "$expected_uid" && -n "$actual_uid" && "$actual_uid" == "$expected_uid" ]]
+}
+
+local_path_pv_is_provisioned_by_local_path() {
+  local pv="$1"
+  local storage_class provisioner pv_provisioner
+
+  storage_class="$(kubectl get pv "$pv" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+  storage_class="$(trim_whitespace "$storage_class")"
+  provisioner="$(storage_class_provisioner "$storage_class")"
+  pv_provisioner="$(kubectl get pv "$pv" -o jsonpath='{.metadata.annotations.pv\.kubernetes\.io/provisioned-by}' 2>/dev/null || true)"
+  pv_provisioner="$(trim_whitespace "$pv_provisioner")"
+
+  [[ "$provisioner" == "rancher.io/local-path" || "$provisioner" == *"local-path"* ]] || return 1
+  [[ "$pv_provisioner" == "rancher.io/local-path" || "$pv_provisioner" == *"local-path"* ]]
 }
 
 resolve_node_name_for_hostname_value() {
@@ -6401,33 +6432,139 @@ collect_local_path_nodes_for_pv() {
     return 0
   fi
 
-  while IFS= read -r node; do
-    node="$(trim_whitespace "$node")"
-    [[ -z "$node" ]] && continue
-    append_unique_item "$node" nodes_ref
-  done < <(list_node_names)
+  echo "Error: refusing local-path host cleanup for PV ${pv}: its node affinity could not be resolved." >&2
+  return 1
 }
 
 append_local_path_exact_cleanup_rows_for_pv() {
   local pv="$1"
   local pvc_ref="$2"
   local -n rows_ref="$3"
-  local path rel node
+  local path node pv_uid pvc_uid pvc_ns pvc_name
   local -a nodes=()
 
   is_true "$KUBETON_LOCAL_PATH_CLEANUP" || return 0
   [[ -n "$pv" ]] || return 0
 
-  path="$(local_path_pv_host_path "$pv")"
-  rel="$(local_path_relative_target "$path" 2>/dev/null || true)"
-  [[ -n "$rel" ]] || return 0
+  if ! path="$(local_path_pv_host_path "$pv")"; then
+    echo "Error: refusing local-path cleanup for PV ${pv}: its host path could not be inspected." >&2
+    return 1
+  fi
+  # Non-hostPath PVs (for example Longhorn CSI) are handled by their own
+  # deletion path and never become host cleanup targets.
+  [[ -n "$path" ]] || return 0
 
-  collect_local_path_nodes_for_pv "$pv" nodes
+  if ! local_path_pv_matches_claim "$pv" "$pvc_ref"; then
+    echo "Error: refusing local-path cleanup for PV ${pv}: its claimRef does not match ${pvc_ref}." >&2
+    return 1
+  fi
+  if ! local_path_pv_is_provisioned_by_local_path "$pv"; then
+    echo "Error: refusing host cleanup for PV ${pv}: it has hostPath data but is not a verified local-path PV." >&2
+    return 1
+  fi
+
+  path="$(local_path_absolute_target "$path" 2>/dev/null || true)"
+  if [[ -z "$path" ]]; then
+    echo "Error: refusing unsafe local-path cleanup target reported by PV ${pv}." >&2
+    return 1
+  fi
+
+  if ! collect_local_path_nodes_for_pv "$pv" nodes; then
+    return 1
+  fi
+  if [[ ${#nodes[@]} -ne 1 ]]; then
+    echo "Error: refusing local-path host cleanup for PV ${pv}: exactly one owning node is required." >&2
+    return 1
+  fi
+  IFS=/ read -r pvc_ns pvc_name <<<"$pvc_ref"
+  pv_uid="$(kubectl get pv "$pv" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  pvc_uid="$(kubectl -n "$pvc_ns" get pvc "$pvc_name" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  pv_uid="$(trim_whitespace "$pv_uid")"
+  pvc_uid="$(trim_whitespace "$pvc_uid")"
+  if [[ -z "$pv_uid" || -z "$pvc_uid" ]]; then
+    echo "Error: refusing local-path cleanup for PV ${pv}: missing PV or PVC identity." >&2
+    return 1
+  fi
   for node in "${nodes[@]}"; do
     node="$(trim_whitespace "$node")"
     [[ -z "$node" ]] && continue
-    append_unique_item "$node"$'\t'"$path"$'\t'"$pv"$'\t'"$pvc_ref" rows_ref
+    append_unique_item "$node"$'\t'"$path"$'\t'"$pv"$'\t'"$pvc_ref"$'\t'"$pv_uid"$'\t'"$pvc_uid" rows_ref
   done
+}
+
+# Record every bound PV, not only a local-path PV.  Kubernetes objects can be
+# removed between uninstall attempts, so the UID-bound record is what lets a
+# retry safely finish an encrypted/CSI volume without guessing from a PVC
+# name.  Local-path PVs additionally get an exact host-path target above.
+append_pv_cleanup_ledger_row_for_pv() {
+  local pv="$1"
+  local pvc_ref="$2"
+  local -n rows_ref="$3"
+  local pvc_ns pvc_name pv_identity pv_uid claim_ns claim_name claim_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_ns longhorn_uid
+
+  [[ -n "$pv" && -n "$pvc_ref" ]] || return 1
+  IFS=/ read -r pvc_ns pvc_name <<<"$pvc_ref"
+  [[ -n "$pvc_ns" && -n "$pvc_name" ]] || return 1
+
+  if ! pv_identity="$(kubectl get pv "$pv" --ignore-not-found \
+    -o jsonpath='{.metadata.uid}{"\t"}{.spec.claimRef.namespace}{"\t"}{.spec.claimRef.name}{"\t"}{.spec.claimRef.uid}{"\t"}{.spec.persistentVolumeReclaimPolicy}{"\t"}{.spec.csi.driver}{"\t"}{.spec.csi.volumeHandle}' 2>/dev/null)"; then
+    echo "Error: could not inspect PV ${pv} before recording cleanup state." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r pv_uid claim_ns claim_name claim_uid reclaim_policy csi_driver volume_handle <<<"$pv_identity"
+  pv_uid="$(trim_whitespace "$pv_uid")"
+  claim_ns="$(trim_whitespace "$claim_ns")"
+  claim_name="$(trim_whitespace "$claim_name")"
+  claim_uid="$(trim_whitespace "$claim_uid")"
+  reclaim_policy="$(trim_whitespace "$reclaim_policy")"
+  csi_driver="$(trim_whitespace "$csi_driver")"
+  volume_handle="$(trim_whitespace "$volume_handle")"
+  if [[ -z "$pv_uid" || -z "$reclaim_policy" ]]; then
+    echo "Error: bound PV ${pv} disappeared before cleanup state could be recorded." >&2
+    return 1
+  fi
+  if ! pvc_uid="$(kubectl -n "$pvc_ns" get pvc "$pvc_name" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not inspect PVC ${pvc_ref} before recording cleanup state." >&2
+    return 1
+  fi
+  pvc_uid="$(trim_whitespace "$pvc_uid")"
+  if [[ -z "$pvc_uid" || "$claim_ns" != "$pvc_ns" || "$claim_name" != "$pvc_name" || "$claim_uid" != "$pvc_uid" ]]; then
+    echo "Error: refusing to record PV ${pv}: its claimRef does not match PVC ${pvc_ref}." >&2
+    return 1
+  fi
+
+  longhorn_uid=""
+  # A Longhorn CSI volume is identified by its CSI volumeHandle, not by the
+  # Kubernetes PV name.  Store that immutable mapping and the Volume UID so a
+  # later retry cannot delete a different Longhorn volume that reused a name.
+  if [[ "$csi_driver" == "driver.longhorn.io" ]]; then
+    if [[ -z "$volume_handle" ]]; then
+      echo "Error: refusing to record Longhorn PV ${pv} without a CSI volume handle." >&2
+      return 1
+    fi
+    if ! longhorn_ns="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not inspect Longhorn namespace ${LONGHORN_NAMESPACE} before recording PV ${pv}." >&2
+      return 1
+    fi
+    longhorn_ns="$(trim_whitespace "$longhorn_ns")"
+    if [[ -n "$longhorn_ns" ]]; then
+      if ! longhorn_uid="$(kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$volume_handle" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+        echo "Error: could not inspect Longhorn volume ${volume_handle} before recording cleanup state." >&2
+        return 1
+      fi
+      longhorn_uid="$(trim_whitespace "$longhorn_uid")"
+    fi
+  fi
+
+  if [[ "$pv$pvc_ref$pv_uid$pvc_uid$reclaim_policy$csi_driver$volume_handle$longhorn_uid" == *$'\t'* || "$pv$pvc_ref$pv_uid$pvc_uid$reclaim_policy$csi_driver$volume_handle$longhorn_uid" == *$'\n'* ]]; then
+    echo "Error: refusing to record an unsafe PV cleanup ledger field for ${pv}." >&2
+    return 1
+  fi
+  append_unique_item "$pv"$'\t'"$pvc_ref"$'\t'"$pv_uid"$'\t'"$pvc_uid"$'\t'"$reclaim_policy"$'\t'"$csi_driver"$'\t'"$volume_handle"$'\t'"$longhorn_uid" rows_ref
+}
+
+local_path_pattern_cleanup_enabled() {
+  is_true "$KUBETON_LOCAL_PATH_PATTERN_CLEANUP"
 }
 
 collect_local_path_pattern_cleanup_rows_for_pvcs() {
@@ -6437,7 +6574,7 @@ collect_local_path_pattern_cleanup_rows_for_pvcs() {
   local -a nodes=()
 
   is_true "$KUBETON_LOCAL_PATH_CLEANUP" || return 0
-  is_true "$KUBETON_LOCAL_PATH_PATTERN_CLEANUP" || return 0
+  local_path_pattern_cleanup_enabled || return 0
   mapfile -t nodes < <(list_node_names)
   [[ ${#nodes[@]} -gt 0 ]] || return 0
 
@@ -6464,13 +6601,13 @@ build_local_path_cleanup_script() {
   local pattern_rows_name="$4"
   local -n exact_rows_ref="$exact_rows_name"
   local -n pattern_rows_ref="$pattern_rows_name"
-  local row row_node path pv pvc_ref ns pvc rel pattern
+  local row row_node path pv pvc_ref ns pvc pattern
   local emitted=0
 
   {
     printf 'set -eu\n'
+    printf 'host_root=/host\n'
     printf 'root=%s\n' "$(shell_quote "/host${root}")"
-    printf 'if [ ! -d "$root" ]; then exit 0; fi\n'
     printf 'remaining=0\n'
     printf 'rm_errors="/tmp/kubeton-local-path-rm.err"\n'
     printf 'remove_path_if_present() {\n'
@@ -6490,6 +6627,11 @@ build_local_path_cleanup_script() {
     printf 'remove_pattern_matches() {\n'
     printf '  pattern="$1"\n'
     printf '  label="$2"\n'
+    printf '  if [ ! -d "$root" ]; then\n'
+    printf '    echo "Error: local-path provisioner root is unavailable: ${root}" >&2\n'
+    printf '    remaining=1\n'
+    printf '    return 0\n'
+    printf '  fi\n'
     printf '  : > "$rm_errors"\n'
     printf '  find "$root" -mindepth 1 -maxdepth 1 -type d -name "$pattern" -exec rm -rf -- {} + 2>"$rm_errors" || true\n'
     printf '  if [ -n "$(find "$root" -mindepth 1 -maxdepth 1 -type d -name "$pattern" -print -quit)" ]; then\n'
@@ -6504,10 +6646,10 @@ build_local_path_cleanup_script() {
       [[ -z "$row" ]] && continue
       IFS=$'\t' read -r row_node path pv pvc_ref <<<"$row"
       [[ "$row_node" == "$node" ]] || continue
-      rel="$(local_path_relative_target "$path" 2>/dev/null || true)"
-      [[ -n "$rel" ]] || continue
-      printf 'target="$root"/%s\n' "$(shell_quote "$rel")"
-      printf 'remove_path_if_present "$target" "${target#$root/}"\n'
+      path="$(local_path_absolute_target "$path" 2>/dev/null || true)"
+      [[ -n "$path" ]] || continue
+      printf 'target="$host_root"%s\n' "$(shell_quote "$path")"
+      printf 'remove_path_if_present "$target" "${target#$host_root/}"\n'
       emitted=1
     done
 
@@ -6574,8 +6716,12 @@ run_local_path_cleanup_pod_for_node() {
     timeout_seconds=180
   fi
 
-  echo "[${label}] Purging local-path data on node ${node} under ${root} ..."
-  cat <<EOF | kubectl -n "$cleanup_ns" apply -f - >/dev/null
+  if [[ -n "$root" ]]; then
+    echo "[${label}] Purging local-path data on node ${node} under ${root} ..."
+  else
+    echo "[${label}] Purging exact local-path PV data on node ${node} ..."
+  fi
+  if ! cat <<EOF | kubectl -n "$cleanup_ns" apply -f - >/dev/null; then
 apiVersion: v1
 kind: Pod
 metadata:
@@ -6611,6 +6757,10 @@ $(printf '%s\n' "$script" | sed 's/^/          /')
         path: /
         type: Directory
 EOF
+    echo "Warning: could not create local-path cleanup pod ${cleanup_ns}/${pod}." >&2
+    kubectl -n "$cleanup_ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    return 1
+  fi
 
   if ! wait_local_path_cleanup_pod_done "$cleanup_ns" "$pod" "$timeout_seconds"; then
     rc=1
@@ -6619,14 +6769,34 @@ EOF
   return "$rc"
 }
 
+run_local_path_cleanup_pod_for_node_with_fallback() {
+  local namespaces_name="$1"
+  local node="$2"
+  local root="$3"
+  local label="$4"
+  local exact_rows_name="$5"
+  local pattern_rows_name="$6"
+  local -n namespaces_ref="$namespaces_name"
+  local cleanup_ns
+
+  for cleanup_ns in "${namespaces_ref[@]}"; do
+    if run_local_path_cleanup_pod_for_node "$cleanup_ns" "$node" "$root" "$label" "$exact_rows_name" "$pattern_rows_name"; then
+      return 0
+    fi
+    echo "Warning: local-path ${label} cleanup could not run in namespace ${cleanup_ns}; trying another eligible namespace." >&2
+  done
+  return 1
+}
+
 cleanup_local_path_provisioner_data() {
   local exact_rows_name="$1"
   local pattern_rows_name="$2"
   local label="${3:-cleanup}"
   local -n exact_rows_ref="$exact_rows_name"
   local -n pattern_rows_ref="$pattern_rows_name"
-  local root cleanup_ns row node rc=0
+  local root row node rc=0
   local -a nodes=()
+  local -a cleanup_namespaces=()
   local -a cleanup_pids=()
   local -a cleanup_nodes=()
   local i
@@ -6636,8 +6806,18 @@ cleanup_local_path_provisioner_data() {
     return 0
   fi
 
-  root="$(local_path_provisioner_root)" || return 1
-  cleanup_ns="$(local_path_cleanup_namespace)" || return 1
+  # Exact PV targets come from the bound PV itself and may live under a custom
+  # local-path root.  The configured root is needed only for optional wildcard
+  # orphan cleanup.
+  root=""
+  if [[ ${#pattern_rows_ref[@]} -gt 0 ]]; then
+    root="$(local_path_provisioner_root)" || return 1
+  fi
+  mapfile -t cleanup_namespaces < <(local_path_cleanup_namespaces)
+  if [[ ${#cleanup_namespaces[@]} -eq 0 ]]; then
+    echo "Error: no usable namespace found for local-path cleanup pod." >&2
+    return 1
+  fi
 
   for row in "${exact_rows_ref[@]}"; do
     [[ -z "$row" ]] && continue
@@ -6656,7 +6836,7 @@ cleanup_local_path_provisioner_data() {
 
   for node in "${nodes[@]}"; do
     [[ -z "$node" ]] && continue
-    run_local_path_cleanup_pod_for_node "$cleanup_ns" "$node" "$root" "$label" "$exact_rows_name" "$pattern_rows_name" &
+    run_local_path_cleanup_pod_for_node_with_fallback cleanup_namespaces "$node" "$root" "$label" "$exact_rows_name" "$pattern_rows_name" &
     cleanup_pids+=("$!")
     cleanup_nodes+=("$node")
   done
@@ -6670,21 +6850,1032 @@ cleanup_local_path_provisioner_data() {
   return "$rc"
 }
 
+# PVC/PV objects can disappear before a host cleanup pod gets a chance to run.
+# Persist the exact, verified host paths first, so a later `kubeton uninstall`
+# can finish the cleanup without guessing from a broad directory pattern.
+local_path_cleanup_ledger_id() {
+  local raw base primary_hash secondary_hash
+
+  raw="${RELEASE_NAME}-${TON_NAMESPACE}"
+  base="$(sanitize_k8s_name_fragment "$raw")"
+  # cksum is part of POSIX userlands, unlike sha256sum. Use two independent
+  # deterministic inputs so every host computes the same, collision-resistant
+  # ledger identity without a runtime tool dependency.
+  primary_hash="$(printf '%s' "$raw" | cksum | awk '{print $1}')"
+  secondary_hash="$(printf '%s:%s' "$raw" "${#raw}" | cksum | awk '{print $1}')"
+  printf '%s-%s-%s' "${base:0:8}" "$primary_hash" "$secondary_hash"
+}
+
+local_path_cleanup_ledger_name() {
+  local name
+  name="$(trim_whitespace "${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME:-}")"
+  if [[ -n "$name" ]]; then
+    if ! [[ "$name" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+      echo "Error: invalid KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME='${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME}'." >&2
+      return 1
+    fi
+    if (( ${#name} > 63 )); then
+      echo "Error: KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME must be at most 63 characters." >&2
+      return 1
+    fi
+    printf '%s' "$name"
+    return 0
+  fi
+  printf 'kubeton-local-path-cleanup-%s' "$(local_path_cleanup_ledger_id)"
+}
+
+local_path_cleanup_ledger_namespace() {
+  local configured ns phase
+
+  configured="$(trim_whitespace "${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE:-}")"
+  if [[ -n "$configured" ]]; then
+    case "$configured" in
+      "$OP_NAMESPACE"|"$VAULT_NAMESPACE"|"$LONGHORN_NAMESPACE")
+        echo "Error: KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE=${configured} is deleted by kubeton uninstall and cannot retain cleanup state." >&2
+        return 1
+        ;;
+    esac
+    if ! kubectl get namespace "$configured" >/dev/null 2>&1; then
+      echo "Error: cleanup-ledger namespace ${configured} does not exist." >&2
+      return 1
+    fi
+    phase="$(kubectl get namespace "$configured" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [[ "$phase" == "Terminating" ]]; then
+      echo "Error: cleanup-ledger namespace ${configured} is terminating." >&2
+      return 1
+    fi
+    printf '%s' "$configured"
+    return 0
+  fi
+
+  # This ConfigMap is an authorization boundary for a privileged host cleanup
+  # pod. Keep it in kube-system by default rather than an application
+  # namespace where a workload may be able to write arbitrary ConfigMaps.
+  for ns in kube-system; do
+    case "$ns" in
+      "$OP_NAMESPACE"|"$VAULT_NAMESPACE"|"$LONGHORN_NAMESPACE") continue ;;
+    esac
+    kubectl get namespace "$ns" >/dev/null 2>&1 || continue
+    phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [[ "$phase" == "Terminating" ]] && continue
+    printf '%s' "$ns"
+    return 0
+  done
+
+  echo "Error: no durable protected namespace is available for the local-path cleanup ledger. Set KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE to an existing admin-only namespace that kubeton uninstall does not delete." >&2
+  return 1
+}
+
+list_local_path_cleanup_ledger_locations() {
+  local ns name found purpose ledger_id found_ledger_id
+
+  ns="$(local_path_cleanup_ledger_namespace)" || return 1
+  name="$(local_path_cleanup_ledger_name)" || return 1
+  if ! found="$(kubectl -n "$ns" get configmap "$name" --ignore-not-found -o jsonpath='{.metadata.name}' 2>/dev/null)"; then
+    echo "Error: could not inspect local-path cleanup ledger ${ns}/${name}." >&2
+    return 1
+  fi
+  found="$(trim_whitespace "$found")"
+  [[ -n "$found" ]] || return 0
+  purpose="$(kubectl -n "$ns" get configmap "$name" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)"
+  found_ledger_id="$(kubectl -n "$ns" get configmap "$name" -o jsonpath='{.metadata.labels.ton\.ton\.org/kubeton-storage-cleanup}' 2>/dev/null || true)"
+  ledger_id="$(local_path_cleanup_ledger_id)"
+  if [[ "$purpose" != "kubeton-local-path-cleanup-ledger" || "$found_ledger_id" != "$ledger_id" ]]; then
+    echo "Error: refusing to use ConfigMap ${ns}/${name} as a local-path cleanup ledger because its ownership labels do not match." >&2
+    return 1
+  fi
+  printf '%s\t%s\n' "$ns" "$name"
+}
+
+collect_local_path_cleanup_ledger_rows() {
+  local -n rows_ref="$1"
+  local ns name contents row node path pv pvc_ref pv_uid pvc_uid extra locations
+
+  locations="$(list_local_path_cleanup_ledger_locations)" || return 1
+  [[ -n "$locations" ]] || return 0
+  while IFS=$'\t' read -r ns name; do
+    ns="$(trim_whitespace "$ns")"
+    name="$(trim_whitespace "$name")"
+    [[ -n "$ns" && -n "$name" ]] || continue
+    if ! contents="$(kubectl -n "$ns" get configmap "$name" -o jsonpath='{.data.targets}' 2>/dev/null)"; then
+      echo "Error: could not read local-path cleanup ledger ${ns}/${name}." >&2
+      return 1
+    fi
+    while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      IFS=$'\t' read -r node path pv pvc_ref pv_uid pvc_uid extra <<<"$row"
+      node="$(trim_whitespace "$node")"
+      path="$(local_path_absolute_target "$path" 2>/dev/null || true)"
+      pv="$(trim_whitespace "$pv")"
+      pvc_ref="$(trim_whitespace "$pvc_ref")"
+      pv_uid="$(trim_whitespace "$pv_uid")"
+      pvc_uid="$(trim_whitespace "$pvc_uid")"
+      if [[ -n "$extra" || -z "$node" || -z "$path" || -z "$pv" || -z "$pvc_ref" || -z "$pv_uid" || -z "$pvc_uid" ]]; then
+        echo "Error: local-path cleanup ledger ${ns}/${name} contains an invalid target record." >&2
+        return 1
+      fi
+      append_unique_item "$node"$'\t'"$path"$'\t'"$pv"$'\t'"$pvc_ref"$'\t'"$pv_uid"$'\t'"$pvc_uid" rows_ref
+    done <<<"$contents"
+  done <<<"$locations"
+}
+
+# `pv-targets` tracks every backed PVC, including CSI volumes with no host
+# path. It is deliberately a separate ConfigMap key so existing targets-only
+# ledgers remain readable across upgrades.
+collect_pv_cleanup_ledger_rows() {
+  local -n rows_ref="$1"
+  local ns name contents row pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid extra locations
+
+  locations="$(list_local_path_cleanup_ledger_locations)" || return 1
+  [[ -n "$locations" ]] || return 0
+  while IFS=$'\t' read -r ns name; do
+    ns="$(trim_whitespace "$ns")"
+    name="$(trim_whitespace "$name")"
+    [[ -n "$ns" && -n "$name" ]] || continue
+    if ! contents="$(kubectl -n "$ns" get configmap "$name" -o jsonpath='{.data.pv-targets}' 2>/dev/null)"; then
+      echo "Error: could not read PV cleanup targets from ledger ${ns}/${name}." >&2
+      return 1
+    fi
+    while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      IFS=$'\t' read -r pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid extra <<<"$row"
+      pv="$(trim_whitespace "$pv")"
+      pvc_ref="$(trim_whitespace "$pvc_ref")"
+      pv_uid="$(trim_whitespace "$pv_uid")"
+      pvc_uid="$(trim_whitespace "$pvc_uid")"
+      reclaim_policy="$(trim_whitespace "$reclaim_policy")"
+      csi_driver="$(trim_whitespace "$csi_driver")"
+      volume_handle="$(trim_whitespace "$volume_handle")"
+      longhorn_uid="$(trim_whitespace "$longhorn_uid")"
+      if [[ -n "$extra" || -z "$pv" || -z "$pvc_ref" || -z "$pv_uid" || -z "$pvc_uid" || -z "$reclaim_policy" ]]; then
+        echo "Error: local-path cleanup ledger ${ns}/${name} contains an invalid PV target record." >&2
+        return 1
+      fi
+      if [[ "$csi_driver" == "driver.longhorn.io" && -z "$volume_handle" ]]; then
+        echo "Error: local-path cleanup ledger ${ns}/${name} has a Longhorn PV target without a volume handle." >&2
+        return 1
+      fi
+      append_unique_item "$pv"$'\t'"$pvc_ref"$'\t'"$pv_uid"$'\t'"$pvc_uid"$'\t'"$reclaim_policy"$'\t'"$csi_driver"$'\t'"$volume_handle"$'\t'"$longhorn_uid" rows_ref
+    done <<<"$contents"
+  done <<<"$locations"
+}
+
+storage_cleanup_ledger_has_pending_longhorn_targets() {
+  local -a pv_rows=()
+  local row pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid
+
+  collect_pv_cleanup_ledger_rows pv_rows || return 2
+  for row in "${pv_rows[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid <<<"$row"
+    [[ "$csi_driver" == "driver.longhorn.io" ]] && return 0
+  done
+  return 1
+}
+
+record_local_path_cleanup_ledger() {
+  local exact_rows_name="$1"
+  local pv_rows_name="${2:-}"
+  local -n exact_rows_ref="$exact_rows_name"
+  local -a ledger_rows=()
+  local -a pv_ledger_rows=()
+  local row ledger_ns ledger_name targets_file pv_targets_file ledger_id existing_name existing_purpose existing_id
+
+  collect_local_path_cleanup_ledger_rows ledger_rows || return 1
+  collect_pv_cleanup_ledger_rows pv_ledger_rows || return 1
+  for row in "${exact_rows_ref[@]}"; do
+    [[ -n "$row" ]] && append_unique_item "$row" ledger_rows
+  done
+  if [[ -n "$pv_rows_name" ]]; then
+    local -n requested_pv_rows_ref="$pv_rows_name"
+    for row in "${requested_pv_rows_ref[@]}"; do
+      [[ -n "$row" ]] && append_unique_item "$row" pv_ledger_rows
+    done
+  fi
+  [[ ${#ledger_rows[@]} -gt 0 || ${#pv_ledger_rows[@]} -gt 0 ]] || return 0
+
+  ledger_ns="$(local_path_cleanup_ledger_namespace)" || return 1
+  ledger_name="$(local_path_cleanup_ledger_name)" || return 1
+  ledger_id="$(local_path_cleanup_ledger_id)"
+
+  targets_file="$(mktemp "${TMPDIR:-/tmp}/kubeton-local-path-ledger-targets.XXXXXX")" || return 1
+  pv_targets_file="$(mktemp "${TMPDIR:-/tmp}/kubeton-local-path-ledger-pvs.XXXXXX")" || {
+    rm -f "$targets_file"
+    return 1
+  }
+  printf '%s\n' "${ledger_rows[@]}" >"$targets_file"
+  printf '%s\n' "${pv_ledger_rows[@]}" >"$pv_targets_file"
+  if ! existing_name="$(kubectl -n "$ledger_ns" get configmap "$ledger_name" --ignore-not-found -o jsonpath='{.metadata.name}' 2>/dev/null)"; then
+    rm -f "$targets_file" "$pv_targets_file"
+    echo "Error: could not inspect local-path cleanup ledger ${ledger_ns}/${ledger_name}; leaving PVCs intact." >&2
+    return 1
+  fi
+  existing_name="$(trim_whitespace "$existing_name")"
+  if [[ -n "$existing_name" ]]; then
+    existing_purpose="$(kubectl -n "$ledger_ns" get configmap "$ledger_name" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)"
+    existing_id="$(kubectl -n "$ledger_ns" get configmap "$ledger_name" -o jsonpath='{.metadata.labels.ton\.ton\.org/kubeton-storage-cleanup}' 2>/dev/null || true)"
+    if [[ "$existing_purpose" != "kubeton-local-path-cleanup-ledger" || "$existing_id" != "$ledger_id" ]]; then
+      rm -f "$targets_file" "$pv_targets_file"
+      echo "Error: refusing to overwrite non-kubeton ConfigMap ${ledger_ns}/${ledger_name} with cleanup state." >&2
+      return 1
+    fi
+  elif kubectl -n "$ledger_ns" create configmap "$ledger_name" --from-file=targets="$targets_file" --from-file=pv-targets="$pv_targets_file" --dry-run=client -o yaml \
+    | kubectl label --local -f - \
+      app.kubernetes.io/name=kubeton-local-path-cleanup-ledger \
+      "ton.ton.org/kubeton-storage-cleanup=${ledger_id}" --overwrite -o yaml \
+    | kubectl -n "$ledger_ns" create -f - >/dev/null; then
+    rm -f "$targets_file" "$pv_targets_file"
+    return 0
+  else
+    rm -f "$targets_file" "$pv_targets_file"
+    echo "Error: could not create local-path cleanup ledger ${ledger_ns}/${ledger_name}; leaving PVCs intact." >&2
+    return 1
+  fi
+
+  if ! kubectl -n "$ledger_ns" create configmap "$ledger_name" --from-file=targets="$targets_file" --from-file=pv-targets="$pv_targets_file" --dry-run=client -o yaml \
+    | kubectl label --local -f - \
+      app.kubernetes.io/name=kubeton-local-path-cleanup-ledger \
+      "ton.ton.org/kubeton-storage-cleanup=${ledger_id}" --overwrite -o yaml \
+    | kubectl apply -f - >/dev/null; then
+    rm -f "$targets_file" "$pv_targets_file"
+    echo "Error: could not persist local-path cleanup ledger ${ledger_ns}/${ledger_name}; leaving PVCs intact." >&2
+    return 1
+  fi
+  rm -f "$targets_file" "$pv_targets_file"
+}
+
+# Make sure a recorded directory is not referenced by any other current
+# hostPath/local PV before the privileged cleanup pod removes it.  This is
+# needed whether the recorded PV is already gone or is still present: a static
+# or rebound PV can share the same directory in either case.
+local_path_target_is_exclusive_to_recorded_pv() {
+  local expected_path="$1"
+  local expected_pv="$2"
+  local expected_pv_uid="$3"
+  local pv_names candidate_pv candidate_uid candidate_path
+
+  if ! pv_names="$(kubectl get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: could not check whether local-path target ${expected_path} was rebound to another PV." >&2
+    return 1
+  fi
+  while IFS= read -r candidate_pv; do
+    candidate_pv="$(trim_whitespace "$candidate_pv")"
+    [[ -n "$candidate_pv" ]] || continue
+    if ! candidate_uid="$(kubectl get pv "$candidate_pv" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not inspect PV ${candidate_pv} while checking local-path target ${expected_path}." >&2
+      return 1
+    fi
+    candidate_uid="$(trim_whitespace "$candidate_uid")"
+    [[ -n "$candidate_uid" ]] || continue
+    if ! candidate_path="$(local_path_pv_host_path "$candidate_pv")"; then
+      return 1
+    fi
+    candidate_path="$(local_path_absolute_target "$candidate_path" 2>/dev/null || true)"
+    [[ "$candidate_path" == "$expected_path" ]] || continue
+    if [[ "$candidate_pv" == "$expected_pv" && "$candidate_uid" == "$expected_pv_uid" ]]; then
+      continue
+    fi
+    echo "Error: refusing to remove local-path target ${expected_path}: it is currently referenced by PV ${candidate_pv} (UID ${candidate_uid})." >&2
+    return 1
+  done <<<"$pv_names"
+  return 0
+}
+
+local_path_recorded_pv_can_be_deleted() {
+  local pv="$1"
+  local expected_path="$2"
+  local pvc_ref="$3"
+  local expected_pv_uid="$4"
+  local expected_pvc_uid="$5"
+  local expected_node="$6"
+  local actual_path actual_identity actual_pv_uid actual_reclaim_policy expected_ns expected_pvc actual_ns actual_pvc actual_pvc_uid live_pvc_uid namespace_marker claim_ref node
+  local -a pv_nodes=()
+
+  if ! actual_identity="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.metadata.uid}{"\t"}{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)"; then
+    echo "Error: could not verify recorded PV ${pv} before local-path cleanup." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r actual_pv_uid actual_reclaim_policy <<<"$actual_identity"
+  actual_pv_uid="$(trim_whitespace "$actual_pv_uid")"
+  actual_reclaim_policy="$(trim_whitespace "$actual_reclaim_policy")"
+  if [[ -z "$actual_pv_uid" ]]; then
+    local_path_target_is_exclusive_to_recorded_pv "$expected_path" "$pv" "$expected_pv_uid"
+    return $?
+  fi
+  if [[ -z "$actual_pv_uid" || "$actual_pv_uid" != "$expected_pv_uid" ]]; then
+    echo "Error: refusing to delete PV ${pv}: its UID no longer matches the cleanup ledger." >&2
+    return 1
+  fi
+  if [[ "$actual_reclaim_policy" != "Delete" ]]; then
+    echo "Error: refusing local-path cleanup for PV ${pv}: reclaimPolicy is ${actual_reclaim_policy:-unknown}, not Delete." >&2
+    return 1
+  fi
+  if ! actual_path="$(local_path_pv_host_path "$pv")"; then
+    return 1
+  fi
+  actual_path="$(local_path_absolute_target "$actual_path" 2>/dev/null || true)"
+  if [[ -z "$actual_path" || "$actual_path" != "$expected_path" ]]; then
+    echo "Error: refusing to delete PV ${pv}: its host path no longer matches the cleanup ledger." >&2
+    return 1
+  fi
+  if ! local_path_pv_is_provisioned_by_local_path "$pv"; then
+    echo "Error: refusing to delete PV ${pv}: it is no longer a verified local-path PV." >&2
+    return 1
+  fi
+  if ! collect_local_path_nodes_for_pv "$pv" pv_nodes || [[ ${#pv_nodes[@]} -ne 1 ]]; then
+    echo "Error: refusing to delete PV ${pv}: its local-path node affinity is no longer uniquely resolvable." >&2
+    return 1
+  fi
+  node="${pv_nodes[0]}"
+  if [[ "$node" != "$expected_node" ]]; then
+    echo "Error: refusing to delete PV ${pv}: its local-path node no longer matches the cleanup ledger." >&2
+    return 1
+  fi
+
+  IFS=/ read -r expected_ns expected_pvc <<<"$pvc_ref"
+  if ! claim_ref="$(kubectl get pv "$pv" -o jsonpath='{.spec.claimRef.namespace}{"\t"}{.spec.claimRef.name}{"\t"}{.spec.claimRef.uid}' 2>/dev/null)"; then
+    echo "Error: could not verify claimRef for recorded PV ${pv}." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r actual_ns actual_pvc actual_pvc_uid <<<"$claim_ref"
+  actual_ns="$(trim_whitespace "$actual_ns")"
+  actual_pvc="$(trim_whitespace "$actual_pvc")"
+  actual_pvc_uid="$(trim_whitespace "$actual_pvc_uid")"
+  if [[ -n "$actual_ns" || -n "$actual_pvc" || -n "$actual_pvc_uid" ]]; then
+    if [[ "$actual_ns" != "$expected_ns" || "$actual_pvc" != "$expected_pvc" || "$actual_pvc_uid" != "$expected_pvc_uid" ]]; then
+      echo "Error: refusing to delete PV ${pv}: its claimRef no longer matches the cleanup ledger." >&2
+      return 1
+    fi
+  fi
+  if ! namespace_marker="$(kubectl get namespace "$expected_ns" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not verify namespace ${expected_ns} before local-path cleanup." >&2
+    return 1
+  fi
+  namespace_marker="$(trim_whitespace "$namespace_marker")"
+  if [[ -n "$namespace_marker" ]]; then
+    if ! live_pvc_uid="$(kubectl -n "$expected_ns" get pvc "$expected_pvc" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not verify PVC ${expected_ns}/${expected_pvc} before local-path cleanup." >&2
+      return 1
+    fi
+    live_pvc_uid="$(trim_whitespace "$live_pvc_uid")"
+  else
+    live_pvc_uid=""
+  fi
+  if [[ -n "$live_pvc_uid" ]]; then
+    echo "Error: refusing to delete PV ${pv}: PVC ${expected_ns}/${expected_pvc} exists again." >&2
+    return 1
+  fi
+  if ! local_path_target_is_exclusive_to_recorded_pv "$expected_path" "$pv" "$expected_pv_uid"; then
+    return 1
+  fi
+  return 0
+}
+
+pvc_has_pod_references() {
+  local ns="$1"
+  local pvc="$2"
+  local pod claims claim rows namespace_name namespace_phase
+  local -a referenced_pods=()
+  local -a claim_rows=()
+
+  if ! namespace_name="$(kubectl get namespace "$ns" --ignore-not-found -o jsonpath='{.metadata.name}' 2>/dev/null)"; then
+    echo "Error: could not verify namespace ${ns} before local-path cleanup." >&2
+    return 0
+  fi
+  namespace_name="$(trim_whitespace "$namespace_name")"
+  # A deleted namespace cannot contain a pod still mounting the old PVC.
+  [[ -n "$namespace_name" ]] || return 1
+  namespace_phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [[ "$namespace_phase" == "Terminating" ]]; then
+    echo "Error: namespace ${ns} is terminating; cannot verify pod references for PVC ${ns}/${pvc}." >&2
+    return 0
+  fi
+  if ! rows="$(kubectl -n "$ns" get pods \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{","}{end}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: could not verify pod references for PVC ${ns}/${pvc}." >&2
+    return 0
+  fi
+  while IFS=$'\t' read -r pod claims; do
+    pod="$(trim_whitespace "$pod")"
+    [[ -n "$pod" ]] || continue
+    IFS=',' read -r -a claim_rows <<<"$claims"
+    for claim in "${claim_rows[@]}"; do
+      claim="$(trim_whitespace "$claim")"
+      [[ "$claim" == "$pvc" ]] && append_unique_item "$pod" referenced_pods
+    done
+  done <<<"$rows"
+
+  if [[ ${#referenced_pods[@]} -eq 0 ]]; then
+    return 1
+  fi
+  echo "Error: refusing destructive PVC/host cleanup while pod(s) still reference ${ns}/${pvc}: ${referenced_pods[*]}" >&2
+  return 0
+}
+
+verify_no_pod_references_for_pvc() {
+  local ns="$1"
+  local pvc="$2"
+
+  if pvc_has_pod_references "$ns" "$pvc"; then
+    return 1
+  fi
+  return 0
+}
+
+# Host data is destructive to remove, so a local-path target is eligible only
+# when the same PV cleanup record says reclaimPolicy=Delete. Older ledgers that
+# lack that record may proceed only while the still-live PV proves Delete.
+verify_recorded_local_path_targets_use_delete_reclaim_policy() {
+  local exact_rows_name="$1"
+  local pv_rows_name="$2"
+  local -n exact_rows_ref="$exact_rows_name"
+  local -n pv_rows_ref="$pv_rows_name"
+  local row pv_row node path pv pvc_ref pv_uid pvc_uid recorded_pv recorded_pvc_ref recorded_pv_uid recorded_pvc_uid recorded_reclaim matching_rows same_name_rows current_reclaim
+  local -A exact_identities=()
+
+  for row in "${exact_rows_ref[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r node path pv pvc_ref pv_uid pvc_uid <<<"$row"
+    pv="$(trim_whitespace "$pv")"
+    [[ -n "$pv" ]] || return 1
+    local exact_identity="${pvc_ref}|${pv_uid}|${pvc_uid}|${path}"
+    if [[ -n "${exact_identities[$pv]+present}" && "${exact_identities[$pv]}" != "$exact_identity" ]]; then
+      echo "Error: refusing local-path cleanup for reused PV name ${pv}: the cleanup ledger has multiple target identities." >&2
+      return 1
+    fi
+    exact_identities[$pv]="$exact_identity"
+  done
+
+  for row in "${exact_rows_ref[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r node path pv pvc_ref pv_uid pvc_uid <<<"$row"
+    pv="$(trim_whitespace "$pv")"
+    [[ -n "$pv" ]] || return 1
+    matching_rows=0
+    same_name_rows=0
+    recorded_reclaim=""
+    for pv_row in "${pv_rows_ref[@]}"; do
+      [[ -n "$pv_row" ]] || continue
+      IFS=$'\t' read -r recorded_pv recorded_pvc_ref recorded_pv_uid recorded_pvc_uid recorded_reclaim _ <<<"$pv_row"
+      recorded_pv="$(trim_whitespace "$recorded_pv")"
+      [[ "$recorded_pv" == "$pv" ]] || continue
+      ((same_name_rows+=1))
+      if [[ "$recorded_pvc_ref" != "$pvc_ref" || "$recorded_pv_uid" != "$pv_uid" || "$recorded_pvc_uid" != "$pvc_uid" ]]; then
+        continue
+      fi
+      ((matching_rows+=1))
+      recorded_reclaim="$(trim_whitespace "$recorded_reclaim")"
+    done
+    if (( same_name_rows > 1 )); then
+      echo "Error: refusing local-path cleanup for PV ${pv}: the cleanup ledger has multiple lifetimes for that PV name." >&2
+      return 1
+    fi
+    if (( matching_rows == 1 )); then
+      if [[ "$recorded_reclaim" != "Delete" ]]; then
+        echo "Error: refusing local-path cleanup for PV ${pv}: cleanup ledger recorded reclaimPolicy ${recorded_reclaim:-unknown}, not Delete." >&2
+        return 1
+      fi
+      continue
+    fi
+    if (( same_name_rows == 1 )); then
+      echo "Error: refusing local-path cleanup for PV ${pv}: its PV/PVC identity does not match the cleanup ledger." >&2
+      return 1
+    fi
+
+    if ! current_reclaim="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null)"; then
+      echo "Error: cannot verify reclaimPolicy for legacy local-path target PV ${pv}." >&2
+      return 1
+    fi
+    current_reclaim="$(trim_whitespace "$current_reclaim")"
+    if [[ "$current_reclaim" != "Delete" ]]; then
+      echo "Error: refusing local-path cleanup for legacy target PV ${pv}: reclaimPolicy is ${current_reclaim:-unknown}, not Delete." >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+verify_recorded_local_path_targets_safe_for_host_cleanup() {
+  local exact_rows_name="$1"
+  local -n exact_rows_ref="$exact_rows_name"
+  local row node path pv pvc_ref pv_uid pvc_uid ns pvc live_pvc_uid namespace_marker
+
+  for row in "${exact_rows_ref[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r node path pv pvc_ref pv_uid pvc_uid <<<"$row"
+    IFS=/ read -r ns pvc <<<"$pvc_ref"
+    ns="$(trim_whitespace "$ns")"
+    pvc="$(trim_whitespace "$pvc")"
+    if [[ -z "$ns" || -z "$pvc" ]]; then
+      echo "Error: cleanup ledger has an invalid PVC reference for PV ${pv}." >&2
+      return 1
+    fi
+    if ! namespace_marker="$(kubectl get namespace "$ns" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not verify namespace ${ns} before local-path cleanup." >&2
+      return 1
+    fi
+    namespace_marker="$(trim_whitespace "$namespace_marker")"
+    if [[ -n "$namespace_marker" ]]; then
+      if ! live_pvc_uid="$(kubectl -n "$ns" get pvc "$pvc" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+        echo "Error: could not verify PVC ${ns}/${pvc} before local-path cleanup." >&2
+        return 1
+      fi
+      live_pvc_uid="$(trim_whitespace "$live_pvc_uid")"
+    else
+      live_pvc_uid=""
+    fi
+    if [[ -n "$live_pvc_uid" ]]; then
+      echo "Error: refusing local-path host cleanup: PVC ${ns}/${pvc} exists again." >&2
+      return 1
+    fi
+    if ! verify_no_pod_references_for_pvc "$ns" "$pvc"; then
+      return 1
+    fi
+    if ! local_path_recorded_pv_can_be_deleted "$pv" "$path" "$pvc_ref" "$pv_uid" "$pvc_uid" "$node"; then
+      return 1
+    fi
+  done
+}
+
+delete_recorded_local_path_pvs() {
+  local exact_rows_name="$1"
+  local label="${2:-cleanup}"
+  local -n exact_rows_ref="$exact_rows_name"
+  local row node path pv pvc_ref expected_pv_uid pvc_uid actual_pv_uid final_pv_uid rc=0
+  local -a processed_pvs=()
+
+  for row in "${exact_rows_ref[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r node path pv pvc_ref expected_pv_uid pvc_uid <<<"$row"
+    pv="$(trim_whitespace "$pv")"
+    [[ -n "$pv" ]] || { rc=1; continue; }
+    if [[ " ${processed_pvs[*]} " == *" ${pv} "* ]]; then
+      continue
+    fi
+    processed_pvs+=("$pv")
+    if ! local_path_recorded_pv_can_be_deleted "$pv" "$path" "$pvc_ref" "$expected_pv_uid" "$pvc_uid" "$node"; then
+      rc=1
+      continue
+    fi
+    if ! actual_pv_uid="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not verify recorded PV ${pv} before deletion." >&2
+      rc=1
+      continue
+    fi
+    actual_pv_uid="$(trim_whitespace "$actual_pv_uid")"
+    if [[ -z "$actual_pv_uid" ]]; then
+      continue
+    fi
+    if [[ "$actual_pv_uid" != "$expected_pv_uid" ]]; then
+      echo "Error: refusing to delete PV ${pv}: its UID changed after local-path cleanup was verified." >&2
+      rc=1
+      continue
+    fi
+    if ! ensure_volume_attachments_gone_for_pv "$pv"; then
+      rc=1
+      continue
+    fi
+    # The attachment wait can take long enough for a name to be reused. Check
+    # immediately before the destructive API call rather than deleting by a
+    # stale PV name alone.
+    if ! final_pv_uid="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not recheck recorded PV ${pv} immediately before deletion." >&2
+      rc=1
+      continue
+    fi
+    final_pv_uid="$(trim_whitespace "$final_pv_uid")"
+    if [[ -z "$final_pv_uid" ]]; then
+      continue
+    fi
+    if [[ "$final_pv_uid" != "$expected_pv_uid" ]]; then
+      echo "Error: refusing to delete PV ${pv}: its UID changed immediately before deletion." >&2
+      rc=1
+      continue
+    fi
+    echo "[${label}] Deleting verified local-path PV ${pv} ..."
+    if ! delete_pv_and_wait_for_gone "$pv" 180 60; then
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+recorded_pvc_is_absent_and_unmounted() {
+  local pvc_ref="$1"
+  local expected_pvc_uid="$2"
+  local ns pvc namespace_marker live_pvc_uid
+
+  IFS=/ read -r ns pvc <<<"$pvc_ref"
+  ns="$(trim_whitespace "$ns")"
+  pvc="$(trim_whitespace "$pvc")"
+  if [[ -z "$ns" || -z "$pvc" || -z "$expected_pvc_uid" ]]; then
+    echo "Error: cleanup ledger has an invalid PVC identity." >&2
+    return 1
+  fi
+  if ! namespace_marker="$(kubectl get namespace "$ns" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not verify namespace ${ns} before storage cleanup." >&2
+    return 1
+  fi
+  namespace_marker="$(trim_whitespace "$namespace_marker")"
+  if [[ -n "$namespace_marker" ]]; then
+    if ! live_pvc_uid="$(kubectl -n "$ns" get pvc "$pvc" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not verify PVC ${ns}/${pvc} before storage cleanup." >&2
+      return 1
+    fi
+    live_pvc_uid="$(trim_whitespace "$live_pvc_uid")"
+    if [[ -n "$live_pvc_uid" ]]; then
+      echo "Error: refusing storage cleanup: PVC ${ns}/${pvc} exists again (UID ${live_pvc_uid})." >&2
+      return 1
+    fi
+  fi
+  if ! verify_no_pod_references_for_pvc "$ns" "$pvc"; then
+    return 1
+  fi
+  return 0
+}
+
+recorded_pv_matches_cleanup_ledger() {
+  local pv="$1"
+  local pvc_ref="$2"
+  local expected_pv_uid="$3"
+  local expected_pvc_uid="$4"
+  local expected_reclaim_policy="$5"
+  local expected_csi_driver="$6"
+  local expected_volume_handle="$7"
+  local pv_identity actual_pv_uid actual_ns actual_pvc actual_pvc_uid actual_reclaim_policy actual_csi_driver actual_volume_handle
+
+  if ! recorded_pvc_is_absent_and_unmounted "$pvc_ref" "$expected_pvc_uid"; then
+    return 1
+  fi
+  if ! pv_identity="$(kubectl get pv "$pv" --ignore-not-found \
+    -o jsonpath='{.metadata.uid}{"\t"}{.spec.claimRef.namespace}{"\t"}{.spec.claimRef.name}{"\t"}{.spec.claimRef.uid}{"\t"}{.spec.persistentVolumeReclaimPolicy}{"\t"}{.spec.csi.driver}{"\t"}{.spec.csi.volumeHandle}' 2>/dev/null)"; then
+    echo "Error: could not verify recorded PV ${pv} before cleanup." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r actual_pv_uid actual_ns actual_pvc actual_pvc_uid actual_reclaim_policy actual_csi_driver actual_volume_handle <<<"$pv_identity"
+  actual_pv_uid="$(trim_whitespace "$actual_pv_uid")"
+  # The PV may already have been deleted during an earlier partial teardown.
+  [[ -n "$actual_pv_uid" ]] || return 0
+  actual_ns="$(trim_whitespace "$actual_ns")"
+  actual_pvc="$(trim_whitespace "$actual_pvc")"
+  actual_pvc_uid="$(trim_whitespace "$actual_pvc_uid")"
+  actual_reclaim_policy="$(trim_whitespace "$actual_reclaim_policy")"
+  actual_csi_driver="$(trim_whitespace "$actual_csi_driver")"
+  actual_volume_handle="$(trim_whitespace "$actual_volume_handle")"
+  if [[ "$actual_pv_uid" != "$expected_pv_uid" ]]; then
+    echo "Error: refusing to delete PV ${pv}: its UID no longer matches the cleanup ledger." >&2
+    return 1
+  fi
+  if [[ "$actual_reclaim_policy" != "$expected_reclaim_policy" || "$actual_csi_driver" != "$expected_csi_driver" || "$actual_volume_handle" != "$expected_volume_handle" ]]; then
+    echo "Error: refusing to delete PV ${pv}: its storage identity no longer matches the cleanup ledger." >&2
+    return 1
+  fi
+  if [[ -n "$actual_ns$actual_pvc$actual_pvc_uid" ]]; then
+    local expected_ns expected_pvc
+    IFS=/ read -r expected_ns expected_pvc <<<"$pvc_ref"
+    if [[ "$actual_ns" != "$expected_ns" || "$actual_pvc" != "$expected_pvc" || "$actual_pvc_uid" != "$expected_pvc_uid" ]]; then
+      echo "Error: refusing to delete PV ${pv}: its claimRef no longer matches the cleanup ledger." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+recorded_longhorn_volume_matches_cleanup_ledger() {
+  local csi_driver="$1"
+  local volume_handle="$2"
+  local expected_volume_uid="$3"
+  local namespace_marker actual_volume_uid
+
+  [[ "$csi_driver" == "driver.longhorn.io" ]] || return 0
+  [[ -n "$volume_handle" ]] || return 1
+  if ! namespace_marker="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not verify Longhorn namespace ${LONGHORN_NAMESPACE}." >&2
+    return 1
+  fi
+  namespace_marker="$(trim_whitespace "$namespace_marker")"
+  # If Longhorn itself is gone, its Volume CRs are gone as well.
+  [[ -n "$namespace_marker" ]] || return 0
+  if ! actual_volume_uid="$(kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$volume_handle" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not verify Longhorn volume ${volume_handle}." >&2
+    return 1
+  fi
+  actual_volume_uid="$(trim_whitespace "$actual_volume_uid")"
+  if [[ -z "$expected_volume_uid" ]]; then
+    if [[ -n "$actual_volume_uid" ]]; then
+      echo "Error: refusing to delete Longhorn volume ${volume_handle}: it did not exist when cleanup state was recorded." >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [[ -n "$actual_volume_uid" && "$actual_volume_uid" != "$expected_volume_uid" ]]; then
+    echo "Error: refusing to delete Longhorn volume ${volume_handle}: its UID no longer matches the cleanup ledger." >&2
+    return 1
+  fi
+  return 0
+}
+
+# A CSI volumeHandle is a backend identity, but an old PV can disappear while
+# a different static/rebound PV starts using the same handle. Never ask a CSI
+# controller to delete a PV unless that handle is still exclusive to the
+# recorded PV. This applies to generic CSI drivers as well as Longhorn.
+csi_volume_handle_is_exclusive_to_recorded_pv() {
+  local expected_pv="$1"
+  local expected_pv_uid="$2"
+  local csi_driver="$3"
+  local volume_handle="$4"
+  local recorded_pv_current_uid="${5:-}"
+  local rows row pv pv_uid current_driver current_handle
+
+  [[ -n "$csi_driver" && -n "$volume_handle" ]] || return 0
+  if ! rows="$(kubectl get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.spec.csi.driver}{"\t"}{.spec.csi.volumeHandle}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: could not check whether CSI volume handle ${volume_handle} (${csi_driver}) is referenced by another PV." >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r pv pv_uid current_driver current_handle; do
+    pv="$(trim_whitespace "$pv")"
+    pv_uid="$(trim_whitespace "$pv_uid")"
+    current_driver="$(trim_whitespace "$current_driver")"
+    current_handle="$(trim_whitespace "$current_handle")"
+    [[ "$current_driver" == "$csi_driver" && "$current_handle" == "$volume_handle" ]] || continue
+    if [[ -z "$recorded_pv_current_uid" || "$pv" != "$expected_pv" || "$pv_uid" != "$expected_pv_uid" ]]; then
+      echo "Error: refusing to delete CSI volume handle ${volume_handle} (${csi_driver}): it is now referenced by PV ${pv} (UID ${pv_uid})." >&2
+      return 1
+    fi
+  done <<<"$rows"
+  return 0
+}
+
+# Retain the narrower helper name for Longhorn-specific callers and tests;
+# its safety check is shared with every CSI driver above.
+longhorn_volume_handle_is_exclusive_to_recorded_pv() {
+  csi_volume_handle_is_exclusive_to_recorded_pv "$1" "$2" driver.longhorn.io "$3" "${4:-}"
+}
+
+delete_recorded_pv_cleanup_targets() {
+  local rows_name="$1"
+  local label="${2:-cleanup}"
+  local local_rows_name="${3:-}"
+  local -n rows_ref="$rows_name"
+  local row pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid actual_pv_uid final_pv_uid actual_longhorn_uid longhorn_namespace_uid rc=0
+  local -a processed_pvs=()
+  local -a local_pvs=()
+  local -A pv_identities=()
+  local -A csi_volume_handle_identities=()
+
+  if [[ -n "$local_rows_name" ]]; then
+    local -n local_rows_ref="$local_rows_name"
+    local local_row local_pv
+    for local_row in "${local_rows_ref[@]}"; do
+      [[ -n "$local_row" ]] || continue
+      IFS=$'\t' read -r _ _ local_pv _ <<<"$local_row"
+      local_pv="$(trim_whitespace "$local_pv")"
+      [[ -n "$local_pv" ]] && append_unique_item "$local_pv" local_pvs
+    done
+  fi
+
+  # A name can be reused across PVC/PV lifetimes. Treat differing ledger
+  # identities for the same name as a conflict instead of picking one row and
+  # silently clearing the other backend volume.
+  for row in "${rows_ref[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid <<<"$row"
+    pv="$(trim_whitespace "$pv")"
+    [[ -n "$pv" ]] || { rc=1; continue; }
+    local identity="${pv_uid}|${pvc_ref}|${pvc_uid}|${reclaim_policy}|${csi_driver}|${volume_handle}|${longhorn_uid}"
+    if [[ -n "${pv_identities[$pv]+present}" && "${pv_identities[$pv]}" != "$identity" ]]; then
+      echo "Error: cleanup ledger has conflicting identities for reused PV name ${pv}; retaining it for manual review." >&2
+      return 1
+    fi
+    pv_identities[$pv]="$identity"
+    if [[ -n "$csi_driver" && -n "$volume_handle" ]]; then
+      local handle_key="${csi_driver}|${volume_handle}"
+      local handle_identity="${pv}|${pv_uid}|${pvc_ref}|${pvc_uid}|${reclaim_policy}|${longhorn_uid}"
+      if [[ -n "${csi_volume_handle_identities[$handle_key]+present}" && "${csi_volume_handle_identities[$handle_key]}" != "$handle_identity" ]]; then
+        echo "Error: cleanup ledger has conflicting identities for CSI volume handle ${volume_handle} (${csi_driver}); retaining it for manual review." >&2
+        return 1
+      fi
+      csi_volume_handle_identities[$handle_key]="$handle_identity"
+    fi
+  done
+
+  for row in "${rows_ref[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid <<<"$row"
+    pv="$(trim_whitespace "$pv")"
+    [[ -n "$pv" ]] || { rc=1; continue; }
+    if [[ " ${processed_pvs[*]} " == *" ${pv} "* ]]; then
+      continue
+    fi
+    processed_pvs+=("$pv")
+    if [[ " ${local_pvs[*]} " == *" ${pv} "* ]]; then
+      # This PV was already verified and removed by the host-path phase.
+      continue
+    fi
+
+    if [[ "$reclaim_policy" != "Delete" ]]; then
+      echo "Error: PV ${pv} uses reclaimPolicy ${reclaim_policy}; retaining its cleanup ledger for manual storage removal." >&2
+      rc=1
+      continue
+    fi
+    if [[ -z "$csi_driver" ]]; then
+      echo "Error: PV ${pv} has no CSI driver and is not a recorded local-path target; retaining its cleanup ledger for manual review." >&2
+      rc=1
+      continue
+    fi
+
+    if ! recorded_pv_matches_cleanup_ledger "$pv" "$pvc_ref" "$pv_uid" "$pvc_uid" "$reclaim_policy" "$csi_driver" "$volume_handle"; then
+      rc=1
+      continue
+    fi
+    if ! actual_pv_uid="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not verify recorded PV ${pv} before deletion." >&2
+      rc=1
+      continue
+    fi
+    actual_pv_uid="$(trim_whitespace "$actual_pv_uid")"
+    if [[ -n "$actual_pv_uid" && "$actual_pv_uid" != "$pv_uid" ]]; then
+      echo "Error: refusing to delete PV ${pv}: its UID changed after cleanup was verified." >&2
+      rc=1
+      continue
+    fi
+
+    if [[ -n "$actual_pv_uid" ]]; then
+      if ! ensure_volume_attachments_gone_for_pv "$pv"; then
+        rc=1
+        continue
+      fi
+    fi
+
+    # A stale VolumeAttachment can outlive its PV object. Longhorn backend
+    # deletion is therefore gated even on a ledger-only retry where the PV is
+    # already absent.
+    if [[ "$csi_driver" == "driver.longhorn.io" && -z "$actual_pv_uid" ]]; then
+      if ! ensure_volume_attachments_gone_for_pv "$pv"; then
+        rc=1
+        continue
+      fi
+    fi
+
+    if [[ "$csi_driver" == "driver.longhorn.io" ]]; then
+      if ! longhorn_volume_handle_is_exclusive_to_recorded_pv "$pv" "$pv_uid" "$volume_handle" "$actual_pv_uid"; then
+        rc=1
+        continue
+      fi
+    elif ! csi_volume_handle_is_exclusive_to_recorded_pv "$pv" "$pv_uid" "$csi_driver" "$volume_handle" "$actual_pv_uid"; then
+      rc=1
+      continue
+    fi
+
+    if ! recorded_longhorn_volume_matches_cleanup_ledger "$csi_driver" "$volume_handle" "$longhorn_uid"; then
+      rc=1
+      continue
+    fi
+    if [[ "$csi_driver" == "driver.longhorn.io" && -n "$longhorn_uid" ]]; then
+      if ! longhorn_namespace_uid="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+        echo "Error: could not verify Longhorn namespace ${LONGHORN_NAMESPACE} before deleting volume ${volume_handle}." >&2
+        rc=1
+        continue
+      fi
+      longhorn_namespace_uid="$(trim_whitespace "$longhorn_namespace_uid")"
+      if [[ -n "$longhorn_namespace_uid" ]]; then
+        if ! actual_longhorn_uid="$(kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$volume_handle" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+          echo "Error: could not verify Longhorn volume ${volume_handle} before deletion." >&2
+          rc=1
+          continue
+        fi
+        actual_longhorn_uid="$(trim_whitespace "$actual_longhorn_uid")"
+        if [[ -n "$actual_longhorn_uid" && "$actual_longhorn_uid" != "$longhorn_uid" ]]; then
+          echo "Error: refusing to delete Longhorn volume ${volume_handle}: its UID changed after cleanup was verified." >&2
+          rc=1
+          continue
+        fi
+        if [[ -n "$actual_longhorn_uid" ]]; then
+          echo "[${label}] Deleting verified Longhorn volume ${volume_handle} ..."
+          kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$volume_handle" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        fi
+        if ! wait_longhorn_volume_gone "$volume_handle" 300; then
+          rc=1
+          continue
+        fi
+      fi
+    fi
+
+    # Re-read the UID immediately before deletion. A PV that disappeared then
+    # reappeared under the same name must leave the ledger intact rather than
+    # being deleted by name.
+    if ! final_pv_uid="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not recheck recorded PV ${pv} immediately before deletion." >&2
+      rc=1
+      continue
+    fi
+    final_pv_uid="$(trim_whitespace "$final_pv_uid")"
+    if [[ -n "$final_pv_uid" && "$final_pv_uid" != "$pv_uid" ]]; then
+      echo "Error: refusing to delete PV ${pv}: its UID changed immediately before deletion." >&2
+      rc=1
+      continue
+    fi
+
+    if [[ -n "$final_pv_uid" ]]; then
+      echo "[${label}] Deleting recorded PV ${pv} ..."
+      if [[ "$csi_driver" == "driver.longhorn.io" ]]; then
+        # Longhorn's recorded Volume CR has already been verified gone.
+        delete_pv_and_wait_for_gone "$pv" 180 60 true || rc=1
+      else
+        # For a generic CSI driver, never strip PV finalizers: that could
+        # remove the Kubernetes object while leaking a cloud disk.
+        delete_pv_and_wait_for_gone "$pv" 180 60 false || rc=1
+      fi
+    fi
+  done
+  return "$rc"
+}
+
+clear_local_path_cleanup_ledgers() {
+  local ns name locations
+
+  locations="$(list_local_path_cleanup_ledger_locations)" || return 1
+  [[ -n "$locations" ]] || return 0
+  while IFS=$'\t' read -r ns name; do
+    ns="$(trim_whitespace "$ns")"
+    name="$(trim_whitespace "$name")"
+    [[ -n "$ns" && -n "$name" ]] || continue
+    if ! kubectl -n "$ns" delete configmap "$name" --ignore-not-found --wait=true >/dev/null; then
+      echo "Error: could not remove completed local-path cleanup ledger ${ns}/${name}." >&2
+      return 1
+    fi
+  done <<<"$locations"
+}
+
+cleanup_recorded_local_path_data() {
+  local label="${1:-cleanup}"
+  local -a exact_rows=()
+  local -a pv_rows=()
+  local -a pattern_rows=()
+
+  collect_local_path_cleanup_ledger_rows exact_rows || return 1
+  collect_pv_cleanup_ledger_rows pv_rows || return 1
+  [[ ${#exact_rows[@]} -gt 0 || ${#pv_rows[@]} -gt 0 ]] || return 0
+
+  if [[ ${#exact_rows[@]} -gt 0 ]]; then
+    if ! is_true "$KUBETON_LOCAL_PATH_CLEANUP"; then
+      echo "Error: local-path cleanup is disabled while the cleanup ledger still has host-path targets." >&2
+      return 1
+    fi
+    if ! verify_recorded_local_path_targets_use_delete_reclaim_policy exact_rows pv_rows; then
+      echo "Error: local-path cleanup ledger has a Retain or unverifiable host-path target; it will be retained for manual cleanup." >&2
+      return 1
+    fi
+    if ! verify_recorded_local_path_targets_safe_for_host_cleanup exact_rows; then
+      echo "Error: local-path cleanup ledger has active or changed storage; it will be retained for retry." >&2
+      return 1
+    fi
+    if ! cleanup_local_path_provisioner_data exact_rows pattern_rows "$label"; then
+      echo "Error: local-path cleanup ledger still has unresolved host data; it will be retained for retry." >&2
+      return 1
+    fi
+    if ! delete_recorded_local_path_pvs exact_rows "$label"; then
+      echo "Error: local-path cleanup ledger still has unresolved PV data; it will be retained for retry." >&2
+      return 1
+    fi
+  fi
+  if ! delete_recorded_pv_cleanup_targets pv_rows "$label" exact_rows; then
+    echo "Error: cleanup ledger still has unresolved PV or backend-volume data; it will be retained for retry." >&2
+    return 1
+  fi
+  clear_local_path_cleanup_ledgers
+}
+
+collect_local_path_cleanup_ledger_leftovers() {
+  local -n rows_ref="$1"
+  local ns name locations
+
+  if ! locations="$(list_local_path_cleanup_ledger_locations)"; then
+    append_unique_item "LocalPathCleanupLedger lookup failed" rows_ref
+    return 0
+  fi
+  [[ -n "$locations" ]] || return 0
+  while IFS=$'\t' read -r ns name; do
+    ns="$(trim_whitespace "$ns")"
+    name="$(trim_whitespace "$name")"
+    [[ -n "$ns" && -n "$name" ]] || continue
+    append_unique_item "LocalPathCleanupLedger ${ns}/${name}" rows_ref
+  done <<<"$locations"
+}
+
 delete_pvc_rows_and_backing_volumes() {
   local pvc_rows_name="$1"
   local label="${2:-cleanup}"
   local -n pvc_rows_ref="$pvc_rows_name"
-  local -a pv_rows=()
-  local -a volume_attachment_rows=()
   local -a local_path_exact_rows=()
+  local -a recorded_pv_rows=()
   local -a local_path_pattern_rows=()
-  local row ns pvc_name volume
-  local candidate_attachment attachment_name source_pv
-  local local_path_cleanup_rc=0
-  local -a pv_match=()
+  local -a empty_local_path_exact_rows=()
+  local -a failed_pvc_rows=()
+  local row ns pvc_name volume failed_row
   local -a wait_pids=()
-  local -a wait_targets=()
-  local i
+  local -a wait_rows=()
+  local i inventory_rc=0 delete_rc=0
 
   if [[ ${#pvc_rows_ref[@]} -eq 0 ]]; then
     return 0
@@ -6695,13 +7886,29 @@ delete_pvc_rows_and_backing_volumes() {
   for row in "${pvc_rows_ref[@]}"; do
     IFS=$'\t' read -r ns pvc_name <<<"$row"
     [[ -z "$ns" || -z "$pvc_name" ]] && continue
-    volume="$(kubectl -n "$ns" get pvc "$pvc_name" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+    if ! volume="$(kubectl -n "$ns" get pvc "$pvc_name" --ignore-not-found -o jsonpath='{.spec.volumeName}' 2>/dev/null)"; then
+      echo "Error: could not inspect PVC ${ns}/${pvc_name} before deleting backing storage." >&2
+      inventory_rc=1
+      continue
+    fi
     volume="$(trim_whitespace "$volume")"
     if [[ -n "$volume" ]]; then
-      append_unique_item "$volume" pv_rows
-      append_local_path_exact_cleanup_rows_for_pv "$volume" "${ns}/${pvc_name}" local_path_exact_rows
+      if ! append_local_path_exact_cleanup_rows_for_pv "$volume" "${ns}/${pvc_name}" local_path_exact_rows; then
+        inventory_rc=1
+      fi
+      if ! append_pv_cleanup_ledger_row_for_pv "$volume" "${ns}/${pvc_name}" recorded_pv_rows; then
+        inventory_rc=1
+      fi
     fi
   done
+
+  if (( inventory_rc != 0 )); then
+    echo "Error: could not safely inventory all local-path backing directories; leaving PVCs intact." >&2
+    return 1
+  fi
+  if ! record_local_path_cleanup_ledger local_path_exact_rows recorded_pv_rows; then
+    return 1
+  fi
 
   echo "[${label}] Deleting PVCs ..."
   for row in "${pvc_rows_ref[@]}"; do
@@ -6715,81 +7922,38 @@ delete_pvc_rows_and_backing_volumes() {
     [[ -z "$ns" || -z "$pvc_name" ]] && continue
     wait_pvc_gone "$ns" "$pvc_name" 120 &
     wait_pids+=("$!")
-    wait_targets+=("PVC ${ns}/${pvc_name}")
+    wait_rows+=("$row")
   done
   for i in "${!wait_pids[@]}"; do
     if ! wait "${wait_pids[$i]}"; then
-      echo "Warning: timed out waiting for ${wait_targets[$i]} to be deleted." >&2
+      failed_row="${wait_rows[$i]:-}"
+      [[ -n "$failed_row" ]] && failed_pvc_rows+=("$failed_row")
     fi
   done
   wait_pids=()
-  wait_targets=()
+  wait_rows=()
 
-  cleanup_local_path_provisioner_data local_path_exact_rows local_path_pattern_rows "$label" || local_path_cleanup_rc=1
-
-  if [[ ${#pv_rows[@]} -eq 0 ]]; then
-    return "$local_path_cleanup_rc"
+  for failed_row in "${failed_pvc_rows[@]}"; do
+    IFS=$'\t' read -r ns pvc_name <<<"$failed_row"
+    [[ -z "$ns" || -z "$pvc_name" ]] && continue
+    if ! delete_pvc_and_wait_for_gone "$ns" "$pvc_name" 60 60; then
+      delete_rc=1
+    fi
+  done
+  if (( delete_rc != 0 )); then
+    return 1
   fi
 
-  mapfile -t volume_attachment_rows < <(
-    kubectl get volumeattachments.storage.k8s.io \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.source.persistentVolumeName}{"\n"}{end}' 2>/dev/null || true
-  )
-
-  for candidate_attachment in "${volume_attachment_rows[@]}"; do
-    [[ -z "$candidate_attachment" ]] && continue
-    IFS=$'\t' read -r attachment_name source_pv <<<"$candidate_attachment"
-    [[ -z "$attachment_name" || -z "$source_pv" ]] && continue
-
-    pv_match=()
-    for volume in "${pv_rows[@]}"; do
-      if [[ "$source_pv" == "$volume" ]]; then
-        pv_match+=("${volume}")
-      fi
-    done
-    if [[ ${#pv_match[@]} -eq 0 ]]; then
-      continue
-    fi
-    echo "[${label}] Deleting stale VolumeAttachment ${attachment_name} for PV ${source_pv} ..."
-    kubectl delete volumeattachment "$attachment_name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done
-
-  for volume in "${pv_rows[@]}"; do
-    wait_volume_attachments_gone "$volume" 180 &
-    wait_pids+=("$!")
-    wait_targets+=("VolumeAttachment for PV ${volume}")
-  done
-  for i in "${!wait_pids[@]}"; do
-    if ! wait "${wait_pids[$i]}"; then
-      echo "Warning: timed out waiting for ${wait_targets[$i]} to be deleted." >&2
-    fi
-  done
-
-  for volume in "${pv_rows[@]}"; do
-    echo "[${label}] Deleting Longhorn volume ${volume} ..."
-    kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    echo "[${label}] Deleting PV ${volume} ..."
-    kubectl delete pv "$volume" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done
-
-  wait_pids=()
-  wait_targets=()
-  for volume in "${pv_rows[@]}"; do
-    (
-      volume_wait_rc=0
-      wait_pv_gone "$volume" 180 || volume_wait_rc=1
-      wait_longhorn_volume_gone "$volume" 300 || volume_wait_rc=1
-      exit "$volume_wait_rc"
-    ) &
-    wait_pids+=("$!")
-    wait_targets+=("PV/Longhorn volume ${volume}")
-  done
-  for i in "${!wait_pids[@]}"; do
-    if ! wait "${wait_pids[$i]}"; then
-      echo "Warning: timed out waiting for ${wait_targets[$i]} to be deleted." >&2
-    fi
-  done
-  return "$local_path_cleanup_rc"
+  # The PVC is gone now, so no Kubernetes pod can still mount its RWO
+  # filesystem.  The persisted ledger makes this retryable if the privileged
+  # cleanup pod cannot remove the host directory on this attempt.
+  if ! cleanup_recorded_local_path_data "$label"; then
+    return 1
+  fi
+  if ! cleanup_local_path_provisioner_data empty_local_path_exact_rows local_path_pattern_rows "$label"; then
+    return 1
+  fi
+  return 0
 }
 
 collect_expected_ton_pvc_rows_from_values() {
@@ -7694,6 +8858,7 @@ resolve_tonnode_pod_row_by_name() {
 
 delete_ton_pvcs_for_statefulsets() {
   local -n sts_rows_ref="$1"
+  local label="${2:-cleanup}"
   local row ns sts
   local -a candidate_rows=()
   local -a pvc_rows=()
@@ -7721,7 +8886,7 @@ delete_ton_pvcs_for_statefulsets() {
 
   collect_expected_ton_pvc_rows_from_values candidate_rows
   collect_labeled_ton_pvc_rows candidate_rows
-  collect_existing_kubeton_pvc_rows candidate_rows pvc_rows "cleanup"
+  collect_existing_kubeton_pvc_rows candidate_rows pvc_rows "$label"
 
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
@@ -7740,7 +8905,7 @@ delete_ton_pvcs_for_statefulsets() {
     return 1
   fi
 
-  delete_pvc_rows_and_backing_volumes pvc_rows "cleanup"
+  delete_pvc_rows_and_backing_volumes pvc_rows "$label"
 }
 
 ton_fleet_resources_exist() {
@@ -7771,6 +8936,9 @@ delete_stale_ton_pvcs_without_fleet() {
   collect_existing_kubeton_pvc_rows candidate_rows existing_rows "$label"
 
   if [[ ${#existing_rows[@]} -eq 0 ]]; then
+    if [[ "$label" == "uninstall" || "$label" == "drop" ]]; then
+      cleanup_recorded_local_path_data "$label" || return 1
+    fi
     return 0
   fi
 
@@ -7785,7 +8953,7 @@ delete_stale_ton_pvcs_without_fleet() {
     echo "  - ${ns}/${pvc}"
   done
 
-  delete_ton_pvcs_for_statefulsets empty_sts_rows
+  delete_ton_pvcs_for_statefulsets empty_sts_rows "$label"
 
   candidate_rows=()
   existing_rows=()
@@ -7794,6 +8962,9 @@ delete_stale_ton_pvcs_without_fleet() {
   collect_existing_kubeton_pvc_rows candidate_rows existing_rows "$label"
 
   if [[ ${#existing_rows[@]} -eq 0 ]]; then
+    if [[ "$label" == "uninstall" || "$label" == "drop" ]]; then
+      cleanup_recorded_local_path_data "$label" || return 1
+    fi
     return 0
   fi
 
@@ -7862,9 +9033,15 @@ wait_pvc_gone() {
   local pvc="$2"
   local timeout_seconds="${3:-600}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
+  local marker
 
   while (( $(date +%s) < deadline )); do
-    if ! kubectl -n "$ns" get pvc "$pvc" >/dev/null 2>&1; then
+    if ! marker="$(kubectl -n "$ns" get pvc "$pvc" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not check whether PVC ${ns}/${pvc} was deleted." >&2
+      return 2
+    fi
+    marker="$(trim_whitespace "$marker")"
+    if [[ -z "$marker" ]]; then
       return 0
     fi
     sleep 2
@@ -7878,9 +9055,15 @@ wait_pv_gone() {
   local pv="$1"
   local timeout_seconds="${2:-300}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
+  local marker
 
   while (( $(date +%s) < deadline )); do
-    if ! kubectl get pv "$pv" >/dev/null 2>&1; then
+    if ! marker="$(kubectl get pv "$pv" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not check whether PV ${pv} was deleted." >&2
+      return 2
+    fi
+    marker="$(trim_whitespace "$marker")"
+    if [[ -z "$marker" ]]; then
       return 0
     fi
     sleep 2
@@ -7895,12 +9078,23 @@ wait_longhorn_volume_gone() {
   local timeout_seconds="${2:-300}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
 
-  if ! kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
+  local namespace_marker marker
+  if ! namespace_marker="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: could not check Longhorn namespace ${LONGHORN_NAMESPACE}." >&2
+    return 2
+  fi
+  namespace_marker="$(trim_whitespace "$namespace_marker")"
+  if [[ -z "$namespace_marker" ]]; then
     return 0
   fi
 
   while (( $(date +%s) < deadline )); do
-    if ! kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$volume" >/dev/null 2>&1; then
+    if ! marker="$(kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$volume" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not check whether Longhorn volume ${volume} was deleted." >&2
+      return 2
+    fi
+    marker="$(trim_whitespace "$marker")"
+    if [[ -z "$marker" ]]; then
       return 0
     fi
     sleep 2
@@ -7914,12 +9108,15 @@ wait_volume_attachments_gone() {
   local pv="$1"
   local timeout_seconds="${2:-180}"
   local deadline=$(( $(date +%s) + timeout_seconds ))
-  local count
+  local count attachment_rows
 
   while (( $(date +%s) < deadline )); do
-    count="$(kubectl get volumeattachments.storage.k8s.io \
-      -o jsonpath='{range .items[?(@.spec.source.persistentVolumeName=="'"${pv}"'")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-      | awk 'NF{c++} END{print c+0}')"
+    if ! attachment_rows="$(kubectl get volumeattachments.storage.k8s.io \
+      -o jsonpath='{range .items[?(@.spec.source.persistentVolumeName=="'"${pv}"'")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+      echo "Error: could not check VolumeAttachment objects for PV ${pv}." >&2
+      return 2
+    fi
+    count="$(printf '%s\n' "$attachment_rows" | awk 'NF{c++} END{print c+0}')"
     if [[ "${count:-0}" == "0" ]]; then
       return 0
     fi
@@ -7927,6 +9124,108 @@ wait_volume_attachments_gone() {
   done
 
   echo "Warning: timeout waiting for VolumeAttachment objects for PV ${pv} to be deleted." >&2
+  return 1
+}
+
+# A PV must not be deleted while Kubernetes still reports an attachment.  The
+# second check is intentionally authoritative: attachment API/RBAC failures
+# and timeouts fail closed rather than being treated as "detached".
+ensure_volume_attachments_gone_for_pv() {
+  local pv="$1"
+  local initial_timeout_seconds="${2:-180}"
+  local recovery_timeout_seconds="${3:-60}"
+  local wait_rc=0
+
+  if wait_volume_attachments_gone "$pv" "$initial_timeout_seconds"; then
+    return 0
+  else
+    wait_rc=$?
+  fi
+  if (( wait_rc == 2 )); then
+    echo "Error: could not verify VolumeAttachment objects for PV ${pv}." >&2
+    return 1
+  fi
+
+  echo "Warning: VolumeAttachment objects for PV ${pv} did not disappear normally; retrying forced attachment cleanup." >&2
+  delete_volume_attachments_for_pv "$pv"
+  if wait_volume_attachments_gone "$pv" "$recovery_timeout_seconds"; then
+    return 0
+  fi
+  echo "Error: VolumeAttachment objects for PV ${pv} remain or cannot be verified; refusing PV deletion." >&2
+  return 1
+}
+
+delete_pvc_and_wait_for_gone() {
+  local ns="$1"
+  local pvc="$2"
+  local initial_timeout_seconds="${3:-120}"
+  local recovery_timeout_seconds="${4:-60}"
+  local wait_rc=0
+
+  kubectl -n "$ns" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if wait_pvc_gone "$ns" "$pvc" "$initial_timeout_seconds"; then
+    return 0
+  else
+    wait_rc=$?
+  fi
+  if (( wait_rc == 2 )); then
+    return 1
+  fi
+
+  if ! verify_no_pod_references_for_pvc "$ns" "$pvc"; then
+    echo "Error: PVC ${ns}/${pvc} is still referenced by a pod; refusing to clear its finalizers." >&2
+    return 1
+  fi
+  echo "Warning: PVC ${ns}/${pvc} did not delete normally; clearing finalizers for destructive cleanup." >&2
+  kubectl -n "$ns" patch pvc "$pvc" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+  kubectl -n "$ns" delete pvc "$pvc" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if wait_pvc_gone "$ns" "$pvc" "$recovery_timeout_seconds"; then
+    return 0
+  else
+    wait_rc=$?
+  fi
+  if (( wait_rc == 2 )); then
+    return 1
+  fi
+
+  echo "Error: PVC ${ns}/${pvc} still exists after destructive finalizer recovery." >&2
+  return 1
+}
+
+delete_pv_and_wait_for_gone() {
+  local pv="$1"
+  local initial_timeout_seconds="${2:-180}"
+  local recovery_timeout_seconds="${3:-60}"
+  local allow_finalizer_recovery="${4:-true}"
+  local wait_rc=0
+
+  kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if wait_pv_gone "$pv" "$initial_timeout_seconds"; then
+    return 0
+  else
+    wait_rc=$?
+  fi
+  if (( wait_rc == 2 )); then
+    return 1
+  fi
+  if ! is_true "$allow_finalizer_recovery"; then
+    echo "Error: PV ${pv} did not delete normally; refusing to clear finalizers for a non-local CSI volume." >&2
+    return 1
+  fi
+
+  echo "Warning: PV ${pv} did not delete normally; clearing finalizers for destructive cleanup." >&2
+  kubectl patch "pv/${pv}" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+  kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if wait_pv_gone "$pv" "$recovery_timeout_seconds"; then
+    return 0
+  else
+    wait_rc=$?
+  fi
+  if (( wait_rc == 2 )); then
+    return 1
+  fi
+
+  echo "Error: PV ${pv} still exists after destructive finalizer recovery." >&2
   return 1
 }
 
@@ -11256,7 +12555,7 @@ run_drop() {
   mapfile -t drop_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
   confirm_or_exit "This will stop TON pods and DELETE TON PVC data. Continue?"
   stop_ton_for_destructive_cleanup drop_sts_rows
-  delete_ton_pvcs_for_statefulsets drop_sts_rows
+  delete_ton_pvcs_for_statefulsets drop_sts_rows "drop"
   echo "[drop] Verifying no stale TON PVCs remain ..."
   delete_stale_ton_pvcs_without_fleet "drop" true
 }
@@ -11802,7 +13101,7 @@ cleanup_operator_release() {
 cleanup_vault_release() {
   local rc=0
   uninstall_vault || true
-  cleanup_vault_force || true
+  cleanup_vault_force || return 1
   delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
   return "$rc"
 }
@@ -11812,7 +13111,19 @@ cleanup_encrypted_storage_class() {
 }
 
 cleanup_longhorn_release() {
-  local rc=0
+  local rc=0 ledger_rc=0
+
+  if storage_cleanup_ledger_has_pending_longhorn_targets; then
+    echo "Error: refusing to uninstall Longhorn while the storage cleanup ledger still contains Longhorn volumes. Rerun kubeton uninstall after resolving the recorded storage cleanup." >&2
+    return 1
+  else
+    ledger_rc=$?
+  fi
+  if (( ledger_rc == 2 )); then
+    echo "Error: could not inspect the storage cleanup ledger before uninstalling Longhorn." >&2
+    return 1
+  fi
+
   uninstall_longhorn || true
   cleanup_longhorn_force || true
   delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
@@ -11900,6 +13211,11 @@ collect_uninstall_leftovers() {
     [[ -n "$ns" && -n "$pvc" ]] && append_unique_item "PVC ${ns}/${pvc}" rows_ref
   done
 
+  # A persisted ledger means host-path cleanup was not verified.  Keep this in
+  # the final report so uninstall never claims success while node-local data is
+  # still pending a retry.
+  collect_local_path_cleanup_ledger_leftovers "$rows_name"
+
   for ns in "$OP_NAMESPACE" "$VAULT_NAMESPACE" "$LONGHORN_NAMESPACE"; do
     ns="$(trim_whitespace "$ns")"
     [[ -z "$ns" ]] && continue
@@ -11985,7 +13301,7 @@ run_uninstall_core() {
     stop_ton_for_destructive_cleanup uninstall_sts_rows
 
   run_uninstall_step uninstall_failures "Step 2/10: deleting TON PVCs and backing storage ..." \
-    delete_ton_pvcs_for_statefulsets uninstall_sts_rows
+    delete_ton_pvcs_for_statefulsets uninstall_sts_rows "uninstall"
 
   run_uninstall_step uninstall_failures "Step 3/10: cleaning leftover kubectl debug pods ..." \
     cleanup_kubectl_debug_pods
@@ -12002,11 +13318,11 @@ run_uninstall_core() {
   run_uninstall_step uninstall_failures "Step 7/10: deleting StorageClass ${ENCRYPTED_SC_NAME} ..." \
     cleanup_encrypted_storage_class
 
-  run_uninstall_step uninstall_failures "Step 8/10: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..." \
-    cleanup_longhorn_release
-
-  run_uninstall_step uninstall_failures "Step 9/10: verifying no stale TON PVCs remain ..." \
+  run_uninstall_step uninstall_failures "Step 8/10: retrying any recorded TON PVC and backing-storage cleanup ..." \
     delete_stale_ton_pvcs_without_fleet "uninstall" true
+
+  run_uninstall_step uninstall_failures "Step 9/10: uninstalling Longhorn release ${LONGHORN_RELEASE_NAME} ..." \
+    cleanup_longhorn_release
 
   run_uninstall_step uninstall_failures "Step 10/10: final kubeton-managed resource sweep ..." \
     cleanup_kubeton_managed_labeled_resources
@@ -12025,7 +13341,13 @@ run_uninstall_core() {
   fi
 
   if [[ ${#uninstall_failures[@]} -gt 0 ]]; then
-    echo "Warning: some uninstall steps reported errors, but no kubeton-managed leftovers were found." >&2
+    echo "Warning: some uninstall steps reported errors even though no Kubernetes leftovers were found:" >&2
+    for item in "${uninstall_failures[@]}"; do
+      [[ -z "$item" ]] && continue
+      echo "  - ${item}" >&2
+    done
+    echo "Uninstall is not marked complete; rerun './kubeton uninstall' after resolving the reported cleanup errors." >&2
+    return 1
   fi
 
   echo "[uninstall] Uninstall complete."
@@ -12055,7 +13377,8 @@ run_purge() {
 
   if (( uninstall_rc != 0 )); then
     echo "[purge] Rechecking leftovers after TonNode CRD deletion ..."
-    verify_uninstall_leftovers || purge_rc=1
+    verify_uninstall_leftovers || true
+    purge_rc=1
   fi
 
   if (( purge_rc != 0 )); then

@@ -67,7 +67,7 @@ tonNode:
     - name: MODE
       value: validator
     - name: DUMP
-      value: "false"
+      value: "true"
     - name: MYTONCTRL_VERSION
       value: master
     - name: CUSTOM_PARAMETERS
