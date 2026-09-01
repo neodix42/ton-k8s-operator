@@ -118,6 +118,125 @@ bash -c '
 ' _ "$kubeton" >"$generic_append_output"
 assert_contains $'pv-keybundle\tdefault/keybundle-tonnode-1\tpv-uid\tpvc-uid\tDelete\tcsi.example.io\tvolume-handle\t' "$generic_append_output"
 
+# A PVC created by an older controller can be missing the labels now used for
+# broad cleanup discovery.  It is still a trusted TON PVC when it is the exact
+# claim-template name of a StatefulSet captured before destructive cleanup.
+# In particular, an incomplete bootstrap must not leave a tiny
+# `mytoncore.db` behind merely because `mytoncore-tonnode-2` lost its labels.
+trusted_legacy_mytoncore_events="$test_dir/trusted-legacy-mytoncore-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"delete pvc mytoncore-tonnode-2"*)
+        printf "delete-pvc mytoncore-tonnode-2\n" >>"$event_log"
+        ;;
+      *"get pvc -o jsonpath="*)
+        printf "mytoncore-tonnode-2\n"
+        ;;
+      *"get pvc mytoncore-tonnode-2"*".spec.volumeName"*)
+        printf "pv-mytoncore"
+        ;;
+      *"get pvc mytoncore-tonnode-2"*)
+        # Exists, but deliberately has no kubeton/ton-k8s-operator labels.
+        :
+        ;;
+    esac
+  }
+  collect_expected_ton_pvc_rows_from_values() { :; }
+  collect_labeled_ton_pvc_rows() { :; }
+  # Values may have been renamed since this legacy StatefulSet was created;
+  # acceptance must come from the captured StatefulSet, not a broad current
+  # values-name match.
+  resolve_tonnode_namespace_from_values() { printf "%s" "other-namespace"; }
+  resolve_tonnode_name_from_values() { printf "%s" "renamed-tonnode"; }
+  list_ton_pods() { :; }
+  collect_local_path_pattern_cleanup_rows_for_pvcs() { :; }
+  append_local_path_exact_cleanup_rows_for_pv() {
+    local -n out="$3"
+    local exact_row
+    printf -v exact_row "devnet-04\t/home/danklishch/state-200gb-b5/pvc-mytoncore_default_mytoncore-tonnode-2\t%s\t%s\tpv-uid\tpvc-uid" "$1" "$2"
+    out+=("$exact_row")
+    printf "inventory-local %s %s\n" "$1" "$2" >>"$event_log"
+  }
+  append_pv_cleanup_ledger_row_for_pv() {
+    local -n out="$3"
+    local pv_row
+    printf -v pv_row "%s\t%s\tpv-uid\tpvc-uid\tDelete\t\t\t" "$1" "$2"
+    out+=("$pv_row")
+    printf "inventory-pv %s %s\n" "$1" "$2" >>"$event_log"
+  }
+  record_local_path_cleanup_ledger() {
+    local -n exact_rows="$1"
+    local -n pv_rows="$2"
+    printf "record-ledger exact=%s pv=%s\n" "${#exact_rows[@]}" "${#pv_rows[@]}" >>"$event_log"
+  }
+  wait_pvc_gone() { return 0; }
+  cleanup_recorded_local_path_data() { printf "cleanup-recorded\n" >>"$event_log"; }
+  cleanup_local_path_provisioner_data() { :; }
+  sts_rows=()
+  printf -v sts_row "default\ttonnode\t3"
+  sts_rows+=("$sts_row")
+  delete_ton_pvcs_for_statefulsets sts_rows uninstall
+' _ "$kubeton" "$trusted_legacy_mytoncore_events"
+assert_contains "inventory-pv pv-mytoncore default/mytoncore-tonnode-2" "$trusted_legacy_mytoncore_events"
+assert_contains "record-ledger exact=1 pv=1" "$trusted_legacy_mytoncore_events"
+assert_order "record-ledger exact=1 pv=1" "delete-pvc mytoncore-tonnode-2" "$trusted_legacy_mytoncore_events"
+
+# Do not turn the legacy compatibility path into a broad prefix deletion.
+# An unlabelled PVC with a similar name but no captured TON StatefulSet is not
+# trusted and must remain untouched.
+untrusted_legacy_mytoncore_events="$test_dir/untrusted-legacy-mytoncore-events.out"
+bash -c '
+  source "$1"
+  event_log="$2"
+  kubectl() {
+    case "$*" in
+      *"get pvc mytoncore-foreign-2"*) : ;;
+    esac
+  }
+  collect_expected_ton_pvc_rows_from_values() {
+    local -n out="$1"
+    local foreign_row
+    printf -v foreign_row "default\tmytoncore-foreign-2"
+    out+=("$foreign_row")
+  }
+  collect_labeled_ton_pvc_rows() { :; }
+  delete_pvc_rows_and_backing_volumes() {
+    printf "UNSAFE delete %s\n" "${1:-}" >>"$event_log"
+  }
+  sts_rows=()
+  delete_ton_pvcs_for_statefulsets sts_rows uninstall
+' _ "$kubeton" "$untrusted_legacy_mytoncore_events"
+if [[ -s "$untrusted_legacy_mytoncore_events" ]]; then
+  echo "an untrusted unlabelled mytoncore PVC was selected for deletion" >&2
+  cat "$untrusted_legacy_mytoncore_events" >&2
+  exit 1
+fi
+
+# A retry can run after the operator and StatefulSet have already disappeared.
+# The exact configured claim-template identity remains sufficient for explicit
+# uninstall/drop, but must not be accepted by the non-destructive start path.
+configured_legacy_mytoncore_selection="$test_dir/configured-legacy-mytoncore-selection.out"
+bash -c '
+  source "$1"
+  kubectl() {
+    case "$*" in
+      *"get pvc mytoncore-tonnode-2"*) : ;;
+    esac
+  }
+  resolve_tonnode_namespace_from_values() { printf "%s" "default"; }
+  resolve_tonnode_name_from_values() { printf "%s" "tonnode"; }
+  candidates=($'"'"'default\tmytoncore-tonnode-2'"'"')
+  uninstall_rows=()
+  start_rows=()
+  collect_existing_kubeton_pvc_rows candidates uninstall_rows uninstall
+  collect_existing_kubeton_pvc_rows candidates start_rows start
+  printf "uninstall=%s start=%s\n" "${uninstall_rows[*]:-}" "${start_rows[*]:-}"
+' _ "$kubeton" >"$configured_legacy_mytoncore_selection"
+assert_contains $'uninstall=default\tmytoncore-tonnode-2 start=' "$configured_legacy_mytoncore_selection"
+
 # A present local-path PV follows the verified path through its final delete;
 # this guards the fresh-UID check from becoming an unbound-variable failure.
 present_local_events="$test_dir/present-local-events.out"

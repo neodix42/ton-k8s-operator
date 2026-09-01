@@ -8019,6 +8019,51 @@ pvc_has_kubeton_attribution() {
   return 1
 }
 
+# Older chart/controller versions did not always preserve the labels carried by
+# a StatefulSet VolumeClaimTemplate.  During an explicitly destructive TON
+# cleanup, the configured claim-template names are still a narrow and useful
+# ownership signal: a PVC named mytoncore-<configured-tonnode>-<ordinal> cannot
+# coexist with that StatefulSet's claim for the same ordinal.  Do not use this
+# fallback during normal start/repair flows; those must continue to require
+# Kubernetes ownership labels.
+pvc_is_configured_ton_claim_template() {
+  local ns="$1"
+  local pvc="$2"
+  local configured_ns configured_sts claim_prefix prefix ordinal
+  local -a claim_prefixes=("ton-work" "ton-src" "mytoncore" "mytonctrl" "keybundle")
+
+  configured_ns="$(resolve_tonnode_namespace_from_values)"
+  configured_sts="$(resolve_tonnode_name_from_values)"
+  [[ -n "$configured_ns" && -n "$configured_sts" && "$ns" == "$configured_ns" ]] || return 1
+
+  for claim_prefix in "${claim_prefixes[@]}"; do
+    prefix="${claim_prefix}-${configured_sts}-"
+    [[ "$pvc" == "$prefix"* ]] || continue
+    ordinal="${pvc#"$prefix"}"
+    [[ "$ordinal" =~ ^(0|[1-9][0-9]*)$ ]] && return 0
+  done
+  return 1
+}
+
+# A current StatefulSet selected with TON_POD_LABEL is an additional trusted
+# provenance source for an unlabelled legacy claim.  This lets uninstall clean
+# a fleet whose values file was renamed after deployment, while limiting the
+# fallback to names captured from that particular StatefulSet.
+pvc_row_has_trusted_ton_statefulset_provenance() {
+  local ns="$1"
+  local pvc="$2"
+  local trusted_rows_name="${3:-}"
+  local expected_row row
+
+  [[ -n "$trusted_rows_name" ]] || return 1
+  local -n trusted_rows_ref="$trusted_rows_name"
+  expected_row="${ns}"$'\t'"${pvc}"
+  for row in "${trusted_rows_ref[@]}"; do
+    [[ "$row" == "$expected_row" ]] && return 0
+  done
+  return 1
+}
+
 collect_existing_pvc_rows() {
   local -n candidate_rows_ref="$1"
   local -n existing_rows_ref="$2"
@@ -8038,6 +8083,7 @@ collect_existing_kubeton_pvc_rows() {
   local -n candidate_rows_ref="$1"
   local -n existing_rows_ref="$2"
   local label="${3:-cleanup}"
+  local trusted_rows_name="${4:-}"
   local row ns pvc
 
   for row in "${candidate_rows_ref[@]}"; do
@@ -8048,6 +8094,11 @@ collect_existing_kubeton_pvc_rows() {
       continue
     fi
     if pvc_has_kubeton_attribution "$ns" "$pvc"; then
+      append_unique_item "$ns"$'\t'"$pvc" existing_rows_ref
+    elif [[ "$label" == "uninstall" || "$label" == "drop" ]] \
+      && { pvc_is_configured_ton_claim_template "$ns" "$pvc" \
+        || pvc_row_has_trusted_ton_statefulset_provenance "$ns" "$pvc" "$trusted_rows_name"; }; then
+      echo "[${label}] Accepting legacy unlabelled PVC ${ns}/${pvc}: it matches a configured or captured TON claim template." >&2
       append_unique_item "$ns"$'\t'"$pvc" existing_rows_ref
     else
       echo "[${label}] Skipping PVC ${ns}/${pvc}: missing kubeton/ton-k8s-operator ownership labels." >&2
@@ -8861,6 +8912,7 @@ delete_ton_pvcs_for_statefulsets() {
   local label="${2:-cleanup}"
   local row ns sts
   local -a candidate_rows=()
+  local -a trusted_sts_claim_rows=()
   local -a pvc_rows=()
   local -a live_ton_pod_rows=()
   local pvc_name
@@ -8878,6 +8930,7 @@ delete_ton_pvcs_for_statefulsets() {
     while IFS= read -r pvc_name; do
       [[ -z "$pvc_name" ]] && continue
       append_unique_item "$ns"$'\t'"$pvc_name" candidate_rows
+      append_unique_item "$ns"$'\t'"$pvc_name" trusted_sts_claim_rows
     done < <(
       kubectl -n "$ns" get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
         | grep -E "^(ton-work|ton-src|mytoncore|mytonctrl|keybundle)-${sts}-" || true
@@ -8886,7 +8939,7 @@ delete_ton_pvcs_for_statefulsets() {
 
   collect_expected_ton_pvc_rows_from_values candidate_rows
   collect_labeled_ton_pvc_rows candidate_rows
-  collect_existing_kubeton_pvc_rows candidate_rows pvc_rows "$label"
+  collect_existing_kubeton_pvc_rows candidate_rows pvc_rows "$label" trusted_sts_claim_rows
 
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
     return 0
