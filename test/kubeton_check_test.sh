@@ -67,12 +67,46 @@ if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "volumes.longhorn.io"
   exit 1
 fi
 
+if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "statefulset" && "${5:-}" == "tonnode" ]]; then
+  # A same-fleet HostPort is exempt only when the Pod has this live
+  # StatefulSet UID as its controller owner.
+  [[ "$mode" != "host-port-no-current-sts" ]] && printf '%s' 'target-sts-uid'
+  exit 0
+fi
+
 if [[ "${1:-}" == "label" && "${2:-}" == "node" ]]; then
   printf '%s\n' "$*" >>"${KUBETON_TEST_LABEL_LOG:?}"
   exit 0
 fi
 
 if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
+  if [[ "$args" == *".hostPort"* ]]; then
+    case "$mode" in
+      host-port-conflict)
+        printf '%s\n' $'node-good-3\x1fRunning\x1fother\x1fport-holder\x1fother-app\x1fother-manager\x1fother-instance\x1fDeployment/other,\x1fTCP/9777,'
+        ;;
+      host-port-protocol-mismatch)
+        # TCP/30001 must not reserve the TON validator's UDP/30001 endpoint.
+        printf '%s\n' $'node-good-3\x1fRunning\x1fother\x1fport-holder\x1fother-app\x1fother-manager\x1fother-instance\x1fDeployment/other,\x1fTCP/30001,'
+        ;;
+      host-port-current-fleet)
+        # Same-fleet pods are replaceable during an in-place kubeton start and
+        # must not remove their own currently assigned nodes from the pool.
+        printf '%s\n' $'node-good-3\x1fRunning\x1fdefault\x1ftonnode-2\x1fton-node\x1fton-k8s-operator\x1ftonnode\x1fcontroller/StatefulSet/tonnode/target-sts-uid,\x1fUDP/30001,'
+        ;;
+      host-port-label-only)
+        # Matching labels alone are not enough to ignore a reservation: an
+        # orphan/foreign Pod must be owned by this TonNode's StatefulSet too.
+        printf '%s\n' $'node-good-3\x1fRunning\x1fdefault\x1fforeign\x1fton-node\x1fton-k8s-operator\x1ftonnode\x1fcontroller/Deployment/foreign/foreign-uid,\x1fUDP/30001,'
+        ;;
+      host-port-stale-owner)
+        # A recreated StatefulSet can reuse the name. Its old UID must not
+        # exempt a still-assigned orphan from the port reservation check.
+        printf '%s\n' $'node-good-3\x1fRunning\x1fdefault\x1fstale\x1fton-node\x1fton-k8s-operator\x1ftonnode\x1fcontroller/StatefulSet/tonnode/stale-sts-uid,\x1fUDP/30001,'
+        ;;
+    esac
+    exit 0
+  fi
   # A blank app label is intentional here: it guards against losing request
   # columns when parsing unlabelled workloads.
   if [[ "$mode" == "loaded" ]]; then
@@ -205,6 +239,111 @@ assert_contains "node filesystem requirement: >= 1.72 Ti" "$healthy_output"
 assert_contains "node-bad" "$healthy_output"
 assert_contains "FAIL: DiskPressure" "$healthy_output"
 assert_contains "Compatible target nodes: 3/3 required." "$healthy_output"
+
+# `kubeton check` and `kubeton start` must reject a node that kube-scheduler
+# would reject for an already-reserved requested hostPort. This happens before
+# labels/Helm, so a fresh local-path fleet never creates a Pending pod merely
+# because its exporter port is already assigned on the selected node.
+host_port_conflict_output="$test_dir/host-port-conflict.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=host-port-conflict KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$host_port_conflict_output" 2>&1; then
+  echo "expected host-port conflict to fail the node preflight" >&2
+  exit 1
+fi
+assert_contains "required host ports: UDP/30001 UDP/31001 TCP/30003 TCP/9777" "$host_port_conflict_output"
+assert_contains "node-good-3" "$host_port_conflict_output"
+assert_contains "host ports in use (TCP/9777 by other/port-holder)" "$host_port_conflict_output"
+assert_contains "Compatible target nodes: 2/3 required." "$host_port_conflict_output"
+
+# HostPort protocol is part of the scheduler key: a TCP listener must not
+# incorrectly exclude the TON validator's UDP endpoint.
+host_port_protocol_output="$test_dir/host-port-protocol.out"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=host-port-protocol-mismatch KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$host_port_protocol_output" 2>&1
+assert_contains "Compatible target nodes: 3/3 required." "$host_port_protocol_output"
+
+# An in-place start can reuse nodes already occupied by the configured TonNode
+# itself; a different workload is still a conflict as covered above.
+host_port_current_fleet_output="$test_dir/host-port-current-fleet.out"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=host-port-current-fleet KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$host_port_current_fleet_output" 2>&1
+assert_contains "Compatible target nodes: 3/3 required." "$host_port_current_fleet_output"
+
+# A label collision or orphan must still reserve the node. Only Pods owned by
+# this exact StatefulSet are safely replaceable during an in-place start.
+host_port_label_only_output="$test_dir/host-port-label-only.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=host-port-label-only KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$host_port_label_only_output" 2>&1; then
+  echo "expected label-only host-port owner to remain a conflict" >&2
+  exit 1
+fi
+assert_contains "host ports in use (UDP/30001 by default/foreign)" "$host_port_label_only_output"
+
+# StatefulSet names can be reused. An assigned Pod with the old controller UID
+# still reserves its HostPort and must not be exempted merely because labels and
+# owner name match the current TonNode.
+host_port_stale_owner_output="$test_dir/host-port-stale-owner.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=host-port-stale-owner KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$host_port_stale_owner_output" 2>&1; then
+  echo "expected stale StatefulSet owner to remain a host-port conflict" >&2
+  exit 1
+fi
+assert_contains "host ports in use (UDP/30001 by default/stale)" "$host_port_stale_owner_output"
+
+# Disabling host ports deliberately removes this scheduler constraint.
+host_ports_disabled_values="$test_dir/host-ports-disabled-values.yaml"
+cat >"$host_ports_disabled_values" <<'EOF'
+tonNode:
+  replicas: 3
+  storage:
+    tonWorkSize: 700Gi
+    tonSourceSize: 20Gi
+    myTonCoreSize: 20Gi
+    myTonCtrlSize: 20Gi
+  resources:
+    requests:
+      cpu: 16000m
+      memory: 64Gi
+  network:
+    hostPortsEnabled: false
+  env:
+    - name: DUMP
+      value: "false"
+EOF
+host_ports_disabled_output="$test_dir/host-ports-disabled.out"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=host-port-label-only TON_VALUES_FILE="$host_ports_disabled_values" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$host_ports_disabled_output" 2>&1
+assert_contains "required host ports: disabled" "$host_ports_disabled_output"
+assert_contains "Compatible target nodes: 3/3 required." "$host_ports_disabled_output"
+
+# Helm accepts inline maps, but kubeton's lightweight values reader cannot
+# safely infer a custom requested HostPort from one. It must fail closed rather
+# than checking the default UDP/30001 and missing a real UDP/32001 conflict.
+inline_network_values="$test_dir/inline-network-values.yaml"
+cat >"$inline_network_values" <<'EOF'
+tonNode:
+  replicas: 3
+  storage:
+    tonWorkSize: 700Gi
+    tonSourceSize: 20Gi
+    myTonCoreSize: 20Gi
+    myTonCtrlSize: 20Gi
+  resources:
+    requests:
+      cpu: 16000m
+      memory: 64Gi
+  network: { validatorPort: 32001 }
+  env:
+    - name: DUMP
+      value: "false"
+EOF
+inline_network_output="$test_dir/inline-network.out"
+if PATH="$fake_bin:$PATH" TON_VALUES_FILE="$inline_network_values" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$inline_network_output" 2>&1; then
+  echo "expected inline tonNode.network mapping to block host-port preflight" >&2
+  exit 1
+fi
+assert_contains "inline tonNode/network map" "$inline_network_output"
 
 # DUMP=false keeps the ordinary requested-PVC sizing path and does not make a
 # network call to dump.ton.org.

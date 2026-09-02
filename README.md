@@ -217,9 +217,13 @@ The check requires at least 16 vCPU and 64Gi memory per TON pod (or a larger
 `tonNode.resources.requests` value).
 It rejects NotReady/cordoned nodes, `DiskPressure`, `MemoryPressure`,
 `PIDPressure`, hard taints, insufficient allocatable CPU or memory after
-assigned pod requests, and insufficient free node filesystem space. Free disk
-comes from the kubelet Summary API (`nodes/proxy` RBAC is required), rather
-than `ephemeral-storage` allocatable capacity.
+assigned pod requests, insufficient free node filesystem space, and requested
+TON `hostPort` reservations owned by other assigned non-terminal Pods. The
+host-port gate covers validator UDP, QUIC UDP, lite-server TCP, and an optional
+exporter TCP port from literal `CUSTOM_PARAMETERS`; it ignores only Pods of the
+same live TonNode StatefulSet during an in-place upgrade. Free disk comes from the
+kubelet Summary API (`nodes/proxy` RBAC is required), rather than
+`ephemeral-storage` allocatable capacity.
 
 The command prints every node, but succeeds when there are enough compatible
 target nodes for the configured replica count. TON uses hostname anti-affinity,

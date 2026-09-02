@@ -171,6 +171,8 @@ declare -A KUBETON_NODE_CHECK_FREE_MEMORY_BYTES=()
 declare -A KUBETON_NODE_CHECK_FREE_DISK_BYTES=()
 declare -A KUBETON_NODE_CHECK_USED_CPU_MILLI=()
 declare -A KUBETON_NODE_CHECK_USED_MEMORY_BYTES=()
+declare -a KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS=()
+declare -A KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS=()
 declare -a KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS=()
 declare -A KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR=()
 KUBETON_NODE_CHECK_TON_SELECTOR=""
@@ -191,6 +193,7 @@ KUBETON_NODE_CHECK_DUMP_CACHE_DIR=""
 KUBETON_NODE_CHECK_DUMP_ARCHIVE_BYTES=0
 KUBETON_NODE_CHECK_DUMP_EXTRACTED_DB_BYTES=0
 KUBETON_NODE_CHECK_DUMP_PEAK_BYTES=0
+KUBETON_NODE_CHECK_HOST_PORTS_ENABLED=false
 
 usage() {
   cat <<'EOF'
@@ -1128,6 +1131,233 @@ node_check_prereq_label_selector() {
   printf '%s=%s' "$KUBETON_NODE_PREREQ_LABEL_KEY" "$KUBETON_NODE_PREREQ_LABEL_VALUE"
 }
 
+node_check_append_required_host_port() {
+  local protocol="$1"
+  local port="$2"
+  local item existing
+
+  protocol="${protocol^^}"
+  case "$protocol" in
+    TCP|UDP|SCTP)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    return 1
+  fi
+
+  item="${protocol}/${port}"
+  for existing in "${KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS[@]}"; do
+    [[ "$existing" == "$item" ]] && return 0
+  done
+  KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS+=("$item")
+}
+
+node_check_resolve_network_host_port() {
+  local path="$1"
+  local default_port="$2"
+  local port=""
+
+  port="$(resolve_effective_tonnode_path_scalar "$path" || true)"
+  port="$(trim_whitespace "$port")"
+  port="${port:-$default_port}"
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    echo "Error: cannot safely determine tonNode.${path} for host-port preflight." >&2
+    return 1
+  fi
+  printf '%s' "$port"
+}
+
+# The lightweight values reader intentionally supports only block-style YAML.
+# An inline tonNode/network map is valid Helm YAML but could hide a custom
+# requested hostPort from this preflight, so reject it rather than fall back to
+# a chart default and let kube-scheduler discover the conflict later.
+tonnode_network_uses_inline_map_in_values_file() {
+  local values_file="$1"
+
+  [[ -f "$values_file" ]] || return 1
+  awk '
+    function trim(value) {
+      sub(/^[ \t]+/, "", value)
+      sub(/[ \t]+$/, "", value)
+      return value
+    }
+    function leading_indent(value) {
+      match(value, /^[ \t]*/)
+      return RLENGTH
+    }
+    {
+      line=$0
+      if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) next
+      indent=leading_indent(line)
+      body=substr(line, indent + 1)
+      if (body !~ /^[^:#][^:]*:/) next
+
+      colon=index(body, ":")
+      key=trim(substr(body, 1, colon - 1))
+      raw_value=trim(substr(body, colon + 1))
+      sub(/[ \t]+#.*/, "", raw_value)
+      raw_value=trim(raw_value)
+
+      if (!inside_ton) {
+        if (indent == 0 && key == "tonNode") {
+          if (raw_value == "") {
+            inside_ton=1
+            ton_indent=indent
+          } else if (raw_value ~ /[{]/) {
+            unsafe=1
+            exit
+          }
+        }
+        next
+      }
+      if (indent <= ton_indent) exit
+      if (ton_child_indent == "") ton_child_indent=indent
+      if (indent == ton_child_indent && key == "network" && raw_value != "" && raw_value ~ /[{]/) {
+        unsafe=1
+        exit
+      }
+    }
+    END { exit(unsafe ? 0 : 1) }
+  ' "$values_file" >/dev/null 2>&1
+}
+
+# Resolve exactly the host ports that the controller will put on the TON pod.
+# The exporter port is derived from CUSTOM_PARAMETERS, just as the controller
+# does.  A same-name port is deduplicated, matching appendExporterContainerPort.
+node_check_resolve_host_port_requirements() {
+  local configured_enabled=""
+  local validator_port quic_port liteserver_port
+  local custom_parameters="" custom_parameters_rc=0
+  local exporter_address exporter_port
+  local values_file
+
+  KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS=()
+  KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS=()
+  KUBETON_NODE_CHECK_HOST_PORTS_ENABLED=false
+
+  for values_file in "$TON_VALUES_FILE" "$CHART_DIR/values.yaml"; do
+    if tonnode_network_uses_inline_map_in_values_file "$values_file"; then
+      echo "Error: ${values_file} uses an inline tonNode/network map that kubeton cannot safely preflight requested host ports." >&2
+      return 1
+    fi
+  done
+
+  configured_enabled="$(resolve_effective_tonnode_path_scalar "network.hostPortsEnabled" || true)"
+  configured_enabled="$(trim_whitespace "$configured_enabled")"
+  configured_enabled="${configured_enabled,,}"
+  case "$configured_enabled" in
+    ""|true|null|"~")
+      KUBETON_NODE_CHECK_HOST_PORTS_ENABLED=true
+      ;;
+    false)
+      return 0
+      ;;
+    *)
+      echo "Error: cannot safely determine tonNode.network.hostPortsEnabled for host-port preflight." >&2
+      return 1
+      ;;
+  esac
+
+  validator_port="$(node_check_resolve_network_host_port "network.validatorPort" 30001)" || return 1
+  quic_port="$(node_check_resolve_network_host_port "network.quicPort" 31001)" || return 1
+  liteserver_port="$(node_check_resolve_network_host_port "network.liteServerPort" 30003)" || return 1
+  node_check_append_required_host_port UDP "$validator_port" || return 1
+  node_check_append_required_host_port UDP "$quic_port" || return 1
+  node_check_append_required_host_port TCP "$liteserver_port" || return 1
+
+  custom_parameters="$(resolve_effective_tonnode_env_value "CUSTOM_PARAMETERS")" || custom_parameters_rc=$?
+  if (( custom_parameters_rc == 3 )); then
+    echo "Error: TON_VALUES_FILE uses an inline tonNode.env form that kubeton cannot safely preflight requested host ports." >&2
+    return 1
+  fi
+  # The controller cannot derive an exporter container port from an EnvVar
+  # valueFrom either (it only has the literal EnvVar Value), so it is correct
+  # to omit it here as well.
+  if (( custom_parameters_rc == 0 )); then
+    exporter_address="$(extract_exporter_address "$custom_parameters")"
+    exporter_port="$(extract_exporter_port "$exporter_address")"
+    if [[ "$exporter_port" =~ ^[0-9]+$ ]]; then
+      node_check_append_required_host_port TCP "$exporter_port" || return 1
+    fi
+  fi
+}
+
+node_check_append_host_port_conflict() {
+  local node="$1"
+  local detail="$2"
+  local existing="${KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS[$node]:-}"
+
+  if [[ -z "$existing" ]]; then
+    KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS["$node"]="$detail"
+  elif [[ ";${existing};" != *";${detail};"* ]]; then
+    KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS["$node"]+="; ${detail}"
+  fi
+}
+
+# Kube-scheduler reserves hostPorts from assigned, non-terminal Pods.  Model
+# that exact scheduling constraint before kubeton labels nodes and creates a
+# StatefulSet. Existing Pods belonging to this same TonNode are intentionally
+# ignored: they are replaceable members of the fleet being started/upgraded.
+node_check_collect_host_port_conflicts() {
+  local pod_rows row node phase ns pod app_name managed_by instance owners ports
+  local protocol port token key
+  local target_ns target_name target_sts_uid
+  local -A requested=()
+
+  (( ${#KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS[@]} > 0 )) || return 0
+  for key in "${KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS[@]}"; do
+    requested["$key"]=1
+  done
+
+  target_ns="$(resolve_tonnode_namespace_from_values)"
+  target_name="$(resolve_tonnode_name_from_values)"
+  if ! target_sts_uid="$(kubectl -n "$target_ns" get statefulset "$target_name" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: cannot read the configured TonNode StatefulSet identity for host-port preflight." >&2
+    return 1
+  fi
+  target_sts_uid="$(trim_whitespace "$target_sts_uid")"
+  if ! pod_rows="$(kubectl get pods -A -o go-template='{{range .items}}{{if .spec.nodeName}}{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{.metadata.namespace}}{{"\x1f"}}{{.metadata.name}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/name"}}{{end}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/managed-by"}}{{end}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/instance"}}{{end}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}controller{{end}}{{"/"}}{{.kind}}{{"/"}}{{.name}}{{"/"}}{{.uid}}{{","}}{{end}}{{"\x1f"}}{{range .spec.initContainers}}{{range .ports}}{{.protocol}}{{"/"}}{{.hostPort}}{{","}}{{end}}{{end}}{{range .spec.containers}}{{range .ports}}{{.protocol}}{{"/"}}{{.hostPort}}{{","}}{{end}}{{end}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot list assigned Pod hostPort reservations for node preflight." >&2
+    return 1
+  fi
+
+  while IFS=$'\x1f' read -r node phase ns pod app_name managed_by instance owners ports; do
+    node="$(trim_whitespace "$node")"
+    phase="$(trim_whitespace "$phase")"
+    ns="$(trim_whitespace "$ns")"
+    pod="$(trim_whitespace "$pod")"
+    app_name="$(trim_whitespace "$app_name")"
+    managed_by="$(trim_whitespace "$managed_by")"
+    instance="$(trim_whitespace "$instance")"
+    owners="$(trim_whitespace "$owners")"
+    [[ -n "$node" && -n "$ns" && -n "$pod" ]] || continue
+    case "$phase" in
+      Succeeded|Failed) continue ;;
+    esac
+    if [[ -n "$target_sts_uid" && "$ns" == "$target_ns" && "$app_name" == "ton-node" && "$managed_by" == "ton-k8s-operator" && "$instance" == "$target_name" && ",${owners}," == *",controller/StatefulSet/${target_name}/${target_sts_uid},"* ]]; then
+      continue
+    fi
+
+    IFS=',' read -r -a port_tokens <<<"${ports:-}"
+    for token in "${port_tokens[@]}"; do
+      token="$(trim_whitespace "$token")"
+      [[ -n "$token" ]] || continue
+      protocol="${token%%/*}"
+      port="${token#*/}"
+      protocol="${protocol^^}"
+      [[ -n "$protocol" ]] || protocol="TCP"
+      [[ "$protocol" =~ ^(TCP|UDP|SCTP)$ && "$port" =~ ^[0-9]+$ ]] || continue
+      (( port > 0 )) || continue
+      key="${protocol}/${port}"
+      [[ -n "${requested[$key]:-}" ]] || continue
+      node_check_append_host_port_conflict "$node" "${key} by ${ns}/${pod}"
+    done
+  done <<<"$pod_rows"
+}
+
 resolve_ton_replicas_for_node_check() {
   local replicas=""
   replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
@@ -1363,15 +1593,17 @@ run_node_prerequisite_check() {
   local selector="${2:-}"
   local node_rows row node unschedulable alloc_cpu alloc_memory conditions taints
   local basic_reason reason disk_bytes alloc_cpu_milli alloc_memory_bytes used_cpu used_memory free_cpu free_memory
-  local target result cpu_display memory_display disk_display
+  local target result cpu_display memory_display disk_display host_port_reason host_port_display
 
   [[ "$required_nodes" =~ ^[1-9][0-9]*$ ]] || {
     echo "Error: invalid required TON node count '${required_nodes}'." >&2
     return 1
   }
   resolve_node_check_requirements || return 1
+  node_check_resolve_host_port_requirements || return 1
   node_check_scope_nodes "$selector" || return 1
   collect_node_requested_resources || return 1
+  node_check_collect_host_port_conflicts || return 1
 
   KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
   KUBETON_NODE_CHECK_RESULT=()
@@ -1401,8 +1633,13 @@ run_node_prerequisite_check() {
   else
     echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES") (local TON PVC capacity + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom); disk data comes from the kubelet summary API"
   fi
+  if [[ "$KUBETON_NODE_CHECK_HOST_PORTS_ENABLED" == "true" ]]; then
+    echo "  required host ports: ${KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS[*]} (other assigned Pod reservations make a node ineligible)"
+  else
+    echo "  required host ports: disabled"
+  fi
   [[ -n "$selector" ]] && echo "  placement selector: ${selector}"
-  printf '%-36s %-7s %-18s %-20s %-20s %s\n' "node" "target" "cpu free / need" "memory free / need" "node fs free / need" "result"
+  printf '%-36s %-7s %-18s %-20s %-20s %-12s %s\n' "node" "target" "cpu free / need" "memory free / need" "node fs free / need" "host ports" "result"
 
   while IFS=$'\t' read -r node unschedulable alloc_cpu alloc_memory conditions taints; do
     node="$(trim_whitespace "$node")"
@@ -1455,6 +1692,17 @@ run_node_prerequisite_check() {
     if [[ "$disk_bytes" =~ ^[0-9]+$ ]] && (( disk_bytes < KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES )); then
       basic_reason="${basic_reason:+${basic_reason}, }insufficient disk"
     fi
+    host_port_reason="${KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS[$node]:-}"
+    if [[ "$KUBETON_NODE_CHECK_HOST_PORTS_ENABLED" == "true" ]]; then
+      if [[ -n "$host_port_reason" ]]; then
+        host_port_display="busy"
+        basic_reason="${basic_reason:+${basic_reason}, }host ports in use (${host_port_reason})"
+      else
+        host_port_display="free"
+      fi
+    else
+      host_port_display="disabled"
+    fi
 
     KUBETON_NODE_CHECK_FREE_CPU_MILLI["$node"]="$free_cpu"
     KUBETON_NODE_CHECK_FREE_MEMORY_BYTES["$node"]="$free_memory"
@@ -1476,7 +1724,7 @@ run_node_prerequisite_check() {
       KUBETON_NODE_CHECK_RESULT["$node"]="FAIL"
       KUBETON_NODE_CHECK_REASON["$node"]="$basic_reason"
     fi
-    printf '%-36s %-7s %-18s %-20s %-20s %s\n' "$node" "$target" "$cpu_display" "$memory_display" "$disk_display" "$result"
+    printf '%-36s %-7s %-18s %-20s %-20s %-12s %s\n' "$node" "$target" "$cpu_display" "$memory_display" "$disk_display" "$host_port_display" "$result"
   done <<<"$node_rows"
 
   # Prefer the roomiest eligible nodes.  This is especially important for a

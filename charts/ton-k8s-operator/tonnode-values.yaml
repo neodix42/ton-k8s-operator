@@ -68,6 +68,8 @@ tonNode:
       value: validator
     - name: DUMP
       value: "true"
+    - name: DUMP_EXTRACT_THREADS
+      value: "8"
     - name: MYTONCTRL_VERSION
       value: master
     - name: CUSTOM_PARAMETERS
