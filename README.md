@@ -254,6 +254,146 @@ Longhorn volumes: kubeton safely rebuilds its placement on compatible nodes.
 Existing TON resources using local-path are also left on their current node
 selector rather than being relabelled onto a new node.
 
+### Launch evidence and durable logs
+
+`kubeton install` and `kubeton start` create a private evidence directory on
+the machine where the command is executed. The default location is:
+
+```text
+./kubeton-launch-logs/<UTC timestamp>-<install|start>-<pid>/
+```
+
+The directory and its files are owner-only (`0700`/`0600`). It contains the
+complete kubeton command transcript, a timestamped Pod-state timeline, target
+namespace and cluster-wide Kubernetes Event streams, controller output,
+best-effort current/previous output from every TON init and application
+container, and final Pod/StatefulSet/TonNode, PVC/PV, VolumeAttachment, node,
+CSINode, Longhorn, Vault, operator, and Victoria status snapshots. The
+cluster-wide Event watcher starts before storage bootstrap or Helm can create a
+TON Pod, so it also preserves scheduler, CSI, Vault, Longhorn, and logging
+failures that occur before a TON object exists. The path is printed at the
+beginning and end of the command. Treat the bundle as sensitive operational
+data even though kubeton does not read Kubernetes Secret contents, does not
+query Secret or ConfigMap objects for final diagnostics, and does not copy
+literal container environment values into its Pod JSON snapshot.
+
+Useful evidence locations include `events-cluster.log` for the cluster-wide
+stream, `final/events-cluster.txt` for its final snapshot,
+`final/{operator,longhorn,vault}-diagnostics.txt` for each dependency
+namespace, `final/longhorn-storage.txt` for Longhorn CR/storage status, and
+`final/victoria-*-diagnostics.txt` for every configured VictoriaMetrics,
+VictoriaLogs, or VictoriaMetrics-operator namespace, plus
+`final/victoria-*-resources.txt` for Victoria custom-resource status. These
+diagnostics contain workload, Service/endpoint, PVC, lease, Event, and
+non-secret custom-resource status only; they never read Secret payloads.
+
+`kubeton install` keeps these watchers alive until the operator Deployment
+reports Ready (up to 10 minutes by default). A failed rollout makes the command
+fail and leaves its controller logs, Pod status, and Events in the bundle.
+
+For `start`, the local watcher begins before storage bootstrap or Helm creates
+the TON objects. The command no longer treats `Running`/`Ready` as successful
+bootstrap: TON currently has no readiness probe, so Kubernetes can report
+Ready while the dump is still downloading or extracting. By default, `start`
+waits up to 24 hours for every ordinal to have all of the durable MyTonCtrl
+commit state:
+
+- `/var/ton-work/db/mtc_done`
+- a non-empty `/var/ton-work/db/config.json`
+- persisted `validator.service` and `mytoncore.service` units
+
+It prints state changes and one-minute heartbeats such as `FailedScheduling`,
+`FailedAttachVolume`, `downloading`, `extracting`, `CrashLoopBackOff`, and
+`complete`. Five repeated CrashLoop restarts with a non-zero exit fail the
+command early while leaving the Pods/PVCs intact for diagnosis.
+
+On a fresh infrastructure bootstrap, `start` installs the cluster-wide node
+collector before Longhorn or Vault. The collector queues those early container
+logs in a bounded, release-specific host directory under
+`/var/lib/kubeton-vlogs-buffer-*`; the queue flushes when the VictoriaLogs
+backend becomes available. Before the first TON Pod is created, `start` also
+installs or verifies that backend and refuses to deploy TON unless a
+non-terminating Ready collector of the current DaemonSet revision exists on
+every selected TON node. Unavailable unrelated nodes may leave the aggregate
+collector DaemonSet partially Ready, but do not block TON once the selected
+nodes are covered. Sequential local-volume staging rechecks coverage before
+each additional ordinal is created.
+VictoriaLogs is the durable source for container stdout/stderr across rapid
+restarts and an SSH/API interruption; the local bundle supplements it with
+control-plane Events and launch state that do not exist in container logs.
+The tested default chart versions are pinned, collector disk buffering is
+bounded, and collector CPU/memory/ephemeral-storage requests prevent it from
+being a zero-request BestEffort eviction target.
+
+The VictoriaLogs backend itself does not authenticate requests. By default,
+kubeton therefore installs a `NetworkPolicy` that allows backend traffic only
+from the exact kubeton collector release and the exact kubeton VMAuth instance.
+This protects the in-cluster query endpoint when the CNI enforces Kubernetes
+NetworkPolicy (Calico does). Set `VICTORIA_LOGS_NETWORK_POLICY_ENABLED=false`
+only for a cluster whose CNI cannot support that policy; kubeton prints an
+explicit warning because any in-cluster Pod may then reach the backend directly.
+The release-specific collector buffer is intentionally retained on nodes after
+an uninstall so a failed bootstrap/reinstall can resume and flush queued logs;
+after deciding the history is no longer needed, an administrator may remove
+only the printed/configured release's exact `/var/lib/kubeton-vlogs-buffer-*`
+directory on each former collector node. During uninstall, kubeton removes the
+VictoriaLogs access Service first but keeps the ingress NetworkPolicy and its
+release cleanup records until the backend is proven gone. If that bounded
+cleanup check fails, uninstall exits non-zero and also defers Longhorn removal;
+rerunning uninstall safely retries the recorded release instead of exposing or
+stranding the retained launch evidence.
+
+Useful launch controls:
+
+- `KUBETON_LAUNCH_LOG_ROOT` (default `$PWD/kubeton-launch-logs`)
+- `KUBETON_LAUNCH_LOGS_ENABLED` (default `true`)
+- `KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SECONDS` (default `15`)
+- `KUBETON_INSTALL_READY_TIMEOUT_SECONDS` (default `600`; `install` keeps
+  capturing logs and fails unless the operator Deployment becomes Ready)
+- `KUBETON_START_WAIT_FOR_BOOTSTRAP` (default `true`)
+- `KUBETON_START_READY_TIMEOUT_SECONDS` (default `86400`)
+- `KUBETON_START_STATUS_INTERVAL_SECONDS` (default `60`)
+- `KUBETON_START_FATAL_RESTART_COUNT` (default `5`; `0` disables fail-fast)
+- `KUBETON_START_VICTORIA_LOGS_ENABLED` (default `true`; setting it to
+  `false` explicitly accepts that the local watcher cannot guarantee every
+  rapid restart)
+
+The VictoriaLogs collector covers Kubernetes container stdout/stderr, not the
+host's kubelet/containerd/Docker system journal. Continuous host-journal access
+would require a separate privileged node agent and is intentionally not enabled
+by default. Scheduler, CSI, eviction, and kubelet decisions relevant to launch
+are retained from the cluster-wide Kubernetes Event API stream in the local
+evidence bundle. Final dependency snapshots also retain Pod `.status.reason`
+and `.status.message` plus init/application-container restart and termination
+state, including an `Evicted` Pod's low-ephemeral-storage message even when its
+own Event list is empty.
+
+To determine whether a replica downloaded or extracted a dump, use its bundle,
+not `df` from an arbitrary host:
+
+```bash
+grep -E 'downloading|extracting|complete|Failed|CrashLoop' \
+  kubeton-launch-logs/<run>/timeline.tsv \
+  kubeton-launch-logs/<run>/command.log
+grep -R -E 'Download complete|Starting extraction|mtc_done|exit code' \
+  kubeton-launch-logs/<run>/pods/
+```
+
+For durable history after the launching shell exits, install the authenticated
+VictoriaMetrics access layer with `./kubeton victoria-metrics install`, or use
+a temporary direct port-forward and open
+`http://127.0.0.1:9428/select/vmui/`:
+
+```bash
+LOG_SERVICE=$(kubectl -n vm get service \
+  -l app.kubernetes.io/name=kubeton-victoria-logs-access \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl -n vm port-forward "service/${LOG_SERVICE}" 9428:9428
+```
+
+A host filesystem is relevant only after the replica's local-path PV
+`nodeAffinity` or `local.path.provisioner/selected-node` points to that host.
+
 For a separate filesystem mounted at `LOCAL_PATH_PROVISIONER_ROOT`, the kubelet
 node filesystem statistic is only a safety signal, not an authoritative free
 space measurement for that mount. Use a host-level disk monitor/probe as well.
@@ -511,6 +651,15 @@ KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS
 KUBETON_LONGHORN_READY_TIMEOUT_SECONDS
 KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS
 KUBETON_FAIL_ON_LONGHORN_MULTIPATHD
+KUBETON_LAUNCH_LOGS_ENABLED
+KUBETON_LAUNCH_LOG_ROOT
+KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SECONDS
+KUBETON_INSTALL_READY_TIMEOUT_SECONDS
+KUBETON_START_WAIT_FOR_BOOTSTRAP
+KUBETON_START_READY_TIMEOUT_SECONDS
+KUBETON_START_STATUS_INTERVAL_SECONDS
+KUBETON_START_FATAL_RESTART_COUNT
+KUBETON_START_VICTORIA_LOGS_ENABLED
 SKIP_STOP_KEY_BACKUP
 STATUS_EXEC_TIMEOUT
 HELPER_POD_READY_TIMEOUT
@@ -571,9 +720,19 @@ VICTORIA_LOGS_SINGLE_CHART_VERSION
 VICTORIA_LOGS_COLLECTOR_CHART_VERSION
 VICTORIA_LOGS_RETENTION_PERIOD
 VICTORIA_LOGS_PVC_SIZE
+VICTORIA_LOGS_RETENTION_DISK_SPACE
+VICTORIA_LOGS_COLLECTOR_BUFFER_SIZE
+VICTORIA_LOGS_COLLECTOR_CPU_REQUEST
+VICTORIA_LOGS_COLLECTOR_MEMORY_REQUEST
+VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_REQUEST
+VICTORIA_LOGS_COLLECTOR_CPU_LIMIT
+VICTORIA_LOGS_COLLECTOR_MEMORY_LIMIT
+VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_LIMIT
 VICTORIA_LOGS_STORAGE_CLASS
 VICTORIA_LOGS_NODE_SELECTOR
+VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR
 VICTORIA_LOGS_PIN_TO_LONGHORN_CSI
+VICTORIA_LOGS_NETWORK_POLICY_ENABLED
 VICTORIA_LOGS_PORT
 VICTORIA_LOGS_LOCAL_PORT_BASE
 VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE
@@ -583,6 +742,7 @@ VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS
 VICTORIA_LOGS_PORT_FORWARD_ADDRESS
 VICTORIA_LOGS_STATE_CONFIGMAP
 VICTORIA_LOGS_HELM_TIMEOUT_SECONDS
+VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS
 ```
 
 ### PROMETHEUS_TARGET_MODE
@@ -655,13 +815,15 @@ Main environment overrides:
 
 ### kubeton victoria-metrics
 
-`kubeton victoria-metrics install` installs VictoriaMetrics operator (QuickStart-style `install-no-webhook` manifest), deploys `VMSingle` + `VMAgent` + `VMAuth` + `VMUser`, auto-generates TonNode scrape resources (`Service` + `VMServiceScrape`) from TonNode `CUSTOM_PARAMETERS --exporter-address`, and (by default) installs `victoria-logs-single` + `victoria-logs-collector` from the official Helm charts.
+`kubeton victoria-metrics install` installs VictoriaMetrics operator (QuickStart-style `install-no-webhook` manifest), deploys `VMSingle` + `VMAgent` + `VMAuth` + `VMUser`, auto-generates TonNode scrape resources (`Service` + `VMServiceScrape`) from TonNode `CUSTOM_PARAMETERS --exporter-address`, and installs/updates the same VictoriaLogs stack that `kubeton start` ensures before TON bootstrap.
 
 Behavior:
 - applies/updates VictoriaMetrics operator in namespace `vm` (configurable)
 - deploys kubeton-managed VM stack resources with generated or user-provided auth credentials
 - creates/updates TonNode scrape resources so `VMAgent` starts scraping TonNode exporters
-- installs/updates VictoriaLogs backend (`victoria-logs-single`) and cluster-wide collector (`victoria-logs-collector` DaemonSet) with `remoteWrite[0].url` pointed at VictoriaLogs
+- installs/updates VictoriaLogs backend (`victoria-logs-single`) and a stable cluster-wide collector (`victoria-logs-collector` DaemonSet) with `remoteWrite[0].url` pointed at VictoriaLogs
+- caps the collector's per-destination on-node buffer and sets explicit CPU, memory, and ephemeral-storage requests/limits
+- warns when unrelated cluster nodes leave the aggregate collector DaemonSet partially Ready; `kubeton start` strictly requires a Ready collector on every selected TON node
 - on bare-metal, pins VictoriaLogs single to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
 - when using `longhorn` storageClass, also adds Longhorn CSI-based nodeAffinity fallback (from `CSINode`) so VictoriaLogs single cannot schedule to nodes without `driver.longhorn.io`
 - starts background `kubectl port-forward` to `VMAuth` and prints VMUI/targets URLs + credentials
@@ -689,9 +851,20 @@ Main environment overrides:
 - `VICTORIA_LOGS_COLLECTOR_RELEASE_NAME`
 - `VICTORIA_LOGS_RETENTION_PERIOD`
 - `VICTORIA_LOGS_PVC_SIZE`
+- `VICTORIA_LOGS_RETENTION_DISK_SPACE` (default `8GB`)
+- `VICTORIA_LOGS_COLLECTOR_BUFFER_SIZE` (default `5GB` per node/destination)
+- `VICTORIA_LOGS_COLLECTOR_CPU_REQUEST` / `VICTORIA_LOGS_COLLECTOR_CPU_LIMIT`
+- `VICTORIA_LOGS_COLLECTOR_MEMORY_REQUEST` / `VICTORIA_LOGS_COLLECTOR_MEMORY_LIMIT`
+- `VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_REQUEST` / `VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_LIMIT`
+- `VICTORIA_LOGS_SINGLE_CHART_VERSION` (tested default `0.13.9`)
+- `VICTORIA_LOGS_COLLECTOR_CHART_VERSION` (tested default `0.3.7`)
 - `VICTORIA_LOGS_STORAGE_CLASS` (default auto; uses `longhorn` when available)
 - `VICTORIA_LOGS_NODE_SELECTOR` (default on bare-metal: `LONGHORN_NODE_SELECTOR`)
+- `VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR` (default empty, meaning cluster-wide;
+  set only when collector coverage is intentionally restricted)
 - `VICTORIA_LOGS_PIN_TO_LONGHORN_CSI` (default `true`; adds nodeAffinity to nodes exposing `driver.longhorn.io`)
+- `VICTORIA_LOGS_NETWORK_POLICY_ENABLED` (default `true`; isolates the unauthenticated backend so only the kubeton collector and VMAuth can connect; requires enforcement by the cluster CNI)
+- `VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS` (default `300`; keeps backend ingress protection and cleanup state when uninstall cannot prove that logging workloads are gone)
 - `VICTORIA_LOGS_PORT`
 
 ### Cloud Install Options

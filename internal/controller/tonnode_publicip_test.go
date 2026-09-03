@@ -716,6 +716,64 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	}
 }
 
+func TestDesiredPodTemplateTerminationMessagePolicies(t *testing.T) {
+	reconciler := &TonNodeReconciler{}
+	tonNode := &tonv1alpha1.TonNode{
+		Spec: tonv1alpha1.TonNodeSpec{
+			ConfigRef: &corev1.LocalObjectReference{Name: "bootstrap-config"},
+			KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
+				Enabled: true,
+			},
+		},
+	}
+
+	tpl := reconciler.desiredPodTemplate(
+		tonNode,
+		map[string]string{"app.kubernetes.io/instance": "tonnode"},
+		corev1.EnvVar{Name: "PUBLIC_IP", Value: "95.217.73.161"},
+		nil,
+	)
+
+	wantContainers := map[string]bool{
+		tonContainerName: false,
+		"key-backup":     false,
+	}
+	for _, container := range tpl.Spec.Containers {
+		if _, ok := wantContainers[container.Name]; !ok {
+			t.Fatalf("unexpected app container %q", container.Name)
+		}
+		wantContainers[container.Name] = true
+		if container.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+			t.Errorf("app container %q terminationMessagePolicy = %q, want %q", container.Name, container.TerminationMessagePolicy, corev1.TerminationMessageFallbackToLogsOnError)
+		}
+	}
+	for name, found := range wantContainers {
+		if !found {
+			t.Errorf("expected app container %q", name)
+		}
+	}
+
+	wantInitContainers := map[string]bool{
+		persistentLayoutInitName: false,
+		"key-restore":            false,
+		"bootstrap-config":       false,
+	}
+	for _, container := range tpl.Spec.InitContainers {
+		if _, ok := wantInitContainers[container.Name]; !ok {
+			t.Fatalf("unexpected init container %q", container.Name)
+		}
+		wantInitContainers[container.Name] = true
+		if container.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+			t.Errorf("init container %q terminationMessagePolicy = %q, want %q", container.Name, container.TerminationMessagePolicy, corev1.TerminationMessageFallbackToLogsOnError)
+		}
+	}
+	for name, found := range wantInitContainers {
+		if !found {
+			t.Errorf("expected init container %q", name)
+		}
+	}
+}
+
 func TestDesiredStickyNodeHostnames(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

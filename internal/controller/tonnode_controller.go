@@ -637,13 +637,14 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	}
 
 	container := corev1.Container{
-		Name:            tonContainerName,
-		Image:           desiredImage(tonNode),
-		ImagePullPolicy: desiredImagePullPolicy(tonNode),
-		Env:             env,
-		Resources:       desiredResources(tonNode),
-		Ports:           containerPorts,
-		VolumeMounts:    volumeMounts,
+		Name:                     tonContainerName,
+		Image:                    desiredImage(tonNode),
+		ImagePullPolicy:          desiredImagePullPolicy(tonNode),
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+		Env:                      env,
+		Resources:                desiredResources(tonNode),
+		Ports:                    containerPorts,
+		VolumeMounts:             volumeMounts,
 	}
 	if holdOnFailureEnabled(tonNode) {
 		container.Command = []string{"bash", "-lc"}
@@ -683,9 +684,10 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 
 	if tonNode.Spec.ConfigRef != nil {
 		podSpec.InitContainers = append(podSpec.InitContainers, corev1.Container{
-			Name:            "bootstrap-config",
-			Image:           "busybox:1.36",
-			ImagePullPolicy: corev1.PullIfNotPresent,
+			Name:                     "bootstrap-config",
+			Image:                    "busybox:1.36",
+			ImagePullPolicy:          corev1.PullIfNotPresent,
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 			Command: []string{
 				"sh",
 				"-c",
@@ -1026,9 +1028,10 @@ func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
 
 func desiredPersistentLayoutInitContainer(tonNode *tonv1alpha1.TonNode) corev1.Container {
 	return corev1.Container{
-		Name:            persistentLayoutInitName,
-		Image:           desiredImage(tonNode),
-		ImagePullPolicy: desiredImagePullPolicy(tonNode),
+		Name:                     persistentLayoutInitName,
+		Image:                    desiredImage(tonNode),
+		ImagePullPolicy:          desiredImagePullPolicy(tonNode),
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		Command: []string{
 			"sh",
 			"-ec",
@@ -1053,27 +1056,29 @@ chmod 755 /mnt/ton-src /mnt/mytonctrl || true`,
 
 func desiredKeyRestoreInitContainer(tonNode *tonv1alpha1.TonNode) corev1.Container {
 	return corev1.Container{
-		Name:            "key-restore",
-		Image:           desiredKeyAgentImage(tonNode),
-		ImagePullPolicy: desiredKeyAgentImagePullPolicy(tonNode),
-		Command:         []string{"sh", "-ec", keyRestoreScript},
-		Env:             desiredKeyAgentEnv(tonNode),
-		EnvFrom:         desiredKeyAgentEnvFrom(tonNode),
-		Resources:       desiredKeyAgentResources(tonNode),
-		VolumeMounts:    desiredKeyAgentVolumeMounts(),
+		Name:                     "key-restore",
+		Image:                    desiredKeyAgentImage(tonNode),
+		ImagePullPolicy:          desiredKeyAgentImagePullPolicy(tonNode),
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+		Command:                  []string{"sh", "-ec", keyRestoreScript},
+		Env:                      desiredKeyAgentEnv(tonNode),
+		EnvFrom:                  desiredKeyAgentEnvFrom(tonNode),
+		Resources:                desiredKeyAgentResources(tonNode),
+		VolumeMounts:             desiredKeyAgentVolumeMounts(),
 	}
 }
 
 func desiredKeyBackupSidecar(tonNode *tonv1alpha1.TonNode) corev1.Container {
 	return corev1.Container{
-		Name:            "key-backup",
-		Image:           desiredKeyAgentImage(tonNode),
-		ImagePullPolicy: desiredKeyAgentImagePullPolicy(tonNode),
-		Command:         []string{"sh", "-ec", keyBackupScript},
-		Env:             desiredKeyAgentEnv(tonNode),
-		EnvFrom:         desiredKeyAgentEnvFrom(tonNode),
-		Resources:       desiredKeyAgentResources(tonNode),
-		VolumeMounts:    desiredKeyAgentVolumeMounts(),
+		Name:                     "key-backup",
+		Image:                    desiredKeyAgentImage(tonNode),
+		ImagePullPolicy:          desiredKeyAgentImagePullPolicy(tonNode),
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+		Command:                  []string{"sh", "-ec", keyBackupScript},
+		Env:                      desiredKeyAgentEnv(tonNode),
+		EnvFrom:                  desiredKeyAgentEnvFrom(tonNode),
+		Resources:                desiredKeyAgentResources(tonNode),
+		VolumeMounts:             desiredKeyAgentVolumeMounts(),
 	}
 }
 

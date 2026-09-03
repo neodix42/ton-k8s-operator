@@ -66,6 +66,15 @@ KUBETON_LONGHORN_READY_TIMEOUT_SECONDS="${KUBETON_LONGHORN_READY_TIMEOUT_SECONDS
 KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY="${KUBETON_SKIP_LONGHORN_HELM_UPGRADE_WHEN_READY:-true}"
 KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS="${KUBETON_VAULT_MOUNT_RECOVERY_ATTEMPTS:-2}"
 KUBETON_FAIL_ON_LONGHORN_MULTIPATHD="${KUBETON_FAIL_ON_LONGHORN_MULTIPATHD:-true}"
+KUBETON_LAUNCH_LOGS_ENABLED="${KUBETON_LAUNCH_LOGS_ENABLED:-true}"
+KUBETON_LAUNCH_LOG_ROOT="${KUBETON_LAUNCH_LOG_ROOT:-${PWD}/kubeton-launch-logs}"
+KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SECONDS="${KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SECONDS:-15}"
+KUBETON_INSTALL_READY_TIMEOUT_SECONDS="${KUBETON_INSTALL_READY_TIMEOUT_SECONDS:-600}"
+KUBETON_START_WAIT_FOR_BOOTSTRAP="${KUBETON_START_WAIT_FOR_BOOTSTRAP:-true}"
+KUBETON_START_READY_TIMEOUT_SECONDS="${KUBETON_START_READY_TIMEOUT_SECONDS:-86400}"
+KUBETON_START_STATUS_INTERVAL_SECONDS="${KUBETON_START_STATUS_INTERVAL_SECONDS:-60}"
+KUBETON_START_FATAL_RESTART_COUNT="${KUBETON_START_FATAL_RESTART_COUNT:-5}"
+KUBETON_START_VICTORIA_LOGS_ENABLED="${KUBETON_START_VICTORIA_LOGS_ENABLED:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 MYTONCTRL_EXEC_TIMEOUT="${MYTONCTRL_EXEC_TIMEOUT:-180s}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
@@ -119,13 +128,23 @@ VICTORIA_LOGS_RELEASE_NAME="${VICTORIA_LOGS_RELEASE_NAME:-kubeton-vlogs}"
 VICTORIA_LOGS_COLLECTOR_RELEASE_NAME="${VICTORIA_LOGS_COLLECTOR_RELEASE_NAME:-kubeton-vlogs-collector}"
 VICTORIA_LOGS_HELM_REPO_NAME="${VICTORIA_LOGS_HELM_REPO_NAME:-vm}"
 VICTORIA_LOGS_HELM_REPO_URL="${VICTORIA_LOGS_HELM_REPO_URL:-https://victoriametrics.github.io/helm-charts}"
-VICTORIA_LOGS_SINGLE_CHART_VERSION="${VICTORIA_LOGS_SINGLE_CHART_VERSION:-}"
-VICTORIA_LOGS_COLLECTOR_CHART_VERSION="${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}"
+VICTORIA_LOGS_SINGLE_CHART_VERSION="${VICTORIA_LOGS_SINGLE_CHART_VERSION:-0.13.9}"
+VICTORIA_LOGS_COLLECTOR_CHART_VERSION="${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-0.3.7}"
 VICTORIA_LOGS_RETENTION_PERIOD="${VICTORIA_LOGS_RETENTION_PERIOD:-30d}"
 VICTORIA_LOGS_PVC_SIZE="${VICTORIA_LOGS_PVC_SIZE:-10Gi}"
+VICTORIA_LOGS_RETENTION_DISK_SPACE="${VICTORIA_LOGS_RETENTION_DISK_SPACE:-8GB}"
+VICTORIA_LOGS_COLLECTOR_BUFFER_SIZE="${VICTORIA_LOGS_COLLECTOR_BUFFER_SIZE:-5GB}"
+VICTORIA_LOGS_COLLECTOR_CPU_REQUEST="${VICTORIA_LOGS_COLLECTOR_CPU_REQUEST:-100m}"
+VICTORIA_LOGS_COLLECTOR_MEMORY_REQUEST="${VICTORIA_LOGS_COLLECTOR_MEMORY_REQUEST:-128Mi}"
+VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_REQUEST="${VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_REQUEST:-256Mi}"
+VICTORIA_LOGS_COLLECTOR_CPU_LIMIT="${VICTORIA_LOGS_COLLECTOR_CPU_LIMIT:-1}"
+VICTORIA_LOGS_COLLECTOR_MEMORY_LIMIT="${VICTORIA_LOGS_COLLECTOR_MEMORY_LIMIT:-1Gi}"
+VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_LIMIT="${VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_LIMIT:-6Gi}"
 VICTORIA_LOGS_STORAGE_CLASS="${VICTORIA_LOGS_STORAGE_CLASS:-}"
 VICTORIA_LOGS_NODE_SELECTOR="${VICTORIA_LOGS_NODE_SELECTOR:-}"
+VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR="${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}"
 VICTORIA_LOGS_PIN_TO_LONGHORN_CSI="${VICTORIA_LOGS_PIN_TO_LONGHORN_CSI:-true}"
+VICTORIA_LOGS_NETWORK_POLICY_ENABLED="${VICTORIA_LOGS_NETWORK_POLICY_ENABLED:-true}"
 VICTORIA_LOGS_PORT="${VICTORIA_LOGS_PORT:-9428}"
 VICTORIA_LOGS_LOCAL_PORT_BASE="${VICTORIA_LOGS_LOCAL_PORT_BASE:-9428}"
 VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE="${VICTORIA_LOGS_API_PROXY_LOCAL_PORT_BASE:-19428}"
@@ -135,6 +154,7 @@ VICTORIA_LOGS_PORT_FORWARD_VERIFY_SECONDS="${VICTORIA_LOGS_PORT_FORWARD_VERIFY_S
 VICTORIA_LOGS_PORT_FORWARD_ADDRESS="${VICTORIA_LOGS_PORT_FORWARD_ADDRESS:-}"
 VICTORIA_LOGS_STATE_CONFIGMAP="${VICTORIA_LOGS_STATE_CONFIGMAP:-kubeton-victoria-logs-state}"
 VICTORIA_LOGS_HELM_TIMEOUT_SECONDS="${VICTORIA_LOGS_HELM_TIMEOUT_SECONDS:-600}"
+VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS="${VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS:-300}"
 MAIN_WALLET_IMAGE_REPOSITORY="${MAIN_WALLET_IMAGE_REPOSITORY:-ghcr.io/ton-blockchain/ton}"
 MAIN_WALLET_IMAGE="${MAIN_WALLET_IMAGE:-}"
 MAIN_WALLET_SCRIPT_FILE="${MAIN_WALLET_SCRIPT_FILE:-$CHART_DIR/main-wallet.sh}"
@@ -169,6 +189,9 @@ declare -a KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS=()
 declare -A KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS=()
 declare -a KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS=()
 declare -A KUBETON_NODE_CHECK_LONGHORN_DAEMONSET_SELECTOR=()
+declare -a KUBETON_LAUNCH_WATCHER_PIDS=()
+KUBETON_ACTIVE_LAUNCH_DIR=""
+KUBETON_RETAIN_VICTORIA_LOGS_GUARDS=0
 KUBETON_NODE_CHECK_TON_SELECTOR=""
 KUBETON_NODE_CHECK_TON_VALUES_SELECTOR=""
 KUBETON_NODE_CHECK_SCOPE_SELECTOR=""
@@ -188,9 +211,9 @@ Usage:
 
 Commands:
   check                Check schedulable nodes against TON CPU, memory, disk, and pressure prerequisites.
-  install              Install or upgrade operator only (Helm upgrade --install with operator-values.yaml).
+  install              Install or upgrade operator and retain a local launch evidence bundle.
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
-  start                Start TON fleet.
+  start                Start TON fleet, archive launch evidence, and wait for completed MyTonCtrl bootstrap.
   prometheus start     Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
   prometheus stop      Stop/drop kubeton-managed Prometheus resources and local background port-forward(s).
   grafana start        Create/update Grafana, provision kubeton Prometheus datasource(s) and starter dashboard(s), and start local background port-forward.
@@ -257,6 +280,752 @@ run_with_timeout() {
     return $?
   fi
   "$@"
+}
+
+launch_session_selector() {
+  local tonnode_name="$1"
+  printf 'app.kubernetes.io/name=ton-node,app.kubernetes.io/managed-by=ton-k8s-operator,app.kubernetes.io/instance=%s' "$tonnode_name"
+}
+
+kubeton_process_identity_from_proc() {
+  local pid="$1"
+  local proc_root="${KUBETON_PROCESS_PROC_ROOT:-/proc}"
+  local stat_line stat_tail parsed actual_parent process_state start_time
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "${proc_root%/}/${pid}/stat" ]] || return 1
+  stat_line="$(awk 'NR == 1 {print; exit}' "${proc_root%/}/${pid}/stat" 2>/dev/null || true)"
+  [[ -n "$stat_line" && "$stat_line" == *") "* ]] || return 1
+  # The comm field is parenthesized and may itself contain spaces. Remove
+  # through the final closing parenthesis before indexing the remaining
+  # fields: state=1, ppid=2, and starttime=20 (field 22 in procfs).
+  stat_tail="${stat_line##*) }"
+  parsed="$(printf '%s\n' "$stat_tail" | awk 'NF >= 20 {print $2 "\t" substr($1, 1, 1) "\t" $20; exit}')"
+  IFS=$'\t' read -r actual_parent process_state start_time <<<"$parsed"
+  [[ "$actual_parent" =~ ^[0-9]+$ && "$start_time" =~ ^[0-9]+$ && -n "$process_state" ]] || return 1
+  printf '%s\t%s\tproc:%s' "$actual_parent" "$process_state" "$start_time"
+}
+
+kubeton_process_identity_from_ps() {
+  local pid="$1"
+  local start_field row parsed actual_parent process_state start_token
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  # lstart is available in procps and BSD ps and gives a fixed wall-clock
+  # identity. Some smaller implementations expose the same fixed value as
+  # start. If neither format exists, fail closed instead of signaling a PID
+  # based only on its mutable command name or current parent.
+  for start_field in lstart start; do
+    row="$(LC_ALL=C ps -p "$pid" -o ppid= -o stat= -o "${start_field}=" 2>/dev/null || true)"
+    parsed="$(printf '%s\n' "$row" | awk -v prefix="ps-${start_field}:" '
+      NF >= 3 {
+        parent = $1
+        state = substr($2, 1, 1)
+        $1 = ""
+        $2 = ""
+        sub(/^[[:space:]]+/, "")
+        if (parent ~ /^[0-9]+$/ && state != "" && $0 != "") {
+          print parent "\t" state "\t" prefix $0
+          exit
+        }
+      }
+    ')"
+    IFS=$'\t' read -r actual_parent process_state start_token <<<"$parsed"
+    if [[ "$actual_parent" =~ ^[0-9]+$ && -n "$process_state" && -n "$start_token" ]]; then
+      printf '%s\t%s\t%s' "$actual_parent" "$process_state" "$start_token"
+      return 0
+    fi
+  done
+  return 1
+}
+
+kubeton_process_identity() {
+  local pid="$1"
+
+  kubeton_process_identity_from_proc "$pid" && return 0
+  kubeton_process_identity_from_ps "$pid"
+}
+
+terminate_owned_process_tree() {
+  local root_pid="$1"
+  local expected_parent="${2:-}"
+  local expected_identity_token="${3:-}"
+  local identity actual_parent process_state identity_token identity_token_now child attempt
+
+  [[ "$root_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  identity="$(kubeton_process_identity "$root_pid" 2>/dev/null || true)"
+  IFS=$'\t' read -r actual_parent process_state identity_token <<<"$identity"
+  [[ "$actual_parent" =~ ^[0-9]+$ && -n "$identity_token" ]] || return 0
+  if [[ -n "$expected_parent" ]]; then
+    [[ "$actual_parent" == "$expected_parent" ]] || return 0
+  else
+    expected_parent="$actual_parent"
+  fi
+  if [[ -n "$expected_identity_token" && "$identity_token" != "$expected_identity_token" ]]; then
+    return 0
+  fi
+  # Freeze each verified process before enumerating children so it cannot
+  # create a new descendant between the ownership walk and termination.
+  kill -STOP "$root_pid" >/dev/null 2>&1 || return 0
+  identity="$(kubeton_process_identity "$root_pid" 2>/dev/null || true)"
+  IFS=$'\t' read -r actual_parent process_state identity_token_now <<<"$identity"
+  if [[ "$actual_parent" != "$expected_parent" || "$identity_token_now" != "$identity_token" ]]; then
+    # We cannot prove this is still the process which was observed above.
+    # Undo our STOP best-effort, but never TERM/KILL the changed identity.
+    kill -CONT "$root_pid" >/dev/null 2>&1 || true
+    return 0
+  fi
+  while IFS= read -r child; do
+    child="$(trim_whitespace "$child")"
+    [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
+    terminate_owned_process_tree "$child" "$root_pid"
+  done < <(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$root_pid" '$2 == parent {print $1}')
+  kill -TERM "$root_pid" >/dev/null 2>&1 || true
+  kill -CONT "$root_pid" >/dev/null 2>&1 || true
+  for attempt in {1..10}; do
+    identity="$(kubeton_process_identity "$root_pid" 2>/dev/null || true)"
+    IFS=$'\t' read -r actual_parent process_state identity_token_now <<<"$identity"
+    if [[ "$actual_parent" != "$expected_parent" \
+      || "$identity_token_now" != "$identity_token" \
+      || "$process_state" == "Z" \
+      || -z "$identity" ]]; then
+      return 0
+    fi
+    command sleep 0.05
+  done
+  # This is a private process tree rooted in a PID whose parent and start time
+  # were verified above. Escalate so a TERM-ignoring child cannot retain a
+  # transcript FIFO and hang kubeton shutdown indefinitely.
+  identity="$(kubeton_process_identity "$root_pid" 2>/dev/null || true)"
+  IFS=$'\t' read -r actual_parent process_state identity_token_now <<<"$identity"
+  if [[ -n "$identity" \
+    && "$actual_parent" == "$expected_parent" \
+    && "$identity_token_now" == "$identity_token" \
+    && "$process_state" != "Z" ]]; then
+    kill -KILL "$root_pid" >/dev/null 2>&1 || true
+  fi
+}
+
+launch_session_drain_or_stop_tee() {
+  local tee_pid="$1"
+  local expected_parent="$2"
+  local identity actual_parent process_state identity_token identity_token_now attempt
+
+  [[ "$tee_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  identity="$(kubeton_process_identity "$tee_pid" 2>/dev/null || true)"
+  IFS=$'\t' read -r actual_parent process_state identity_token <<<"$identity"
+  [[ "$actual_parent" == "$expected_parent" && -n "$identity_token" ]] || return 0
+
+  # Once command-side FIFO writers are stopped, give tee time to consume bytes
+  # already queued by the kernel. This preserves the tail of an interrupted
+  # command instead of killing the transcript writer immediately. Bound the
+  # grace period so an escaped process which inherited the FIFO cannot hang
+  # kubeton forever.
+  for attempt in {1..40}; do
+    identity="$(kubeton_process_identity "$tee_pid" 2>/dev/null || true)"
+    IFS=$'\t' read -r actual_parent process_state identity_token_now <<<"$identity"
+    if [[ -z "$identity" \
+      || "$actual_parent" != "$expected_parent" \
+      || "$identity_token_now" != "$identity_token" \
+      || "$process_state" == "Z" ]]; then
+      return 0
+    fi
+    command sleep 0.05
+  done
+  terminate_owned_process_tree "$tee_pid" "$expected_parent" "$identity_token"
+}
+
+terminate_owned_child_processes() {
+  local parent_pid="$1"
+  local child
+
+  while IFS= read -r child; do
+    child="$(trim_whitespace "$child")"
+    [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
+    terminate_owned_process_tree "$child" "$parent_pid"
+  done < <(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$parent_pid" '$2 == parent {print $1}')
+}
+
+launch_session_begin() {
+  local command_name="$1"
+  local root run_id launch_dir context="unknown"
+
+  root="$(trim_whitespace "${KUBETON_LAUNCH_LOG_ROOT:-}")"
+  if [[ -z "$root" ]]; then
+    echo "Error: KUBETON_LAUNCH_LOG_ROOT must not be empty." >&2
+    return 1
+  fi
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-${command_name}-$$"
+  launch_dir="${root%/}/${run_id}"
+  if [[ -e "$launch_dir" ]]; then
+    launch_dir="${launch_dir}-${RANDOM}"
+  fi
+
+  (umask 077; mkdir -p "$launch_dir/pods" "$launch_dir/final") || {
+    echo "Error: cannot create launch evidence directory ${launch_dir}." >&2
+    return 1
+  }
+  # Never chmod a caller-supplied existing root (it may be a shared directory
+  # or even the workspace itself). The per-run directory is the security
+  # boundary; a newly created root already inherited umask 077 above.
+  chmod 700 "$launch_dir" "$launch_dir/pods" "$launch_dir/final" 2>/dev/null || true
+  context="$(kubectl config current-context 2>/dev/null || true)"
+  context="$(trim_whitespace "$context")"
+  [[ -z "$context" ]] && context="unknown"
+  (umask 077; {
+    printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'command=%s\n' "$command_name"
+    printf 'pid=%s\n' "$$"
+    printf 'kube_context=%s\n' "$context"
+    printf 'ton_values_file=%s\n' "$TON_VALUES_FILE"
+  } >"$launch_dir/session.meta")
+  echo "[launch] Evidence is being retained in ${launch_dir}" >&2
+  printf '%s' "$launch_dir"
+}
+
+launch_session_event_watch() {
+  local launch_dir="$1"
+  local ns="$2"
+  local stop_file="$launch_dir/.stop"
+  local output_file="$launch_dir/events.log"
+
+  umask 077
+  printf '# Kubernetes events for namespace %s; watcher started %s\n' "$ns" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$output_file"
+
+  while [[ ! -e "$stop_file" ]]; do
+    # `kubectl get --watch` performs the initial list and starts its watch from
+    # that list's resourceVersion inside one supported client operation. This
+    # avoids a list/watch race without relying on a kubectl --resource-version
+    # flag (which `kubectl get` does not expose). A real reconnect can repeat
+    # retained Events, but the long-lived stream is not periodically replayed.
+    printf '\n# event list/watch connected %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$output_file"
+    kubectl -n "$ns" get events --watch \
+      -o go-template='{{.metadata.creationTimestamp}}{{"\t"}}{{.lastTimestamp}}{{"\t"}}{{.type}}{{"\t"}}{{.reason}}{{"\t"}}{{.involvedObject.kind}}{{"/"}}{{.involvedObject.name}}{{"\t"}}{{.count}}{{"\t"}}{{.message}}{{"\n"}}' \
+      >>"$output_file" 2>>"$launch_dir/watcher-errors.log" || true
+    [[ -e "$stop_file" ]] || sleep 2
+  done
+}
+
+# Namespace-scoped Events explain the TON workload itself, while a cluster-wide
+# stream captures the dependencies that can fail before a TON Pod exists:
+# scheduler/node pressure, Longhorn CSI, Vault, the operator, and VictoriaLogs.
+# Events are retained by the API long enough for the initial list to close the
+# small scheduling gap between launching this background watcher and the first
+# bootstrap action.
+launch_session_cluster_event_watch() {
+  local launch_dir="$1"
+  local stop_file="$launch_dir/.stop"
+  local output_file="$launch_dir/events-cluster.log"
+
+  umask 077
+  printf '# Kubernetes events for all namespaces; watcher started %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$output_file"
+
+  while [[ ! -e "$stop_file" ]]; do
+    printf '\n# cluster event list/watch connected %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$output_file"
+    kubectl get events --all-namespaces --watch \
+      -o go-template='{{.metadata.creationTimestamp}}{{"\t"}}{{.metadata.namespace}}{{"\t"}}{{.lastTimestamp}}{{"\t"}}{{.type}}{{"\t"}}{{.reason}}{{"\t"}}{{.involvedObject.kind}}{{"/"}}{{.involvedObject.name}}{{"\t"}}{{.count}}{{"\t"}}{{.message}}{{"\n"}}' \
+      >>"$output_file" 2>>"$launch_dir/watcher-errors.log" || true
+    [[ -e "$stop_file" ]] || sleep 2
+  done
+}
+
+launch_session_timeline_watch() {
+  local launch_dir="$1"
+  local ns="$2"
+  local tonnode_name="$3"
+  local selector stop_file interval
+
+  selector="$(launch_session_selector "$tonnode_name")"
+  stop_file="$launch_dir/.stop"
+  interval="$(trim_whitespace "${KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SECONDS:-15}")"
+  if ! [[ "$interval" =~ ^[1-9][0-9]*$ ]]; then
+    interval=15
+  fi
+  umask 077
+  printf 'observed_at\tpod\tuid\tnode\tphase\tinitialized\tready\trestarts\twaiting_reason\tlast_exit\n' >"$launch_dir/timeline.tsv"
+
+  while [[ ! -e "$stop_file" ]]; do
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods -l "$selector" \
+      -o go-template="{{range .items}}{{printf \"%s\\t%s\\t%s\\t%s\\t%s\\t\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" .metadata.name .metadata.uid .spec.nodeName .status.phase}}{{range .status.conditions}}{{if eq .type \"Initialized\"}}{{.status}}{{end}}{{end}}{{printf \"\\t\"}}{{range .status.conditions}}{{if eq .type \"Ready\"}}{{.status}}{{end}}{{end}}{{printf \"\\t\"}}{{range .status.initContainerStatuses}}{{.restartCount}}{{\"+\"}}{{end}}{{range .status.containerStatuses}}{{.restartCount}}{{\"+\"}}{{end}}{{printf \"\\t\"}}{{range .status.initContainerStatuses}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{end}}{{range .status.containerStatuses}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{end}}{{printf \"\\t\"}}{{range .status.initContainerStatuses}}{{if .lastState.terminated}}{{.lastState.terminated.exitCode}}{{end}}{{end}}{{range .status.containerStatuses}}{{if .lastState.terminated}}{{.lastState.terminated.exitCode}}{{end}}{{end}}{{printf \"\\n\"}}{{end}}" \
+      >>"$launch_dir/timeline.tsv" 2>>"$launch_dir/watcher-errors.log" || true
+    sleep "$interval" &
+    wait "$!" || true
+  done
+}
+
+launch_session_init_container_completed() {
+  local ns="$1"
+  local pod="$2"
+  local expected_uid="$3"
+  local container="$4"
+  local status_rows row name exit_code current_uid
+
+  status_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pod "$pod" --ignore-not-found \
+    -o go-template='{{.metadata.uid}}{{"\n"}}{{range .status.initContainerStatuses}}{{.name}}{{"\x1f"}}{{if .state.terminated}}{{.state.terminated.exitCode}}{{end}}{{"\n"}}{{end}}' \
+    2>/dev/null || true)"
+  current_uid="$(printf '%s\n' "$status_rows" | head -n1)"
+  current_uid="$(trim_whitespace "$current_uid")"
+  [[ "$current_uid" == "$expected_uid" ]] || return 1
+  while IFS= read -r row; do
+    IFS=$'\x1f' read -r name exit_code <<<"$row"
+    if [[ "$name" == "$container" && "$exit_code" == "0" ]]; then
+      return 0
+    fi
+  done < <(printf '%s\n' "$status_rows" | tail -n +2)
+  return 1
+}
+
+launch_session_follow_one_container() {
+  local launch_dir="$1"
+  local ns="$2"
+  local pod="$3"
+  local expected_uid="$4"
+  local container="$5"
+  local container_kind="$6"
+  local safe_uid safe_container stop_file current_uid output_file error_file
+
+  safe_uid="${expected_uid//[^a-zA-Z0-9_.-]/_}"
+  safe_container="${container//[^a-zA-Z0-9_.-]/_}"
+  stop_file="$launch_dir/.stop"
+  output_file="$launch_dir/pods/${pod}-${safe_uid}-${safe_container}.log"
+  error_file="$launch_dir/pods/${pod}-${safe_uid}-${safe_container}.errors.log"
+  umask 077
+
+  while [[ ! -e "$stop_file" ]]; do
+    current_uid="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pod "$pod" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    current_uid="$(trim_whitespace "$current_uid")"
+    if [[ -z "$current_uid" || "$current_uid" != "$expected_uid" ]]; then
+      return 0
+    fi
+    printf '\n===== %s/%s container=%s kind=%s log connection %s =====\n' \
+      "$ns" "$pod" "$container" "$container_kind" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$output_file"
+    # Each container gets its own follower. A long-lived sidecar must not keep
+    # kubectl open after ton-node exits and hide a later restart generation.
+    # Shutdown explicitly kills the owned kubectl child, so no stream timeout
+    # is needed and a long download log is not replayed every minute.
+    kubectl -n "$ns" logs "$pod" -c "$container" --timestamps=true \
+      --follow --pod-running-timeout=15s >>"$output_file" 2>>"$error_file" || true
+    [[ -e "$stop_file" ]] && break
+    printf '\n===== previous %s container=%s snapshot %s =====\n' \
+      "$container_kind" "$container" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$output_file"
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" logs "$pod" -c "$container" \
+      --timestamps=true --previous >>"$output_file" 2>>"$error_file" || true
+    if [[ "$container_kind" == "init" ]] \
+      && launch_session_init_container_completed "$ns" "$pod" "$expected_uid" "$container"; then
+      return 0
+    fi
+    sleep 2
+  done
+}
+
+launch_session_log_supervisor() {
+  local launch_dir="$1"
+  local ns="$2"
+  local tonnode_name="$3"
+  local selector stop_file row pod uid container_kind container key
+  local -A seen=()
+
+  selector="$(launch_session_selector "$tonnode_name")"
+  stop_file="$launch_dir/.stop"
+  trap 'terminate_owned_child_processes "$BASHPID"' EXIT
+  trap 'terminate_owned_child_processes "$BASHPID"; exit 0' INT TERM
+  while [[ ! -e "$stop_file" ]]; do
+    while IFS=$'\t' read -r pod uid container_kind container; do
+      pod="$(trim_whitespace "$pod")"
+      uid="$(trim_whitespace "$uid")"
+      container_kind="$(trim_whitespace "$container_kind")"
+      container="$(trim_whitespace "$container")"
+      [[ -z "$pod" || -z "$uid" || -z "$container" ]] && continue
+      key="${pod}/${uid}/${container_kind}/${container}"
+      [[ -n "${seen[$key]:-}" ]] && continue
+      seen["$key"]=1
+      launch_session_follow_one_container "$launch_dir" "$ns" "$pod" "$uid" "$container" "$container_kind" &
+    done < <(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods -l "$selector" \
+      -o go-template='{{range .items}}{{$pod := .metadata.name}}{{$uid := .metadata.uid}}{{range .spec.initContainers}}{{$pod}}{{"\t"}}{{$uid}}{{"\tinit\t"}}{{.name}}{{"\n"}}{{end}}{{range .spec.containers}}{{$pod}}{{"\t"}}{{$uid}}{{"\tapp\t"}}{{.name}}{{"\n"}}{{end}}{{end}}' \
+      2>>"$launch_dir/watcher-errors.log" || true)
+    sleep 2
+  done
+}
+
+resolve_operator_controller_deployment_name() {
+  local deployment_rows row deployment_name="" count=0
+
+  # The Helm fullname changes with RELEASE_NAME/nameOverride. Resolve the
+  # controller by immutable release/role labels instead of assuming the
+  # default release's rendered name. Keep OP_CONTROLLER_DEPLOYMENT as a
+  # compatibility fallback for older or externally rendered installations.
+  deployment_rows="$(kubectl -n "$OP_NAMESPACE" get deployment \
+    -l "app.kubernetes.io/instance=${RELEASE_NAME},control-plane=controller-manager" \
+    -o go-template='{{range .items}}{{.metadata.name}}{{"\n"}}{{end}}' 2>/dev/null || true)"
+  while IFS= read -r row; do
+    row="$(trim_whitespace "$row")"
+    [[ -z "$row" ]] && continue
+    deployment_name="$row"
+    count=$((count + 1))
+  done <<<"$deployment_rows"
+  if (( count == 1 )); then
+    printf '%s' "$deployment_name"
+    return 0
+  fi
+  if (( count > 1 )); then
+    return 1
+  fi
+  if kubectl -n "$OP_NAMESPACE" get deployment "$OP_CONTROLLER_DEPLOYMENT" >/dev/null 2>&1; then
+    printf '%s' "$OP_CONTROLLER_DEPLOYMENT"
+    return 0
+  fi
+  return 1
+}
+
+launch_session_operator_log_watch() {
+  local launch_dir="$1"
+  local stop_file="$launch_dir/.stop"
+  local operator_deployment=""
+  umask 077
+  while [[ ! -e "$stop_file" ]]; do
+    operator_deployment="$(resolve_operator_controller_deployment_name || true)"
+    operator_deployment="$(trim_whitespace "$operator_deployment")"
+    if [[ -z "$operator_deployment" ]]; then
+      sleep 2
+      continue
+    fi
+    printf '\n===== operator log connection %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$launch_dir/operator.log"
+    kubectl -n "$OP_NAMESPACE" logs "deployment/${operator_deployment}" \
+      --all-containers=true --prefix=true --timestamps=true --follow --pod-running-timeout=15s \
+      >>"$launch_dir/operator.log" 2>>"$launch_dir/watcher-errors.log" || true
+    [[ -e "$stop_file" ]] || sleep 2
+  done
+}
+
+# Capture operational status, not configuration payloads. In particular this
+# intentionally does not query Secret or ConfigMap objects: their names may be
+# visible through normal workload status, but no Secret data is read into a
+# launch evidence bundle.
+launch_session_namespace_diagnostics() {
+  local destination="$1"
+  local label="$2"
+  local ns="$3"
+  local output_file
+
+  ns="$(trim_whitespace "$ns")"
+  [[ -n "$ns" ]] || return 0
+  label="${label//[^A-Za-z0-9_.-]/_}"
+  [[ -n "$label" ]] || label="namespace"
+  output_file="$destination/${label}-diagnostics.txt"
+
+  umask 077
+  {
+    printf '# Non-secret diagnostics for namespace %s; captured %s\n' "$ns" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '\n===== namespace =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get namespace "$ns" \
+      -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,CREATED:.metadata.creationTimestamp' || true
+    printf '\n===== pods =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods -o wide || true
+    printf '\n===== pod status and eviction/scheduling reasons =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods \
+      -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,REASON:.status.reason,MESSAGE:.status.message,DELETING:.metadata.deletionTimestamp' || true
+    printf '\n===== container restart and termination status =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods \
+      -o go-template='{{range .items}}{{$pod := .metadata.name}}{{range .status.initContainerStatuses}}{{$pod}}{{"\tinit\t"}}{{.name}}{{"\trestarts="}}{{.restartCount}}{{"\twaiting="}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{"\tterminated="}}{{if .state.terminated}}{{.state.terminated.reason}}{{"/exit="}}{{.state.terminated.exitCode}}{{end}}{{"\tlast="}}{{if .lastState.terminated}}{{.lastState.terminated.reason}}{{"/exit="}}{{.lastState.terminated.exitCode}}{{end}}{{"\n"}}{{end}}{{range .status.containerStatuses}}{{$pod}}{{"\tapp\t"}}{{.name}}{{"\trestarts="}}{{.restartCount}}{{"\twaiting="}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{"\tterminated="}}{{if .state.terminated}}{{.state.terminated.reason}}{{"/exit="}}{{.state.terminated.exitCode}}{{end}}{{"\tlast="}}{{if .lastState.terminated}}{{.lastState.terminated.reason}}{{"/exit="}}{{.lastState.terminated.exitCode}}{{end}}{{"\n"}}{{end}}{{end}}' || true
+    printf '\n===== workloads =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get deployment,daemonset,statefulset,replicaset,job,cronjob -o wide || true
+    printf '\n===== services and endpoints =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get service,endpoints,endpointslice -o wide || true
+    printf '\n===== persistent volume claims =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pvc -o wide || true
+    printf '\n===== leases =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get lease.coordination.k8s.io -o wide || true
+    printf '\n===== events =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get events --sort-by=.metadata.creationTimestamp \
+      -o custom-columns='FIRST:.firstTimestamp,LAST:.lastTimestamp,TYPE:.type,REASON:.reason,KIND:.involvedObject.kind,OBJECT:.involvedObject.name,COUNT:.count,MESSAGE:.message' || true
+  } >"$output_file" 2>&1
+}
+
+launch_session_longhorn_storage_diagnostics() {
+  local destination="$1"
+  local ns="$2"
+  local output_file="$destination/longhorn-storage.txt"
+  local resource
+  local -a resources=(
+    volumes.longhorn.io
+    engines.longhorn.io
+    replicas.longhorn.io
+    nodes.longhorn.io
+    engineimages.longhorn.io
+    backingimages.longhorn.io
+  )
+
+  ns="$(trim_whitespace "$ns")"
+  [[ -n "$ns" ]] || return 0
+  umask 077
+  {
+    printf '# Non-secret Longhorn storage diagnostics for namespace %s; captured %s\n' "$ns" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for resource in "${resources[@]}"; do
+      printf '\n===== %s =====\n' "$resource"
+      run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get "$resource" -o wide || true
+    done
+    printf '\n===== storage classes =====\n'
+    run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get storageclass \
+      -o custom-columns='NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy,BINDING:.volumeBindingMode,DEFAULT:.metadata.annotations.storageclass\.kubernetes\.io/is-default-class' || true
+  } >"$output_file" 2>&1
+}
+
+launch_session_victoria_resources_diagnostics() {
+  local destination="$1"
+  local label="$2"
+  local ns="$3"
+  local output_file resource
+  local -a resources=(
+    vmsingles.operator.victoriametrics.com
+    vmagents.operator.victoriametrics.com
+    vmauths.operator.victoriametrics.com
+    vmusers.operator.victoriametrics.com
+    vmservicescrapes.operator.victoriametrics.com
+    vmpodscrapes.operator.victoriametrics.com
+    vmnodescrapes.operator.victoriametrics.com
+  )
+
+  ns="$(trim_whitespace "$ns")"
+  [[ -n "$ns" ]] || return 0
+  label="${label//[^A-Za-z0-9_.-]/_}"
+  [[ -n "$label" ]] || label="victoria"
+  output_file="$destination/${label}-resources.txt"
+  umask 077
+  {
+    printf '# Non-secret Victoria resource diagnostics for namespace %s; captured %s\n' "$ns" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for resource in "${resources[@]}"; do
+      printf '\n===== %s =====\n' "$resource"
+      # Never use -o yaml/json here: VMUser can contain user-supplied auth
+      # material in spec. Only retain generic reconciliation metadata/status.
+      run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get "$resource" \
+        -o custom-columns='NAME:.metadata.name,CREATED:.metadata.creationTimestamp,GENERATION:.metadata.generation,OBSERVED:.status.observedGeneration,UPDATE_STATUS:.status.updateStatus,REASON:.status.reason' || true
+    done
+  } >"$output_file" 2>&1
+}
+
+launch_session_victoria_namespace_diagnostics() {
+  local destination="$1"
+  local metrics_ns operator_ns logs_ns ns safe_ns seen_ns
+  local -a namespaces=()
+
+  metrics_ns="$(trim_whitespace "${VICTORIA_METRICS_NAMESPACE:-}")"
+  operator_ns="$(trim_whitespace "${VICTORIA_METRICS_OPERATOR_NAMESPACE:-}")"
+  logs_ns="$(victoria_logs_namespace 2>/dev/null || true)"
+  logs_ns="$(trim_whitespace "$logs_ns")"
+
+  for ns in "$metrics_ns" "$operator_ns" "$logs_ns"; do
+    [[ -n "$ns" ]] || continue
+    for seen_ns in "${namespaces[@]:-}"; do
+      [[ "$seen_ns" == "$ns" ]] && continue 2
+    done
+    namespaces+=("$ns")
+  done
+
+  for ns in "${namespaces[@]:-}"; do
+    safe_ns="${ns//[^A-Za-z0-9_.-]/_}"
+    [[ -n "$safe_ns" ]] || safe_ns="namespace"
+    launch_session_namespace_diagnostics "$destination" "victoria-${safe_ns}" "$ns"
+    launch_session_victoria_resources_diagnostics "$destination" "victoria-${safe_ns}" "$ns"
+  done
+}
+
+launch_session_snapshot() {
+  local launch_dir="$1"
+  local ns="$2"
+  local tonnode_name="$3"
+  local destination="$4"
+  local selector
+
+  selector="$(launch_session_selector "$tonnode_name")"
+  (umask 077; mkdir -p "$destination") || return 1
+  chmod 700 "$destination" 2>/dev/null || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods -l "$selector" -o wide \
+    >"$destination/pods.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods -l "$selector" -o json \
+    | if command -v jq >/dev/null 2>&1; then
+        jq '{items:[.items[]|{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,creationTimestamp:.metadata.creationTimestamp,deletionTimestamp:.metadata.deletionTimestamp,labels:.metadata.labels,ownerReferences:.metadata.ownerReferences},spec:{nodeName:.spec.nodeName,nodeSelector:.spec.nodeSelector,affinity:.spec.affinity,volumes:.spec.volumes,initContainers:[.spec.initContainers[]?|{name,image,terminationMessagePolicy}],containers:[.spec.containers[]?|{name,image,ports,terminationMessagePolicy}]},status:.status}]}'
+      else
+        printf '{"warning":"jq is unavailable; redacted pod JSON was not captured"}\n'
+      fi >"$destination/pods.json" 2>"$destination/pods-json.errors" || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get statefulset "$tonnode_name" \
+    -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,CURRENT:.status.currentReplicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,REVISION:.status.updateRevision' \
+    >"$destination/statefulsets.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get tonnodes.ton.ton.org "$tonnode_name" \
+    -o custom-columns='NAME:.metadata.name,GENERATION:.metadata.generation,OBSERVED:.status.observedGeneration,REPLICAS:.spec.replicas' \
+    >"$destination/tonnodes.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pvc -o wide >"$destination/pvcs.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get pv -o custom-columns='NAME:.metadata.name,SC:.spec.storageClassName,PHASE:.status.phase,CLAIM_NS:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,NODE:.metadata.annotations.local\.path\.provisioner/selected-node,PATH:.spec.hostPath.path' \
+    >"$destination/pvs.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get volumeattachments.storage.k8s.io \
+    -o custom-columns='NAME:.metadata.name,ATTACHER:.spec.attacher,NODE:.spec.nodeName,PV:.spec.source.persistentVolumeName,ATTACHED:.status.attached,ERROR:.status.attachError.message' \
+    >"$destination/volumeattachments.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get nodes \
+    -o custom-columns='NAME:.metadata.name,UNSCHEDULABLE:.spec.unschedulable,TAINTS:.spec.taints,READY:.status.conditions[?(@.type=="Ready")].status,DISK_PRESSURE:.status.conditions[?(@.type=="DiskPressure")].status' \
+    >"$destination/nodes.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get csinode -o custom-columns='NAME:.metadata.name,DRIVERS:.spec.drivers[*].name' \
+    >"$destination/csinodes.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get events --sort-by=.metadata.creationTimestamp >"$destination/events.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get events --all-namespaces --sort-by=.metadata.creationTimestamp \
+    >"$destination/events-cluster.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$OP_NAMESPACE" get pods -o wide >"$destination/operator-pods.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$LONGHORN_NAMESPACE" get pods -o wide >"$destination/longhorn-pods.txt" 2>&1 || true
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$VAULT_NAMESPACE" get pods -o wide >"$destination/vault-pods.txt" 2>&1 || true
+  launch_session_namespace_diagnostics "$destination" operator "$OP_NAMESPACE" || true
+  launch_session_namespace_diagnostics "$destination" longhorn "$LONGHORN_NAMESPACE" || true
+  launch_session_namespace_diagnostics "$destination" vault "$VAULT_NAMESPACE" || true
+  launch_session_longhorn_storage_diagnostics "$destination" "$LONGHORN_NAMESPACE" || true
+  launch_session_victoria_namespace_diagnostics "$destination" || true
+  chmod -R go-rwx "$destination" 2>/dev/null || true
+}
+
+launch_session_start_watchers() {
+  local launch_dir="$1"
+  local ns="$2"
+  local tonnode_name="$3"
+
+  KUBETON_LAUNCH_WATCHER_PIDS=()
+  launch_session_event_watch "$launch_dir" "$ns" &
+  KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
+  launch_session_cluster_event_watch "$launch_dir" &
+  KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
+  launch_session_timeline_watch "$launch_dir" "$ns" "$tonnode_name" &
+  KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
+  launch_session_log_supervisor "$launch_dir" "$ns" "$tonnode_name" &
+  KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
+  launch_session_operator_log_watch "$launch_dir" &
+  KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
+}
+
+launch_session_stop_watchers() {
+  local launch_dir="$1"
+  local pid
+  : >"$launch_dir/.stop"
+  for pid in "${KUBETON_LAUNCH_WATCHER_PIDS[@]:-}"; do
+    terminate_owned_process_tree "$pid" "$BASHPID"
+  done
+  for pid in "${KUBETON_LAUNCH_WATCHER_PIDS[@]:-}"; do
+    wait "$pid" >/dev/null 2>&1 || true
+  done
+  KUBETON_LAUNCH_WATCHER_PIDS=()
+}
+
+run_with_launch_session() {
+  local command_name="$1"
+  local command_function="$2"
+  shift 2
+  local launch_dir ns tonnode_name replicas rc=0 tee_rc=0 interrupted_rc=0
+  local stdout_fifo stderr_fifo command_pid="" stdout_tee_pid stderr_tee_pid stdout_tee_rc=0 stderr_tee_rc=0
+  local caller_had_errexit=0 command_was_started=0
+
+  [[ $- == *e* ]] && caller_had_errexit=1
+
+  if ! is_true "$KUBETON_LAUNCH_LOGS_ENABLED"; then
+    "$command_function" "$@"
+    return $?
+  fi
+
+  ns="$(resolve_tonnode_namespace_from_values)"
+  tonnode_name="$(resolve_tonnode_name_from_values)"
+  replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" 2>/dev/null || true)"
+  launch_dir="$(launch_session_begin "$command_name")" || return 1
+  KUBETON_ACTIVE_LAUNCH_DIR="$launch_dir"
+  # Install signal handling before starting any watcher. The handler records
+  # intent and stops only process trees whose PIDs are already known. Checks
+  # on both sides of command PID assignment close the remaining spawn window.
+  trap 'interrupted_rc=130; rc=130; terminate_owned_process_tree "$command_pid" "$BASHPID"; launch_session_stop_watchers "$launch_dir"' INT
+  trap 'interrupted_rc=143; rc=143; terminate_owned_process_tree "$command_pid" "$BASHPID"; launch_session_stop_watchers "$launch_dir"' TERM
+  trap 'interrupted_rc=129; rc=129; terminate_owned_process_tree "$command_pid" "$BASHPID"; launch_session_stop_watchers "$launch_dir"' HUP
+  {
+    printf 'ton_namespace=%s\n' "$ns"
+    printf 'tonnode_name=%s\n' "$tonnode_name"
+    printf 'desired_replicas=%s\n' "${replicas:-unknown}"
+  } >>"$launch_dir/session.meta"
+  launch_session_start_watchers "$launch_dir" "$ns" "$tonnode_name"
+  stdout_fifo="$launch_dir/.stdout.pipe"
+  stderr_fifo="$launch_dir/.stderr.pipe"
+  if ! mkfifo "$stdout_fifo" "$stderr_fifo"; then
+    echo "Error: cannot create launch transcript pipes in ${launch_dir}." >&2
+    launch_session_stop_watchers "$launch_dir"
+    trap - INT TERM HUP
+    KUBETON_ACTIVE_LAUNCH_DIR=""
+    return 1
+  fi
+  tee -a "$launch_dir/command.stdout.log" <"$stdout_fifo" &
+  stdout_tee_pid="$!"
+  tee -a "$launch_dir/command.stderr.log" <"$stderr_fifo" >&2 &
+  stderr_tee_pid="$!"
+
+  set +e
+  if (( interrupted_rc == 0 )); then
+    (set -e; "$command_function" "$@") >"$stdout_fifo" 2>"$stderr_fifo" &
+    command_pid="$!"
+    command_was_started=1
+    # A signal can be delivered after the asynchronous command is spawned but
+    # before its PID assignment becomes visible to the trap. Recheck here and
+    # terminate the now-identifiable private command tree before waiting.
+    if (( interrupted_rc != 0 )); then
+      terminate_owned_process_tree "$command_pid" "$BASHPID"
+    fi
+    wait "$command_pid"
+    rc=$?
+    command_pid=""
+  else
+    rc="$interrupted_rc"
+  fi
+  if (( command_was_started == 1 )); then
+    launch_session_drain_or_stop_tee "$stdout_tee_pid" "$BASHPID"
+    launch_session_drain_or_stop_tee "$stderr_tee_pid" "$BASHPID"
+  else
+    terminate_owned_process_tree "$stdout_tee_pid" "$BASHPID"
+    terminate_owned_process_tree "$stderr_tee_pid" "$BASHPID"
+  fi
+  wait "$stdout_tee_pid" || stdout_tee_rc=$?
+  wait "$stderr_tee_pid" || stderr_tee_rc=$?
+  rm -f "$stdout_fifo" "$stderr_fifo" >/dev/null 2>&1 || true
+  if (( stdout_tee_rc != 0 )); then
+    tee_rc="$stdout_tee_rc"
+  elif (( stderr_tee_rc != 0 )); then
+    tee_rc="$stderr_tee_rc"
+  fi
+  if (( tee_rc != 0 )); then
+    echo "Warning: writing the launch command transcript failed with exit code ${tee_rc}; preserving the command result ${rc}." >&2
+  fi
+
+  {
+    echo "===== STDOUT ====="
+    cat "$launch_dir/command.stdout.log" 2>/dev/null || true
+    echo "===== STDERR ====="
+    cat "$launch_dir/command.stderr.log" 2>/dev/null || true
+  } >"$launch_dir/command.log"
+
+  launch_session_stop_watchers "$launch_dir"
+  launch_session_snapshot "$launch_dir" "$ns" "$tonnode_name" "$launch_dir/final" || true
+  if (( interrupted_rc != 0 )); then
+    rc="$interrupted_rc"
+  fi
+  {
+    printf 'finished_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'exit_code=%s\n' "$rc"
+  } >>"$launch_dir/session.meta"
+  {
+    printf 'kubeton %s exit code: %s\n' "$command_name" "$rc"
+    printf 'TON target: %s/%s (desired replicas: %s)\n' "$ns" "$tonnode_name" "${replicas:-unknown}"
+    printf 'Command transcript: %s/command.log\n' "$launch_dir"
+    printf 'Pod/container log capture: %s/pods/\n' "$launch_dir"
+    printf 'Lifecycle events: %s/events.log\n' "$launch_dir"
+    printf 'Cluster-wide lifecycle events: %s/events-cluster.log\n' "$launch_dir"
+    printf 'Final resource evidence: %s/final/\n' "$launch_dir"
+  } >"$launch_dir/summary.txt"
+  chmod -R go-rwx "$launch_dir" 2>/dev/null || true
+  trap - INT TERM HUP
+  echo "[launch] Evidence bundle: ${launch_dir}" >&2
+  KUBETON_ACTIVE_LAUNCH_DIR=""
+  if (( caller_had_errexit == 1 )); then
+    set -e
+  else
+    set +e
+  fi
+  return "$rc"
 }
 
 print_prefixed_lines() {
@@ -2446,14 +3215,17 @@ resolve_main_wallet_image() {
 }
 
 current_operator_image() {
-  kubectl -n "$OP_NAMESPACE" get deploy "$OP_CONTROLLER_DEPLOYMENT" \
+  local operator_deployment
+
+  operator_deployment="$(resolve_operator_controller_deployment_name)" || return 1
+  kubectl -n "$OP_NAMESPACE" get deploy "$operator_deployment" \
     -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null \
     | awk 'NF {print; exit}'
 }
 
 ensure_external_nodeip_operator_support() {
   local timeout_seconds="${1:-420}"
-  local desired_image current_image
+  local desired_image current_image operator_deployment
 
   if ! is_true "$PROMETHEUS_EXTERNAL_NODEIP_OPERATOR_AUTOFIX"; then
     return 0
@@ -2477,8 +3249,10 @@ ensure_external_nodeip_operator_support() {
     echo "Warning: failed to auto-upgrade operator release ${RELEASE_NAME}." >&2
     return 1
   fi
-  if ! kubectl -n "$OP_NAMESPACE" rollout status "deployment/${OP_CONTROLLER_DEPLOYMENT}" --timeout="${timeout_seconds}s" >/dev/null 2>&1; then
-    echo "Warning: operator deployment ${OP_NAMESPACE}/${OP_CONTROLLER_DEPLOYMENT} did not become Ready after auto-upgrade." >&2
+  operator_deployment="$(resolve_operator_controller_deployment_name || true)"
+  if [[ -z "$operator_deployment" ]] \
+    || ! kubectl -n "$OP_NAMESPACE" rollout status "deployment/${operator_deployment}" --timeout="${timeout_seconds}s" >/dev/null 2>&1; then
+    echo "Warning: operator deployment for Helm release ${OP_NAMESPACE}/${RELEASE_NAME} did not become Ready after auto-upgrade." >&2
     return 1
   fi
 
@@ -3762,6 +4536,20 @@ read_victoria_logs_state_value() {
     || true
 }
 
+victoria_logs_state_record_name() {
+  local logs_namespace="$1"
+  local release_name="$2"
+  local collector_release_name="$3"
+  local safe_namespace safe_release checksum
+
+  safe_namespace="$(printf '%s' "$logs_namespace" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9.-]+/-/g; s/^[.-]+//; s/[.-]+$//')"
+  safe_release="$(printf '%s' "$release_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9.-]+/-/g; s/^[.-]+//; s/[.-]+$//')"
+  [[ -n "$safe_namespace" && -n "$safe_release" ]] || return 1
+  checksum="$(printf '%s\t%s\t%s' "$logs_namespace" "$release_name" "$collector_release_name" | cksum | awk '{print $1}')"
+  [[ "$checksum" =~ ^[0-9]+$ ]] || return 1
+  printf 'kubeton-vlogs-state-%.40s-%.40s-%s' "$safe_namespace" "$safe_release" "$checksum"
+}
+
 write_victoria_logs_state() {
   local state_ns="$1"
   local logs_namespace="$2"
@@ -3769,9 +4557,35 @@ write_victoria_logs_state() {
   local collector_release_name="$4"
   local service_name="$5"
   local collector_daemonset="$6"
+  local collector_buffer_path record_name target_state_ns
+  local -a state_namespaces=()
 
-  ensure_namespace "$state_ns"
-  cat <<EOF | kubectl -n "$state_ns" apply -f - >/dev/null
+  if ! collector_buffer_path="$(victoria_logs_collector_buffer_path "$logs_namespace" "$collector_release_name")"; then
+    echo "Error: cannot persist an invalid VictoriaLogs collector buffer path." >&2
+    return 1
+  fi
+  if ! record_name="$(victoria_logs_state_record_name "$logs_namespace" "$release_name" "$collector_release_name")"; then
+    echo "Error: cannot derive a VictoriaLogs state-ledger record name." >&2
+    return 1
+  fi
+
+  state_namespaces+=("$state_ns")
+  if [[ "$logs_namespace" != "$state_ns" ]]; then
+    # Mirror the small non-secret cleanup ledger beside the logging resources.
+    # It survives removal of the operator namespace when backend cleanup is
+    # intentionally blocked, while the operator-namespace copy lets a plain
+    # uninstall discover a custom logs namespace in the first place.
+    state_namespaces+=("$logs_namespace")
+  fi
+  for target_state_ns in "${state_namespaces[@]}"; do
+    if ! ensure_namespace "$target_state_ns"; then
+      echo "Error: failed to ensure VictoriaLogs state namespace ${target_state_ns}." >&2
+      return 1
+    fi
+    # Keep a canonical latest record for existing readers and an immutable
+    # identity-specific record. Changing custom release names cannot overwrite
+    # the only cleanup provenance for a previous or partially installed stack.
+    if ! cat <<EOF | kubectl -n "$target_state_ns" apply -f - >/dev/null
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -3786,7 +4600,29 @@ data:
   collectorReleaseName: $(yaml_quote "$collector_release_name")
   serviceName: $(yaml_quote "$service_name")
   collectorDaemonSet: $(yaml_quote "$collector_daemonset")
+  collectorBufferPath: $(yaml_quote "$collector_buffer_path")
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${record_name}
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-logs
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-logs
+data:
+  namespace: $(yaml_quote "$logs_namespace")
+  releaseName: $(yaml_quote "$release_name")
+  collectorReleaseName: $(yaml_quote "$collector_release_name")
+  serviceName: $(yaml_quote "$service_name")
+  collectorDaemonSet: $(yaml_quote "$collector_daemonset")
+  collectorBufferPath: $(yaml_quote "$collector_buffer_path")
 EOF
+    then
+      echo "Error: failed to persist VictoriaLogs state in namespace ${target_state_ns}." >&2
+      return 1
+    fi
+  done
 }
 
 resolve_victoria_metrics_rollout_timeout_seconds() {
@@ -4438,7 +5274,7 @@ ensure_victoria_metrics_nodeport_access() {
     remote_port=8427
   fi
 
-  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+  if ! cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
 kind: Service
 metadata:
@@ -4458,6 +5294,10 @@ spec:
       port: ${remote_port}
       targetPort: ${remote_port}
 EOF
+  then
+    echo "Warning: failed to create VictoriaMetrics NodePort access Service ${ns}/${service_name}." >&2
+    return 1
+  fi
 
   node_port="$(kubectl -n "$ns" get service "$service_name" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)"
   node_port="$(trim_whitespace "$node_port")"
@@ -4497,15 +5337,70 @@ EOF
 ensure_victoria_logs_access_service() {
   local ns="$1"
   local release_name="$2"
-  local remote_port="$3"
-  local service_name
+  local collector_release_name="$3"
+  local remote_port="$4"
+  local service_name network_policy_name auth_namespace auth_stack_name
 
   if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
     remote_port=9428
   fi
   service_name="$(victoria_logs_access_service_name "$release_name")"
+  network_policy_name="${service_name}-ingress"
+  auth_namespace="$(trim_whitespace "${VICTORIA_METRICS_NAMESPACE:-vm}")"
+  [[ -n "$auth_namespace" ]] || auth_namespace="vm"
+  auth_stack_name="$(victoria_metrics_stack_name)"
 
-  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+  # The Service is used by vlagent for ingestion and by VMAuth for queries,
+  # but the backend itself has no authentication. Isolate it so arbitrary
+  # in-cluster Pods cannot bypass VMAuth and query collected logs directly.
+  if is_true "$VICTORIA_LOGS_NETWORK_POLICY_ENABLED"; then
+    if ! cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${network_policy_name}
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-logs-access
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-logs
+spec:
+  podSelector:
+    matchLabels:
+      app: server
+      app.kubernetes.io/instance: ${release_name}
+      app.kubernetes.io/name: victoria-logs-single
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: ${collector_release_name}
+              app.kubernetes.io/name: victoria-logs-collector
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${auth_namespace}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: ${auth_stack_name}
+              app.kubernetes.io/name: vmauth
+      ports:
+        - protocol: TCP
+          port: http
+EOF
+    then
+      echo "Error: failed to protect VictoriaLogs backend ${ns}/${release_name} with NetworkPolicy ${network_policy_name}." >&2
+      return 1
+    fi
+  else
+    echo "Warning: VICTORIA_LOGS_NETWORK_POLICY_ENABLED=false; the unauthenticated VictoriaLogs backend is reachable by other in-cluster Pods." >&2
+    if ! kubectl -n "$ns" delete networkpolicy "$network_policy_name" --ignore-not-found >/dev/null; then
+      echo "Error: failed to remove disabled VictoriaLogs NetworkPolicy ${ns}/${network_policy_name}." >&2
+      return 1
+    fi
+  fi
+
+  if ! cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
 kind: Service
 metadata:
@@ -4526,7 +5421,135 @@ spec:
       port: ${remote_port}
       targetPort: http
 EOF
+  then
+    echo "Error: failed to create VictoriaLogs access Service ${ns}/${service_name}." >&2
+    return 1
+  fi
   printf '%s' "$service_name"
+}
+
+victoria_logs_collector_buffer_path() {
+  local ns="$1"
+  local collector_release_name="$2"
+  local safe_ns safe_release
+
+  # Namespace and Helm release names are DNS labels already. Preserve their
+  # complete identities here rather than applying the generic 30-character
+  # name truncation, which could make two releases share a host buffer.
+  safe_ns="$(printf '%s' "$ns" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9.-]+/-/g; s/-+/-/g; s/^[.-]+//; s/[.-]+$//')"
+  safe_release="$(printf '%s' "$collector_release_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9.-]+/-/g; s/-+/-/g; s/^[.-]+//; s/[.-]+$//')"
+  [[ -n "$safe_ns" && -n "$safe_release" ]] || return 1
+  printf '/var/lib/kubeton-vlogs-buffer-%s-%s' "$safe_ns" "$safe_release"
+}
+
+install_victoria_logs_collector_release() {
+  local ns="$1"
+  local collector_release_name="$2"
+  local collector_chart="$3"
+  local collector_chart_version="$4"
+  local remote_write_url="$5"
+  local helm_timeout_seconds="$6"
+  local collector_node_selector="$7"
+  local collector_buffer_path vlc_selector_values_file=""
+  local -a vlc_cmd=()
+
+  if ! collector_buffer_path="$(victoria_logs_collector_buffer_path "$ns" "$collector_release_name")"; then
+    echo "Error: cannot derive a safe VictoriaLogs collector host-buffer path for ${ns}/${collector_release_name}." >&2
+    return 1
+  fi
+  if [[ -n "$collector_node_selector" ]]; then
+    vlc_selector_values_file="$(build_victoria_logs_collector_selector_values_file "$collector_node_selector")" || return 1
+  fi
+
+  # The release-specific host path survives collector restarts and allows an
+  # early collector to queue logs before the VictoriaLogs Service exists.
+  # Never share this queue between collector releases.
+  vlc_cmd=(helm upgrade --install "$collector_release_name" "$collector_chart" -n "$ns" --create-namespace --timeout "${helm_timeout_seconds}s" \
+    --set-string "remoteWrite[0].url=${remote_write_url}" \
+    --set-string "remoteWrite[0].maxDiskUsagePerURL=${VICTORIA_LOGS_COLLECTOR_BUFFER_SIZE}" \
+    --set-string "collector.excludeFilter=kubernetes.pod_name:=%{HOSTNAME}" \
+    --set-string "extraArgs.tmpDataPath=${collector_buffer_path}" \
+    --set-string "persistence.volume.hostPath.path=${collector_buffer_path}" \
+    --set-string "persistence.volume.hostPath.type=DirectoryOrCreate" \
+    --set-string "resources.requests.cpu=${VICTORIA_LOGS_COLLECTOR_CPU_REQUEST}" \
+    --set-string "resources.requests.memory=${VICTORIA_LOGS_COLLECTOR_MEMORY_REQUEST}" \
+    --set-string "resources.requests.ephemeral-storage=${VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_REQUEST}" \
+    --set-string "resources.limits.cpu=${VICTORIA_LOGS_COLLECTOR_CPU_LIMIT}" \
+    --set-string "resources.limits.memory=${VICTORIA_LOGS_COLLECTOR_MEMORY_LIMIT}" \
+    --set-string "resources.limits.ephemeral-storage=${VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_LIMIT}")
+  if [[ -n "$vlc_selector_values_file" ]]; then
+    vlc_cmd+=(-f "$vlc_selector_values_file")
+  fi
+  if [[ -n "$collector_chart_version" ]]; then
+    vlc_cmd+=(--version "$collector_chart_version")
+  fi
+
+  echo "[victoria-metrics] Installing/updating VictoriaLogs collector (${collector_release_name}); host buffer: ${collector_buffer_path}" >&2
+  if ! run_with_timeout "${helm_timeout_seconds}s" "${vlc_cmd[@]}" >/dev/null; then
+    [[ -z "$vlc_selector_values_file" ]] || rm -f "$vlc_selector_values_file" >/dev/null 2>&1 || true
+    echo "Error: failed to install/upgrade VictoriaLogs collector release ${collector_release_name} in namespace ${ns}." >&2
+    return 1
+  fi
+  [[ -z "$vlc_selector_values_file" ]] || rm -f "$vlc_selector_values_file" >/dev/null 2>&1 || true
+}
+
+ensure_start_victoria_logs_buffering_collector() {
+  local logs_ns logs_release_name collector_release_name remote_port timeout_seconds helm_timeout_seconds
+  local repo_name repo_url collector_chart collector_chart_version collector_node_selector
+  local access_service remote_write_url collector_daemonset
+
+  if ! is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" || ! is_true "$VICTORIA_LOGS_ENABLED"; then
+    return 0
+  fi
+  require_bin helm
+  logs_ns="$(victoria_logs_namespace)"
+  logs_release_name="$(victoria_logs_release_name)"
+  collector_release_name="$(victoria_logs_collector_release_name)"
+  remote_port="$(trim_whitespace "${VICTORIA_LOGS_PORT:-9428}")"
+  [[ "$remote_port" =~ ^[0-9]+$ ]] || remote_port=9428
+  timeout_seconds="$(resolve_victoria_metrics_rollout_timeout_seconds)"
+  helm_timeout_seconds="$(resolve_victoria_logs_helm_timeout_seconds)"
+  repo_name="$(trim_whitespace "${VICTORIA_LOGS_HELM_REPO_NAME:-vm}")"
+  [[ -n "$repo_name" ]] || repo_name=vm
+  repo_url="$(trim_whitespace "${VICTORIA_LOGS_HELM_REPO_URL:-https://victoriametrics.github.io/helm-charts}")"
+  [[ -n "$repo_url" ]] || repo_url=https://victoriametrics.github.io/helm-charts
+  collector_chart="${repo_name}/victoria-logs-collector"
+  collector_chart_version="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}")"
+  collector_node_selector="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")"
+  access_service="$(victoria_logs_access_service_name "$logs_release_name")"
+  remote_write_url="http://${access_service}:${remote_port}"
+  collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
+
+  echo "[launch] Starting the durable node-log buffer before storage/key bootstrap ..." >&2
+  if ! ensure_namespace "$logs_ns"; then
+    echo "Error: the pre-bootstrap VictoriaLogs namespace ${logs_ns} could not be ensured; storage/key bootstrap was not started." >&2
+    return 1
+  fi
+  # Persist the intended release identities and exact host-buffer path before
+  # Helm runs. A failed/partial custom-named Helm install must remain
+  # discoverable by a later plain uninstall even when readiness is never
+  # reached. Recording intent is safe when Helm creates no resources: cleanup
+  # simply finds nothing under these exact identities.
+  if ! write_victoria_logs_state "$OP_NAMESPACE" "$logs_ns" "$logs_release_name" \
+      "$collector_release_name" "$access_service" "$collector_daemonset"; then
+    echo "Error: the pre-bootstrap VictoriaLogs collector state could not be persisted; storage/key bootstrap was not started." >&2
+    return 1
+  fi
+  if ! ensure_helm_repo "$repo_name" "$repo_url" \
+    || ! helm repo update "$repo_name" >/dev/null \
+    || ! install_victoria_logs_collector_release "$logs_ns" "$collector_release_name" \
+      "$collector_chart" "$collector_chart_version" "$remote_write_url" \
+      "$helm_timeout_seconds" "$collector_node_selector"; then
+    echo "Error: the pre-bootstrap VictoriaLogs collector could not be installed; storage/key bootstrap was not started." >&2
+    return 1
+  fi
+  # The exact Pod-level gate also handles an empty TON selector by requiring a
+  # current, owned, non-terminating Ready collector on every DaemonSet target.
+  # `kubectl rollout status` alone can briefly accept a Ready Pod which is
+  # already terminating.
+  wait_victoria_logs_collector_ready_on_selected_nodes "$logs_ns" "$collector_release_name" \
+    "${KUBETON_NODE_CHECK_TON_SELECTOR:-}" "$timeout_seconds" || return 1
+  echo "[launch] Pre-bootstrap container-log buffering is active; queued logs will flush when VictoriaLogs becomes available." >&2
 }
 
 ensure_victoria_logs_stack() {
@@ -4540,14 +5563,13 @@ ensure_victoria_logs_stack() {
   local helm_timeout_seconds="$8"
   local repo_name repo_url single_chart collector_chart
   local single_chart_version collector_chart_version
-  local logs_storage_class logs_node_selector logs_pin_to_longhorn_csi
+  local logs_storage_class logs_node_selector collector_node_selector logs_pin_to_longhorn_csi
   local vls_selector_values_file="" vls_affinity_values_file=""
   local matched_nodes=0
   local -a longhorn_csi_nodes=()
   local service_name collector_daemonset access_service_name remote_write_url
   local ds_desired ds_ready
   local -a vls_cmd=()
-  local -a vlc_cmd=()
 
   repo_name="$(trim_whitespace "${VICTORIA_LOGS_HELM_REPO_NAME:-vm}")"
   if [[ -z "$repo_name" ]]; then
@@ -4563,6 +5585,7 @@ ensure_victoria_logs_stack() {
   collector_chart_version="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_CHART_VERSION:-}")"
   logs_storage_class="$(trim_whitespace "${VICTORIA_LOGS_STORAGE_CLASS:-}")"
   logs_node_selector="$(trim_whitespace "${VICTORIA_LOGS_NODE_SELECTOR:-}")"
+  collector_node_selector="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")"
   logs_pin_to_longhorn_csi="$(trim_whitespace "${VICTORIA_LOGS_PIN_TO_LONGHORN_CSI:-true}")"
   if [[ -z "$logs_node_selector" && ! cluster_is_k3d ]]; then
     logs_node_selector="$(trim_whitespace "${LONGHORN_NODE_SELECTOR:-}")"
@@ -4590,22 +5613,43 @@ ensure_victoria_logs_stack() {
     mapfile -t longhorn_csi_nodes < <(list_longhorn_csi_node_names)
   fi
 
-  ensure_namespace "$ns"
-  ensure_helm_repo "$repo_name" "$repo_url"
-  helm repo update "$repo_name" >/dev/null
+  if ! ensure_namespace "$ns"; then
+    echo "Error: failed to ensure VictoriaLogs namespace ${ns}." >&2
+    return 1
+  fi
+  if ! ensure_helm_repo "$repo_name" "$repo_url"; then
+    echo "Error: failed to ensure VictoriaLogs Helm repository ${repo_name}." >&2
+    return 1
+  fi
+  if ! helm repo update "$repo_name" >/dev/null; then
+    echo "Error: failed to update VictoriaLogs Helm repository ${repo_name}." >&2
+    return 1
+  fi
 
   service_name="$(victoria_logs_service_name "$release_name")"
   collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
+  # Create the restrictive policy before the backend Pod exists, eliminating
+  # an unauthenticated in-cluster exposure window during Helm rollout. The
+  # Service may safely have no endpoints until the StatefulSet becomes Ready.
+  if ! access_service_name="$(ensure_victoria_logs_access_service "$ns" "$release_name" "$collector_release_name" "$remote_port")"; then
+    return 1
+  fi
+  access_service_name="$(trim_whitespace "$access_service_name")"
+  if [[ -z "$access_service_name" ]]; then
+    echo "Error: VictoriaLogs access Service name could not be resolved." >&2
+    return 1
+  fi
+  remote_write_url="http://${access_service_name}:${remote_port}"
   if [[ -n "$logs_node_selector" ]]; then
     vls_selector_values_file="$(build_victoria_logs_single_selector_values_file "$logs_node_selector")" || return 1
   fi
   if [[ "${#longhorn_csi_nodes[@]}" -gt 0 ]]; then
     vls_affinity_values_file="$(build_victoria_logs_single_affinity_values_file longhorn_csi_nodes)" || return 1
   fi
-
   vls_cmd=(helm upgrade --install "$release_name" "$single_chart" -n "$ns" --create-namespace --wait --timeout "${helm_timeout_seconds}s" \
     --set-string "server.retentionPeriod=${retention_period}" \
-    --set-string "server.persistentVolume.size=${pvc_size}")
+    --set-string "server.persistentVolume.size=${pvc_size}" \
+    --set-string "server.retentionDiskSpaceUsage=${VICTORIA_LOGS_RETENTION_DISK_SPACE}")
   if [[ -n "$logs_storage_class" ]]; then
     vls_cmd+=(--set-string "server.persistentVolume.storageClassName=${logs_storage_class}")
   fi
@@ -4663,41 +5707,320 @@ ensure_victoria_logs_stack() {
     rm -f "$vls_affinity_values_file" >/dev/null 2>&1 || true
   fi
 
-  access_service_name="$(ensure_victoria_logs_access_service "$ns" "$release_name" "$remote_port")"
-  remote_write_url="http://${access_service_name}:${remote_port}"
-
-  vlc_cmd=(helm upgrade --install "$collector_release_name" "$collector_chart" -n "$ns" --create-namespace --wait --timeout "${helm_timeout_seconds}s" \
-    --set-string "remoteWrite[0].url=${remote_write_url}" \
-    --set-string "collector.excludeFilter=kubernetes.pod_name:=%{HOSTNAME}")
-  if [[ -n "$collector_chart_version" ]]; then
-    vlc_cmd+=(--version "$collector_chart_version")
-  fi
-
-  echo "[victoria-metrics] Installing/updating VictoriaLogs collector (${collector_release_name}) ..." >&2
-  if ! run_with_timeout "${helm_timeout_seconds}s" "${vlc_cmd[@]}" >/dev/null; then
-    echo "Error: failed to install/upgrade VictoriaLogs collector release ${collector_release_name} in namespace ${ns}." >&2
+  # Keep the collector cluster-wide by default. An unrelated cordoned or
+  # tainted node must not make Helm reject launch logging for healthy TON
+  # targets; selected TON nodes are verified individually below.
+  if ! install_victoria_logs_collector_release "$ns" "$collector_release_name" \
+    "$collector_chart" "$collector_chart_version" "$remote_write_url" \
+    "$helm_timeout_seconds" "$collector_node_selector"; then
     return 1
   fi
 
   if ! kubectl -n "$ns" rollout status "statefulset/${service_name}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
     echo "Warning: VictoriaLogs StatefulSet ${ns}/${service_name} is not Ready yet." >&2
   fi
-  if ! kubectl -n "$ns" rollout status "daemonset/${collector_daemonset}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
-    echo "Warning: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} is not fully Ready yet." >&2
+  if [[ -n "${KUBETON_NODE_CHECK_TON_SELECTOR:-}" ]]; then
+    if ! wait_victoria_logs_collector_ready_on_selected_nodes "$ns" "$collector_release_name" \
+      "$KUBETON_NODE_CHECK_TON_SELECTOR" "$rollout_timeout_seconds"; then
+      return 1
+    fi
+  elif ! kubectl -n "$ns" rollout status "daemonset/${collector_daemonset}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
+    echo "Warning: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} is not fully Ready on every cluster node." >&2
   fi
 
   ds_desired="$(kubectl -n "$ns" get daemonset "$collector_daemonset" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
   ds_ready="$(kubectl -n "$ns" get daemonset "$collector_daemonset" -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
   ds_desired="$(trim_whitespace "$ds_desired")"
   ds_ready="$(trim_whitespace "$ds_ready")"
-  if [[ "$ds_desired" =~ ^[0-9]+$ && "$ds_ready" =~ ^[0-9]+$ ]]; then
-    if (( ds_desired > 0 && ds_ready == 0 )); then
-      echo "Error: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} has 0 ready pods out of ${ds_desired}; log collection is not active." >&2
-      return 1
-    fi
+  if ! [[ "$ds_desired" =~ ^[0-9]+$ && "$ds_ready" =~ ^[0-9]+$ ]]; then
+    echo "Error: cannot read VictoriaLogs collector readiness for ${ns}/${collector_daemonset}; log collection cannot be proven." >&2
+    return 1
+  fi
+  if (( ds_desired == 0 )); then
+    echo "Error: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} targets no nodes; log collection is not active." >&2
+    return 1
+  fi
+  if (( ds_ready != ds_desired )); then
+    echo "Warning: VictoriaLogs collector DaemonSet aggregate readiness is ${ds_ready}/${ds_desired}; selected TON-node coverage was checked separately." >&2
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$access_service_name" "$service_name" "$collector_daemonset" "$remote_write_url" "$ds_ready" "$ds_desired"
+}
+
+victoria_logs_collector_ready_on_selected_nodes() {
+  local ns="$1"
+  local collector_release_name="$2"
+  local node_selector="$3"
+  local collector_daemonset ds_row generation observed_generation daemonset_uid desired_scheduled current_scheduled misscheduled update_revision=""
+  local revision_rows revision_row revision_kind revision_owner revision_owner_uid revision_controller revision_number revision_name
+  local newest_revision=-1
+  local selected_node_rows pod_rows pod_row pod_node pod_revision pod_phase terminating ready_condition owner owner_uid
+  local ready_node_count=0
+  local -a selected_nodes=()
+  local -A ready_by_node=()
+  local node
+
+  node_selector="$(trim_whitespace "$node_selector")"
+  collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
+  if ! ds_row="$(kubectl -n "$ns" get daemonset "$collector_daemonset" \
+    -o go-template='{{.metadata.generation}}{{"\x1f"}}{{.status.observedGeneration}}{{"\x1f"}}{{.metadata.uid}}{{"\x1f"}}{{.status.desiredNumberScheduled}}{{"\x1f"}}{{.status.currentNumberScheduled}}{{"\x1f"}}{{.status.numberMisscheduled}}' 2>/dev/null)"; then
+    echo "Error: cannot read VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset}." >&2
+    return 1
+  fi
+  IFS=$'\x1f' read -r generation observed_generation daemonset_uid desired_scheduled current_scheduled misscheduled <<<"$ds_row"
+  generation="$(trim_whitespace "$generation")"
+  observed_generation="$(trim_whitespace "$observed_generation")"
+  daemonset_uid="$(trim_whitespace "$daemonset_uid")"
+  desired_scheduled="$(trim_whitespace "$desired_scheduled")"
+  current_scheduled="$(trim_whitespace "$current_scheduled")"
+  misscheduled="$(trim_whitespace "$misscheduled")"
+  if ! [[ "$generation" =~ ^[1-9][0-9]*$ && "$observed_generation" == "$generation" ]] \
+    || [[ -z "$daemonset_uid" ]]; then
+    echo "Error: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} has not observed its current generation." >&2
+    return 1
+  fi
+  # DaemonSetStatus has no updateRevision field. Resolve the newest
+  # ControllerRevision owned by this exact DaemonSet UID, then require the
+  # corresponding controller-revision-hash on each Ready collector Pod.
+  if ! revision_rows="$(kubectl -n "$ns" get controllerrevision \
+    -o go-template='{{range .items}}{{$revision := .revision}}{{$revisionName := .metadata.name}}{{range .metadata.ownerReferences}}{{.kind}}{{"\x1f"}}{{.name}}{{"\x1f"}}{{.uid}}{{"\x1f"}}{{if .controller}}true{{else}}false{{end}}{{"\x1f"}}{{$revision}}{{"\x1f"}}{{$revisionName}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot read VictoriaLogs collector revisions for ${ns}/${collector_daemonset}." >&2
+    return 1
+  fi
+  while IFS= read -r revision_row; do
+    IFS=$'\x1f' read -r revision_kind revision_owner revision_owner_uid revision_controller revision_number revision_name <<<"$revision_row"
+    if [[ "$revision_kind" != "DaemonSet" \
+      || "$revision_owner" != "$collector_daemonset" \
+      || "$revision_owner_uid" != "$daemonset_uid" \
+      || "$revision_controller" != "true" \
+      || ! "$revision_number" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+    if (( revision_number > newest_revision )); then
+      newest_revision="$revision_number"
+      update_revision="$revision_name"
+    fi
+  done <<<"$revision_rows"
+  if [[ -z "$update_revision" || "$update_revision" != "${collector_daemonset}-"* ]]; then
+    echo "Error: cannot resolve the current VictoriaLogs collector revision for ${ns}/${collector_daemonset}." >&2
+    return 1
+  fi
+  update_revision="${update_revision#"${collector_daemonset}-"}"
+
+  # With no TON selector, placement is unconstrained. Aggregate DaemonSet
+  # status alone can still count a Ready Pod after deletionTimestamp is set,
+  # so prove that the current revision has one non-terminating Ready Pod on
+  # every desired DaemonSet node. Count unique node names to reject duplicate
+  # Pods on one host masking a missing collector elsewhere.
+  if [[ -z "$node_selector" ]]; then
+    if ! [[ "$desired_scheduled" =~ ^[1-9][0-9]*$ \
+      && "$current_scheduled" =~ ^[0-9]+$ \
+      && "$misscheduled" =~ ^[0-9]+$ ]] \
+      || (( current_scheduled != desired_scheduled || misscheduled != 0 )); then
+      echo "Error: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} target set is not current (current=${current_scheduled:-unknown}, desired=${desired_scheduled:-unknown}, misscheduled=${misscheduled:-unknown})." >&2
+      return 1
+    fi
+    if ! pod_rows="$(kubectl -n "$ns" get pods \
+      -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" \
+      -o go-template='{{range .items}}{{.spec.nodeName}}{{"\x1f"}}{{with .metadata.labels}}{{index . "controller-revision-hash"}}{{end}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{if .metadata.deletionTimestamp}}terminating{{end}}{{"\x1f"}}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}ready{{end}}{{end}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}{{.kind}}{{"/"}}{{.name}}{{"\x1f"}}{{.uid}}{{end}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+      echo "Error: cannot list VictoriaLogs collector Pods for ${ns}/${collector_daemonset}." >&2
+      return 1
+    fi
+    ready_by_node=()
+    while IFS= read -r pod_row; do
+      IFS=$'\x1f' read -r pod_node pod_revision pod_phase terminating ready_condition owner owner_uid <<<"$pod_row"
+      pod_node="$(trim_whitespace "$pod_node")"
+      if [[ -n "$pod_node" \
+        && "$pod_revision" == "$update_revision" \
+        && "$pod_phase" == "Running" \
+        && -z "$terminating" \
+        && "$ready_condition" == "ready" \
+        && "$owner" == "DaemonSet/${collector_daemonset}" \
+        && "$owner_uid" == "$daemonset_uid" ]]; then
+        ready_by_node["$pod_node"]=1
+      fi
+    done <<<"$pod_rows"
+    for node in "${!ready_by_node[@]}"; do
+      ready_node_count=$((ready_node_count + 1))
+    done
+    if (( ready_node_count != desired_scheduled )); then
+      echo "Error: TON placement is unconstrained and only ${ready_node_count}/${desired_scheduled} DaemonSet target node(s) have a non-terminating Ready VictoriaLogs collector of the current revision." >&2
+      return 1
+    fi
+    echo "[launch] VictoriaLogs collector is Ready on every DaemonSet target (${ready_node_count}/${desired_scheduled})." >&2
+    return 0
+  fi
+
+  if ! selected_node_rows="$(kubectl get nodes -l "$node_selector" -o name 2>/dev/null)"; then
+    echo "Error: cannot list nodes selected for TON while verifying VictoriaLogs coverage." >&2
+    return 1
+  fi
+  mapfile -t selected_nodes < <(printf '%s\n' "$selected_node_rows" | sed 's#^node/##' | awk 'NF' | sort -u)
+  if (( ${#selected_nodes[@]} == 0 )); then
+    echo "Error: TON selector '${node_selector}' matches no nodes while verifying VictoriaLogs coverage." >&2
+    return 1
+  fi
+  # Use a direct per-node field selector for the authoritative coverage check
+  # instead of trusting aggregate DaemonSet counts. Require the current
+  # controller revision so an old Ready pod cannot satisfy a just-upgraded
+  # collector configuration.
+  ready_by_node=()
+  for node in "${selected_nodes[@]}"; do
+    if pod_rows="$(kubectl -n "$ns" get pods \
+      -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" \
+      --field-selector "spec.nodeName=${node}" \
+      -o go-template='{{range .items}}{{with .metadata.labels}}{{index . "controller-revision-hash"}}{{end}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{if .metadata.deletionTimestamp}}terminating{{end}}{{"\x1f"}}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}ready{{end}}{{end}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}{{.kind}}{{"/"}}{{.name}}{{"\x1f"}}{{.uid}}{{end}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+      while IFS= read -r pod_row; do
+        IFS=$'\x1f' read -r pod_revision pod_phase terminating ready_condition owner owner_uid <<<"$pod_row"
+        if [[ "$pod_revision" == "$update_revision" \
+          && "$pod_phase" == "Running" \
+          && -z "$terminating" \
+          && "$ready_condition" == "ready" \
+          && "$owner" == "DaemonSet/${collector_daemonset}" \
+          && "$owner_uid" == "$daemonset_uid" ]]; then
+          ready_by_node["$node"]=1
+          break
+        fi
+      done <<<"$pod_rows"
+    fi
+  done
+  for node in "${selected_nodes[@]}"; do
+    if [[ -z "${ready_by_node[$node]:-}" ]]; then
+      echo "Error: selected TON node ${node} has no Ready VictoriaLogs collector; refusing to create TON pods with incomplete restart-log coverage." >&2
+      return 1
+    fi
+  done
+  echo "[launch] VictoriaLogs collector is Ready on every selected TON node (${#selected_nodes[@]} node(s))." >&2
+}
+
+wait_victoria_logs_collector_ready_on_selected_nodes() {
+  local ns="$1"
+  local collector_release_name="$2"
+  local node_selector="$3"
+  local timeout_seconds="$4"
+  local deadline now last_error=""
+
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 1 )); then
+    timeout_seconds=300
+  fi
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while :; do
+    if last_error="$(victoria_logs_collector_ready_on_selected_nodes \
+      "$ns" "$collector_release_name" "$node_selector" 2>&1)"; then
+      [[ -z "$last_error" ]] || printf '%s\n' "$last_error" >&2
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      [[ -z "$last_error" ]] || printf '%s\n' "$last_error" >&2
+      echo "Error: VictoriaLogs collector did not cover every selected TON node within ${timeout_seconds}s." >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+ensure_start_victoria_logs() {
+  local logs_ns logs_release_name logs_collector_release_name
+  local logs_retention_period logs_pvc_size logs_remote_port timeout_seconds helm_timeout_seconds
+  local logs_stack_row access_service backend_service collector_daemonset remote_write_url ds_ready ds_desired
+  local configured_logs_node_selector configured_collector_node_selector
+
+  if ! is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" || ! is_true "$VICTORIA_LOGS_ENABLED"; then
+    echo "Warning: automatic VictoriaLogs launch capture is disabled; the local bundle cannot guarantee preservation of every rapid container restart." >&2
+    return 0
+  fi
+  require_bin helm
+  logs_ns="$(victoria_logs_namespace)"
+  logs_release_name="$(victoria_logs_release_name)"
+  logs_collector_release_name="$(victoria_logs_collector_release_name)"
+  logs_retention_period="$(trim_whitespace "${VICTORIA_LOGS_RETENTION_PERIOD:-30d}")"
+  logs_pvc_size="$(trim_whitespace "${VICTORIA_LOGS_PVC_SIZE:-10Gi}")"
+  logs_remote_port="$(trim_whitespace "${VICTORIA_LOGS_PORT:-9428}")"
+  timeout_seconds="$(resolve_victoria_metrics_rollout_timeout_seconds)"
+  helm_timeout_seconds="$(resolve_victoria_logs_helm_timeout_seconds)"
+  [[ -n "$logs_retention_period" ]] || logs_retention_period=30d
+  [[ -n "$logs_pvc_size" ]] || logs_pvc_size=10Gi
+  [[ "$logs_remote_port" =~ ^[0-9]+$ ]] || logs_remote_port=9428
+
+  configured_logs_node_selector="$(trim_whitespace "${VICTORIA_LOGS_NODE_SELECTOR:-}")"
+  configured_collector_node_selector="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")"
+  access_service="$(victoria_logs_access_service_name "$logs_release_name")"
+  collector_daemonset="$(victoria_logs_collector_daemonset_name "$logs_collector_release_name")"
+
+  echo "[launch] Ensuring durable VictoriaLogs collection before TON pods are created ..." >&2
+  # Persist intent before either Helm release is mutated. A partial custom
+  # backend/collector install must remain discoverable by plain uninstall.
+  if ! write_victoria_logs_state "$OP_NAMESPACE" "$logs_ns" "$logs_release_name" \
+      "$logs_collector_release_name" "$access_service" "$collector_daemonset"; then
+    echo "Error: durable launch logging intent could not be persisted; TON deployment was not applied." >&2
+    return 1
+  fi
+  if ! logs_stack_row="$(VICTORIA_LOGS_NODE_SELECTOR="$configured_logs_node_selector" \
+    VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR="$configured_collector_node_selector" \
+    ensure_victoria_logs_stack "$logs_ns" "$logs_release_name" "$logs_collector_release_name" \
+      "$logs_remote_port" "$logs_retention_period" "$logs_pvc_size" "$timeout_seconds" "$helm_timeout_seconds")"; then
+    echo "Error: durable launch logging is not Ready; TON deployment was not applied." >&2
+    echo "Error: fix VictoriaLogs or set KUBETON_START_VICTORIA_LOGS_ENABLED=false to explicitly accept best-effort local capture." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r access_service backend_service collector_daemonset remote_write_url ds_ready ds_desired <<<"$logs_stack_row"
+  if ! write_victoria_logs_state "$OP_NAMESPACE" "$logs_ns" "$logs_release_name" "$logs_collector_release_name" "$access_service" "$collector_daemonset"; then
+    echo "Error: durable launch logging is running, but its cleanup/access state could not be persisted; TON deployment was not applied." >&2
+    return 1
+  fi
+  echo "[launch] Durable container-log collection is active (${logs_ns}/${collector_daemonset}, ${ds_ready}/${ds_desired} Ready)." >&2
+}
+
+verify_start_victoria_logs_collection_ready() {
+  local logs_ns collector_release_name collector_daemonset ds_row
+  local generation observed_generation desired updated ready available
+
+  if ! is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" || ! is_true "$VICTORIA_LOGS_ENABLED"; then
+    return 0
+  fi
+  logs_ns="$(victoria_logs_namespace)"
+  collector_release_name="$(victoria_logs_collector_release_name)"
+  if [[ -n "${KUBETON_NODE_CHECK_TON_SELECTOR:-}" ]]; then
+    victoria_logs_collector_ready_on_selected_nodes \
+      "$logs_ns" "$collector_release_name" "$KUBETON_NODE_CHECK_TON_SELECTOR"
+    return $?
+  fi
+
+  if [[ -n "$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")" ]]; then
+    echo "Error: TON placement is unconstrained but VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR restricts log collection; kubeton cannot prove that every possible TON node is covered." >&2
+    echo "Error: remove the collector selector for cluster-wide coverage, provide a verified TON selector, or explicitly disable automatic VictoriaLogs launch capture." >&2
+    return 1
+  fi
+
+  # An explicitly skipped preflight or an existing fleet whose placement is
+  # intentionally preserved can leave TON placement unconstrained. In that
+  # case there is no smaller safe coverage set, so require every DaemonSet
+  # target to run the observed/current rollout and be Ready immediately before
+  # creating TON Pods.
+  collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
+  ds_row="$(kubectl -n "$logs_ns" get daemonset "$collector_daemonset" \
+    -o go-template='{{.metadata.generation}}{{"\x1f"}}{{.status.observedGeneration}}{{"\x1f"}}{{.status.desiredNumberScheduled}}{{"\x1f"}}{{.status.updatedNumberScheduled}}{{"\x1f"}}{{.status.numberReady}}{{"\x1f"}}{{.status.numberAvailable}}' 2>/dev/null || true)"
+  IFS=$'\x1f' read -r generation observed_generation desired updated ready available <<<"$ds_row"
+  generation="$(trim_whitespace "$generation")"
+  observed_generation="$(trim_whitespace "$observed_generation")"
+  desired="$(trim_whitespace "$desired")"
+  updated="$(trim_whitespace "$updated")"
+  ready="$(trim_whitespace "$ready")"
+  available="$(trim_whitespace "$available")"
+  if ! [[ "$generation" =~ ^[1-9][0-9]*$ \
+    && "$observed_generation" == "$generation" \
+    && "$desired" =~ ^[1-9][0-9]*$ \
+    && "$updated" =~ ^[0-9]+$ \
+    && "$ready" =~ ^[0-9]+$ \
+    && "$available" =~ ^[0-9]+$ ]] \
+    || (( updated != desired || ready != desired || available != desired )); then
+    echo "Error: TON placement is unconstrained and VictoriaLogs collector rollout is observed=${observed_generation:-unknown}/${generation:-unknown}, updated=${updated:-unknown}, ready=${ready:-unknown}, available=${available:-unknown}, desired=${desired:-unknown}; refusing to create TON pods with incomplete restart-log coverage." >&2
+    return 1
+  fi
+  # DaemonSet status may transiently count a terminating Ready Pod. Resolve
+  # the current ControllerRevision and exact owning Pods as a final guard.
+  victoria_logs_collector_ready_on_selected_nodes "$logs_ns" "$collector_release_name" ""
 }
 
 victoria_logs_port_forward_address() {
@@ -5105,6 +6428,26 @@ build_victoria_logs_single_selector_values_file() {
     echo "server:"
     echo "  nodeSelector:"
     write_yaml_map_from_pairs selector_pairs 4
+  } >"$values_file"
+
+  printf '%s' "$values_file"
+}
+
+build_victoria_logs_collector_selector_values_file() {
+  local selector="$1"
+  local -a selector_pairs=()
+  local values_file
+
+  parse_selector_pairs "$selector" selector_pairs || return 1
+  if [[ ${#selector_pairs[@]} -eq 0 ]]; then
+    echo "Error: VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR is set but has no valid key=value pairs." >&2
+    return 1
+  fi
+
+  values_file="$(mktemp -t kubeton-victoria-logs-collector-selector.XXXXXX.yaml)"
+  {
+    echo "nodeSelector:"
+    write_yaml_map_from_pairs selector_pairs 2
   } >"$values_file"
 
   printf '%s' "$values_file"
@@ -10185,6 +11528,179 @@ wait_pod_ready() {
   return 1
 }
 
+ton_pod_initial_bootstrap_state() {
+  local ns="$1"
+  local pod="$2"
+  local pod_row node phase scheduled_status scheduled_reason scheduled_message
+  local restart_count waiting_reason last_exit event_row event_reason event_message process_state
+
+  if ! pod_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pod "$pod" --ignore-not-found \
+    -o go-template='{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{range .status.conditions}}{{if eq .type "PodScheduled"}}{{.status}}{{"\x1f"}}{{.reason}}{{"\x1f"}}{{.message}}{{end}}{{end}}{{"\x1f"}}{{range .status.containerStatuses}}{{if eq .name "ton-node"}}{{.restartCount}}{{"\x1f"}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{"\x1f"}}{{if .lastState.terminated}}{{.lastState.terminated.exitCode}}{{end}}{{end}}' 2>/dev/null)"; then
+    printf 'unknown\x1f-\x1f0\x1f\x1f\x1funable to read Pod status'
+    return 0
+  fi
+  pod_row="$(printf '%s' "$pod_row" | tr '\t\r\n' '   ')"
+  if [[ -z "$(trim_whitespace "$pod_row")" ]]; then
+    printf 'waiting-for-pod\x1f-\x1f0\x1f\x1f\x1fPod has not been created'
+    return 0
+  fi
+  IFS=$'\x1f' read -r node phase scheduled_status scheduled_reason scheduled_message restart_count waiting_reason last_exit <<<"$pod_row"
+  node="$(trim_whitespace "$node")"
+  phase="$(trim_whitespace "$phase")"
+  scheduled_status="$(trim_whitespace "$scheduled_status")"
+  scheduled_reason="$(trim_whitespace "$scheduled_reason")"
+  scheduled_message="$(trim_whitespace "$scheduled_message")"
+  restart_count="$(trim_whitespace "$restart_count")"
+  waiting_reason="$(trim_whitespace "$waiting_reason")"
+  last_exit="$(trim_whitespace "$last_exit")"
+  [[ -z "$node" ]] && node="-"
+  [[ "$restart_count" =~ ^[0-9]+$ ]] || restart_count=0
+
+  if [[ "$scheduled_status" == "False" || -z "$node" || "$node" == "-" ]]; then
+    event_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get events \
+      --field-selector "involvedObject.kind=Pod,involvedObject.name=${pod},type=Warning" \
+      --sort-by=.lastTimestamp \
+      -o custom-columns='REASON:.reason,MESSAGE:.message' --no-headers 2>/dev/null | tail -n 1 || true)"
+    event_reason="${event_row%%[[:space:]]*}"
+    event_message="${event_row#"$event_reason"}"
+    event_reason="$(trim_whitespace "$event_reason")"
+    event_message="$(trim_whitespace "$event_message")"
+    [[ -z "$event_reason" ]] && event_reason="${scheduled_reason:-Pending}"
+    [[ -z "$event_message" ]] && event_message="${scheduled_message:-Pod is not scheduled}"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' "$event_reason" "$node" "$restart_count" "$waiting_reason" "$last_exit" "$event_message"
+    return 0
+  fi
+
+  if [[ -n "$waiting_reason" ]]; then
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1fcontainer is waiting' "$waiting_reason" "$node" "$restart_count" "$waiting_reason" "$last_exit"
+    return 0
+  fi
+  if [[ "$phase" != "Running" ]]; then
+    event_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get events \
+      --field-selector "involvedObject.kind=Pod,involvedObject.name=${pod},type=Warning" \
+      --sort-by=.lastTimestamp \
+      -o custom-columns='REASON:.reason,MESSAGE:.message' --no-headers 2>/dev/null | tail -n 1 || true)"
+    event_reason="${event_row%%[[:space:]]*}"
+    event_message="${event_row#"$event_reason"}"
+    event_reason="$(trim_whitespace "$event_reason")"
+    event_message="$(trim_whitespace "$event_message")"
+    if [[ -n "$event_reason" ]]; then
+      printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' "$event_reason" "$node" "$restart_count" "$waiting_reason" "$last_exit" "$event_message"
+    else
+      printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1fPod phase is %s' "${phase:-Pending}" "$node" "$restart_count" "$waiting_reason" "$last_exit" "${phase:-unknown}"
+    fi
+    return 0
+  fi
+
+  if run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- sh -ec '
+      test -f /var/ton-work/db/mtc_done
+      test -s /var/ton-work/db/config.json
+      test -s /var/ton-work/db/systemd-units/validator.service
+      test -s /var/ton-work/db/systemd-units/mytoncore.service
+    ' >/dev/null 2>&1; then
+    printf 'complete\x1f%s\x1f%s\x1f%s\x1f%s\x1fMyTonCtrl bootstrap commit state is present' "$node" "$restart_count" "$waiting_reason" "$last_exit"
+    return 0
+  fi
+
+  process_state="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- sh -ec '
+      args="$(ps -eo args 2>/dev/null || true)"
+      if printf "%s\n" "$args" | grep -q "[a]ria2c"; then
+        echo downloading
+      elif printf "%s\n" "$args" | grep -Eq "[p]lzip|[t]ar -xf .*var/ton-work/db"; then
+        echo extracting
+      else
+        echo bootstrapping
+      fi
+    ' 2>/dev/null || true)"
+  process_state="$(trim_whitespace "$process_state")"
+  case "$process_state" in
+    downloading|extracting|bootstrapping) ;;
+    *) process_state="bootstrapping" ;;
+  esac
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1fmtc_done is not committed yet' "$process_state" "$node" "$restart_count" "$waiting_reason" "$last_exit"
+}
+
+wait_ton_initial_bootstrap_complete() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local desired_replicas="$3"
+  local timeout_seconds="${4:-$KUBETON_START_READY_TIMEOUT_SECONDS}"
+  local status_interval fatal_restart_count deadline now started_at ordinal pod row
+  local state node restarts waiting_reason last_exit detail state_key complete_count fatal_count
+  local -A last_state=()
+  local -A last_printed_at=()
+
+  if ! [[ "$desired_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: invalid desired TON replica count '${desired_replicas}' for bootstrap wait." >&2
+    return 1
+  fi
+  timeout_seconds="$(trim_whitespace "$timeout_seconds")"
+  status_interval="$(trim_whitespace "${KUBETON_START_STATUS_INTERVAL_SECONDS:-60}")"
+  fatal_restart_count="$(trim_whitespace "${KUBETON_START_FATAL_RESTART_COUNT:-5}")"
+  if ! [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: invalid KUBETON_START_READY_TIMEOUT_SECONDS '${timeout_seconds}'." >&2
+    return 1
+  fi
+  [[ "$status_interval" =~ ^[1-9][0-9]*$ ]] || status_interval=60
+  [[ "$fatal_restart_count" =~ ^[0-9]+$ ]] || fatal_restart_count=5
+  started_at="$(date +%s)"
+  deadline=$((started_at + timeout_seconds))
+  echo "[start] Waiting for ${desired_replicas} TON replica(s) to commit initial MyTonCtrl bootstrap (timeout ${timeout_seconds}s) ..."
+
+  while :; do
+    now="$(date +%s)"
+    complete_count=0
+    fatal_count=0
+    for ordinal in $(seq 0 $((desired_replicas - 1))); do
+      pod="${tonnode_name}-${ordinal}"
+      row="$(ton_pod_initial_bootstrap_state "$ns" "$pod")"
+      IFS=$'\x1f' read -r state node restarts waiting_reason last_exit detail <<<"$row"
+      state="$(trim_whitespace "$state")"
+      node="$(trim_whitespace "$node")"
+      restarts="$(trim_whitespace "$restarts")"
+      waiting_reason="$(trim_whitespace "$waiting_reason")"
+      last_exit="$(trim_whitespace "$last_exit")"
+      detail="$(trim_whitespace "$detail")"
+      [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+      state_key="${state}|${node}|${restarts}|${waiting_reason}|${last_exit}|${detail}"
+
+      if [[ "${last_state[$pod]:-}" != "$state_key" ]] \
+        || (( now - ${last_printed_at[$pod]:-0} >= status_interval )); then
+        printf '[start] %-24s node=%-16s state=%-22s restarts=%s' "${ns}/${pod}" "${node:--}" "${state:-unknown}" "$restarts"
+        [[ -n "$last_exit" ]] && printf ' lastExit=%s' "$last_exit"
+        [[ -n "$detail" ]] && printf ' - %s' "$detail"
+        printf '\n'
+        last_state["$pod"]="$state_key"
+        last_printed_at["$pod"]="$now"
+      fi
+
+      if [[ "$state" == "complete" ]]; then
+        complete_count=$((complete_count + 1))
+      elif [[ "$state" == "CrashLoopBackOff" ]] \
+        && (( fatal_restart_count > 0 && restarts >= fatal_restart_count )) \
+        && [[ -n "$last_exit" && "$last_exit" != "0" ]]; then
+        fatal_count=$((fatal_count + 1))
+      fi
+    done
+
+    if (( complete_count == desired_replicas )); then
+      echo "[start] All ${desired_replicas} TON replica(s) committed initial MyTonCtrl bootstrap in $((now - started_at))s."
+      return 0
+    fi
+    if (( fatal_count > 0 )); then
+      echo "Error: ${fatal_count} TON replica(s) repeatedly failed with a deterministic non-zero exit; initial bootstrap did not complete." >&2
+      echo "Error: inspect the launch evidence bundle printed by kubeton; the pods were left intact for diagnosis." >&2
+      return 1
+    fi
+    if (( now >= deadline )); then
+      echo "Error: timed out after ${timeout_seconds}s waiting for all TON replicas to commit initial bootstrap (${complete_count}/${desired_replicas} complete)." >&2
+      echo "Error: pods and PVCs were left intact; inspect the launch evidence bundle printed by kubeton." >&2
+      return 1
+    fi
+    sleep 5
+  done
+}
+
 wait_pod_volume_stage_complete() {
   local ns="$1"
   local pod="$2"
@@ -11809,6 +13325,15 @@ sequential_start_ton_fleet() {
   echo "[start] Sequential TON volume staging enabled: scaling to ${target_replicas} one ordinal at a time."
   for ordinal in $(seq 0 $((target_replicas - 1))); do
     current_replicas=$((ordinal + 1))
+    if (( ordinal > 0 )); then
+      # A local-path ordinal can take several minutes to bind and stage.
+      # Refuse the next scale-up if durable log coverage disappeared while
+      # the preceding ordinal was being prepared.
+      if ! verify_start_victoria_logs_collection_ready; then
+        echo "Error: VictoriaLogs coverage was lost before TON ordinal ${ordinal}; the next Pod was not created." >&2
+        return 1
+      fi
+    fi
     for row in "${sts_rows[@]}"; do
       [[ -z "$row" ]] && continue
       IFS=$'\t' read -r ns sts _ <<<"$row"
@@ -12521,13 +14046,20 @@ status_collect_row() {
 run_install() {
   require_bin helm
   require_bin kubectl
+  local install_ready_timeout
+
+  install_ready_timeout="$(trim_whitespace "${KUBETON_INSTALL_READY_TIMEOUT_SECONDS:-600}")"
+  if ! [[ "$install_ready_timeout" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: invalid KUBETON_INSTALL_READY_TIMEOUT_SECONDS '${install_ready_timeout}'." >&2
+    return 1
+  fi
   if is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
     echo "[check] KUBETON_SKIP_NODE_PREREQ_CHECK=true; skipping install-time node preflight." >&2
   else
     run_node_prerequisite_check_readonly || return 1
   fi
 
-  local release_exists=0
+  local release_exists=0 operator_deployment=""
   local -a helm_cmd=()
 
   if helm -n "$OP_NAMESPACE" status "$RELEASE_NAME" >/dev/null 2>&1; then
@@ -12553,6 +14085,23 @@ run_install() {
 
   append_helm_force_conflicts_if_supported helm_cmd
   "${helm_cmd[@]}"
+
+  if ! operator_deployment="$(resolve_operator_controller_deployment_name)"; then
+    echo "Error: cannot uniquely resolve the controller Deployment for Helm release ${OP_NAMESPACE}/${RELEASE_NAME}; inspect the launch evidence bundle." >&2
+    return 1
+  fi
+
+  # Helm applying the Deployment is not evidence that its controller process
+  # ever started. Keep the launch log watchers alive through the rollout and
+  # make install fail when the operator cannot become Ready, leaving the
+  # captured Pod/container/Event evidence available on the invoking host.
+  echo "[install] Waiting for operator deployment ${OP_NAMESPACE}/${operator_deployment} to become Ready (timeout ${install_ready_timeout}s) ..."
+  if ! kubectl -n "$OP_NAMESPACE" rollout status "deployment/${operator_deployment}" \
+      --timeout="${install_ready_timeout}s"; then
+    echo "Error: operator deployment ${OP_NAMESPACE}/${operator_deployment} did not become Ready; inspect the launch evidence bundle." >&2
+    return 1
+  fi
+  echo "[install] Operator deployment is Ready."
 }
 
 fleet_has_stop_annotations() {
@@ -12677,6 +14226,15 @@ run_start() {
   fi
 
   if (( bootstrap_required == 1 )); then
+    # The backend may itself need Longhorn, but the collector has only local
+    # hostPath dependencies. Start it first so Longhorn/Vault container logs
+    # are queued locally even before the VictoriaLogs Service can exist.
+    if ! ensure_start_victoria_logs_buffering_collector; then
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
     ensure_auto_bootstrap_stack
     append_baremetal_key_overrides extra_overrides
     if [[ -z "$ton_selector_values_file" ]] && ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
@@ -12726,6 +14284,16 @@ run_start() {
     fi
   fi
 
+  # Container restart history must be collected before the first TON Pod is
+  # created. Kubernetes only exposes one previous container generation, so a
+  # logging stack installed after a failed bootstrap cannot reconstruct it.
+  if ! ensure_start_victoria_logs; then
+    if [[ -n "$ton_selector_values_file" ]]; then
+      rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+
   if (( restore_from_stop_metadata == 0 )); then
     delete_stale_ton_pvcs_before_fresh_start
   fi
@@ -12770,6 +14338,16 @@ run_start() {
       fi
       return 1
     fi
+  fi
+  # Storage cleanup and readiness waits can take long enough for a collector
+  # to be evicted after the initial VictoriaLogs installation. Narrow that
+  # race with one final exact coverage probe immediately before Helm can
+  # create or restart TON Pods.
+  if ! verify_start_victoria_logs_collection_ready; then
+    if [[ -n "$ton_selector_values_file" ]]; then
+      rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+    fi
+    return 1
   fi
 
   helm_cmd=(
@@ -12818,14 +14396,27 @@ run_start() {
     return "$helm_rc"
   fi
   if (( restore_from_stop_metadata == 1 )); then
-    if ! kubectl -n "$OP_NAMESPACE" rollout status "deployment/${OP_CONTROLLER_DEPLOYMENT}" --timeout=300s >/dev/null 2>&1; then
-      echo "Warning: operator deployment ${OP_NAMESPACE}/${OP_CONTROLLER_DEPLOYMENT} did not report Ready before TON restore; continuing." >&2
+    local restore_operator_deployment=""
+    restore_operator_deployment="$(resolve_operator_controller_deployment_name || true)"
+    if [[ -z "$restore_operator_deployment" ]] \
+      || ! kubectl -n "$OP_NAMESPACE" rollout status "deployment/${restore_operator_deployment}" --timeout=300s >/dev/null 2>&1; then
+      echo "Warning: operator deployment for Helm release ${OP_NAMESPACE}/${RELEASE_NAME} did not report Ready before TON restore; continuing." >&2
     fi
     recreate_stopped_statefulsets_missing_dedicated_pvcs
     run_start_stopped_fleet
   fi
 
-  repair_pending_ton_placement_after_start
+  repair_pending_ton_placement_after_start || return 1
+
+  if is_true "$KUBETON_START_WAIT_FOR_BOOTSTRAP"; then
+    local target_ns target_name
+    target_ns="$(resolve_tonnode_namespace_from_values)"
+    target_name="$(resolve_tonnode_name_from_values)"
+    wait_ton_initial_bootstrap_complete \
+      "$target_ns" "$target_name" "$desired_replicas_for_start" "$KUBETON_START_READY_TIMEOUT_SECONDS"
+  else
+    echo "[start] KUBETON_START_WAIT_FOR_BOOTSTRAP=false; TON was applied without waiting for the MyTonCtrl bootstrap commit." >&2
+  fi
 }
 
 run_backup_keys() {
@@ -13445,6 +15036,14 @@ run_start_stopped_fleet() {
     return
   fi
 
+  # Restoring replicas creates Pods just like a Helm scale-up. Revalidate the
+  # collector after the caller's operator/PVC recovery work and before the
+  # first stopped replica can be recreated.
+  if ! verify_start_victoria_logs_collection_ready; then
+    echo "Error: VictoriaLogs coverage was lost before the stopped TON fleet could be restored." >&2
+    return 1
+  fi
+
   echo "Restoring TON fleet from stop annotations ..."
   for row in "${sts_rows[@]}"; do
     [[ -z "$row" ]] && continue
@@ -13794,11 +15393,30 @@ collect_pvc_rows_by_prefix() {
   local prefix="$1"
   local -n rows_ref="$2"
   local selector="${3:-}"
-  local ns pvc
+  local strict="${4:-false}"
+  local ns pvc pvc_inventory
 
   prefix="$(trim_whitespace "$prefix")"
   selector="$(trim_whitespace "$selector")"
   [[ -n "$prefix" ]] || return 0
+
+  if [[ -n "$selector" ]]; then
+    if ! pvc_inventory="$(kubectl get pvc -A -l "$selector" \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+      if is_true "$strict"; then
+        echo "Error: cannot inventory PVCs matching '${selector}' while resolving prefix ${prefix}." >&2
+        return 1
+      fi
+      pvc_inventory=""
+    fi
+  elif ! pvc_inventory="$(kubectl get pvc -A \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+    if is_true "$strict"; then
+      echo "Error: cannot inventory cluster PVCs while resolving prefix ${prefix}." >&2
+      return 1
+    fi
+    pvc_inventory=""
+  fi
 
   while IFS=$'\t' read -r ns pvc; do
     ns="$(trim_whitespace "$ns")"
@@ -13806,13 +15424,7 @@ collect_pvc_rows_by_prefix() {
     [[ -z "$ns" || -z "$pvc" ]] && continue
     [[ "$pvc" == "$prefix"* ]] || continue
     append_unique_item "$ns"$'\t'"$pvc" rows_ref
-  done < <(
-    if [[ -n "$selector" ]]; then
-      kubectl get pvc -A -l "$selector" -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
-    else
-      kubectl get pvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
-    fi
-  )
+  done <<<"$pvc_inventory"
 }
 
 collect_victoria_logs_release_rows() {
@@ -13821,6 +15433,7 @@ collect_victoria_logs_release_rows() {
   local -n single_rows_ref="$single_rows_name"
   local -n collector_rows_ref="$collector_rows_name"
   local default_ns default_release default_collector row state_ns ns release collector
+  local state_rows single_discovery_rows collector_discovery_rows
 
   default_ns="$(victoria_logs_namespace)"
   default_release="$(victoria_logs_release_name)"
@@ -13828,6 +15441,12 @@ collect_victoria_logs_release_rows() {
   append_unique_item "$default_ns"$'\t'"$default_release" single_rows_ref
   append_unique_item "$default_ns"$'\t'"$default_collector" collector_rows_ref
 
+  if ! state_rows="$(kubectl get configmap -A \
+      -l 'app.kubernetes.io/name=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.data.namespace}{"\t"}{.data.releaseName}{"\t"}{.data.collectorReleaseName}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: cannot inventory the VictoriaLogs cleanup ledger across namespaces." >&2
+    return 1
+  fi
   while IFS=$'\t' read -r state_ns ns release collector; do
     state_ns="$(trim_whitespace "$state_ns")"
     ns="$(trim_whitespace "$ns")"
@@ -13838,12 +15457,14 @@ collect_victoria_logs_release_rows() {
     [[ -z "$collector" ]] && collector="$default_collector"
     [[ -n "$ns" && -n "$release" ]] && append_unique_item "$ns"$'\t'"$release" single_rows_ref
     [[ -n "$ns" && -n "$collector" ]] && append_unique_item "$ns"$'\t'"$collector" collector_rows_ref
-  done < <(
-    kubectl get configmap -A \
-      -l 'app.kubernetes.io/name=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton' \
-      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.data.namespace}{"\t"}{.data.releaseName}{"\t"}{.data.collectorReleaseName}{"\n"}{end}' 2>/dev/null || true
-  )
+  done <<<"$state_rows"
 
+  if ! single_discovery_rows="$(kubectl get statefulset -A \
+      -l 'app.kubernetes.io/name=victoria-logs-single' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.app\.kubernetes\.io/instance}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: cannot inventory VictoriaLogs StatefulSets across namespaces." >&2
+    return 1
+  fi
   while IFS=$'\t' read -r ns release; do
     ns="$(trim_whitespace "$ns")"
     release="$(trim_whitespace "$release")"
@@ -13853,12 +15474,14 @@ collect_victoria_logs_release_rows() {
         append_unique_item "$ns"$'\t'"$release" single_rows_ref
         ;;
     esac
-  done < <(
-    kubectl get statefulset -A \
-      -l 'app.kubernetes.io/name=victoria-logs-single' \
-      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.app\.kubernetes\.io/instance}{"\n"}{end}' 2>/dev/null || true
-  )
+  done <<<"$single_discovery_rows"
 
+  if ! collector_discovery_rows="$(kubectl get daemonset -A \
+      -l 'app.kubernetes.io/name=victoria-logs-collector' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.app\.kubernetes\.io/instance}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: cannot inventory VictoriaLogs collector DaemonSets across namespaces." >&2
+    return 1
+  fi
   while IFS=$'\t' read -r ns collector; do
     ns="$(trim_whitespace "$ns")"
     collector="$(trim_whitespace "$collector")"
@@ -13868,11 +15491,7 @@ collect_victoria_logs_release_rows() {
         append_unique_item "$ns"$'\t'"$collector" collector_rows_ref
         ;;
     esac
-  done < <(
-    kubectl get daemonset -A \
-      -l 'app.kubernetes.io/name=victoria-logs-collector' \
-      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.labels.app\.kubernetes\.io/instance}{"\n"}{end}' 2>/dev/null || true
-  )
+  done <<<"$collector_discovery_rows"
 }
 
 cleanup_main_wallet_resources() {
@@ -13907,7 +15526,7 @@ cleanup_main_wallet_resources() {
 delete_labeled_resources_all_namespaces() {
   local selector="$1"
   local label="${2:-uninstall}"
-  local resource
+  local resource effective_selector
 
   selector="$(trim_whitespace "$selector")"
   [[ -n "$selector" ]] || return 0
@@ -13915,7 +15534,15 @@ delete_labeled_resources_all_namespaces() {
   while IFS= read -r resource; do
     resource="$(trim_whitespace "$resource")"
     [[ -z "$resource" ]] && continue
-    kubectl delete "$resource" -A -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    effective_selector="$selector"
+    if (( KUBETON_RETAIN_VICTORIA_LOGS_GUARDS == 1 )); then
+      case "$resource" in
+        configmaps|configmaps.*|networkpolicies|networkpolicies.*)
+          effective_selector="${selector},app.kubernetes.io/part-of!=kubeton-victoria-logs"
+          ;;
+      esac
+    fi
+    kubectl delete "$resource" -A -l "$effective_selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done < <(kubectl api-resources --verbs=list --namespaced=true -o name 2>/dev/null || true)
 
   while IFS= read -r resource; do
@@ -13950,21 +15577,139 @@ cleanup_victoria_metrics_operator() {
     | xargs -r kubectl delete --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 
+wait_victoria_logs_backend_gone() {
+  local ns="$1"
+  local release_name="$2"
+  local timeout_seconds="$3"
+  local deadline namespace_row remaining
+  local selector="app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}"
+
+  timeout_seconds="$(trim_whitespace "$timeout_seconds")"
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || timeout_seconds=300
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while :; do
+    if ! namespace_row="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+      echo "Error: cannot verify namespace ${ns} while waiting for VictoriaLogs backend deletion." >&2
+      return 1
+    fi
+    namespace_row="$(trim_whitespace "$namespace_row")"
+    [[ -z "$namespace_row" ]] && return 0
+    if ! remaining="$(kubectl -n "$ns" get statefulset,pod -l "$selector" \
+      --ignore-not-found -o name 2>/dev/null)"; then
+      echo "Error: cannot verify VictoriaLogs backend resources for ${ns}/${release_name}." >&2
+      return 1
+    fi
+    remaining="$(trim_whitespace "$remaining")"
+    [[ -z "$remaining" ]] && return 0
+    if (( $(date +%s) >= deadline )); then
+      echo "Error: VictoriaLogs backend ${ns}/${release_name} is still present after ${timeout_seconds}s; retaining its ingress NetworkPolicy and cleanup ledger." >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+wait_victoria_logs_collector_gone() {
+  local ns="$1"
+  local release_name="$2"
+  local timeout_seconds="$3"
+  local deadline namespace_row remaining
+  local selector="app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${release_name}"
+
+  timeout_seconds="$(trim_whitespace "$timeout_seconds")"
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || timeout_seconds=300
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while :; do
+    if ! namespace_row="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+      echo "Error: cannot verify namespace ${ns} while waiting for VictoriaLogs collector deletion." >&2
+      return 1
+    fi
+    namespace_row="$(trim_whitespace "$namespace_row")"
+    [[ -z "$namespace_row" ]] && return 0
+    if ! remaining="$(kubectl -n "$ns" get daemonset,pod -l "$selector" \
+      --ignore-not-found -o name 2>/dev/null)"; then
+      echo "Error: cannot verify VictoriaLogs collector resources for ${ns}/${release_name}." >&2
+      return 1
+    fi
+    remaining="$(trim_whitespace "$remaining")"
+    [[ -z "$remaining" ]] && return 0
+    if (( $(date +%s) >= deadline )); then
+      echo "Error: VictoriaLogs collector ${ns}/${release_name} is still present after ${timeout_seconds}s; retaining its cleanup ledger." >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+victoria_logs_helm_release_is_gone() {
+  local ns="$1"
+  local release_name="$2"
+  local release_rows namespace_row helm_help
+  local -a helm_list_cmd=()
+
+  if ! namespace_row="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot verify namespace ${ns} while checking VictoriaLogs Helm release ${release_name}." >&2
+    return 1
+  fi
+  namespace_row="$(trim_whitespace "$namespace_row")"
+  [[ -z "$namespace_row" ]] && return 0
+
+  # Helm's default Secret driver and legacy ConfigMap driver both label
+  # release records this way. Read metadata only; never expose release data.
+  if ! release_rows="$(kubectl -n "$ns" get secret,configmap \
+    -l "owner=helm,name=${release_name}" --ignore-not-found \
+    -o jsonpath='{range .items[*]}{.metadata.labels.name}{"\n"}{end}' 2>/dev/null)"; then
+    echo "Error: cannot verify stored Helm metadata for VictoriaLogs release ${ns}/${release_name}." >&2
+    return 1
+  fi
+  if printf '%s\n' "$release_rows" | grep -Fxq "$release_name"; then
+    echo "Error: VictoriaLogs Helm release ${ns}/${release_name} still exists; retaining its cleanup ledger." >&2
+    return 1
+  fi
+
+  # Also cover a non-default Helm storage driver. Helm 3 needs --all to show
+  # every release state, while Helm 4 removed that flag and lists all states by
+  # default. Detect the supported interface instead of pinning uninstall to
+  # one Helm major version.
+  if command -v helm >/dev/null 2>&1; then
+    helm_list_cmd=(helm list -n "$ns" --short)
+    helm_help="$(helm list --help 2>/dev/null || true)"
+    if printf '%s\n' "$helm_help" | grep -Eq '(^|[[:space:]])--all([[:space:]]|$)'; then
+      helm_list_cmd+=(--all)
+    fi
+    if ! release_rows="$("${helm_list_cmd[@]}" 2>/dev/null)"; then
+      echo "Error: cannot verify whether VictoriaLogs Helm release ${ns}/${release_name} remains." >&2
+      return 1
+    fi
+    if printf '%s\n' "$release_rows" | grep -Fxq "$release_name"; then
+      echo "Error: VictoriaLogs Helm release ${ns}/${release_name} still exists; retaining its cleanup ledger." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
 cleanup_victoria_logs_resources() {
   local ns state_ns release_name collector_release_name row
   local state_value service_name
   local access_selector='app.kubernetes.io/part-of=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton'
+  local cleanup_timeout all_backends_gone=1 all_collectors_gone=1
+  local all_helm_releases_gone=1 storage_cleanup_complete=1
   local -a single_release_rows=()
   local -a collector_release_rows=()
   local -a pvc_rows=()
 
   ns="$(victoria_logs_namespace)"
-  state_ns="$ns"
+  state_ns="$OP_NAMESPACE"
   if kubectl -n "$state_ns" get configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" >/dev/null 2>&1; then
     :
+  elif kubectl -n "$ns" get configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" >/dev/null 2>&1; then
+    state_ns="$ns"
   elif [[ -n "${VICTORIA_METRICS_OPERATOR_NAMESPACE:-}" ]] && kubectl -n "$VICTORIA_METRICS_OPERATOR_NAMESPACE" get configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" >/dev/null 2>&1; then
     state_ns="$VICTORIA_METRICS_OPERATOR_NAMESPACE"
   fi
+  cleanup_timeout="$(trim_whitespace "${VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS:-300}")"
+  [[ "$cleanup_timeout" =~ ^[1-9][0-9]*$ ]] || cleanup_timeout=300
 
   state_value="$(read_victoria_logs_state_value "$state_ns" "namespace")"
   state_value="$(trim_whitespace "$state_value")"
@@ -13986,9 +15731,17 @@ cleanup_victoria_logs_resources() {
   service_name="$(victoria_logs_service_name "$release_name")"
   append_unique_item "$ns"$'\t'"$release_name" single_release_rows
   append_unique_item "$ns"$'\t'"$collector_release_name" collector_release_rows
-  collect_victoria_logs_release_rows single_release_rows collector_release_rows
+  if ! collect_victoria_logs_release_rows single_release_rows collector_release_rows; then
+    KUBETON_RETAIN_VICTORIA_LOGS_GUARDS=1
+    echo "Error: VictoriaLogs release inventory is incomplete; refusing destructive logging cleanup and retaining ingress protection and cleanup state." >&2
+    cleanup_victoria_logs_port_forwards
+    return 1
+  fi
 
-  echo "[uninstall] Deleting kubeton-managed VictoriaLogs access resources ..."
+  echo "[uninstall] Disabling kubeton-managed VictoriaLogs access Services ..."
+  # Keep ingress isolation in place until every unauthenticated backend Pod is
+  # proven gone. Removing Service access is safe up front; removing the policy
+  # before a stalled StatefulSet disappears would expose its chart Service.
   kubectl delete service -A -l "$access_selector" --ignore-not-found >/dev/null 2>&1 || true
 
   echo "[uninstall] Uninstalling VictoriaLogs releases ..."
@@ -14031,20 +15784,67 @@ cleanup_victoria_logs_resources() {
     [[ -z "$ns" || -z "$release_name" ]] && continue
     service_name="$(victoria_logs_service_name "$release_name")"
     kubectl -n "$ns" delete statefulset,service,configmap,secret -l "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    collect_pvc_rows_by_prefix "server-volume-${service_name}-" pvc_rows "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}"
+    collect_pvc_rows_by_prefix "server-volume-${service_name}-" pvc_rows \
+      "app.kubernetes.io/name=victoria-logs-single,app.kubernetes.io/instance=${release_name}" true \
+      || storage_cleanup_complete=0
   done
 
-  delete_pvc_rows_and_backing_volumes pvc_rows "uninstall" || true
+  for row in "${single_release_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns release_name <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    release_name="$(trim_whitespace "$release_name")"
+    [[ -z "$ns" || -z "$release_name" ]] && continue
+    wait_victoria_logs_backend_gone "$ns" "$release_name" "$cleanup_timeout" || all_backends_gone=0
+  done
 
-  kubectl -n "$state_ns" delete configmap "$VICTORIA_LOGS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete configmap -A -l 'app.kubernetes.io/name=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton' --ignore-not-found >/dev/null 2>&1 || true
+  for row in "${collector_release_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns collector_release_name <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    collector_release_name="$(trim_whitespace "$collector_release_name")"
+    [[ -z "$ns" || -z "$collector_release_name" ]] && continue
+    wait_victoria_logs_collector_gone "$ns" "$collector_release_name" "$cleanup_timeout" || all_collectors_gone=0
+    victoria_logs_helm_release_is_gone "$ns" "$collector_release_name" || all_helm_releases_gone=0
+  done
+
+  for row in "${single_release_rows[@]}"; do
+    [[ -z "$row" ]] && continue
+    IFS=$'\t' read -r ns release_name <<<"$row"
+    ns="$(trim_whitespace "$ns")"
+    release_name="$(trim_whitespace "$release_name")"
+    [[ -z "$ns" || -z "$release_name" ]] && continue
+    victoria_logs_helm_release_is_gone "$ns" "$release_name" || all_helm_releases_gone=0
+  done
+
+  if (( all_backends_gone == 1 )); then
+    delete_pvc_rows_and_backing_volumes pvc_rows "uninstall" || storage_cleanup_complete=0
+  else
+    storage_cleanup_complete=0
+  fi
+
+  if (( all_backends_gone == 1 )); then
+    echo "[uninstall] VictoriaLogs backends are gone; deleting their retained ingress policies ..."
+    kubectl delete networkpolicy -A -l "$access_selector" --ignore-not-found >/dev/null 2>&1 || true
+  fi
+  if (( all_backends_gone == 1 && all_collectors_gone == 1 \
+      && all_helm_releases_gone == 1 && storage_cleanup_complete == 1 )); then
+    echo "[uninstall] VictoriaLogs workloads, releases, and storage are gone; deleting their cleanup state ..."
+    kubectl delete configmap -A -l 'app.kubernetes.io/name=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton' --ignore-not-found >/dev/null 2>&1 || true
+  else
+    KUBETON_RETAIN_VICTORIA_LOGS_GUARDS=1
+    echo "Error: VictoriaLogs cleanup is incomplete; its release ledger and any still-needed ingress NetworkPolicy were retained for a safe retry." >&2
+  fi
   cleanup_victoria_logs_port_forwards
+  (( all_backends_gone == 1 && all_collectors_gone == 1 \
+    && all_helm_releases_gone == 1 && storage_cleanup_complete == 1 ))
 }
 
 cleanup_victoria_metrics_resources() {
   local ns="${VICTORIA_METRICS_NAMESPACE}"
   local operator_ns="${VICTORIA_METRICS_OPERATOR_NAMESPACE}"
   local stack_name state_stack_ns state_operator_ns
+  local rc=0
   local selector='app.kubernetes.io/part-of=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton'
 
   state_operator_ns="$(read_victoria_metrics_state_value "$operator_ns" "operatorNamespace")"
@@ -14076,8 +15876,9 @@ cleanup_victoria_metrics_resources() {
   kubectl -n "$operator_ns" delete configmap "$VICTORIA_METRICS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete configmap -A -l 'app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton' --ignore-not-found >/dev/null 2>&1 || true
   cleanup_victoria_metrics_port_forwards
-  cleanup_victoria_logs_resources
-  cleanup_victoria_metrics_operator "$operator_ns"
+  cleanup_victoria_logs_resources || rc=1
+  cleanup_victoria_metrics_operator "$operator_ns" || rc=1
+  return "$rc"
 }
 
 run_uninstall_step() {
@@ -14096,9 +15897,51 @@ run_uninstall_step() {
   return 0
 }
 
+namespace_has_retained_victoria_logs_guards() {
+  local ns="$1"
+  local guard_rows namespace_row
+  local guard_selector='app.kubernetes.io/part-of=kubeton-victoria-logs,app.kubernetes.io/managed-by=kubeton'
+
+  if ! namespace_row="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot verify namespace ${ns} while VictoriaLogs cleanup guards are active." >&2
+    return 2
+  fi
+  namespace_row="$(trim_whitespace "$namespace_row")"
+  [[ -z "$namespace_row" ]] && return 1
+  if ! guard_rows="$(kubectl -n "$ns" get networkpolicy,configmap \
+      -l "$guard_selector" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot verify retained VictoriaLogs guards in namespace ${ns}." >&2
+    return 2
+  fi
+  guard_rows="$(trim_whitespace "$guard_rows")"
+  [[ -n "$guard_rows" ]]
+}
+
+refuse_guarded_namespace_deletion_if_needed() {
+  local ns="$1"
+  local guard_rc=0
+
+  (( KUBETON_RETAIN_VICTORIA_LOGS_GUARDS == 1 )) || return 1
+  if namespace_has_retained_victoria_logs_guards "$ns"; then
+    echo "Error: retaining namespace ${ns} because it contains VictoriaLogs ingress protection or cleanup-ledger records for a backend that was not proven gone." >&2
+    return 0
+  else
+    guard_rc=$?
+  fi
+  if (( guard_rc == 2 )); then
+    echo "Error: refusing to delete namespace ${ns} because its VictoriaLogs guard state could not be verified." >&2
+    return 0
+  fi
+  return 1
+}
+
 cleanup_operator_release() {
   local rc=0
+
   helm uninstall "$RELEASE_NAME" -n "$OP_NAMESPACE" >/dev/null 2>&1 || true
+  if refuse_guarded_namespace_deletion_if_needed "$OP_NAMESPACE"; then
+    return 1
+  fi
   delete_namespace_with_progress "$OP_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
   return "$rc"
 }
@@ -14107,6 +15950,9 @@ cleanup_vault_release() {
   local rc=0
   uninstall_vault || true
   cleanup_vault_force || return 1
+  if refuse_guarded_namespace_deletion_if_needed "$VAULT_NAMESPACE"; then
+    return 1
+  fi
   delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
   return "$rc"
 }
@@ -14117,6 +15963,11 @@ cleanup_encrypted_storage_class() {
 
 cleanup_longhorn_release() {
   local rc=0 ledger_rc=0
+
+  if (( KUBETON_RETAIN_VICTORIA_LOGS_GUARDS == 1 )); then
+    echo "Error: refusing to uninstall Longhorn while a VictoriaLogs backend or its PVC cleanup is unresolved. Retry uninstall after VictoriaLogs is proven gone so launch evidence is not stranded." >&2
+    return 1
+  fi
 
   if storage_cleanup_ledger_has_pending_longhorn_targets; then
     echo "Error: refusing to uninstall Longhorn while the storage cleanup ledger still contains Longhorn volumes. Rerun kubeton uninstall after resolving the recorded storage cleanup." >&2
@@ -14136,11 +15987,14 @@ cleanup_longhorn_release() {
 }
 
 cleanup_observability_resources() {
+  local rc=0
+
   cleanup_prometheus_resources || true
   cleanup_grafana_resources || true
-  cleanup_victoria_metrics_resources || true
+  cleanup_victoria_metrics_resources || rc=1
   cleanup_main_wallet_resources || true
   cleanup_kubeton_managed_labeled_resources || true
+  return "$rc"
 }
 
 collect_labeled_resource_leftovers() {
@@ -14239,7 +16093,9 @@ collect_uninstall_leftovers() {
     helm status "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && append_unique_item "HelmRelease ${LONGHORN_NAMESPACE}/${LONGHORN_RELEASE_NAME}" rows_ref
   fi
 
-  collect_victoria_logs_release_rows single_release_rows collector_release_rows
+  if ! collect_victoria_logs_release_rows single_release_rows collector_release_rows; then
+    append_unique_item "VictoriaLogs cleanup inventory unavailable" rows_ref
+  fi
   for row in "${single_release_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns release <<<"$row"
@@ -14785,6 +16641,12 @@ run_victoria_metrics_install() {
   write_victoria_metrics_state "$operator_ns" "$stack_name" "$ns" "$operator_ns" "$operator_version" "$operator_manifest_url"
 
   if [[ "$logs_enabled" == "true" ]]; then
+    logs_collector_daemonset="$(victoria_logs_collector_daemonset_name "$logs_collector_release_name")"
+    if ! write_victoria_logs_state "$OP_NAMESPACE" "$logs_ns" "$logs_release_name" \
+        "$logs_collector_release_name" "$logs_access_service" "$logs_collector_daemonset"; then
+      echo "Error: VictoriaLogs install intent could not be persisted; Helm was not started." >&2
+      return 1
+    fi
     if ! logs_stack_row="$(ensure_victoria_logs_stack "$logs_ns" "$logs_release_name" "$logs_collector_release_name" "$logs_remote_port" "$logs_retention_period" "$logs_pvc_size" "$timeout_seconds" "$logs_helm_timeout_seconds")"; then
       return 1
     fi
@@ -14796,7 +16658,7 @@ run_victoria_metrics_install() {
     logs_ds_ready="$(trim_whitespace "$logs_ds_ready")"
     logs_ds_desired="$(trim_whitespace "$logs_ds_desired")"
     logs_access_service="$(trim_whitespace "$logs_access_service")"
-    write_victoria_logs_state "$operator_ns" "$logs_ns" "$logs_release_name" "$logs_collector_release_name" "$logs_access_service" "$logs_collector_daemonset"
+    write_victoria_logs_state "$OP_NAMESPACE" "$logs_ns" "$logs_release_name" "$logs_collector_release_name" "$logs_access_service" "$logs_collector_daemonset"
   fi
 
   auth_service_name="$(resolve_victoria_metrics_auth_service_name "$ns" "$stack_name" || true)"
@@ -15970,13 +17832,13 @@ main() {
       run_check "$@"
       ;;
     install)
-      run_install
+      run_with_launch_session install run_install
       ;;
     bootstrap-baremetal)
       run_bootstrap_baremetal
       ;;
     start)
-      run_start "$@"
+      run_with_launch_session start run_start "$@"
       ;;
     prometheus)
       run_prometheus "$@"

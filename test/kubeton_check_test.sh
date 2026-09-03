@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kubeton="$repo_root/charts/ton-k8s-operator/kubeton"
+export KUBETON_LAUNCH_LOGS_ENABLED=false
+export KUBETON_START_VICTORIA_LOGS_ENABLED=false
+export KUBETON_START_WAIT_FOR_BOOTSTRAP=false
 test_dir="$(mktemp -d)"
 fake_bin="$test_dir/bin"
 mkdir -p "$fake_bin"

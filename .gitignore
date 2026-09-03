@@ -13,6 +13,9 @@ Dockerfile.cross
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
+# Local kubeton launch evidence (may contain sensitive operational logs)
+kubeton-launch-logs/
+
 # Go workspace file
 go.work
 
