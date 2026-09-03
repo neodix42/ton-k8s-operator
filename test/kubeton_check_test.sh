@@ -21,7 +21,7 @@ args="$*"
 
 if [[ "${1:-}" == "get" && "${2:-}" == "--raw" ]]; then
   available_bytes=2199023255552
-  if [[ "$mode" == "dump-too-small" ]]; then
+  if [[ "$mode" == "storage-control" ]]; then
     available_bytes=1099511627776
   elif [[ "$mode" == "large-work" ]]; then
     available_bytes=3298534883328
@@ -48,8 +48,8 @@ fi
 
 if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "daemonset" ]]; then
   # Preflight tests model either a fresh or existing Longhorn deployment.
-  if [[ "$mode" == "existing" || "$mode" == "existing-csi" || "$mode" == "existing-empty" ]]; then
-    if [[ "$mode" == "existing-csi" && "$args" == *"go-template="* ]]; then
+  if [[ "$mode" == "existing" || "$mode" == "existing-csi" || "$mode" == "existing-csi-registration-gap" || "$mode" == "existing-empty" ]]; then
+    if [[ ( "$mode" == "existing-csi" || "$mode" == "existing-csi-registration-gap" ) && "$args" == *"go-template="* ]]; then
       case "$args" in
         *"longhorn-manager"*) printf '%s\n' 'storage=manager' ;;
         *"longhorn-csi-plugin"*) printf '%s\n' 'storage=csi' ;;
@@ -71,6 +71,12 @@ if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "statefulset" && "${5
   # A same-fleet HostPort is exempt only when the Pod has this live
   # StatefulSet UID as its controller owner.
   [[ "$mode" != "host-port-no-current-sts" ]] && printf '%s' 'target-sts-uid'
+  exit 0
+fi
+
+if [[ "${1:-}" == "-n" && "${3:-}" == "get" && "${4:-}" == "pods" && "$args" == *"app=longhorn-csi-plugin"* ]]; then
+  printf '%s\n' node-good-1 node-good-2
+  [[ "$mode" != "csi-plugin-not-ready" ]] && printf '%s\n' node-good-3
   exit 0
 fi
 
@@ -116,6 +122,28 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "get" && "${2:-}" == "csinode" ]]; then
+  case "$mode" in
+    csi-missing-selected|existing-csi-registration-gap)
+      # node-good-3 intentionally lacks driver.longhorn.io even though the
+      # aggregate registration count still looks healthy.
+      printf '%s\n' node-good-1 node-good-2
+      ;;
+    csi-read-error)
+      exit 1
+      ;;
+    *)
+      printf '%s\n' node-good-1 node-good-2 node-good-3
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" == "storageclass" && "${3:-}" == "encrypted-sc" ]]; then
+  [[ "$mode" == "longhorn-sc-manager-missing" ]] && printf '%s' 'driver.longhorn.io'
+  exit 0
+fi
+
 if [[ "${1:-}" == "get" && "${2:-}" == "tonnodes.ton.ton.org" ]]; then
   [[ "$mode" == "existing-ton" ]] && printf '%s\n' 'default/tonnode'
   exit 0
@@ -151,7 +179,8 @@ if [[ "${1:-}" == "get" && "${2:-}" == "nodes" ]]; then
       exit 0
     fi
     if [[ "$args" == *"storage=csi"* ]]; then
-      printf '%s\n' node-good-1 node-good-2 node-good-3 node-bad
+      printf '%s\n' node-good-1 node-good-2 node-good-3
+      [[ "$mode" != "existing-csi-registration-gap" ]] && printf '%s\n' node-bad
       exit 0
     fi
     # The default values file has no TON node selector. This branch keeps the
@@ -217,6 +246,16 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local needle="$1"
+  local file="$2"
+  if grep -Fq -- "$needle" "$file"; then
+    echo "expected output not to contain: $needle" >&2
+    sed -n '1,160p' "$file" >&2
+    exit 1
+  fi
+}
+
 assert_order() {
   local first="$1"
   local second="$2"
@@ -232,13 +271,71 @@ assert_order() {
 }
 
 healthy_output="$test_dir/healthy.out"
-PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" "$kubeton" check >"$healthy_output" 2>&1
+: >"$test_dir/curl.log"
+PATH="$fake_bin:$PATH" KUBETON_TEST_CURL_LOG="$test_dir/curl.log" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$healthy_output" 2>&1
 assert_contains "local TON PVC capacity: 760.00 Gi" "$healthy_output"
-assert_contains "dump bootstrap (testnet, /var/ton-work/dump-cache)" "$healthy_output"
-assert_contains "node filesystem requirement: >= 1.72 Ti" "$healthy_output"
+assert_contains "node filesystem requirement: >= 780.00 Gi" "$healthy_output"
+assert_not_contains "dump bootstrap" "$healthy_output"
 assert_contains "node-bad" "$healthy_output"
 assert_contains "FAIL: DiskPressure" "$healthy_output"
 assert_contains "Compatible target nodes: 3/3 required." "$healthy_output"
+if [[ -s "$test_dir/curl.log" ]]; then
+  echo "node preflight unexpectedly fetched dump metadata" >&2
+  cat "$test_dir/curl.log" >&2
+  exit 1
+fi
+
+# Longhorn's aggregate CSI readiness can be satisfied by registrations on
+# other nodes. The start gate must instead inspect every node selected for TON
+# and identify the exact missing CSINode driver registration.
+csi_missing_nodes_output="$test_dir/csi-missing-nodes.out"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=csi-missing-selected KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  bash -c 'source "$1"; ton_selected_nodes_missing_longhorn_csi storage=manager' _ "$kubeton" >"$csi_missing_nodes_output"
+assert_contains "node-good-3" "$csi_missing_nodes_output"
+if grep -Eq 'node-good-1|node-good-2' "$csi_missing_nodes_output"; then
+  echo "Longhorn CSI gate reported a node that has driver.longhorn.io" >&2
+  cat "$csi_missing_nodes_output" >&2
+  exit 1
+fi
+
+csi_ready_nodes_output="$test_dir/csi-ready-nodes.out"
+PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  bash -c 'source "$1"; wait_ton_selected_nodes_longhorn_csi_ready storage=manager 1' _ "$kubeton" >"$csi_ready_nodes_output" 2>&1
+assert_contains "registered and its node plugin is Ready on every selected TON node" "$csi_ready_nodes_output"
+
+csi_read_error_output="$test_dir/csi-read-error.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=csi-read-error KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  bash -c 'source "$1"; ton_selected_nodes_missing_longhorn_csi storage=manager' _ "$kubeton" >"$csi_read_error_output" 2>&1; then
+  echo "expected unreadable CSINode inventory to fail closed" >&2
+  exit 1
+fi
+assert_contains "cannot list CSINode objects" "$csi_read_error_output"
+
+# Read-only `kubeton check` reports an exact registration gap when Longhorn
+# exists, instead of trusting aggregate DaemonSet/CSINode counts.
+csi_check_gap_output="$test_dir/csi-check-gap.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=existing-csi-registration-gap KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$csi_check_gap_output" 2>&1; then
+  echo "expected kubeton check to reject a selected node without Longhorn CSI registration" >&2
+  exit 1
+fi
+assert_contains "driver registration or Ready node plugin is missing" "$csi_check_gap_output"
+assert_contains "node-good-3" "$csi_check_gap_output"
+
+csi_plugin_not_ready_output="$test_dir/csi-plugin-not-ready.out"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=csi-plugin-not-ready KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  bash -c 'source "$1"; ton_selected_nodes_missing_longhorn_csi storage=manager' _ "$kubeton" >"$csi_plugin_not_ready_output"
+assert_contains "node-good-3" "$csi_plugin_not_ready_output"
+
+missing_manager_output="$test_dir/missing-longhorn-manager.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=longhorn-sc-manager-missing KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$missing_manager_output" 2>&1; then
+  echo "expected a Longhorn-backed encrypted-sc without longhorn-manager to fail check" >&2
+  exit 1
+fi
+assert_contains "encrypted-sc uses driver.longhorn.io" "$missing_manager_output"
+assert_contains "longhorn-system/longhorn-manager is missing or unreadable" "$missing_manager_output"
 
 # `kubeton check` and `kubeton start` must reject a node that kube-scheduler
 # would reject for an already-reserved requested hostPort. This happens before
@@ -345,10 +442,11 @@ if PATH="$fake_bin:$PATH" TON_VALUES_FILE="$inline_network_values" KUBETON_TEST_
 fi
 assert_contains "inline tonNode/network map" "$inline_network_output"
 
-# DUMP=false keeps the ordinary requested-PVC sizing path and does not make a
-# network call to dump.ton.org.
-no_dump_values="$test_dir/no-dump-values.yaml"
-cat >"$no_dump_values" <<'EOF'
+# DUMP=true does not change the declared-capacity sizing path or cause a
+# metadata fetch. With tonWorkSize=700Gi, a node with 1Ti free still passes;
+# capacity policy remains under the operator's explicit control.
+dump_enabled_values="$test_dir/dump-enabled-values.yaml"
+cat >"$dump_enabled_values" <<'EOF'
 tonNode:
   replicas: 3
   storage:
@@ -362,22 +460,22 @@ tonNode:
       memory: 64Gi
   env:
     - name: DUMP
-      value: "false"
+      value: "true"
 EOF
-no_dump_output="$test_dir/no-dump.out"
+dump_enabled_output="$test_dir/dump-enabled.out"
 : >"$test_dir/curl.log"
-PATH="$fake_bin:$PATH" TON_VALUES_FILE="$no_dump_values" KUBETON_TEST_CURL_LOG="$test_dir/curl.log" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
-  "$kubeton" check >"$no_dump_output" 2>&1
-assert_contains "node filesystem requirement: >= 780.00 Gi" "$no_dump_output"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=storage-control TON_VALUES_FILE="$dump_enabled_values" \
+  KUBETON_TEST_CURL_LOG="$test_dir/curl.log" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$dump_enabled_output" 2>&1
+assert_contains "node filesystem requirement: >= 780.00 Gi" "$dump_enabled_output"
+assert_contains "Compatible target nodes: 3/3 required." "$dump_enabled_output"
 if [[ -s "$test_dir/curl.log" ]]; then
-  echo "DUMP=false unexpectedly fetched dump metadata" >&2
+  echo "DUMP=true unexpectedly fetched dump metadata" >&2
   cat "$test_dir/curl.log" >&2
   exit 1
 fi
 
-# Preserve the existing configured-capacity floor when it is larger than the
-# live dump peak. A large tonWork request must not make a smaller node pass
-# merely because the current dump happens to be smaller.
+# A larger tonWork request directly raises the node filesystem requirement.
 large_work_values="$test_dir/large-work-values.yaml"
 cat >"$large_work_values" <<'EOF'
 tonNode:
@@ -403,22 +501,16 @@ PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=large-work TON_VALUES_FILE="$large_work
 assert_contains "local TON PVC capacity: 2.06 Ti" "$large_work_output"
 assert_contains "node filesystem requirement: >= 2.08 Ti" "$large_work_output"
 
-# A host that would pass the old 780Gi request sum must now fail before Helm
-# when it cannot hold the archive and extracted testnet database together.
-dump_too_small_output="$test_dir/dump-too-small.out"
-: >"$test_dir/helm.log"
-if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=dump-too-small KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
-  bash -c 'source "$1"; should_bootstrap_baremetal() { return 1; }; longhorn_manager_exists() { return 1; }; run_start' _ "$kubeton" >"$dump_too_small_output" 2>&1; then
-  echo "expected start to reject a node filesystem below the dump bootstrap peak" >&2
+# The same 1Ti hosts which pass tonWorkSize=700Gi are rejected when the
+# configured tonWorkSize is 2Ti. This verifies that the setting is the gate.
+configured_too_large_output="$test_dir/configured-too-large.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=storage-control TON_VALUES_FILE="$large_work_values" \
+  KUBETON_TEST_HELM_LOG="$test_dir/helm.log" "$kubeton" check >"$configured_too_large_output" 2>&1; then
+  echo "expected configured TON storage capacity to reject 1Ti nodes" >&2
   exit 1
 fi
-assert_contains "dump bootstrap (testnet, /var/ton-work/dump-cache)" "$dump_too_small_output"
-assert_contains "insufficient disk" "$dump_too_small_output"
-if [[ -s "$test_dir/helm.log" ]]; then
-  echo "helm was invoked even though dump-aware start preflight failed" >&2
-  cat "$test_dir/helm.log" >&2
-  exit 1
-fi
+assert_contains "node filesystem requirement: >= 2.08 Ti" "$configured_too_large_output"
+assert_contains "insufficient disk" "$configured_too_large_output"
 
 # A fresh disk read after Longhorn/Vault bootstrap must still happen before
 # stale PVC deletion or Helm. Model a bootstrap that consumes too much space
@@ -465,6 +557,142 @@ if [[ -e "$post_bootstrap_selector" ]]; then
   exit 1
 fi
 
+# An already-installed Longhorn cluster does not run the bootstrap branch, so
+# the exact selected-node CSINode gate must still run before stale PVC cleanup
+# or Helm can create a TON pod. This models the driver missing from one of the
+# selected nodes and verifies that start makes no deployment-side mutation.
+existing_csi_gate_events="$test_dir/existing-csi-gate-events.out"
+existing_csi_gate_selector="$test_dir/existing-csi-gate-selector.yaml"
+: >"$existing_csi_gate_selector"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  bash -c '
+    source "$1"
+    event_log="$2"
+    selector_path="$3"
+    require_bin() { :; }
+    resolve_ton_replicas_from_values_file() { printf "3"; }
+    should_bootstrap_baremetal() { return 1; }
+    longhorn_manager_exists() { return 1; }
+    storage_class_is_longhorn() { return 0; }
+    prepare_node_prerequisites_for_workload() {
+      KUBETON_NODE_CHECK_TON_SELECTOR="storage=manager"
+      printf "initial-preflight\n" >>"$event_log"
+    }
+    build_ton_node_selector_values_file() { printf "%s" "$selector_path"; }
+    fleet_has_stop_annotations() { return 1; }
+    ensure_ton_storage_class_available() { :; }
+    append_ton_storage_overrides() { :; }
+    should_use_sequential_ton_start() { return 1; }
+    validate_external_key_prereqs() { :; }
+    wait_ton_selected_nodes_longhorn_csi_ready() { printf "csi-gate\n" >>"$event_log"; return 1; }
+    delete_stale_ton_pvcs_before_fresh_start() { printf "UNSAFE stale-cleanup\n" >>"$event_log"; }
+    run_start
+  ' _ "$kubeton" "$existing_csi_gate_events" "$existing_csi_gate_selector" >"$test_dir/existing-csi-gate.out" 2>&1; then
+  echo "expected selected-node Longhorn CSI gate to stop start" >&2
+  exit 1
+fi
+assert_order "initial-preflight" "csi-gate" "$existing_csi_gate_events"
+if grep -Fq "UNSAFE" "$existing_csi_gate_events"; then
+  echo "start continued to stale PVC cleanup after selected-node Longhorn CSI gate failed" >&2
+  cat "$existing_csi_gate_events" >&2
+  exit 1
+fi
+if [[ -e "$existing_csi_gate_selector" ]]; then
+  echo "start left its generated selector values file behind after Longhorn CSI gate failure" >&2
+  exit 1
+fi
+
+# k3d runs the automatic bootstrap path but intentionally backs encrypted-sc
+# with local-path, not Longhorn. It must retain node checks without waiting for
+# a driver that this supported mode never installs.
+k3d_start_events="$test_dir/k3d-start-events.out"
+: >"$k3d_start_events"
+: >"$test_dir/helm.log"
+PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  bash -c '
+    source "$1"
+    event_log="$2"
+    require_bin() { :; }
+    resolve_ton_replicas_from_values_file() { printf "3"; }
+    should_bootstrap_baremetal() { return 0; }
+    cluster_is_k3d() { return 0; }
+    longhorn_manager_exists() { return 1; }
+    storage_class_is_longhorn() { return 1; }
+    prepare_node_prerequisites_for_workload() {
+      printf "use-longhorn=%s\n" "$2" >>"$event_log"
+      KUBETON_NODE_CHECK_REQUIRED_NODES=3
+      KUBETON_NODE_CHECK_TON_SELECTOR="ton.ton.org/kubeton-prereq=ready"
+    }
+    fleet_has_stop_annotations() { return 1; }
+    ensure_ton_storage_class_available() { :; }
+    append_ton_storage_overrides() { :; }
+    should_use_sequential_ton_start() { return 1; }
+    ensure_auto_bootstrap_stack() { printf "local-bootstrap\n" >>"$event_log"; }
+    append_baremetal_key_overrides() { :; }
+    run_node_prerequisite_check() { printf "node-recheck\n" >>"$event_log"; }
+    node_check_selector_is_all_compatible() { :; }
+    wait_ton_selected_nodes_longhorn_csi_ready() { printf "UNSAFE csi-wait\n" >>"$event_log"; return 1; }
+    verify_ton_selected_nodes_longhorn_csi_ready() { printf "UNSAFE csi-probe\n" >>"$event_log"; return 1; }
+    delete_stale_ton_pvcs_before_fresh_start() { printf "stale-cleanup\n" >>"$event_log"; }
+    append_helm_force_conflicts_if_supported() { :; }
+    repair_pending_ton_placement_after_start() { :; }
+    run_start
+  ' _ "$kubeton" "$k3d_start_events" >"$test_dir/k3d-start.out" 2>&1
+assert_contains "use-longhorn=false" "$k3d_start_events"
+assert_contains "local-bootstrap" "$k3d_start_events"
+if grep -Fq "UNSAFE" "$k3d_start_events"; then
+  echo "k3d start incorrectly required Longhorn CSI" >&2
+  cat "$k3d_start_events" >&2
+  exit 1
+fi
+assert_contains "upgrade" "$test_dir/helm.log"
+
+# An existing Longhorn installation skips the bootstrap-only recheck. Even in
+# that path, stale cleanup must be followed by one last resource/DiskPressure/
+# HostPort check before Helm. A failure also removes the generated overlay.
+final_recheck_events="$test_dir/final-recheck-events.out"
+final_recheck_selector="$test_dir/final-recheck-selector.yaml"
+: >"$final_recheck_selector"
+: >"$test_dir/helm.log"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  bash -c '
+    source "$1"
+    event_log="$2"
+    selector_path="$3"
+    require_bin() { :; }
+    resolve_ton_replicas_from_values_file() { printf "3"; }
+    should_bootstrap_baremetal() { return 1; }
+    longhorn_manager_exists() { return 0; }
+    prepare_node_prerequisites_for_workload() {
+      KUBETON_NODE_CHECK_REQUIRED_NODES=3
+      KUBETON_NODE_CHECK_TON_SELECTOR="storage=manager"
+      printf "initial-preflight\n" >>"$event_log"
+    }
+    build_ton_node_selector_values_file() { printf "%s" "$selector_path"; }
+    fleet_has_stop_annotations() { return 1; }
+    ensure_ton_storage_class_available() { :; }
+    append_ton_storage_overrides() { :; }
+    should_use_sequential_ton_start() { return 1; }
+    validate_external_key_prereqs() { :; }
+    wait_ton_selected_nodes_longhorn_csi_ready() { printf "csi-gate\n" >>"$event_log"; }
+    delete_stale_ton_pvcs_before_fresh_start() { printf "stale-cleanup\n" >>"$event_log"; }
+    run_node_prerequisite_check() { printf "final-node-recheck\n" >>"$event_log"; return 1; }
+    run_start
+  ' _ "$kubeton" "$final_recheck_events" "$final_recheck_selector" >"$test_dir/final-recheck.out" 2>&1; then
+  echo "expected final existing-Longhorn node recheck to stop start" >&2
+  exit 1
+fi
+assert_order "stale-cleanup" "final-node-recheck" "$final_recheck_events"
+if [[ -s "$test_dir/helm.log" ]]; then
+  echo "start invoked Helm after its final node recheck failed" >&2
+  cat "$test_dir/helm.log" >&2
+  exit 1
+fi
+if [[ -e "$final_recheck_selector" ]]; then
+  echo "start left its generated selector values file behind after final recheck failure" >&2
+  exit 1
+fi
+
 # A selector can acquire an extra managed-label node while bootstrap runs.
 # Rechecking only the count would still allow Helm to place a TON pod on that
 # failed node, so require every node selected by the rendered selector to pass.
@@ -504,55 +732,22 @@ if grep -Fq "UNSAFE" "$selector_drift_events"; then
   exit 1
 fi
 
+# Dump service availability is no longer part of the node check: configured
+# storage remains authoritative even when the metadata endpoint is unavailable.
 metadata_unavailable_output="$test_dir/metadata-unavailable.out"
-if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=metadata-unavailable KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
-  "$kubeton" check >"$metadata_unavailable_output" 2>&1; then
-  echo "expected DUMP=true preflight to fail closed when metadata is unavailable" >&2
-  exit 1
-fi
-assert_contains "could not read current testnet dump metadata" "$metadata_unavailable_output"
-
-# An air-gapped control host can deliberately provide both components of the
-# peak. Partial overrides are rejected by kubeton, while the complete pair
-# avoids a network fetch and retains the same disk gate.
-offline_metadata_output="$test_dir/offline-metadata.out"
 : >"$test_dir/curl.log"
 PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=metadata-unavailable KUBETON_TEST_CURL_LOG="$test_dir/curl.log" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
-  KUBETON_DUMP_ARCHIVE_BYTES=900000000000 KUBETON_DUMP_EXTRACTED_DB_BYTES=900000000000 \
-  "$kubeton" check >"$offline_metadata_output" 2>&1
-assert_contains "dump bootstrap (testnet, /var/ton-work/dump-cache)" "$offline_metadata_output"
+  "$kubeton" check >"$metadata_unavailable_output" 2>&1
+assert_contains "node filesystem requirement: >= 780.00 Gi" "$metadata_unavailable_output"
+assert_contains "Compatible target nodes: 3/3 required." "$metadata_unavailable_output"
 if [[ -s "$test_dir/curl.log" ]]; then
-  echo "paired offline dump-size overrides unexpectedly fetched metadata" >&2
+  echo "storage-configured preflight unexpectedly depended on dump metadata" >&2
   cat "$test_dir/curl.log" >&2
   exit 1
 fi
 
-partial_override_output="$test_dir/partial-override.out"
-if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=metadata-unavailable KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
-  KUBETON_DUMP_ARCHIVE_BYTES=900000000000 "$kubeton" check >"$partial_override_output" 2>&1; then
-  echo "expected a partial offline dump-size override to fail" >&2
-  exit 1
-fi
-assert_contains "set both KUBETON_DUMP_ARCHIVE_BYTES and KUBETON_DUMP_EXTRACTED_DB_BYTES" "$partial_override_output"
-
-# Only direct tonNode.env is effective. A nested helper env block must not
-# suppress the top-level chart DUMP=true configuration.
-nested_env_values="$test_dir/nested-env-values.yaml"
-cat >"$nested_env_values" <<'EOF'
-tonNode:
-    keyManagement:
-        agent:
-            env:
-                - name: DUMP
-                  value: "false"
-EOF
-nested_env_output="$test_dir/nested-env.out"
-PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_effective_tonnode_env_value DUMP' _ \
-  "$kubeton" "$nested_env_values" >"$nested_env_output"
-assert_contains "true" "$nested_env_output"
-
-# YAML indentation is not required to be two spaces. A direct four-space env
-# entry still controls the effective setting and skips the dump metadata call.
+# YAML indentation is not required to be two spaces. The configured storage
+# quantities remain authoritative with a four-space values layout.
 four_space_env_values="$test_dir/four-space-env-values.yaml"
 cat >"$four_space_env_values" <<'EOF'
 tonNode:
@@ -566,42 +761,35 @@ tonNode:
         requests:
             cpu: 16000m
             memory: 64Gi
-    env:
-        - name: DUMP
-          value: "false"
 EOF
 four_space_env_output="$test_dir/four-space-env.out"
-: >"$test_dir/curl.log"
-PATH="$fake_bin:$PATH" TON_VALUES_FILE="$four_space_env_values" KUBETON_TEST_CURL_LOG="$test_dir/curl.log" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+PATH="$fake_bin:$PATH" TON_VALUES_FILE="$four_space_env_values" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
   "$kubeton" check >"$four_space_env_output" 2>&1
 assert_contains "node filesystem requirement: >= 780.00 Gi" "$four_space_env_output"
-if [[ -s "$test_dir/curl.log" ]]; then
-  echo "four-space DUMP=false unexpectedly fetched dump metadata" >&2
-  exit 1
-fi
 
 # Literal EnvVar ordering matches Kubernetes/controller merge semantics: the
-# final DUMP entry wins. A valueFrom cannot be evaluated safely on the control
-# host, so it blocks preflight rather than being treated as false.
+# final entry wins when host-port discovery reads CUSTOM_PARAMETERS.
 duplicate_env_values="$test_dir/duplicate-env-values.yaml"
 cat >"$duplicate_env_values" <<'EOF'
 tonNode:
+  name: tonnode
   env:
-    - name: DUMP
-      value: "false"
-    - name: DUMP
-      value: "true"
-    - name: NETWORK
-      value: testnet
+    - name: CUSTOM_PARAMETERS
+      value: "--exporter-address 0.0.0.0:9777"
+    - name: CUSTOM_PARAMETERS
+      value: "--exporter-address 0.0.0.0:9888"
 EOF
 duplicate_env_output="$test_dir/duplicate-env.out"
-PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_effective_tonnode_env_value DUMP' _ \
+PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_effective_tonnode_env_value CUSTOM_PARAMETERS' _ \
   "$kubeton" "$duplicate_env_values" >"$duplicate_env_output"
-assert_contains "true" "$duplicate_env_output"
+assert_contains "0.0.0.0:9888" "$duplicate_env_output"
 
+# DUMP may come from valueFrom because node capacity no longer depends on
+# interpreting it. The storage-only check must still complete successfully.
 value_from_env_values="$test_dir/value-from-env-values.yaml"
 cat >"$value_from_env_values" <<'EOF'
 tonNode:
+  name: tonnode
   env:
     - name: DUMP
       valueFrom:
@@ -610,59 +798,42 @@ tonNode:
           key: dump
 EOF
 value_from_output="$test_dir/value-from.out"
-if PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_tonnode_dump_bootstrap_requirements' _ \
-  "$kubeton" "$value_from_env_values" >"$value_from_output" 2>&1; then
-  echo "expected DUMP valueFrom to block dump preflight" >&2
+if ! PATH="$fake_bin:$PATH" TON_VALUES_FILE="$value_from_env_values" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
+  "$kubeton" check >"$value_from_output" 2>&1; then
+  echo "storage-only check failed for an unrelated DUMP valueFrom" >&2
+  cat "$value_from_output" >&2
   exit 1
 fi
-assert_contains "DUMP is configured through valueFrom" "$value_from_output"
+assert_contains "node filesystem requirement: >= 780.00 Gi" "$value_from_output"
+assert_contains "Compatible target nodes: 3/3 required." "$value_from_output"
 
 # Inline YAML is valid Helm input, but this lightweight shell parser cannot
-# safely reproduce an inline EnvVar list.  It must stop before assuming that
-# DUMP is false and allowing a peak-space bootstrap onto an undersized node.
+# safely reproduce an inline EnvVar list. Host-port discovery still fails
+# closed because an exporter HostPort may be hidden in CUSTOM_PARAMETERS.
 inline_env_values="$test_dir/inline-env-values.yaml"
 cat >"$inline_env_values" <<'EOF'
 tonNode:
-  env: [{name: DUMP, value: "true"}]
+  env: [{name: CUSTOM_PARAMETERS, value: "--exporter-address 0.0.0.0:9888"}]
 EOF
 inline_env_output="$test_dir/inline-env.out"
-if PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_tonnode_dump_bootstrap_requirements' _ \
+if PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; node_check_resolve_host_port_requirements' _ \
   "$kubeton" "$inline_env_values" >"$inline_env_output" 2>&1; then
-  echo "expected inline tonNode.env to block dump preflight" >&2
+  echo "expected inline tonNode.env to block host-port preflight" >&2
   exit 1
 fi
-assert_contains "inline tonNode.env form" "$inline_env_output"
+assert_contains "inline tonNode.env form that kubeton cannot safely preflight requested host ports" "$inline_env_output"
 
 inline_tonnode_values="$test_dir/inline-tonnode-values.yaml"
 cat >"$inline_tonnode_values" <<'EOF'
-tonNode: { env: [{ name: DUMP, value: "true" }] }
+tonNode: { env: [{ name: CUSTOM_PARAMETERS, value: "--exporter-address 0.0.0.0:9888" }] }
 EOF
 inline_tonnode_output="$test_dir/inline-tonnode.out"
-if PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_tonnode_dump_bootstrap_requirements' _ \
+if PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; node_check_resolve_host_port_requirements' _ \
   "$kubeton" "$inline_tonnode_values" >"$inline_tonnode_output" 2>&1; then
-  echo "expected inline tonNode mapping with env to block dump preflight" >&2
+  echo "expected inline tonNode mapping with env to block host-port preflight" >&2
   exit 1
 fi
-assert_contains "inline tonNode.env form" "$inline_tonnode_output"
-
-unsafe_cache_values="$test_dir/unsafe-cache-values.yaml"
-cat >"$unsafe_cache_values" <<'EOF'
-tonNode:
-  env:
-    - name: DUMP
-      value: "true"
-    - name: NETWORK
-      value: testnet
-    - name: DUMP_CACHE_DIR
-      value: /var/ton-work/../tmp
-EOF
-unsafe_cache_output="$test_dir/unsafe-cache.out"
-if PATH="$fake_bin:$PATH" bash -c 'source "$1"; TON_VALUES_FILE="$2"; resolve_tonnode_dump_bootstrap_requirements' _ \
-  "$kubeton" "$unsafe_cache_values" >"$unsafe_cache_output" 2>&1; then
-  echo "expected traversal-like DUMP_CACHE_DIR to block dump preflight" >&2
-  exit 1
-fi
-assert_contains "not a normalized path inside /var/ton-work" "$unsafe_cache_output"
+assert_contains "inline tonNode/network map that kubeton cannot safely preflight requested host ports" "$inline_tonnode_output"
 
 short_output="$test_dir/short.out"
 if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=short KUBETON_TEST_HELM_LOG="$test_dir/helm.log" "$kubeton" check >"$short_output" 2>&1; then
@@ -711,8 +882,8 @@ assert_contains "label node node-good-1 ton.ton.org/kubeton-prereq=ready --overw
 assert_contains "label node node-good-3 node.longhorn.io/create-default-disk=true --overwrite" "$test_dir/labels.log"
 
 # Every selected node passes the same lower bound, but choose the least-used
-# ones first so dump growth does not leave the alphabetically first hosts with
-# the thinnest margin.
+# ones first so the alphabetically first hosts are not selected with the
+# thinnest remaining disk margin.
 ranked_output="$test_dir/ranked.out"
 : >"$test_dir/labels.log"
 PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=ranked KUBETON_TEST_HELM_LOG="$test_dir/helm.log" KUBETON_TEST_LABEL_LOG="$test_dir/labels.log" \
@@ -723,16 +894,21 @@ assert_contains "Selected compatible node(s): node-good-3 node-good-2 node-good-
 # Exercise a successful fresh start and inspect the transient final -f overlay
 # while fake Helm receives it; both managed selector terms must be present.
 start_selector_values="$test_dir/start-selector-values.out"
+start_gate_events="$test_dir/start-gate-events.out"
 : >"$test_dir/helm.log"
 : >"$start_selector_values"
+: >"$start_gate_events"
 PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" KUBETON_TEST_HELM_VALUES_LOG="$start_selector_values" \
   bash -c '
     source "$1"
+    event_log="$2"
+    csi_call_count=0
     require_bin() { :; }
     resolve_ton_replicas_from_values_file() { printf "3"; }
     should_bootstrap_baremetal() { return 1; }
-    longhorn_manager_exists() { return 1; }
+    longhorn_manager_exists() { return 0; }
     prepare_node_prerequisites_for_workload() {
+      KUBETON_NODE_CHECK_REQUIRED_NODES=3
       KUBETON_NODE_CHECK_TON_SELECTOR="node.longhorn.io/create-default-disk=true,ton.ton.org/kubeton-prereq=ready"
     }
     fleet_has_stop_annotations() { return 1; }
@@ -740,13 +916,28 @@ PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" KUBETON_TEST_H
     append_ton_storage_overrides() { :; }
     should_use_sequential_ton_start() { return 1; }
     validate_external_key_prereqs() { :; }
-    delete_stale_ton_pvcs_before_fresh_start() { :; }
+    wait_ton_selected_nodes_longhorn_csi_ready() {
+      ((csi_call_count+=1))
+      printf "csi-%s\n" "$csi_call_count" >>"$event_log"
+    }
+    verify_ton_selected_nodes_longhorn_csi_ready() {
+      ((csi_call_count+=1))
+      printf "csi-%s\n" "$csi_call_count" >>"$event_log"
+    }
+    delete_stale_ton_pvcs_before_fresh_start() { printf "stale-cleanup\n" >>"$event_log"; }
+    run_node_prerequisite_check() { printf "final-node-recheck\n" >>"$event_log"; }
+    node_check_selector_is_all_compatible() { printf "final-selector-recheck\n" >>"$event_log"; }
     append_helm_force_conflicts_if_supported() { :; }
     repair_pending_ton_placement_after_start() { :; }
     run_start
-  ' _ "$kubeton" >"$test_dir/start-selector.out" 2>&1
+  ' _ "$kubeton" "$start_gate_events" >"$test_dir/start-selector.out" 2>&1
 assert_contains "\"node.longhorn.io/create-default-disk\": \"true\"" "$start_selector_values"
 assert_contains "\"ton.ton.org/kubeton-prereq\": \"ready\"" "$start_selector_values"
+assert_order "csi-1" "stale-cleanup" "$start_gate_events"
+assert_order "stale-cleanup" "csi-2" "$start_gate_events"
+assert_order "csi-2" "final-node-recheck" "$start_gate_events"
+assert_order "final-node-recheck" "final-selector-recheck" "$start_gate_events"
+assert_order "final-selector-recheck" "csi-3" "$start_gate_events"
 
 preserve_output="$test_dir/preserve.out"
 : >"$test_dir/labels.log"

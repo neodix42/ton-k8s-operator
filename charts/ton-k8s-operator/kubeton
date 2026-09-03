@@ -17,12 +17,6 @@ KUBETON_SKIP_NODE_PREREQ_CHECK="${KUBETON_SKIP_NODE_PREREQ_CHECK:-false}"
 KUBETON_CHECK_MIN_CPU="${KUBETON_CHECK_MIN_CPU:-16}"
 KUBETON_CHECK_MIN_MEMORY="${KUBETON_CHECK_MIN_MEMORY:-64Gi}"
 KUBETON_CHECK_DISK_HEADROOM="${KUBETON_CHECK_DISK_HEADROOM:-20Gi}"
-# When DUMP=true, kubeton reads the current archive/extracted-DB sizes from
-# dump.ton.org before it selects a node.  These paired overrides are for an
-# air-gapped control host; using just one would make the peak calculation
-# meaningless, so both must be supplied together.
-KUBETON_DUMP_ARCHIVE_BYTES="${KUBETON_DUMP_ARCHIVE_BYTES:-}"
-KUBETON_DUMP_EXTRACTED_DB_BYTES="${KUBETON_DUMP_EXTRACTED_DB_BYTES:-}"
 KUBETON_NODE_PREREQ_LABEL_KEY="${KUBETON_NODE_PREREQ_LABEL_KEY:-ton.ton.org/kubeton-prereq}"
 KUBETON_NODE_PREREQ_LABEL_VALUE="${KUBETON_NODE_PREREQ_LABEL_VALUE:-ready}"
 
@@ -183,16 +177,8 @@ KUBETON_NODE_CHECK_EXISTING_LONGHORN=0
 KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR=""
 KUBETON_LONGHORN_PLACEMENT_RECONFIGURE=0
 KUBETON_NODE_CHECK_TON_DATA_BYTES=0
-KUBETON_NODE_CHECK_SUPPORTING_TON_DATA_BYTES=0
-KUBETON_NODE_CHECK_WORK_BYTES=0
 KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES=0
 KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=0
-KUBETON_NODE_CHECK_DUMP_ENABLED=false
-KUBETON_NODE_CHECK_DUMP_NETWORK=""
-KUBETON_NODE_CHECK_DUMP_CACHE_DIR=""
-KUBETON_NODE_CHECK_DUMP_ARCHIVE_BYTES=0
-KUBETON_NODE_CHECK_DUMP_EXTRACTED_DB_BYTES=0
-KUBETON_NODE_CHECK_DUMP_PEAK_BYTES=0
 KUBETON_NODE_CHECK_HOST_PORTS_ENABLED=false
 
 usage() {
@@ -570,9 +556,8 @@ resolve_effective_tonnode_path_scalar() {
 # fall back to a same-named environment variable from chart defaults.
 # Return 0 when a direct block-style tonNode.env override is present, 1 when
 # there is no direct override, and 2 when the file uses a compact/inline env
-# form that this shell parser cannot model safely.  The latter must be
-# fail-closed: Helm would accept it and could turn DUMP on without the node
-# preflight accounting for the archive-plus-extraction peak.
+# form that this shell parser cannot model safely. Consumers which require a
+# literal value (for example requested HostPort discovery) fail closed.
 tonnode_env_block_exists_in_values_file() {
   local values_file="$1"
 
@@ -755,138 +740,6 @@ resolve_effective_tonnode_env_value() {
   value="$(trim_whitespace "$value")"
   [[ -n "$value" ]] || return 1
   printf '%s' "$value"
-}
-
-resolve_tonnode_dump_bootstrap_requirements() {
-  local dump_enabled network cache_dir latest_name artifact_name
-  local archive_bytes extracted_bytes dump_env_rc=0 network_env_rc=0 cache_env_rc=0
-
-  KUBETON_NODE_CHECK_DUMP_ENABLED=false
-  KUBETON_NODE_CHECK_DUMP_NETWORK=""
-  KUBETON_NODE_CHECK_DUMP_CACHE_DIR=""
-  KUBETON_NODE_CHECK_DUMP_ARCHIVE_BYTES=0
-  KUBETON_NODE_CHECK_DUMP_EXTRACTED_DB_BYTES=0
-  KUBETON_NODE_CHECK_DUMP_PEAK_BYTES=0
-
-  dump_enabled="$(resolve_effective_tonnode_env_value "DUMP")" || dump_env_rc=$?
-  if (( dump_env_rc == 3 )); then
-    echo "Error: TON_VALUES_FILE uses an inline tonNode.env form that kubeton cannot safely preflight." >&2
-    echo "Use block-style tonNode.env entries with literal values before starting this fleet." >&2
-    return 1
-  fi
-  if (( dump_env_rc == 2 )); then
-    echo "Error: DUMP is configured through valueFrom, so kubeton cannot safely determine whether dump bootstrap is enabled." >&2
-    echo "Use a literal DUMP value for kubeton preflight, or set DUMP=false before starting this fleet." >&2
-    return 1
-  fi
-  (( dump_env_rc == 0 )) || dump_enabled=""
-  if ! is_true "$dump_enabled"; then
-    return 0
-  fi
-
-  network="$(resolve_effective_tonnode_env_value "NETWORK")" || network_env_rc=$?
-  if (( network_env_rc == 3 )); then
-    echo "Error: TON_VALUES_FILE uses an inline tonNode.env form that kubeton cannot safely preflight." >&2
-    return 1
-  fi
-  if (( network_env_rc == 2 )); then
-    echo "Error: NETWORK is configured through valueFrom, so kubeton cannot select safe dump metadata." >&2
-    return 1
-  fi
-  (( network_env_rc == 0 )) || network=""
-  network="$(trim_whitespace "$network")"
-  network="${network,,}"
-  case "$network" in
-    testnet)
-      latest_name="latest_testnet"
-      ;;
-    mainnet|"")
-      network="mainnet"
-      latest_name="latest"
-      ;;
-    *)
-      echo "Error: DUMP=true uses unsupported NETWORK=${network}; node preflight supports mainnet and testnet dumps." >&2
-      echo "Set NETWORK to mainnet/testnet, or disable DUMP before starting this fleet." >&2
-      return 1
-      ;;
-  esac
-
-  cache_dir="$(resolve_effective_tonnode_env_value "DUMP_CACHE_DIR")" || cache_env_rc=$?
-  if (( cache_env_rc == 3 )); then
-    echo "Error: TON_VALUES_FILE uses an inline tonNode.env form that kubeton cannot safely preflight." >&2
-    return 1
-  fi
-  if (( cache_env_rc == 2 )); then
-    echo "Error: DUMP_CACHE_DIR is configured through valueFrom, so kubeton cannot safely model the dump filesystem." >&2
-    return 1
-  fi
-  (( cache_env_rc == 0 )) || cache_dir=""
-  cache_dir="$(trim_whitespace "$cache_dir")"
-  cache_dir="${cache_dir:-/var/ton-work/dump-cache}"
-  case "$cache_dir" in
-    /var/ton-work|/var/ton-work/*)
-      ;;
-    *)
-      echo "Error: DUMP_CACHE_DIR=${cache_dir} is outside /var/ton-work; the kubelet node filesystem statistic cannot safely model that separate dump filesystem." >&2
-      echo "Use the default /var/ton-work/dump-cache or disable DUMP until that mount is preflighted separately." >&2
-      return 1
-      ;;
-  esac
-  if [[ "$cache_dir" == *"//"* || "$cache_dir" == */./* || "$cache_dir" == */../* \
-    || "$cache_dir" == */. || "$cache_dir" == */.. ]]; then
-    echo "Error: DUMP_CACHE_DIR=${cache_dir} is not a normalized path inside /var/ton-work." >&2
-    return 1
-  fi
-  case "$cache_dir" in
-    /var/ton-work/keys|/var/ton-work/keys/*)
-      echo "Error: DUMP_CACHE_DIR=${cache_dir} is under the keys tmpfs, not the persistent ton-work filesystem." >&2
-      return 1
-      ;;
-  esac
-
-  archive_bytes="$(trim_whitespace "$KUBETON_DUMP_ARCHIVE_BYTES")"
-  extracted_bytes="$(trim_whitespace "$KUBETON_DUMP_EXTRACTED_DB_BYTES")"
-  if [[ -n "$archive_bytes" || -n "$extracted_bytes" ]]; then
-    if ! [[ "$archive_bytes" =~ ^[1-9][0-9]*$ && "$extracted_bytes" =~ ^[1-9][0-9]*$ ]]; then
-      echo "Error: set both KUBETON_DUMP_ARCHIVE_BYTES and KUBETON_DUMP_EXTRACTED_DB_BYTES to positive byte counts, or set neither to use live dump metadata." >&2
-      return 1
-    fi
-  else
-    if ! command -v curl >/dev/null 2>&1; then
-      echo "Error: DUMP=true node preflight needs curl to read current ${network} dump metadata." >&2
-      echo "Install curl or set both KUBETON_DUMP_ARCHIVE_BYTES and KUBETON_DUMP_EXTRACTED_DB_BYTES." >&2
-      return 1
-    fi
-    if ! artifact_name="$(curl -fsSL --connect-timeout 5 --max-time 20 "https://dump.ton.org/dumps/${latest_name}.tar.name.txt" 2>/dev/null)"; then
-      echo "Error: could not read current ${network} dump metadata from dump.ton.org." >&2
-      echo "Retry when the dump service is reachable, or set both KUBETON_DUMP_ARCHIVE_BYTES and KUBETON_DUMP_EXTRACTED_DB_BYTES." >&2
-      return 1
-    fi
-    artifact_name="$(trim_whitespace "$artifact_name")"
-    if ! [[ "$artifact_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-      echo "Error: dump.ton.org returned an unsafe ${network} dump artifact name." >&2
-      return 1
-    fi
-    if ! archive_bytes="$(curl -fsSL --connect-timeout 5 --max-time 20 "https://dump.ton.org/dumps/${artifact_name}.size.archive.txt" 2>/dev/null)" \
-      || ! extracted_bytes="$(curl -fsSL --connect-timeout 5 --max-time 20 "https://dump.ton.org/dumps/${artifact_name}.size.disk.txt" 2>/dev/null)"; then
-      echo "Error: could not read current ${network} dump size metadata from dump.ton.org." >&2
-      echo "Retry when the dump service is reachable, or set both KUBETON_DUMP_ARCHIVE_BYTES and KUBETON_DUMP_EXTRACTED_DB_BYTES." >&2
-      return 1
-    fi
-    archive_bytes="$(trim_whitespace "$archive_bytes")"
-    extracted_bytes="$(trim_whitespace "$extracted_bytes")"
-    if ! [[ "$archive_bytes" =~ ^[1-9][0-9]*$ && "$extracted_bytes" =~ ^[1-9][0-9]*$ ]]; then
-      echo "Error: dump.ton.org returned invalid ${network} dump size metadata." >&2
-      return 1
-    fi
-  fi
-
-  KUBETON_NODE_CHECK_DUMP_ENABLED=true
-  KUBETON_NODE_CHECK_DUMP_NETWORK="$network"
-  KUBETON_NODE_CHECK_DUMP_CACHE_DIR="$cache_dir"
-  KUBETON_NODE_CHECK_DUMP_ARCHIVE_BYTES="$archive_bytes"
-  KUBETON_NODE_CHECK_DUMP_EXTRACTED_DB_BYTES="$extracted_bytes"
-  KUBETON_NODE_CHECK_DUMP_PEAK_BYTES=$((archive_bytes + extracted_bytes))
 }
 
 resolve_tonnode_node_selector_from_values_file() {
@@ -1412,29 +1265,8 @@ resolve_node_check_requirements() {
     KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES="$min_memory_bytes"
   fi
   KUBETON_NODE_CHECK_TON_DATA_BYTES=$((work_bytes + source_bytes + core_bytes + ctrl_bytes))
-  KUBETON_NODE_CHECK_SUPPORTING_TON_DATA_BYTES=$((source_bytes + core_bytes + ctrl_bytes))
-  KUBETON_NODE_CHECK_WORK_BYTES="$work_bytes"
   KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES="$headroom_bytes"
   KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=$((KUBETON_NODE_CHECK_TON_DATA_BYTES + headroom_bytes))
-
-  # MyTonCtrl downloads the compressed dump into DUMP_CACHE_DIR and extracts
-  # the database under /var/ton-work/db.  With the chart's default cache path
-  # they are on the same filesystem, so the transient requirement is the sum,
-  # not merely the final database size. Preserve a larger configured PVC
-  # capacity as a floor, too: a deliberately larger tonWorkSize must not make
-  # a previously safe node pass with less filesystem headroom.
-  resolve_tonnode_dump_bootstrap_requirements || return 1
-  if is_true "$KUBETON_NODE_CHECK_DUMP_ENABLED"; then
-    local dump_required_bytes
-    dump_required_bytes=$((
-      KUBETON_NODE_CHECK_DUMP_PEAK_BYTES
-      + KUBETON_NODE_CHECK_SUPPORTING_TON_DATA_BYTES
-      + headroom_bytes
-    ))
-    if (( dump_required_bytes > KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES )); then
-      KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES="$dump_required_bytes"
-    fi
-  fi
 }
 
 node_filesystem_available_bytes() {
@@ -1624,15 +1456,7 @@ run_node_prerequisite_check() {
   echo "Node prerequisites from ${TON_VALUES_FILE}:"
   echo "  per TON pod: cpu >= $(node_check_format_cpu "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI") cores, memory >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES")"
   echo "  local TON PVC capacity: $(node_check_format_bytes "$KUBETON_NODE_CHECK_TON_DATA_BYTES") (tonWork + tonSource + myTonCore + myTonCtrl)"
-  if is_true "$KUBETON_NODE_CHECK_DUMP_ENABLED"; then
-    echo "  dump bootstrap (${KUBETON_NODE_CHECK_DUMP_NETWORK}, ${KUBETON_NODE_CHECK_DUMP_CACHE_DIR}): $(node_check_format_bytes "$KUBETON_NODE_CHECK_DUMP_ARCHIVE_BYTES") archive + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DUMP_EXTRACTED_DB_BYTES") extracted DB = $(node_check_format_bytes "$KUBETON_NODE_CHECK_DUMP_PEAK_BYTES")"
-    echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES") (larger of configured tonWork or dump peak, plus tonSource + myTonCore + myTonCtrl + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom); disk data comes from the kubelet summary API"
-    if (( KUBETON_NODE_CHECK_WORK_BYTES < KUBETON_NODE_CHECK_DUMP_PEAK_BYTES )); then
-      echo "  WARNING: tonWorkSize $(node_check_format_bytes "$KUBETON_NODE_CHECK_WORK_BYTES") is below the current dump peak. This works only with non-quota local-path storage; set it to at least $(node_check_format_bytes "$KUBETON_NODE_CHECK_DUMP_PEAK_BYTES") for capacity-enforcing storage." >&2
-    fi
-  else
-    echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES") (local TON PVC capacity + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom); disk data comes from the kubelet summary API"
-  fi
+  echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES") (configured local TON PVC capacity + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom); disk data comes from the kubelet summary API"
   if [[ "$KUBETON_NODE_CHECK_HOST_PORTS_ENABLED" == "true" ]]; then
     echo "  required host ports: ${KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS[*]} (other assigned Pod reservations make a node ineligible)"
   else
@@ -1727,10 +1551,8 @@ run_node_prerequisite_check() {
     printf '%-36s %-7s %-18s %-20s %-20s %-12s %s\n' "$node" "$target" "$cpu_display" "$memory_display" "$disk_display" "$host_port_display" "$result"
   done <<<"$node_rows"
 
-  # Prefer the roomiest eligible nodes.  This is especially important for a
-  # dump bootstrap: all PASS nodes satisfy the lower bound, but the less-used
-  # nodes retain a safer buffer if dump metadata grows between preflight and
-  # download.
+  # Prefer the roomiest eligible nodes so selected hosts retain the largest
+  # buffer above the configured capacity requirement.
   mapfile -t KUBETON_NODE_CHECK_COMPATIBLE_NODES < <(
     for node in "${KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]}"; do
       [[ -n "$node" ]] || continue
@@ -1972,6 +1794,9 @@ node_check_should_use_longhorn() {
   if longhorn_manager_exists; then
     return 0
   fi
+  if storage_class_is_longhorn "$ENCRYPTED_SC_NAME"; then
+    return 0
+  fi
   if should_bootstrap_baremetal && ! cluster_is_k3d; then
     return 0
   fi
@@ -1989,10 +1814,15 @@ run_node_prerequisite_check_readonly() {
   if node_check_should_use_longhorn; then
     use_longhorn="true"
   fi
+  if storage_class_is_longhorn "$ENCRYPTED_SC_NAME" && ! longhorn_manager_exists; then
+    echo "Error: StorageClass ${ENCRYPTED_SC_NAME} uses driver.longhorn.io, but ${LONGHORN_NAMESPACE}/longhorn-manager is missing or unreadable." >&2
+    return 1
+  fi
   resolve_workload_node_prerequisite_scope "$replicas" "$use_longhorn" || return 1
   run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" || return 1
   if (( KUBETON_NODE_CHECK_EXISTING_LONGHORN == 1 )); then
     node_check_verify_existing_longhorn_daemonsets || return 1
+    verify_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_SCOPE_SELECTOR" || return 1
   fi
 }
 
@@ -5280,10 +5110,133 @@ build_victoria_logs_single_selector_values_file() {
   printf '%s' "$values_file"
 }
 
+list_longhorn_csi_node_names_checked() {
+  local rows
+
+  if ! rows="$(kubectl get csinode -o go-template='{{range .items}}{{ $node := .metadata.name }}{{range .spec.drivers}}{{if eq .name "driver.longhorn.io"}}{{$node}}{{"\n"}}{{end}}{{end}}{{end}}' 2>/dev/null)"; then
+    return 1
+  fi
+  printf '%s\n' "$rows" | awk 'NF' | sort -u
+}
+
 list_longhorn_csi_node_names() {
-  kubectl get csinode -o go-template='{{range .items}}{{ $node := .metadata.name }}{{range .spec.drivers}}{{if eq .name "driver.longhorn.io"}}{{$node}}{{"\n"}}{{end}}{{end}}{{end}}' 2>/dev/null \
-    | awk 'NF' \
-    | sort -u
+  list_longhorn_csi_node_names_checked
+}
+
+list_ready_longhorn_csi_plugin_node_names_checked() {
+  local rows
+
+  if ! rows="$(kubectl -n "$LONGHORN_NAMESPACE" get pods \
+    -l app=longhorn-csi-plugin \
+    -o go-template='{{range .items}}{{if .metadata.deletionTimestamp}}{{else}}{{ $node := .spec.nodeName }}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{$node}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)"; then
+    return 1
+  fi
+  printf '%s\n' "$rows" | awk 'NF' | sort -u
+}
+
+# Return the selected nodes which do not currently advertise Longhorn's CSI
+# driver.  The scheduler checks CSINode.spec.drivers when it attaches a
+# Longhorn PVC, so a healthy aggregate DaemonSet count is not enough: a
+# different node can account for that count while a selected TON node is
+# missing driver.longhorn.io.
+ton_selected_nodes_missing_longhorn_csi() {
+  local selector="$1"
+  local selected_rows csi_rows ready_plugin_rows node selector_display
+  local -A selected_nodes=()
+  local -A csi_nodes=()
+  local -A ready_plugin_nodes=()
+
+  selector="$(trim_whitespace "$selector")"
+  selector_display="${selector:-all Kubernetes nodes}"
+  if ! selected_rows="$(node_check_list_selector_nodes "$selector")"; then
+    echo "Error: cannot list nodes selected by '${selector_display}' for Longhorn CSI verification." >&2
+    return 1
+  fi
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] && selected_nodes["$node"]=1
+  done <<<"$selected_rows"
+  if (( ${#selected_nodes[@]} == 0 )); then
+    echo "Error: selected TON node selector '${selector_display}' matched no nodes for Longhorn CSI verification." >&2
+    return 1
+  fi
+
+  if ! csi_rows="$(list_longhorn_csi_node_names_checked)"; then
+    echo "Error: cannot list CSINode objects while verifying selected TON nodes." >&2
+    return 1
+  fi
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] && csi_nodes["$node"]=1
+  done <<<"$csi_rows"
+  if ! ready_plugin_rows="$(list_ready_longhorn_csi_plugin_node_names_checked)"; then
+    echo "Error: cannot list Ready Longhorn CSI node-plugin Pods while verifying selected TON nodes." >&2
+    return 1
+  fi
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] && ready_plugin_nodes["$node"]=1
+  done <<<"$ready_plugin_rows"
+
+  for node in "${!selected_nodes[@]}"; do
+    if [[ -z "${csi_nodes[$node]:-}" || -z "${ready_plugin_nodes[$node]:-}" ]]; then
+      printf '%s\n' "$node"
+    fi
+  done | sort
+}
+
+verify_ton_selected_nodes_longhorn_csi_ready() {
+  local selector="$1"
+  local missing_nodes node
+
+  if ! missing_nodes="$(ton_selected_nodes_missing_longhorn_csi "$selector")"; then
+    return 1
+  fi
+  if [[ -z "$(trim_whitespace "$missing_nodes")" ]]; then
+    echo "[check] Longhorn CSI driver is registered and its node plugin is Ready on every selected TON node."
+    return 0
+  fi
+
+  echo "Error: Longhorn CSI driver registration or Ready node plugin is missing on selected TON node(s):" >&2
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] && echo "  - ${node}" >&2
+  done <<<"$missing_nodes"
+  echo "Ensure ${LONGHORN_NAMESPACE}/longhorn-csi-plugin is scheduled and Ready on every selected node." >&2
+  return 1
+}
+
+wait_ton_selected_nodes_longhorn_csi_ready() {
+  local selector="$1"
+  local timeout_seconds="${2:-$KUBETON_LONGHORN_READY_TIMEOUT_SECONDS}"
+  local deadline missing_nodes
+
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 1 )); then
+    echo "Error: invalid Longhorn CSI readiness timeout '${timeout_seconds}'." >&2
+    return 1
+  fi
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  echo "[check] Waiting for Longhorn CSI driver registration on selected TON node(s) (timeout ${timeout_seconds}s) ..."
+
+  while :; do
+    if ! missing_nodes="$(ton_selected_nodes_missing_longhorn_csi "$selector")"; then
+      return 1
+    fi
+    if [[ -z "$(trim_whitespace "$missing_nodes")" ]]; then
+      echo "[check] Longhorn CSI driver is registered and its node plugin is Ready on every selected TON node."
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      echo "Error: Longhorn CSI driver registration or Ready node plugin was not available on selected TON node(s):" >&2
+      while IFS= read -r node; do
+        node="$(trim_whitespace "$node")"
+        [[ -n "$node" ]] && echo "  - ${node}" >&2
+      done <<<"$missing_nodes"
+      echo "TON deployment was not applied. Ensure ${LONGHORN_NAMESPACE}/longhorn-csi-plugin is scheduled and Ready on every selected node, then rerun kubeton start." >&2
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 list_schedulable_nodes_by_selector() {
@@ -12691,7 +12644,12 @@ run_start() {
   if should_bootstrap_baremetal; then
     bootstrap_required=1
   fi
-  if (( bootstrap_required == 1 )) || longhorn_manager_exists; then
+  # Local k3d uses a local encrypted StorageClass and intentionally skips
+  # Longhorn. Bare-metal bootstrap, an existing manager, or an already
+  # Longhorn-backed encrypted StorageClass each require the per-node CSI gate.
+  if { (( bootstrap_required == 1 )) && ! cluster_is_k3d; } \
+    || longhorn_manager_exists \
+    || storage_class_is_longhorn "$ENCRYPTED_SC_NAME"; then
     preflight_uses_longhorn="true"
   fi
   if is_true "$preflight_uses_longhorn"; then
@@ -12752,8 +12710,66 @@ run_start() {
     validate_external_key_prereqs
   fi
 
+  # The aggregate Longhorn readiness wait proves that some CSI nodes are
+  # registered, but it cannot prove that every node selected for this TON
+  # StatefulSet has driver.longhorn.io. Check the actual placement selector
+  # before PVC cleanup or Helm can create a pod that later fails to attach its
+  # encrypted key-bundle PVC. When an explicit preflight was skipped and no
+  # selector is available, the helper deliberately checks every node: that is
+  # the only safe interpretation of an unconstrained TON placement.
+  if is_true "$preflight_uses_longhorn"; then
+    if ! wait_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+  fi
+
   if (( restore_from_stop_metadata == 0 )); then
     delete_stale_ton_pvcs_before_fresh_start
+  fi
+
+  # Stale-PVC reconciliation and CSI recovery can take long enough for node
+  # pressure or HostPort reservations to change after the earlier checks.
+  # Refresh every deployment prerequisite after cleanup and as close to Helm
+  # as possible.  Waiting for CSI comes first because it may consume most of
+  # the timeout; the final immediate probe then catches a registration which
+  # disappears while the resource/HostPort check is running.
+  if is_true "$preflight_uses_longhorn"; then
+    if ! wait_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+  fi
+  if ! is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
+    echo "[check] Rechecking selected TON nodes immediately before TON deployment ..."
+    if ! run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      echo "Error: selected TON nodes no longer meet deployment requirements; TON deployment was not applied." >&2
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+    if [[ -n "$KUBETON_NODE_CHECK_TON_SELECTOR" ]] \
+      && ! node_check_selector_is_all_compatible "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      echo "Error: the TON node selector includes a node that no longer meets deployment requirements; TON deployment was not applied." >&2
+      node_check_print_failed_selector_nodes "$KUBETON_NODE_CHECK_TON_SELECTOR"
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+  fi
+  if is_true "$preflight_uses_longhorn"; then
+    if ! verify_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
   fi
 
   helm_cmd=(
