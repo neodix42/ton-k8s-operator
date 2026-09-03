@@ -143,6 +143,63 @@ test_run_with_launch_session_exit_and_evidence() (
   assert_contains "final-snapshot" "$launch_dir/final/evidence.txt"
 )
 
+test_launch_session_keeps_transcript_pipes_outside_chart() (
+  local chart_dir="$test_dir/fifo-chart-root"
+  local runtime_dir="$test_dir/fifo-runtime"
+  mkdir -p "$chart_dir" "$runtime_dir"
+  export CHART_DIR="$chart_dir"
+  export KUBETON_LAUNCH_LOG_ROOT="$CHART_DIR/kubeton-launch-logs"
+  export KUBETON_LAUNCH_LOGS_ENABLED=true
+  export TON_VALUES_FILE="$test_dir/tonnode-values.yaml"
+  export TMPDIR="$runtime_dir"
+  source "$kubeton"
+
+  kubectl() {
+    if [[ "$*" == "config current-context" ]]; then
+      printf '%s\n' test-context
+      return 0
+    fi
+    return 1
+  }
+  resolve_tonnode_namespace_from_values() { printf '%s' test-ns; }
+  resolve_tonnode_name_from_values() { printf '%s' test-tonnode; }
+  resolve_ton_replicas_from_values_file() { printf '%s' 1; }
+  launch_session_start_watchers() { :; }
+  launch_session_stop_watchers() { :; }
+  launch_session_snapshot() { mkdir -p "$4"; }
+  helm_like_chart_scan() {
+    local irregular
+    irregular="$(find "$CHART_DIR" -mindepth 1 ! -type d ! -type f ! -type l -print -quit)"
+    if [[ -n "$irregular" ]]; then
+      printf 'irregular chart payload entry: %s\n' "$irregular" >&2
+      return 86
+    fi
+    printf '%s\n' 'chart scan saw only regular payload entries'
+  }
+
+  local rc=0 launch_dir
+  run_with_launch_session install helm_like_chart_scan \
+    >"$test_dir/fifo-chart.out" 2>"$test_dir/fifo-chart.stderr" || rc=$?
+  [[ "$rc" == 0 ]] || {
+    sed -n '1,100p' "$test_dir/fifo-chart.stderr" >&2
+    fail "chart-root evidence exposed an irregular file during wrapped command (rc=$rc)"
+  }
+  assert_contains 'chart scan saw only regular payload entries' "$test_dir/fifo-chart.out"
+  launch_dir="$(find "$KUBETON_LAUNCH_LOG_ROOT" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+  [[ -n "$launch_dir" && -f "$launch_dir/command.stdout.log" ]] \
+    || fail 'chart-root launch evidence was not retained'
+  if find "$runtime_dir" -mindepth 1 -print -quit | grep -q .; then
+    fail 'temporary launch transcript directory was not removed'
+  fi
+)
+
+test_chart_ignores_default_launch_evidence() (
+  local helmignore="$repo_root/charts/ton-k8s-operator/.helmignore"
+  if ! grep -Fxq 'kubeton-launch-logs/' "$helmignore"; then
+    fail 'Helm chart does not ignore the default launch evidence directory'
+  fi
+)
+
 test_install_waits_for_operator_rollout_inside_launch_session() (
   export KUBETON_LAUNCH_LOGS_ENABLED=true
   export KUBETON_LAUNCH_LOG_ROOT="$test_dir/install-rollout-launches"
@@ -2933,6 +2990,8 @@ test_owned_process_tree_ps_fallback_rejects_reused_pid
 test_run_start_rechecks_log_coverage_immediately_before_helm
 test_launch_session_begin_permissions
 test_run_with_launch_session_exit_and_evidence
+test_launch_session_keeps_transcript_pipes_outside_chart
+test_chart_ignores_default_launch_evidence
 test_install_waits_for_operator_rollout_inside_launch_session
 test_launch_session_preserves_enabled_errexit
 test_launch_session_preserves_errexit

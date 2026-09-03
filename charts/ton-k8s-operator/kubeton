@@ -917,7 +917,8 @@ run_with_launch_session() {
   local command_function="$2"
   shift 2
   local launch_dir ns tonnode_name replicas rc=0 tee_rc=0 interrupted_rc=0
-  local stdout_fifo stderr_fifo command_pid="" stdout_tee_pid stderr_tee_pid stdout_tee_rc=0 stderr_tee_rc=0
+  local transcript_runtime_dir="" stdout_fifo stderr_fifo
+  local command_pid="" stdout_tee_pid stderr_tee_pid stdout_tee_rc=0 stderr_tee_rc=0
   local caller_had_errexit=0 command_was_started=0
 
   [[ $- == *e* ]] && caller_had_errexit=1
@@ -944,10 +945,25 @@ run_with_launch_session() {
     printf 'desired_replicas=%s\n' "${replicas:-unknown}"
   } >>"$launch_dir/session.meta"
   launch_session_start_watchers "$launch_dir" "$ns" "$tonnode_name"
-  stdout_fifo="$launch_dir/.stdout.pipe"
-  stderr_fifo="$launch_dir/.stderr.pipe"
+  # Keep transient IPC outside the durable evidence tree. In the distributed
+  # chart, CHART_DIR and PWD are normally the same directory, so the default
+  # evidence root is beneath the chart. Helm rejects named pipes while loading
+  # a directory chart, even though the transcript logs themselves are regular
+  # files. A private runtime directory also ensures a SIGKILL cannot leave an
+  # irregular file behind in a future Helm chart scan.
+  if ! transcript_runtime_dir="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/kubeton-launch-pipes.XXXXXX")"; then
+    echo "Error: cannot create temporary launch transcript directory." >&2
+    launch_session_stop_watchers "$launch_dir"
+    trap - INT TERM HUP
+    KUBETON_ACTIVE_LAUNCH_DIR=""
+    return 1
+  fi
+  stdout_fifo="$transcript_runtime_dir/stdout.pipe"
+  stderr_fifo="$transcript_runtime_dir/stderr.pipe"
   if ! mkfifo "$stdout_fifo" "$stderr_fifo"; then
-    echo "Error: cannot create launch transcript pipes in ${launch_dir}." >&2
+    echo "Error: cannot create temporary launch transcript pipes." >&2
+    rm -f "$stdout_fifo" "$stderr_fifo" >/dev/null 2>&1 || true
+    rmdir "$transcript_runtime_dir" >/dev/null 2>&1 || true
     launch_session_stop_watchers "$launch_dir"
     trap - INT TERM HUP
     KUBETON_ACTIVE_LAUNCH_DIR=""
@@ -985,6 +1001,7 @@ run_with_launch_session() {
   wait "$stdout_tee_pid" || stdout_tee_rc=$?
   wait "$stderr_tee_pid" || stderr_tee_rc=$?
   rm -f "$stdout_fifo" "$stderr_fifo" >/dev/null 2>&1 || true
+  rmdir "$transcript_runtime_dir" >/dev/null 2>&1 || true
   if (( stdout_tee_rc != 0 )); then
     tee_rc="$stdout_tee_rc"
   elif (( stderr_tee_rc != 0 )); then

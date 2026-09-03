@@ -277,6 +277,11 @@ data even though kubeton does not read Kubernetes Secret contents, does not
 query Secret or ConfigMap objects for final diagnostics, and does not copy
 literal container environment values into its Pod JSON snapshot.
 
+When the default evidence directory is inside an extracted chart, Helm excludes
+it from the chart payload. The live transcript pipes are created separately in
+a private temporary directory and removed after the command, so Helm never
+encounters those irregular files while loading the chart.
+
 Useful evidence locations include `events-cluster.log` for the cluster-wide
 stream, `final/events-cluster.txt` for its final snapshot,
 `final/{operator,longhorn,vault}-diagnostics.txt` for each dependency

@@ -1,4 +1,7 @@
-# Prevent large local backup artifacts from inflating Helm release payloads.
+# Prevent runtime evidence and large local backup artifacts from inflating or
+# invalidating Helm release payloads. Launch sessions briefly use named pipes;
+# Helm must never traverse them while loading this directory as a chart.
+kubeton-launch-logs/
 key-backups/
 
 # Common local/package artifacts.
