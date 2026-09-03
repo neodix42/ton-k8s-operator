@@ -84,6 +84,8 @@ test_launch_session_begin_permissions() (
 
 test_run_with_launch_session_exit_and_evidence() (
   export KUBETON_LAUNCH_LOGS_ENABLED=true
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
   export KUBETON_LAUNCH_LOG_ROOT="$test_dir/run-root"
   export TON_VALUES_FILE="$test_dir/tonnode-values.yaml"
   source "$kubeton"
@@ -98,7 +100,10 @@ test_run_with_launch_session_exit_and_evidence() (
   resolve_tonnode_namespace_from_values() { printf '%s' test-ns; }
   resolve_tonnode_name_from_values() { printf '%s' test-tonnode; }
   resolve_ton_replicas_from_values_file() { printf '%s' 2; }
-  launch_session_start_watchers() { :; }
+  launch_session_start_watchers() {
+    [[ "${4:-}" == "start" ]] \
+      || fail "run_with_launch_session did not pass the start command to watcher selection"
+  }
   launch_session_stop_watchers() { :; }
   launch_session_snapshot() {
     local destination="$4"
@@ -138,8 +143,10 @@ test_run_with_launch_session_exit_and_evidence() (
   assert_contains "command stderr" "$launch_dir/command.log"
   assert_contains "ton_namespace=test-ns" "$launch_dir/session.meta"
   assert_contains "desired_replicas=2" "$launch_dir/session.meta"
+  assert_contains "pod_log_capture=victoria-logs-required" "$launch_dir/session.meta"
   assert_contains "exit_code=23" "$launch_dir/session.meta"
   assert_contains "kubeton start exit code: 23" "$launch_dir/summary.txt"
+  assert_contains "start requires Ready VictoriaLogs" "$launch_dir/summary.txt"
   assert_contains "final-snapshot" "$launch_dir/final/evidence.txt"
 )
 
@@ -807,7 +814,7 @@ test_launch_watchers_track_and_stop_cluster_event_stream() (
   launch_session_log_supervisor() { watcher_stub "$1" pod-logs; }
   launch_session_operator_log_watch() { watcher_stub "$1" operator-logs; }
 
-  launch_session_start_watchers "$launch_dir" default tonnode
+  launch_session_start_watchers "$launch_dir" default tonnode install
   [[ "${#KUBETON_LAUNCH_WATCHER_PIDS[@]}" == "5" ]] \
     || fail "launch session did not track all five evidence watchers"
   watcher_pids=("${KUBETON_LAUNCH_WATCHER_PIDS[@]}")
@@ -827,6 +834,107 @@ test_launch_watchers_track_and_stop_cluster_event_stream() (
       fail "launch watcher PID $pid survived launch_session_stop_watchers"
     fi
   done
+)
+
+test_launch_pod_capture_source_selection() (
+  source "$kubeton"
+
+  KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  VICTORIA_LOGS_ENABLED=true
+  launch_session_uses_victoria_logs_for_pod_capture start \
+    || fail "start did not select durable VictoriaLogs pod capture"
+  if launch_session_uses_victoria_logs_for_pod_capture install; then
+    fail "install incorrectly disabled its local pod-log followers"
+  fi
+
+  KUBETON_START_VICTORIA_LOGS_ENABLED=false
+  if launch_session_uses_victoria_logs_for_pod_capture start; then
+    fail "start used VictoriaLogs capture after automatic launch logging was disabled"
+  fi
+
+  KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  VICTORIA_LOGS_ENABLED=false
+  if launch_session_uses_victoria_logs_for_pod_capture start; then
+    fail "start used VictoriaLogs capture while VictoriaLogs itself was disabled"
+  fi
+)
+
+test_start_watchers_use_victoria_logs_instead_of_container_streams() (
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
+  source "$kubeton"
+
+  local launch_dir="$test_dir/victoria-watcher-lifecycle"
+  local watcher_log="$test_dir/victoria-watcher-lifecycle.log"
+  local deadline
+  mkdir -p "$launch_dir"
+  : >"$watcher_log"
+
+  watcher_stub() {
+    local dir="$1"
+    local name="$2"
+    printf 'started-%s\n' "$name" >>"$watcher_log"
+    while [[ ! -e "$dir/.stop" ]]; do
+      sleep 0.02
+    done
+  }
+  launch_session_event_watch() { watcher_stub "$1" namespace-events; }
+  launch_session_cluster_event_watch() { watcher_stub "$1" cluster-events; }
+  launch_session_timeline_watch() { watcher_stub "$1" timeline; }
+  launch_session_log_supervisor() { watcher_stub "$1" pod-logs; }
+  launch_session_operator_log_watch() { watcher_stub "$1" operator-logs; }
+
+  launch_session_start_watchers "$launch_dir" default tonnode start
+  [[ "${#KUBETON_LAUNCH_WATCHER_PIDS[@]}" == "4" ]] \
+    || fail "VictoriaLogs-backed start tracked ${#KUBETON_LAUNCH_WATCHER_PIDS[@]} watchers, expected 4"
+  deadline=$((SECONDS + 2))
+  while [[ "$(wc -l <"$watcher_log")" -lt 4 ]]; do
+    (( SECONDS < deadline )) || fail "VictoriaLogs-backed evidence watchers did not all start"
+    sleep 0.02
+  done
+  assert_not_contains "started-pod-logs" "$watcher_log"
+  assert_contains "started-namespace-events" "$watcher_log"
+  assert_contains "started-cluster-events" "$watcher_log"
+  assert_contains "started-timeline" "$watcher_log"
+  assert_contains "started-operator-logs" "$watcher_log"
+  launch_session_stop_watchers "$launch_dir"
+)
+
+test_start_watchers_keep_container_streams_without_victoria_logs() (
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=false
+  export VICTORIA_LOGS_ENABLED=true
+  source "$kubeton"
+
+  local launch_dir="$test_dir/local-log-watcher-lifecycle"
+  local watcher_log="$test_dir/local-log-watcher-lifecycle.log"
+  local deadline
+  mkdir -p "$launch_dir"
+  : >"$watcher_log"
+
+  watcher_stub() {
+    local dir="$1"
+    local name="$2"
+    printf 'started-%s\n' "$name" >>"$watcher_log"
+    while [[ ! -e "$dir/.stop" ]]; do
+      sleep 0.02
+    done
+  }
+  launch_session_event_watch() { watcher_stub "$1" namespace-events; }
+  launch_session_cluster_event_watch() { watcher_stub "$1" cluster-events; }
+  launch_session_timeline_watch() { watcher_stub "$1" timeline; }
+  launch_session_log_supervisor() { watcher_stub "$1" pod-logs; }
+  launch_session_operator_log_watch() { watcher_stub "$1" operator-logs; }
+
+  launch_session_start_watchers "$launch_dir" default tonnode start
+  [[ "${#KUBETON_LAUNCH_WATCHER_PIDS[@]}" == "5" ]] \
+    || fail "local-log fallback tracked ${#KUBETON_LAUNCH_WATCHER_PIDS[@]} watchers, expected 5"
+  deadline=$((SECONDS + 2))
+  while [[ "$(wc -l <"$watcher_log")" -lt 5 ]]; do
+    (( SECONDS < deadline )) || fail "local-log fallback watchers did not all start"
+    sleep 0.02
+  done
+  assert_contains "started-pod-logs" "$watcher_log"
+  launch_session_stop_watchers "$launch_dir"
 )
 
 test_event_watchers_use_atomic_list_watch_without_replay_timeout() (
@@ -929,6 +1037,7 @@ test_launch_snapshot_captures_dependency_diagnostics_without_secrets() (
 test_running_without_commit_is_extracting() (
   source "$kubeton"
 
+  local bootstrap_commit_state=pending
   run_with_timeout() {
     shift
     "$@"
@@ -941,7 +1050,8 @@ test_running_without_commit_is_extracting() (
       return 0
     fi
     if [[ "$args" == *" exec tonnode-0 "* && "$args" == *"test -f /var/ton-work/db/mtc_done"* ]]; then
-      return 1
+      printf '%s' "$bootstrap_commit_state"
+      return 0
     fi
     if [[ "$args" == *" exec tonnode-0 "* && "$args" == *"ps -eo args"* ]]; then
       printf '%s\n' extracting
@@ -955,6 +1065,46 @@ test_running_without_commit_is_extracting() (
   IFS=$'\x1f' read -r state _ _ _ _ detail <<<"$row"
   [[ "$state" == "extracting" ]] || fail "Running pod without mtc_done was reported as '$state', expected extracting"
   [[ "$detail" == *"mtc_done is not committed"* ]] || fail "missing uncommitted-bootstrap detail"
+
+  bootstrap_commit_state=complete
+  row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
+  IFS=$'\x1f' read -r state _ _ _ _ detail <<<"$row"
+  [[ "$state" == "complete" ]] \
+    || fail "committed bootstrap probe was reported as '$state', expected complete"
+  [[ "$detail" == *"bootstrap commit state is present"* ]] \
+    || fail "committed bootstrap probe lost its success detail"
+)
+
+test_running_pod_bootstrap_probe_failure_is_a_status_read_error() (
+  source "$kubeton"
+
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  kubectl() {
+    local args="$*"
+    if [[ "$args" == *" get pod tonnode-0 "* ]]; then
+      printf 'node-a\x1fRunning\x1fTrue\x1f\x1f\x1f0\x1f\x1f'
+      return 0
+    fi
+    if [[ "$args" == *" exec tonnode-0 "* && "$args" == *"test -f /var/ton-work/db/mtc_done"* ]]; then
+      printf '%s\n' 'remote API proxy refused the exec stream' >&2
+      return 124
+    fi
+    return 1
+  }
+
+  local row state node detail
+  row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
+  IFS=$'\x1f' read -r state node _ _ _ detail <<<"$row"
+  [[ "$state" == "status-read-error" ]] \
+    || fail "failed bootstrap exec probe was reported as '$state', expected status-read-error"
+  [[ "$node" == "node-a" ]] || fail "failed bootstrap exec probe lost the Pod node"
+  [[ "$detail" == *'kubectl exec bootstrap probe failed (exit=124)'* ]] \
+    || fail "bootstrap exec probe failure lost the exit code: $detail"
+  [[ "$detail" == *'remote API proxy refused the exec stream'* ]] \
+    || fail "bootstrap exec probe failure lost kubectl stderr: $detail"
 )
 
 test_scheduled_pending_pod_reports_attach_failure() (
@@ -989,6 +1139,103 @@ test_scheduled_pending_pod_reports_attach_failure() (
     || fail "FailedAttachVolume state lost the Warning event message"
   [[ "$detail" == *"does not contain driver driver.longhorn.io"* ]] \
     || fail "FailedAttachVolume state truncated the Warning event cause"
+)
+
+test_bootstrap_status_read_failure_preserves_exit_reason() (
+  source "$kubeton"
+
+  local failure_rc=124
+  run_with_timeout() {
+    printf '%s\n' 'remote API proxy refused another stream' >&2
+    return "$failure_rc"
+  }
+
+  local row state detail
+  row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
+  IFS=$'\x1f' read -r state _ _ _ _ detail <<<"$row"
+  [[ "$state" == "status-read-error" ]] \
+    || fail "failed Pod status read was reported as '$state', expected status-read-error"
+  [[ "$detail" == *'kubectl get Pod failed (exit=124)'* ]] \
+    || fail "Pod status read failure lost the kubectl exit code: $detail"
+  [[ "$detail" == *'timed out after'* ]] \
+    || fail "Pod status timeout lost its timeout reason: $detail"
+  [[ "$detail" == *'remote API proxy refused another stream'* ]] \
+    || fail "Pod status read failure lost kubectl stderr: $detail"
+
+  failure_rc=137
+  row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
+  IFS=$'\x1f' read -r state _ _ _ _ detail <<<"$row"
+  [[ "$state" == "status-read-error" && "$detail" == *'exit=137'* \
+    && "$detail" == *'terminated by SIGKILL'* ]] \
+    || fail "SIGKILLed Pod status read was mislabeled as a timeout: $detail"
+)
+
+test_bootstrap_status_distinguishes_missing_pod_from_read_failure() (
+  source "$kubeton"
+
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  kubectl() { return 0; }
+
+  local row state detail
+  row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
+  IFS=$'\x1f' read -r state _ _ _ _ detail <<<"$row"
+  [[ "$state" == "waiting-for-pod" ]] \
+    || fail "missing Pod was reported as '$state', expected waiting-for-pod"
+  [[ "$detail" == "Pod has not been created" ]] \
+    || fail "missing Pod lost its distinct status detail: $detail"
+)
+
+test_bootstrap_wait_bounds_repeated_status_read_errors() (
+  export KUBETON_START_STATUS_READ_ERROR_LIMIT=3
+  source "$kubeton"
+
+  local calls_file="$test_dir/status-read-errors.calls"
+  : >"$calls_file"
+  ton_pod_initial_bootstrap_state() {
+    printf '%s\n' "$2" >>"$calls_file"
+    printf 'status-read-error\x1f-\x1f0\x1f\x1f\x1fkubectl get Pod failed (exit=124): timed out'
+  }
+  sleep() { :; }
+
+  if wait_ton_initial_bootstrap_complete default tonnode 1 3600 \
+      >"$test_dir/status-read-errors.out" 2>&1; then
+    fail "bootstrap wait ignored repeated Pod status read failures"
+  fi
+  [[ "$(wc -l <"$calls_file")" == "3" ]] \
+    || fail "bootstrap wait did not stop at the configured status read error limit"
+  assert_contains "cannot read Pod default/tonnode-0 after 3 consecutive attempts" \
+    "$test_dir/status-read-errors.out"
+  assert_contains "Kubernetes API progress cannot be observed" \
+    "$test_dir/status-read-errors.out"
+)
+
+test_bootstrap_wait_resets_status_read_error_count_after_successful_read() (
+  export KUBETON_START_STATUS_READ_ERROR_LIMIT=2
+  source "$kubeton"
+
+  local calls_file="$test_dir/transient-status-read-errors.calls"
+  : >"$calls_file"
+  ton_pod_initial_bootstrap_state() {
+    local calls
+    printf '%s\n' "$2" >>"$calls_file"
+    calls="$(wc -l <"$calls_file")"
+    case "$calls" in
+      1|3) printf 'status-read-error\x1f-\x1f0\x1f\x1f\x1ftemporary API failure' ;;
+      2) printf 'extracting\x1fnode-a\x1f0\x1f\x1f\x1fmtc_done is not committed yet' ;;
+      *) printf 'complete\x1fnode-a\x1f0\x1f\x1f\x1fcommitted' ;;
+    esac
+  }
+  sleep() { :; }
+
+  wait_ton_initial_bootstrap_complete default tonnode 1 3600 \
+    >"$test_dir/transient-status-read-errors.out" 2>&1
+  [[ "$(wc -l <"$calls_file")" == "4" ]] \
+    || fail "a successful Pod read did not reset the consecutive error counter"
+  assert_contains "All 1 TON replica(s) committed" \
+    "$test_dir/transient-status-read-errors.out"
 )
 
 test_bootstrap_wait_requires_every_replica() (
@@ -2518,6 +2765,167 @@ test_sequential_start_rechecks_log_coverage_before_each_scaleup() (
     || fail "sequential start did not recheck log coverage before every ordinal after zero"
 )
 
+test_controller_reconcile_wait_requires_current_generations_and_all_pods() (
+  export KUBETON_START_STATUS_READ_ERROR_LIMIT=3
+  source "$kubeton"
+
+  local observations="$test_dir/controller-reconcile.observations"
+  : >"$observations"
+  ton_start_reconcile_observation() {
+    local count
+    printf '%s\n' observation >>"$observations"
+    count="$(wc -l <"$observations")"
+    if (( count == 1 )); then
+      printf 'tonnode\x1f7\x1f6\x1f3\n'
+      printf 'statefulset\x1f8\x1f8\x1f3\n'
+      printf 'tonnode-0\x1fpod-0\x1f\n'
+      printf 'tonnode-1\x1fpod-1\x1f\n'
+      printf 'tonnode-2\x1fpod-2\x1f\n'
+      return 0
+    fi
+    if (( count == 2 )); then
+      printf 'tonnode\x1f7\x1f7\x1f3\n'
+      printf 'statefulset\x1f8\x1f8\x1f3\n'
+      printf 'tonnode-0\x1fpod-0\x1f\n'
+      printf 'tonnode-1\x1fpod-1\x1f\n'
+      printf 'tonnode-2\x1fpod-2\x1fterminating\n'
+      return 0
+    fi
+    printf 'tonnode\x1f7\x1f7\x1f3\n'
+    printf 'statefulset\x1f8\x1f8\x1f3\n'
+    printf 'tonnode-0\x1fpod-0\x1f\n'
+    printf 'tonnode-1\x1fpod-1\x1f\n'
+    printf 'tonnode-2\x1fpod-2\x1f\n'
+  }
+  sleep() { :; }
+
+  wait_ton_controller_reconciled_after_start default tonnode 3 60 \
+    >"$test_dir/controller-reconcile.out" 2>&1
+  [[ "$(wc -l <"$observations")" == "3" ]] \
+    || fail "controller reconciliation gate accepted stale generation or an incomplete Pod set"
+  assert_contains "all 3 Pod object(s) are present and non-terminating" \
+    "$test_dir/controller-reconcile.out"
+)
+
+test_controller_reconcile_observation_uses_explicit_termination_marker() (
+  source "$kubeton"
+
+  local kubectl_log="$test_dir/controller-reconcile-observation.kubectl"
+  local observation
+  : >"$kubectl_log"
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  kubectl() {
+    printf '%s\n' "$*" >>"$kubectl_log"
+    if [[ "$*" == *" get tonnodes.ton.ton.org tonnode "* ]]; then
+      printf '7\x1f7\x1f3'
+    elif [[ "$*" == *" get statefulset tonnode "* ]]; then
+      printf '8\x1f8\x1f3'
+    elif [[ "$*" == *" get pods -l "* ]]; then
+      printf 'tonnode-0\x1fpod-0\x1f\n'
+    else
+      return 1
+    fi
+  }
+
+  observation="$(ton_start_reconcile_observation default tonnode)"
+  [[ "$observation" == *$'tonnode-0\x1fpod-0\x1f'* ]] \
+    || fail "controller reconciliation observation lost a healthy Pod row"
+  assert_contains '{{if .metadata.deletionTimestamp}}terminating{{end}}' "$kubectl_log"
+)
+
+test_controller_reconcile_wait_bounds_api_read_errors() (
+  export KUBETON_START_STATUS_READ_ERROR_LIMIT=2
+  source "$kubeton"
+
+  local observations="$test_dir/controller-reconcile-errors.observations"
+  : >"$observations"
+  ton_start_reconcile_observation() {
+    printf '%s\n' observation >>"$observations"
+    printf '%s\n' 'remote API proxy rejected the read' >&2
+    return 124
+  }
+  sleep() { :; }
+
+  if wait_ton_controller_reconciled_after_start default tonnode 3 3600 \
+      >"$test_dir/controller-reconcile-errors.out" 2>&1; then
+    fail "controller reconciliation gate ignored repeated API read errors"
+  fi
+  [[ "$(wc -l <"$observations")" == "2" ]] \
+    || fail "controller reconciliation gate did not stop at the API read error limit"
+  assert_contains "after 2 consecutive API attempts (exit=124)" \
+    "$test_dir/controller-reconcile-errors.out"
+  assert_contains "remote API proxy rejected the read" \
+    "$test_dir/controller-reconcile-errors.out"
+)
+
+test_sequential_run_start_waits_for_final_controller_convergence() (
+  export KUBETON_SKIP_NODE_PREREQ_CHECK=true
+  export KUBETON_SEQUENTIAL_TON_START=true
+  export KUBETON_START_WAIT_FOR_BOOTSTRAP=true
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=false
+  export VICTORIA_LOGS_ENABLED=false
+  export KUBETON_START_RECONCILE_TIMEOUT_SECONDS=3700
+  source "$kubeton"
+
+  local event_log="$test_dir/sequential-final-convergence.events"
+  local helm_count=0
+  : >"$event_log"
+  require_bin() { :; }
+  resolve_ton_replicas_from_values_file() { printf '%s' 3; }
+  resolve_tonnode_namespace_from_values() { printf '%s' default; }
+  resolve_tonnode_name_from_values() { printf '%s' tonnode; }
+  should_bootstrap_baremetal() { return 1; }
+  longhorn_manager_exists() { return 1; }
+  storage_class_is_longhorn() { return 1; }
+  prepare_node_prerequisites_for_workload() {
+    KUBETON_NODE_CHECK_REQUIRED_NODES=3
+    KUBETON_NODE_CHECK_TON_SELECTOR=""
+  }
+  fleet_has_stop_annotations() { return 1; }
+  ensure_ton_storage_class_available() { :; }
+  append_ton_storage_overrides() { :; }
+  should_use_sequential_ton_start() { return 0; }
+  validate_external_key_prereqs() { :; }
+  ensure_start_victoria_logs() { :; }
+  delete_stale_ton_pvcs_before_fresh_start() { :; }
+  verify_start_victoria_logs_collection_ready() { :; }
+  append_helm_force_conflicts_if_supported() { :; }
+  sequential_start_ton_fleet() { printf '%s\n' staged >>"$event_log"; }
+  wait_ton_controller_reconciled_after_start() {
+    printf 'converged ns=%s name=%s replicas=%s timeout=%s\n' \
+      "$1" "$2" "$3" "$4" >>"$event_log"
+  }
+  repair_pending_ton_placement_after_start() { printf '%s\n' repaired >>"$event_log"; }
+  wait_ton_initial_bootstrap_complete() { printf '%s\n' bootstrap-wait >>"$event_log"; }
+  helm() {
+    helm_count=$((helm_count + 1))
+    printf 'helm-%s %s\n' "$helm_count" "$*" >>"$event_log"
+  }
+
+  run_start >"$test_dir/sequential-final-convergence.out" 2>&1
+  assert_order "helm-1" "staged" "$event_log"
+  assert_order "staged" "helm-2" "$event_log"
+  assert_order "helm-2" "converged ns=default name=tonnode replicas=3 timeout=3700" "$event_log"
+  assert_order "converged ns=default name=tonnode replicas=3 timeout=3700" "repaired" "$event_log"
+  assert_order "repaired" "bootstrap-wait" "$event_log"
+
+  : >"$event_log"
+  helm_count=0
+  wait_ton_controller_reconciled_after_start() {
+    printf '%s\n' convergence-failed >>"$event_log"
+    return 1
+  }
+  if run_start >"$test_dir/sequential-final-convergence-failure.out" 2>&1; then
+    fail "sequential start continued after final controller convergence failed"
+  fi
+  assert_order "helm-2" "convergence-failed" "$event_log"
+  assert_not_contains "repaired" "$event_log"
+  assert_not_contains "bootstrap-wait" "$event_log"
+)
+
 test_run_start_rechecks_log_coverage_immediately_before_helm() (
   export KUBETON_SKIP_NODE_PREREQ_CHECK=false
   export KUBETON_START_WAIT_FOR_BOOTSTRAP=false
@@ -2998,10 +3406,18 @@ test_launch_session_preserves_errexit
 test_container_followers_reconnect_independently
 test_log_supervisor_spawns_every_container
 test_launch_watchers_track_and_stop_cluster_event_stream
+test_launch_pod_capture_source_selection
+test_start_watchers_use_victoria_logs_instead_of_container_streams
+test_start_watchers_keep_container_streams_without_victoria_logs
 test_event_watchers_use_atomic_list_watch_without_replay_timeout
 test_launch_snapshot_captures_dependency_diagnostics_without_secrets
 test_running_without_commit_is_extracting
+test_running_pod_bootstrap_probe_failure_is_a_status_read_error
 test_scheduled_pending_pod_reports_attach_failure
+test_bootstrap_status_read_failure_preserves_exit_reason
+test_bootstrap_status_distinguishes_missing_pod_from_read_failure
+test_bootstrap_wait_bounds_repeated_status_read_errors
+test_bootstrap_wait_resets_status_read_error_count_after_successful_read
 test_bootstrap_wait_requires_every_replica
 test_bootstrap_wait_fails_repeated_crashloop
 test_victoria_logs_requires_ready_collector_per_selected_node
@@ -3025,6 +3441,10 @@ test_victoria_logs_state_mirrors_canonical_and_preserves_identity_records
 test_victoria_logs_access_network_policy_is_exact
 test_victoria_logs_access_service_failure_blocks_collector
 test_sequential_start_rechecks_log_coverage_before_each_scaleup
+test_controller_reconcile_wait_requires_current_generations_and_all_pods
+test_controller_reconcile_observation_uses_explicit_termination_marker
+test_controller_reconcile_wait_bounds_api_read_errors
+test_sequential_run_start_waits_for_final_controller_convergence
 test_start_preserves_explicit_victoria_logs_selector_constraints
 test_standalone_victoria_metrics_install_refreshes_checked_hostnames
 test_failed_preflight_still_restricts_existing_collector

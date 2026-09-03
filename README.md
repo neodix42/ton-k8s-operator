@@ -266,9 +266,11 @@ the machine where the command is executed. The default location is:
 The directory and its files are owner-only (`0700`/`0600`). It contains the
 complete kubeton command transcript, a timestamped Pod-state timeline, target
 namespace and cluster-wide Kubernetes Event streams, controller output,
-best-effort current/previous output from every TON init and application
-container, and final Pod/StatefulSet/TonNode, PVC/PV, VolumeAttachment, node,
-CSINode, Longhorn, Vault, operator, and Victoria status snapshots. The
+and final Pod/StatefulSet/TonNode, PVC/PV, VolumeAttachment, node, CSINode,
+Longhorn, Vault, operator, and Victoria status snapshots. During `install`, or
+when automatic VictoriaLogs capture is explicitly disabled for `start`, it
+also retains best-effort current/previous output from every TON init and
+application container. The
 cluster-wide Event watcher starts before storage bootstrap or Helm can create a
 TON Pod, so it also preserves scheduler, CSI, Vault, Longhorn, and logging
 failures that occur before a TON object exists. The path is printed at the
@@ -276,6 +278,13 @@ beginning and end of the command. Treat the bundle as sensitive operational
 data even though kubeton does not read Kubernetes Secret contents, does not
 query Secret or ConfigMap objects for final diagnostics, and does not copy
 literal container environment values into its Pod JSON snapshot.
+
+When automatic VictoriaLogs is enabled, `start` deliberately does not open a
+second long-lived `kubectl logs --follow` connection for every TON container.
+VictoriaLogs is already required to be Ready before the first TON Pod is
+created and durably captures those streams. Avoiding the redundant followers
+also preserves API/proxy connection capacity for placement, reconciliation,
+and bootstrap status reads on remote clusters.
 
 When the default evidence directory is inside an extracted chart, Helm excludes
 it from the chart payload. The live transcript pipes are created separately in
@@ -310,7 +319,12 @@ commit state:
 It prints state changes and one-minute heartbeats such as `FailedScheduling`,
 `FailedAttachVolume`, `downloading`, `extracting`, `CrashLoopBackOff`, and
 `complete`. Five repeated CrashLoop restarts with a non-zero exit fail the
-command early while leaving the Pods/PVCs intact for diagnosis.
+command early while leaving the Pods/PVCs intact for diagnosis. After a
+sequential scale-up, `start` also waits for the final TonNode and StatefulSet
+generations and every expected non-terminating Pod object before starting the
+bootstrap-content checks. Repeated Kubernetes API read failures retain the
+`kubectl` exit reason and fail after three consecutive attempts by default
+instead of being reported as an unknown Pod state for the full 24-hour window.
 
 On a fresh infrastructure bootstrap, `start` installs the node collector before
 Longhorn or Vault. Both that collector and the VictoriaLogs backend are
@@ -378,8 +392,14 @@ Useful launch controls:
   capturing logs and fails unless the operator Deployment becomes Ready)
 - `KUBETON_START_WAIT_FOR_BOOTSTRAP` (default `true`)
 - `KUBETON_START_READY_TIMEOUT_SECONDS` (default `86400`)
+- `KUBETON_START_RECONCILE_TIMEOUT_SECONDS` (default `auto`, calculated as 15
+  minutes per replica plus 15 minutes; final TonNode/StatefulSet generation
+  and Pod-object convergence after sequential staging)
 - `KUBETON_START_STATUS_INTERVAL_SECONDS` (default `60`)
 - `KUBETON_START_FATAL_RESTART_COUNT` (default `5`; `0` disables fail-fast)
+- `KUBETON_START_STATUS_READ_ERROR_LIMIT` (default `3`; consecutive failed
+  Kubernetes API reads before `start` stops waiting; `0` leaves only the
+  overall wait timeout in effect)
 - `KUBETON_START_VICTORIA_LOGS_ENABLED` (default `true`; setting it to
   `false` explicitly accepts that the local watcher cannot guarantee every
   rapid restart)
@@ -448,7 +468,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.2.5/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.2.6/install.sh" | bash
 ```
 
 The script:
@@ -685,8 +705,10 @@ KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SECONDS
 KUBETON_INSTALL_READY_TIMEOUT_SECONDS
 KUBETON_START_WAIT_FOR_BOOTSTRAP
 KUBETON_START_READY_TIMEOUT_SECONDS
+KUBETON_START_RECONCILE_TIMEOUT_SECONDS
 KUBETON_START_STATUS_INTERVAL_SECONDS
 KUBETON_START_FATAL_RESTART_COUNT
+KUBETON_START_STATUS_READ_ERROR_LIMIT
 KUBETON_START_VICTORIA_LOGS_ENABLED
 SKIP_STOP_KEY_BACKUP
 STATUS_EXEC_TIMEOUT
@@ -941,7 +963,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.2.5/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.2.6/install.sh" | bash
 cd ./ton-k8s-operator-0.1.35
 
 # review values before upgrade

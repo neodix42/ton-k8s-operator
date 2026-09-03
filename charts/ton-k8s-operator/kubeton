@@ -72,8 +72,10 @@ KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SECONDS="${KUBETON_LAUNCH_SNAPSHOT_INTERVAL_SEC
 KUBETON_INSTALL_READY_TIMEOUT_SECONDS="${KUBETON_INSTALL_READY_TIMEOUT_SECONDS:-600}"
 KUBETON_START_WAIT_FOR_BOOTSTRAP="${KUBETON_START_WAIT_FOR_BOOTSTRAP:-true}"
 KUBETON_START_READY_TIMEOUT_SECONDS="${KUBETON_START_READY_TIMEOUT_SECONDS:-86400}"
+KUBETON_START_RECONCILE_TIMEOUT_SECONDS="${KUBETON_START_RECONCILE_TIMEOUT_SECONDS:-auto}"
 KUBETON_START_STATUS_INTERVAL_SECONDS="${KUBETON_START_STATUS_INTERVAL_SECONDS:-60}"
 KUBETON_START_FATAL_RESTART_COUNT="${KUBETON_START_FATAL_RESTART_COUNT:-5}"
+KUBETON_START_STATUS_READ_ERROR_LIMIT="${KUBETON_START_STATUS_READ_ERROR_LIMIT:-3}"
 KUBETON_START_VICTORIA_LOGS_ENABLED="${KUBETON_START_VICTORIA_LOGS_ENABLED:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 MYTONCTRL_EXEC_TIMEOUT="${MYTONCTRL_EXEC_TIMEOUT:-180s}"
@@ -283,6 +285,25 @@ run_with_timeout() {
     return $?
   fi
   "$@"
+}
+
+captured_command_error_reason() {
+  local exit_code="$1"
+  local timeout_value="$2"
+  local error_file="$3"
+  local error_text=""
+
+  if [[ -f "$error_file" ]]; then
+    error_text="$(tr '\t\r\n\037' '    ' <"$error_file" | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//')"
+  fi
+  if (( exit_code == 124 )); then
+    error_text="timed out after ${timeout_value}${error_text:+: ${error_text}}"
+  elif (( exit_code == 137 )); then
+    error_text="terminated by SIGKILL${error_text:+: ${error_text}}"
+  elif [[ -z "$error_text" ]]; then
+    error_text="command returned no error text"
+  fi
+  printf '%s' "${error_text:0:500}"
 }
 
 launch_session_selector() {
@@ -881,10 +902,19 @@ launch_session_snapshot() {
   chmod -R go-rwx "$destination" 2>/dev/null || true
 }
 
+launch_session_uses_victoria_logs_for_pod_capture() {
+  local command_name="${1:-}"
+
+  [[ "$command_name" == "start" ]] \
+    && is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" \
+    && is_true "$VICTORIA_LOGS_ENABLED"
+}
+
 launch_session_start_watchers() {
   local launch_dir="$1"
   local ns="$2"
   local tonnode_name="$3"
+  local command_name="${4:-}"
 
   KUBETON_LAUNCH_WATCHER_PIDS=()
   launch_session_event_watch "$launch_dir" "$ns" &
@@ -893,8 +923,16 @@ launch_session_start_watchers() {
   KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
   launch_session_timeline_watch "$launch_dir" "$ns" "$tonnode_name" &
   KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
-  launch_session_log_supervisor "$launch_dir" "$ns" "$tonnode_name" &
-  KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
+  # A follower per init/application container can consume every available
+  # streaming connection through a constrained SSH/API proxy once several TON
+  # replicas exist. During `start`, VictoriaLogs is installed and proven Ready
+  # before Helm may create a TON Pod, so it is both the durable log source and
+  # the safe replacement for those redundant local followers. Preserve the
+  # followers for install and for the explicit no-VictoriaLogs fallback.
+  if ! launch_session_uses_victoria_logs_for_pod_capture "$command_name"; then
+    launch_session_log_supervisor "$launch_dir" "$ns" "$tonnode_name" &
+    KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
+  fi
   launch_session_operator_log_watch "$launch_dir" &
   KUBETON_LAUNCH_WATCHER_PIDS+=("$!")
 }
@@ -916,7 +954,7 @@ run_with_launch_session() {
   local command_name="$1"
   local command_function="$2"
   shift 2
-  local launch_dir ns tonnode_name replicas rc=0 tee_rc=0 interrupted_rc=0
+  local launch_dir ns tonnode_name replicas pod_log_capture rc=0 tee_rc=0 interrupted_rc=0
   local transcript_runtime_dir="" stdout_fifo stderr_fifo
   local command_pid="" stdout_tee_pid stderr_tee_pid stdout_tee_rc=0 stderr_tee_rc=0
   local caller_had_errexit=0 command_was_started=0
@@ -931,6 +969,10 @@ run_with_launch_session() {
   ns="$(resolve_tonnode_namespace_from_values)"
   tonnode_name="$(resolve_tonnode_name_from_values)"
   replicas="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" 2>/dev/null || true)"
+  pod_log_capture="local-followers"
+  if launch_session_uses_victoria_logs_for_pod_capture "$command_name"; then
+    pod_log_capture="victoria-logs-required"
+  fi
   launch_dir="$(launch_session_begin "$command_name")" || return 1
   KUBETON_ACTIVE_LAUNCH_DIR="$launch_dir"
   # Install signal handling before starting any watcher. The handler records
@@ -943,8 +985,9 @@ run_with_launch_session() {
     printf 'ton_namespace=%s\n' "$ns"
     printf 'tonnode_name=%s\n' "$tonnode_name"
     printf 'desired_replicas=%s\n' "${replicas:-unknown}"
+    printf 'pod_log_capture=%s\n' "$pod_log_capture"
   } >>"$launch_dir/session.meta"
-  launch_session_start_watchers "$launch_dir" "$ns" "$tonnode_name"
+  launch_session_start_watchers "$launch_dir" "$ns" "$tonnode_name" "$command_name"
   # Keep transient IPC outside the durable evidence tree. In the distributed
   # chart, CHART_DIR and PWD are normally the same directory, so the default
   # evidence root is beneath the chart. Helm rejects named pipes while loading
@@ -1031,7 +1074,11 @@ run_with_launch_session() {
     printf 'kubeton %s exit code: %s\n' "$command_name" "$rc"
     printf 'TON target: %s/%s (desired replicas: %s)\n' "$ns" "$tonnode_name" "${replicas:-unknown}"
     printf 'Command transcript: %s/command.log\n' "$launch_dir"
-    printf 'Pod/container log capture: %s/pods/\n' "$launch_dir"
+    if [[ "$pod_log_capture" == "victoria-logs-required" ]]; then
+      printf 'Local per-container log followers: disabled; start requires Ready VictoriaLogs before creating TON Pods\n'
+    else
+      printf 'Pod/container log capture: %s/pods/\n' "$launch_dir"
+    fi
     printf 'Lifecycle events: %s/events.log\n' "$launch_dir"
     printf 'Cluster-wide lifecycle events: %s/events-cluster.log\n' "$launch_dir"
     printf 'Final resource evidence: %s/final/\n' "$launch_dir"
@@ -12003,12 +12050,21 @@ ton_pod_initial_bootstrap_state() {
   local pod="$2"
   local pod_row node phase scheduled_status scheduled_reason scheduled_message
   local restart_count waiting_reason last_exit event_row event_reason event_message process_state
+  local status_error_file status_error pod_rc=0 bootstrap_probe bootstrap_probe_rc=0
 
-  if ! pod_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pod "$pod" --ignore-not-found \
-    -o go-template='{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{range .status.conditions}}{{if eq .type "PodScheduled"}}{{.status}}{{"\x1f"}}{{.reason}}{{"\x1f"}}{{.message}}{{end}}{{end}}{{"\x1f"}}{{range .status.containerStatuses}}{{if eq .name "ton-node"}}{{.restartCount}}{{"\x1f"}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{"\x1f"}}{{if .lastState.terminated}}{{.lastState.terminated.exitCode}}{{end}}{{end}}' 2>/dev/null)"; then
-    printf 'unknown\x1f-\x1f0\x1f\x1f\x1funable to read Pod status'
+  if ! status_error_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/kubeton-pod-status.XXXXXX")"; then
+    printf 'status-read-error\x1f-\x1f0\x1f\x1f\x1fcannot create a temporary file for kubectl error capture'
     return 0
   fi
+  pod_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pod "$pod" --ignore-not-found \
+    -o go-template='{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{range .status.conditions}}{{if eq .type "PodScheduled"}}{{.status}}{{"\x1f"}}{{.reason}}{{"\x1f"}}{{.message}}{{end}}{{end}}{{"\x1f"}}{{range .status.containerStatuses}}{{if eq .name "ton-node"}}{{.restartCount}}{{"\x1f"}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{"\x1f"}}{{if .lastState.terminated}}{{.lastState.terminated.exitCode}}{{end}}{{end}}' 2>"$status_error_file")" || pod_rc=$?
+  if (( pod_rc != 0 )); then
+    status_error="$(captured_command_error_reason "$pod_rc" "$STATUS_EXEC_TIMEOUT" "$status_error_file")"
+    rm -f "$status_error_file" >/dev/null 2>&1 || true
+    printf 'status-read-error\x1f-\x1f0\x1f\x1f\x1fkubectl get Pod failed (exit=%s): %s' "$pod_rc" "$status_error"
+    return 0
+  fi
+  rm -f "$status_error_file" >/dev/null 2>&1 || true
   pod_row="$(printf '%s' "$pod_row" | tr '\t\r\n' '   ')"
   if [[ -z "$(trim_whitespace "$pod_row")" ]]; then
     printf 'waiting-for-pod\x1f-\x1f0\x1f\x1f\x1fPod has not been created'
@@ -12062,13 +12118,41 @@ ton_pod_initial_bootstrap_state() {
     return 0
   fi
 
-  if run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- sh -ec '
-      test -f /var/ton-work/db/mtc_done
-      test -s /var/ton-work/db/config.json
-      test -s /var/ton-work/db/systemd-units/validator.service
-      test -s /var/ton-work/db/systemd-units/mytoncore.service
-    ' >/dev/null 2>&1; then
+  if ! status_error_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/kubeton-bootstrap-probe.XXXXXX")"; then
+    printf 'status-read-error\x1f%s\x1f%s\x1f%s\x1f%s\x1fcannot create a temporary file for bootstrap-probe error capture' \
+      "$node" "$restart_count" "$waiting_reason" "$last_exit"
+    return 0
+  fi
+  # The remote shell returns success for both expected states. A non-zero
+  # local kubectl result therefore means transport, timeout, auth, or exec
+  # failure rather than an ordinary not-yet-committed bootstrap.
+  bootstrap_probe="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- sh -ec '
+      if test -f /var/ton-work/db/mtc_done \
+        && test -s /var/ton-work/db/config.json \
+        && test -s /var/ton-work/db/systemd-units/validator.service \
+        && test -s /var/ton-work/db/systemd-units/mytoncore.service; then
+        printf complete
+      else
+        printf pending
+      fi
+    ' 2>"$status_error_file")" || bootstrap_probe_rc=$?
+  if (( bootstrap_probe_rc != 0 )); then
+    status_error="$(captured_command_error_reason \
+      "$bootstrap_probe_rc" "$STATUS_EXEC_TIMEOUT" "$status_error_file")"
+    rm -f "$status_error_file" >/dev/null 2>&1 || true
+    printf 'status-read-error\x1f%s\x1f%s\x1f%s\x1f%s\x1fkubectl exec bootstrap probe failed (exit=%s): %s' \
+      "$node" "$restart_count" "$waiting_reason" "$last_exit" "$bootstrap_probe_rc" "$status_error"
+    return 0
+  fi
+  rm -f "$status_error_file" >/dev/null 2>&1 || true
+  bootstrap_probe="$(trim_whitespace "$bootstrap_probe")"
+  if [[ "$bootstrap_probe" == "complete" ]]; then
     printf 'complete\x1f%s\x1f%s\x1f%s\x1f%s\x1fMyTonCtrl bootstrap commit state is present' "$node" "$restart_count" "$waiting_reason" "$last_exit"
+    return 0
+  fi
+  if [[ "$bootstrap_probe" != "pending" ]]; then
+    printf 'status-read-error\x1f%s\x1f%s\x1f%s\x1f%s\x1fkubectl exec bootstrap probe returned an unexpected response' \
+      "$node" "$restart_count" "$waiting_reason" "$last_exit"
     return 0
   fi
 
@@ -12095,10 +12179,12 @@ wait_ton_initial_bootstrap_complete() {
   local tonnode_name="$2"
   local desired_replicas="$3"
   local timeout_seconds="${4:-$KUBETON_START_READY_TIMEOUT_SECONDS}"
-  local status_interval fatal_restart_count deadline now started_at ordinal pod row
+  local status_interval fatal_restart_count status_read_error_limit deadline now started_at ordinal pod row
   local state node restarts waiting_reason last_exit detail state_key complete_count fatal_count
+  local status_read_errors_for_pod
   local -A last_state=()
   local -A last_printed_at=()
+  local -A consecutive_status_read_errors=()
 
   if ! [[ "$desired_replicas" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: invalid desired TON replica count '${desired_replicas}' for bootstrap wait." >&2
@@ -12107,12 +12193,14 @@ wait_ton_initial_bootstrap_complete() {
   timeout_seconds="$(trim_whitespace "$timeout_seconds")"
   status_interval="$(trim_whitespace "${KUBETON_START_STATUS_INTERVAL_SECONDS:-60}")"
   fatal_restart_count="$(trim_whitespace "${KUBETON_START_FATAL_RESTART_COUNT:-5}")"
+  status_read_error_limit="$(trim_whitespace "${KUBETON_START_STATUS_READ_ERROR_LIMIT:-3}")"
   if ! [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: invalid KUBETON_START_READY_TIMEOUT_SECONDS '${timeout_seconds}'." >&2
     return 1
   fi
   [[ "$status_interval" =~ ^[1-9][0-9]*$ ]] || status_interval=60
   [[ "$fatal_restart_count" =~ ^[0-9]+$ ]] || fatal_restart_count=5
+  [[ "$status_read_error_limit" =~ ^[0-9]+$ ]] || status_read_error_limit=3
   started_at="$(date +%s)"
   deadline=$((started_at + timeout_seconds))
   echo "[start] Waiting for ${desired_replicas} TON replica(s) to commit initial MyTonCtrl bootstrap (timeout ${timeout_seconds}s) ..."
@@ -12145,11 +12233,24 @@ wait_ton_initial_bootstrap_complete() {
       fi
 
       if [[ "$state" == "complete" ]]; then
+        consecutive_status_read_errors["$pod"]=0
         complete_count=$((complete_count + 1))
+      elif [[ "$state" == "status-read-error" ]]; then
+        status_read_errors_for_pod=$(( ${consecutive_status_read_errors["$pod"]:-0} + 1 ))
+        consecutive_status_read_errors["$pod"]="$status_read_errors_for_pod"
+        if (( status_read_error_limit > 0 \
+          && status_read_errors_for_pod >= status_read_error_limit )); then
+          echo "Error: cannot read Pod ${ns}/${pod} after ${status_read_errors_for_pod} consecutive attempts; latest failure: ${detail:-unknown kubectl error}." >&2
+          echo "Error: aborting the bootstrap wait because Kubernetes API progress cannot be observed; the Pods and PVCs were left intact." >&2
+          return 1
+        fi
       elif [[ "$state" == "CrashLoopBackOff" ]] \
         && (( fatal_restart_count > 0 && restarts >= fatal_restart_count )) \
         && [[ -n "$last_exit" && "$last_exit" != "0" ]]; then
+        consecutive_status_read_errors["$pod"]=0
         fatal_count=$((fatal_count + 1))
+      else
+        consecutive_status_read_errors["$pod"]=0
       fi
     done
 
@@ -13773,6 +13874,172 @@ should_use_sequential_ton_start() {
   return 1
 }
 
+ton_start_reconcile_observation() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local selector tonnode_row statefulset_row pod_rows rc=0
+
+  selector="$(launch_session_selector "$tonnode_name")"
+  tonnode_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" \
+    get tonnodes.ton.ton.org "$tonnode_name" --ignore-not-found \
+    -o go-template='{{.metadata.generation}}{{"\x1f"}}{{if .status.observedGeneration}}{{.status.observedGeneration}}{{else}}0{{end}}{{"\x1f"}}{{.spec.replicas}}')" || {
+      rc=$?
+      echo "reading TonNode ${ns}/${tonnode_name} failed (exit=${rc})" >&2
+      return "$rc"
+    }
+  statefulset_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" \
+    get statefulset "$tonnode_name" --ignore-not-found \
+    -o go-template='{{.metadata.generation}}{{"\x1f"}}{{if .status.observedGeneration}}{{.status.observedGeneration}}{{else}}0{{end}}{{"\x1f"}}{{.spec.replicas}}')" || {
+      rc=$?
+      echo "reading StatefulSet ${ns}/${tonnode_name} failed (exit=${rc})" >&2
+      return "$rc"
+    }
+  pod_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pods -l "$selector" \
+    -o go-template='{{range .items}}{{.metadata.name}}{{"\x1f"}}{{.metadata.uid}}{{"\x1f"}}{{if .metadata.deletionTimestamp}}terminating{{end}}{{"\n"}}{{end}}')" || {
+      rc=$?
+      echo "listing TON Pods for ${ns}/${tonnode_name} failed (exit=${rc})" >&2
+      return "$rc"
+    }
+
+  printf 'tonnode\x1f%s\nstatefulset\x1f%s\n%s' \
+    "$tonnode_row" "$statefulset_row" "$pod_rows"
+}
+
+wait_ton_controller_reconciled_after_start() {
+  local ns="$1"
+  local tonnode_name="$2"
+  local desired_replicas="$3"
+  local timeout_seconds="${4:-$KUBETON_START_RECONCILE_TIMEOUT_SECONDS}"
+  local status_read_error_limit deadline now observation observation_error_file observation_error
+  local observation_rc read_errors=0 kind field1 field2 field3 pod_name pod_uid pod_deleting
+  local ton_generation ton_observed ton_replicas sts_generation sts_observed sts_replicas
+  local observed_pod_count ordinal last_detail="waiting for the controller to observe the TonNode generation"
+  local -A expected_pods=()
+  local -A observed_pods=()
+
+  if ! [[ "$desired_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: invalid desired TON replica count '${desired_replicas}' for controller reconciliation." >&2
+    return 1
+  fi
+  timeout_seconds="$(trim_whitespace "$timeout_seconds")"
+  status_read_error_limit="$(trim_whitespace "${KUBETON_START_STATUS_READ_ERROR_LIMIT:-3}")"
+  if [[ "$timeout_seconds" == "auto" ]]; then
+    # Controller sticky-placement repair may wait 10 minutes for old Pods to
+    # disappear and 15 minutes for each ordinal to be assigned. Add another
+    # five-minute margin without imposing a 24-hour wait on a missing object.
+    timeout_seconds=$((900 * desired_replicas + 900))
+  elif ! [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: invalid KUBETON_START_RECONCILE_TIMEOUT_SECONDS '${timeout_seconds}'." >&2
+    return 1
+  fi
+  [[ "$status_read_error_limit" =~ ^[0-9]+$ ]] || status_read_error_limit=3
+  for ordinal in $(seq 0 $((desired_replicas - 1))); do
+    expected_pods["${tonnode_name}-${ordinal}"]=1
+  done
+
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  echo "[start] Waiting for ${ns}/${tonnode_name} controller reconciliation at ${desired_replicas} replica(s) ..."
+  while :; do
+    observation_rc=0
+    if ! observation_error_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/kubeton-start-reconcile.XXXXXX")"; then
+      echo "Error: cannot create a temporary file for controller-reconciliation error capture." >&2
+      return 1
+    fi
+    observation="$(ton_start_reconcile_observation "$ns" "$tonnode_name" \
+      2>"$observation_error_file")" || observation_rc=$?
+    if (( observation_rc != 0 )); then
+      read_errors=$((read_errors + 1))
+      observation_error="$(captured_command_error_reason \
+        "$observation_rc" "$STATUS_EXEC_TIMEOUT" "$observation_error_file")"
+      rm -f "$observation_error_file" >/dev/null 2>&1 || true
+      last_detail="${observation_error}"
+      if (( status_read_error_limit > 0 && read_errors >= status_read_error_limit )); then
+        echo "Error: cannot observe TON controller reconciliation after ${read_errors} consecutive API attempts (exit=${observation_rc}): ${observation_error}." >&2
+        echo "Error: the TON objects and PVCs were left intact; inspect the launch evidence bundle and API/proxy capacity." >&2
+        return 1
+      fi
+      now="$(date +%s)"
+      if (( now >= deadline )); then
+        echo "Error: timed out after ${timeout_seconds}s waiting for TON controller reconciliation: ${last_detail}." >&2
+        echo "Error: the TON objects and PVCs were left intact; inspect the launch evidence bundle and API/proxy capacity." >&2
+        return 1
+      fi
+      sleep 2
+      continue
+    fi
+    rm -f "$observation_error_file" >/dev/null 2>&1 || true
+    read_errors=0
+    ton_generation=""
+    ton_observed=""
+    ton_replicas=""
+    sts_generation=""
+    sts_observed=""
+    sts_replicas=""
+    observed_pods=()
+
+    while IFS=$'\x1f' read -r kind field1 field2 field3; do
+      case "$kind" in
+        tonnode)
+          ton_generation="$(trim_whitespace "$field1")"
+          ton_observed="$(trim_whitespace "$field2")"
+          ton_replicas="$(trim_whitespace "$field3")"
+          ;;
+        statefulset)
+          sts_generation="$(trim_whitespace "$field1")"
+          sts_observed="$(trim_whitespace "$field2")"
+          sts_replicas="$(trim_whitespace "$field3")"
+          ;;
+        *)
+          pod_name="$(trim_whitespace "$kind")"
+          pod_uid="$(trim_whitespace "$field1")"
+          pod_deleting="$(trim_whitespace "$field2")"
+          if [[ -n "$pod_name" && -n "$pod_uid" && -z "$pod_deleting" ]]; then
+            if [[ -n "${expected_pods[$pod_name]:-}" ]]; then
+              observed_pods["$pod_name"]=1
+            fi
+          fi
+          ;;
+      esac
+    done <<<"$observation"
+    observed_pod_count="${#observed_pods[@]}"
+
+    if [[ "$ton_generation" =~ ^[1-9][0-9]*$ \
+      && "$ton_observed" =~ ^[1-9][0-9]*$ \
+      && "$ton_replicas" == "$desired_replicas" \
+      && "$ton_observed" -ge "$ton_generation" \
+      && "$sts_generation" =~ ^[1-9][0-9]*$ \
+      && "$sts_observed" =~ ^[1-9][0-9]*$ \
+      && "$sts_replicas" == "$desired_replicas" \
+      && "$sts_observed" -ge "$sts_generation" \
+      && "$observed_pod_count" == "$desired_replicas" ]]; then
+      echo "[start] ${ns}/${tonnode_name} is reconciled; all ${desired_replicas} Pod object(s) are present and non-terminating."
+      return 0
+    fi
+
+    if [[ -z "$ton_generation" ]]; then
+      last_detail="TonNode has not been observed"
+    elif [[ "$ton_replicas" != "$desired_replicas" || "$ton_observed" != "$ton_generation" ]]; then
+      last_detail="TonNode generation observed=${ton_observed:-0}/${ton_generation:-unknown}, replicas=${ton_replicas:-unknown}/${desired_replicas}"
+    elif [[ -z "$sts_generation" ]]; then
+      last_detail="StatefulSet has not been created"
+    elif [[ ! "$sts_generation" =~ ^[1-9][0-9]*$ \
+      || "$sts_replicas" != "$desired_replicas" || ! "$sts_observed" =~ ^[1-9][0-9]*$ \
+      || "$sts_observed" -lt "$sts_generation" ]]; then
+      last_detail="StatefulSet generation observed=${sts_observed:-0}/${sts_generation:-unknown}, replicas=${sts_replicas:-unknown}/${desired_replicas}"
+    else
+      last_detail="non-terminating Pod objects present=${observed_pod_count}/${desired_replicas}"
+    fi
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      echo "Error: timed out after ${timeout_seconds}s waiting for TON controller reconciliation: ${last_detail}." >&2
+      echo "Error: the TON objects and PVCs were left intact; inspect the launch evidence bundle." >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 sequential_start_ton_fleet() {
   local target_replicas="$1"
   local -a sts_rows=()
@@ -14948,6 +15215,14 @@ run_start() {
   fi
   if (( helm_rc != 0 )); then
     return "$helm_rc"
+  fi
+  if (( sequential_start == 1 )); then
+    local reconcile_ns reconcile_name
+    reconcile_ns="$(resolve_tonnode_namespace_from_values)"
+    reconcile_name="$(resolve_tonnode_name_from_values)"
+    wait_ton_controller_reconciled_after_start \
+      "$reconcile_ns" "$reconcile_name" "$desired_replicas_for_start" \
+      "$KUBETON_START_RECONCILE_TIMEOUT_SECONDS" || return 1
   fi
   if (( restore_from_stop_metadata == 1 )); then
     local restore_operator_deployment=""
