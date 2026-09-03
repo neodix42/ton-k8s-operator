@@ -984,7 +984,11 @@ test_victoria_logs_requires_ready_collector_per_selected_node() (
   kubectl() {
     local args="$*"
     if [[ "$args" == *" get daemonset collector-victoria-logs-collector "* ]]; then
-      printf '7\x1f7\x1fds-current-uid\x1f2\x1f2\x1f0'
+      if [[ "$coverage_mode" == "misscheduled" ]]; then
+        printf '7\x1f7\x1fds-current-uid\x1f2\x1f1\x1f1'
+      else
+        printf '7\x1f7\x1fds-current-uid\x1f2\x1f2\x1f0'
+      fi
       return 0
     fi
     if [[ "$args" == *" get controllerrevision "* ]]; then
@@ -996,23 +1000,24 @@ test_victoria_logs_requires_ready_collector_per_selected_node() (
       return 0
     fi
     if [[ "$args" == get\ nodes\ -l* ]]; then
-      printf '%s\n' node/node-a node/node-b
-      return 0
-    fi
-    if [[ "$args" == *"--field-selector spec.nodeName=node-a"* ]]; then
-      if [[ "$coverage_mode" == "old" ]]; then
-        printf 'oldhash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
+      if [[ "$args" == *" -o name"* ]]; then
+        printf '%s\n' node/node-a node/node-b
       else
-        printf 'currenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
+        printf '%s\n' node-a node-b
       fi
       return 0
     fi
-    if [[ "$args" == *"--field-selector spec.nodeName=node-b"* ]]; then
-      if [[ "$coverage_mode" != "missing" ]]; then
-        if [[ "$coverage_mode" == "old" ]]; then
-          printf 'oldhash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
-        else
-          printf 'currenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
+    if [[ "$args" == *" get pods "* ]]; then
+      if [[ "$coverage_mode" == "old" ]]; then
+        printf 'node-a\x1foldhash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
+        printf 'node-b\x1foldhash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
+      else
+        printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
+        if [[ "$coverage_mode" != "missing" ]]; then
+          printf 'node-b\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
+        fi
+        if [[ "$coverage_mode" == "rejected-terminating" ]]; then
+          printf 'devnet-01\x1fcurrenthash\x1fRunning\x1fterminating\x1fready\x1fDaemonSet/collector-victoria-logs-collector\x1fds-current-uid\n'
         fi
       fi
       return 0
@@ -1020,6 +1025,7 @@ test_victoria_logs_requires_ready_collector_per_selected_node() (
     return 1
   }
 
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(node-a node-b)
   victoria_logs_collector_ready_on_selected_nodes vm collector 'ton-ready=true' \
     >"$test_dir/coverage-complete.out" 2>&1
   coverage_mode=old
@@ -1027,169 +1033,27 @@ test_victoria_logs_requires_ready_collector_per_selected_node() (
       >"$test_dir/coverage-old-revision.out" 2>&1; then
     fail "collector coverage accepted Ready Pods from the previous ControllerRevision"
   fi
-  assert_contains "node-a has no Ready VictoriaLogs collector" "$test_dir/coverage-old-revision.out"
+  assert_contains "preflight-approved node node-a has no Ready VictoriaLogs collector" "$test_dir/coverage-old-revision.out"
   coverage_mode=missing
   if victoria_logs_collector_ready_on_selected_nodes vm collector 'ton-ready=true' \
       >"$test_dir/coverage-missing.out" 2>&1; then
     fail "collector coverage succeeded without a Ready collector on node-b"
   fi
-  assert_contains "node-b has no Ready VictoriaLogs collector" "$test_dir/coverage-missing.out"
-)
-
-test_clusterwide_collector_verify_requires_current_complete_rollout() (
-  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
-  export VICTORIA_LOGS_ENABLED=true
-  source "$kubeton"
-
-  local mode=complete
-  local call_log="$test_dir/clusterwide-collector-verify.calls"
-  local failed_mode desired_for_mode
-  : >"$call_log"
-
-  victoria_logs_namespace() { printf '%s' logs-ns; }
-  victoria_logs_collector_release_name() { printf '%s' collector-release; }
-  victoria_logs_collector_daemonset_name() { printf '%s' collector-ds; }
-  kubectl() {
-    local args="$*"
-    if [[ "$args" == *" get daemonset collector-ds "* && "$args" == *".metadata.uid"* ]]; then
-      case "$mode" in
-        terminating-pod|old-revision|wrong-owner) desired_for_mode=1 ;;
-        duplicate-node|misscheduled-target) desired_for_mode=2 ;;
-        *) desired_for_mode=3 ;;
-      esac
-      printf 'identity-%s\n' "$mode" >>"$call_log"
-      if [[ "$mode" == "misscheduled-target" ]]; then
-        printf '9\x1f9\x1fcollector-ds-uid\x1f2\x1f1\x1f1'
-      else
-        printf '9\x1f9\x1fcollector-ds-uid\x1f%s\x1f%s\x1f0' \
-          "$desired_for_mode" "$desired_for_mode"
-      fi
-      return 0
-    fi
-    if [[ "$args" == *" get daemonset collector-ds "* ]]; then
-      printf 'aggregate-%s\n' "$mode" >>"$call_log"
-      case "$mode" in
-        complete)          printf '9\x1f9\x1f3\x1f3\x1f3\x1f3' ;;
-        stale-generation)  printf '9\x1f8\x1f3\x1f3\x1f3\x1f3' ;;
-        stale-updated)     printf '9\x1f9\x1f3\x1f2\x1f3\x1f3' ;;
-        stale-ready)       printf '9\x1f9\x1f3\x1f3\x1f2\x1f3' ;;
-        stale-available)   printf '9\x1f9\x1f3\x1f3\x1f3\x1f2' ;;
-        terminating-pod|old-revision|wrong-owner)
-                           printf '9\x1f9\x1f1\x1f1\x1f1\x1f1' ;;
-        duplicate-node)    printf '9\x1f9\x1f2\x1f2\x1f2\x1f2' ;;
-        misscheduled-target)
-                           printf '9\x1f9\x1f2\x1f2\x1f2\x1f2' ;;
-      esac
-      return 0
-    fi
-    if [[ "$args" == *" get controllerrevision "* ]]; then
-      printf 'revision-%s\n' "$mode" >>"$call_log"
-      printf 'DaemonSet\x1fcollector-ds\x1fcollector-ds-uid\x1ftrue\x1f1\x1fcollector-ds-oldhash\n'
-      printf 'DaemonSet\x1fcollector-ds\x1fcollector-ds-uid\x1ftrue\x1f2\x1fcollector-ds-currenthash\n'
-      return 0
-    fi
-    if [[ "$args" == *" get pods "* ]]; then
-      printf 'pods-%s\n' "$mode" >>"$call_log"
-      case "$mode" in
-        complete)
-          printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          printf 'node-b\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          printf 'node-c\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          # Invalid decoys must not inflate the unique current-owner count.
-          printf 'node-z\x1foldhash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          printf 'node-y\x1fcurrenthash\x1fRunning\x1fterminating\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          ;;
-        terminating-pod)
-          printf 'node-a\x1fcurrenthash\x1fRunning\x1fterminating\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          ;;
-        duplicate-node)
-          printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          ;;
-        old-revision)
-          printf 'node-a\x1foldhash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          ;;
-        wrong-owner)
-          printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fstale-owner-uid\n'
-          ;;
-        misscheduled-target)
-          printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          printf 'node-c\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-          ;;
-      esac
-      return 0
-    fi
-    return 1
-  }
-
-  KUBETON_NODE_CHECK_TON_SELECTOR=""
-  verify_start_victoria_logs_collection_ready \
-    >"$test_dir/clusterwide-complete.out" 2>&1
-  assert_contains "Ready on every DaemonSet target (3/3)" "$test_dir/clusterwide-complete.out"
-
-  for failed_mode in stale-generation stale-updated stale-ready stale-available; do
-    mode="$failed_mode"
-    if verify_start_victoria_logs_collection_ready \
-        >"$test_dir/clusterwide-${failed_mode}.out" 2>&1; then
-      fail "cluster-wide verification accepted ${failed_mode} collector rollout status"
-    fi
-    assert_contains "refusing to create TON pods with incomplete restart-log coverage" \
-      "$test_dir/clusterwide-${failed_mode}.out"
-  done
-  for failed_mode in terminating-pod duplicate-node old-revision wrong-owner; do
-    mode="$failed_mode"
-    if verify_start_victoria_logs_collection_ready \
-        >"$test_dir/clusterwide-${failed_mode}.out" 2>&1; then
-      fail "cluster-wide verification accepted ${failed_mode} collector coverage"
-    fi
-    assert_contains "only" "$test_dir/clusterwide-${failed_mode}.out"
-    assert_contains "non-terminating Ready VictoriaLogs collector of the current revision" \
-      "$test_dir/clusterwide-${failed_mode}.out"
-  done
-  mode=misscheduled-target
-  if verify_start_victoria_logs_collection_ready \
-      >"$test_dir/clusterwide-misscheduled-target.out" 2>&1; then
-    fail "cluster-wide verification trusted valid-looking Pods on a stale/misscheduled DaemonSet target set"
+  assert_contains "preflight-approved node node-b has no Ready VictoriaLogs collector" "$test_dir/coverage-missing.out"
+  coverage_mode=misscheduled
+  if victoria_logs_collector_ready_on_selected_nodes vm collector 'ton-ready=true' \
+      >"$test_dir/coverage-misscheduled.out" 2>&1; then
+    fail "selected-node coverage accepted a collector still present on a failed/misscheduled node"
   fi
-  assert_contains "target set is not current (current=1, desired=2, misscheduled=1)" \
-    "$test_dir/clusterwide-misscheduled-target.out"
-  assert_not_contains "pods-misscheduled-target" "$call_log"
-  [[ "$(grep -c '^aggregate-' "$call_log")" == "10" ]] \
-    || fail "cluster-wide verification did not obtain exactly one aggregate DaemonSet row per check"
-  [[ "$(grep -c '^identity-' "$call_log")" == "6" ]] \
-    || fail "aggregate-stale rollouts unexpectedly proceeded to exact Pod identity checks"
-)
-
-test_unconstrained_ton_rejects_restricted_collector_before_daemonset_query() (
-  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
-  export VICTORIA_LOGS_ENABLED=true
-  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR='logs-only=true'
-  source "$kubeton"
-
-  local query_log="$test_dir/restricted-collector-unconstrained-ton.queries"
-  : >"$query_log"
-  KUBETON_NODE_CHECK_TON_SELECTOR=""
-  victoria_logs_namespace() { printf '%s' logs-ns; }
-  victoria_logs_collector_release_name() { printf '%s' collector-release; }
-  victoria_logs_collector_ready_on_selected_nodes() {
-    printf 'selected-node-probe %s\n' "$*" >>"$query_log"
-    return 0
-  }
-  kubectl() {
-    printf 'kubectl %s\n' "$*" >>"$query_log"
-    return 0
-  }
-
-  if verify_start_victoria_logs_collection_ready \
-      >"$test_dir/restricted-collector-unconstrained-ton.out" \
-      2>"$test_dir/restricted-collector-unconstrained-ton.stderr"; then
-    fail "unconstrained TON placement trusted a selector-restricted collector"
+  assert_contains "target set is not the current preflight-approved set (current=1, desired=2, approved=2, misscheduled=1)" \
+    "$test_dir/coverage-misscheduled.out"
+  coverage_mode=rejected-terminating
+  if victoria_logs_collector_ready_on_selected_nodes vm collector 'ton-ready=true' \
+      >"$test_dir/coverage-rejected-terminating.out" 2>&1; then
+    fail "collector coverage accepted a terminating Pod left on a preflight-rejected node"
   fi
-  [[ ! -s "$query_log" ]] \
-    || fail "restricted collector mismatch was not rejected before DaemonSet/node queries"
-  assert_contains \
-    "TON placement is unconstrained but VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR restricts log collection" \
-    "$test_dir/restricted-collector-unconstrained-ton.stderr"
+  assert_contains "collector Pod remains on rejected node devnet-01" \
+    "$test_dir/coverage-rejected-terminating.out"
 )
 
 test_victoria_logs_helm_durability_settings() (
@@ -1233,16 +1097,20 @@ test_victoria_logs_helm_durability_settings() (
     if [[ "$args" == *" rollout status "* ]]; then
       return 0
     fi
+    if [[ "$args" == *" get pod vlogs-server-0 "* ]]; then
+      printf 'node-a\x1fRunning\x1f\x1fready'
+      return 0
+    fi
     if [[ "$args" == *" get daemonset vlogs-collector "* && "$args" == *"metadata.generation"* ]]; then
-      printf '5\x1f5\x1fds-vlogs-uid\x1f4\x1f4\x1f0'
+      printf '5\x1f5\x1fds-vlogs-uid\x1f2\x1f2\x1f0'
       return 0
     fi
     if [[ "$args" == *" get daemonset vlogs-collector "* && "$args" == *"desiredNumberScheduled"* ]]; then
-      printf '%s' 4
+      printf '%s' 2
       return 0
     fi
     if [[ "$args" == *" get daemonset vlogs-collector "* && "$args" == *"numberReady"* ]]; then
-      printf '%s' 3
+      printf '%s' 2
       return 0
     fi
     if [[ "$args" == *" get controllerrevision "* ]]; then
@@ -1250,20 +1118,23 @@ test_victoria_logs_helm_durability_settings() (
       return 0
     fi
     if [[ "$args" == get\ nodes\ -l\ ton-ready=true* ]]; then
-      printf '%s\n' node/node-a node/node-b
+      if [[ "$args" == *" -o name"* ]]; then
+        printf '%s\n' node/node-a node/node-b
+      else
+        printf '%s\n' node-a node-b
+      fi
       return 0
     fi
-    if [[ "$args" == *" get pods "* && "$args" == *"spec.nodeName=node-a"* ]]; then
-      printf 'currenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/vlogs-collector\x1fds-vlogs-uid\n'
-      return 0
-    fi
-    if [[ "$args" == *" get pods "* && "$args" == *"spec.nodeName=node-b"* ]]; then
-      printf 'currenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/vlogs-collector\x1fds-vlogs-uid\n'
+    if [[ "$args" == *" get pods "* ]]; then
+      printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/vlogs-collector\x1fds-vlogs-uid\n'
+      printf 'node-b\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/vlogs-collector\x1fds-vlogs-uid\n'
       return 0
     fi
     return 1
   }
 
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=(node-a node-b)
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(node-a node-b)
   KUBETON_NODE_CHECK_TON_SELECTOR="ton-ready=true"
   ensure_victoria_logs_stack vm vlogs collector 9428 11d 12Gi 60 60 \
     >"$test_dir/victoria.out" 2>"$test_dir/victoria.stderr"
@@ -1280,12 +1151,268 @@ test_victoria_logs_helm_durability_settings() (
   assert_contains "extraArgs.tmpDataPath=/var/lib/kubeton-vlogs-buffer-vm-collector" "$helm_log"
   assert_contains "persistence.volume.hostPath.path=/var/lib/kubeton-vlogs-buffer-vm-collector" "$helm_log"
   assert_contains "persistence.volume.hostPath.type=DirectoryOrCreate" "$helm_log"
-  assert_contains "readiness is 3/4" "$test_dir/victoria.stderr"
-  assert_contains "Ready on every selected TON node" "$test_dir/victoria.stderr"
+  assert_contains "Ready only on the fresh preflight-approved nodes (2 node(s))" "$test_dir/victoria.stderr"
   assert_not_contains "nodeSelector" "$helm_log"
   if grep -F "upgrade --install collector " "$helm_log" | grep -Fq -- " --wait "; then
-    fail "cluster-wide VictoriaLogs collector Helm upgrade waits for unrelated nodes"
+    fail "VictoriaLogs collector Helm upgrade unexpectedly used Helm's aggregate DaemonSet wait"
   fi
+)
+
+test_victoria_logs_helm_affinity_uses_only_checked_hostnames() (
+  export VICTORIA_LOGS_STORAGE_CLASS=""
+  export VICTORIA_LOGS_NODE_SELECTOR='logs-backend=true'
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR='logs-collector=true'
+  export VICTORIA_LOGS_PIN_TO_LONGHORN_CSI=false
+  export LONGHORN_NODE_SELECTOR=""
+  source "$kubeton"
+
+  local helm_log="$test_dir/victoria-checked-hosts.helm"
+  local backend_overlays="$test_dir/victoria-checked-hosts.backend.yaml"
+  local collector_overlays="$test_dir/victoria-checked-hosts.collector.yaml"
+  local cluster_kind=baremetal
+  : >"$helm_log"
+  : >"$backend_overlays"
+  : >"$collector_overlays"
+
+  cluster_is_k3d() { [[ "$cluster_kind" == k3d ]]; }
+  ensure_namespace() { :; }
+  ensure_helm_repo() { :; }
+  victoria_logs_service_name() { printf '%s' vlogs-server; }
+  victoria_logs_collector_daemonset_name() { printf '%s' vlogs-collector; }
+  ensure_victoria_logs_access_service() { printf '%s' vlogs-access; }
+  wait_victoria_logs_collector_ready_on_selected_nodes() { :; }
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  helm() {
+    local release="" overlay_file="" previous="" arg
+    printf '%s\n' "$*" >>"$helm_log"
+    if [[ "${1:-}" == upgrade && "${2:-}" == --install ]]; then
+      release="${3:-}"
+      case "$release" in
+        vlogs) overlay_file="$backend_overlays" ;;
+        collector) overlay_file="$collector_overlays" ;;
+      esac
+      if [[ -n "$overlay_file" ]]; then
+        for arg in "$@"; do
+          if [[ "$previous" == -f ]]; then
+            printf '%s\n' '---' >>"$overlay_file"
+            sed -n '1,240p' "$arg" >>"$overlay_file"
+          fi
+          previous="$arg"
+        done
+      fi
+    fi
+  }
+  kubectl() {
+    local args="$*"
+    if [[ "$args" == "get storageclass longhorn" ]]; then
+      return 1
+    fi
+    if [[ "$args" == get\ nodes\ -l\ logs-backend=true* \
+      || "$args" == get\ nodes\ -l\ logs-collector=true* ]]; then
+      # The explicit selectors alone are intentionally wider than the fresh
+      # prerequisite result. The required hostname affinity must intersect
+      # them with the exact PASS set.
+      printf '%s\n' devnet-01 devnet-02 k3d-ton-worker
+      return 0
+    fi
+    if [[ "$args" == get\ nodes\ -l\ "${KUBETON_NODE_PREREQ_LABEL_KEY}=${KUBETON_NODE_PREREQ_LABEL_VALUE}"* ]]; then
+      if [[ "$args" == *" -o name"* ]]; then
+        [[ "$cluster_kind" == k3d ]] \
+          && printf '%s\n' node/k3d-ton-worker \
+          || printf '%s\n' node/devnet-02
+      else
+        [[ "$cluster_kind" == k3d ]] \
+          && printf '%s\n' k3d-ton-worker \
+          || printf '%s\n' devnet-02
+      fi
+      return 0
+    fi
+    if [[ "$args" == *" rollout status "* ]]; then
+      return 0
+    fi
+    if [[ "$args" == *" get pod vlogs-server-0 "* ]]; then
+      if [[ "$cluster_kind" == k3d ]]; then
+        printf 'k3d-ton-worker\x1fRunning\x1f\x1fready'
+      else
+        printf 'devnet-02\x1fRunning\x1f\x1fready'
+      fi
+      return 0
+    fi
+    if [[ "$args" == *" get daemonset vlogs-collector "* && "$args" == *"desiredNumberScheduled"* ]]; then
+      printf '%s' 1
+      return 0
+    fi
+    if [[ "$args" == *" get daemonset vlogs-collector "* && "$args" == *"numberReady"* ]]; then
+      printf '%s' 1
+      return 0
+    fi
+    return 1
+  }
+
+  # devnet-01 failed preflight; only the exact PASS hostname may appear in
+  # either workload's required scheduling affinity.
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=(devnet-02)
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+  KUBETON_NODE_CHECK_TON_SELECTOR="${KUBETON_NODE_PREREQ_LABEL_KEY}=${KUBETON_NODE_PREREQ_LABEL_VALUE}"
+  ensure_victoria_logs_stack vm vlogs collector 9428 11d 12Gi 60 60 \
+    >"$test_dir/victoria-checked-hosts.out" 2>"$test_dir/victoria-checked-hosts.stderr"
+
+  for overlay_file in "$backend_overlays" "$collector_overlays"; do
+    assert_contains 'kubernetes.io/hostname' "$overlay_file"
+    assert_contains 'operator: In' "$overlay_file"
+    assert_contains 'devnet-02' "$overlay_file"
+    assert_not_contains 'devnet-01' "$overlay_file"
+  done
+  assert_contains 'logs-backend' "$backend_overlays"
+  assert_contains 'logs-collector' "$collector_overlays"
+
+  # Local k3d is not an exemption: its collector/backend must be bound to the
+  # exact hostnames returned by the same successful resource check.
+  cluster_kind=k3d
+  : >"$backend_overlays"
+  : >"$collector_overlays"
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=(k3d-ton-worker)
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(k3d-ton-worker)
+  ensure_victoria_logs_stack vm vlogs collector 9428 11d 12Gi 60 60 \
+    >"$test_dir/victoria-checked-hosts-k3d.out" 2>"$test_dir/victoria-checked-hosts-k3d.stderr"
+  for overlay_file in "$backend_overlays" "$collector_overlays"; do
+    assert_contains 'kubernetes.io/hostname' "$overlay_file"
+    assert_contains 'k3d-ton-worker' "$overlay_file"
+    assert_not_contains 'devnet-01' "$overlay_file"
+  done
+)
+
+test_victoria_logs_refuses_unknown_checked_hostname_set_before_upgrade() (
+  export VICTORIA_LOGS_STORAGE_CLASS=""
+  export VICTORIA_LOGS_NODE_SELECTOR=""
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR=""
+  export VICTORIA_LOGS_PIN_TO_LONGHORN_CSI=false
+  export LONGHORN_NODE_SELECTOR=""
+  source "$kubeton"
+
+  local helm_log="$test_dir/victoria-empty-checked-hosts.helm"
+  : >"$helm_log"
+  cluster_is_k3d() { return 0; }
+  ensure_namespace() { :; }
+  ensure_helm_repo() { :; }
+  ensure_victoria_logs_access_service() { printf '%s' vlogs-access; }
+  wait_victoria_logs_collector_ready_on_selected_nodes() { :; }
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  helm() { printf '%s\n' "$*" >>"$helm_log"; }
+  kubectl() {
+    [[ "$*" == "get storageclass longhorn" ]] && return 1
+    return 0
+  }
+
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=()
+  KUBETON_NODE_CHECK_TON_SELECTOR="${KUBETON_NODE_PREREQ_LABEL_KEY}=${KUBETON_NODE_PREREQ_LABEL_VALUE}"
+  if ensure_victoria_logs_stack vm vlogs collector 9428 11d 12Gi 60 60 \
+      >"$test_dir/victoria-empty-checked-hosts.out" \
+      2>"$test_dir/victoria-empty-checked-hosts.stderr"; then
+    fail "VictoriaLogs accepted an empty/unknown checked-hostname set"
+  fi
+  assert_not_contains 'upgrade --install vlogs ' "$helm_log"
+  assert_not_contains 'upgrade --install collector ' "$helm_log"
+  assert_contains 'no fresh node-preflight PASS set' "$test_dir/victoria-empty-checked-hosts.stderr"
+)
+
+test_unconstrained_ton_rejects_collector_selector_that_drops_checked_node() (
+  export VICTORIA_LOGS_STORAGE_CLASS=""
+  export VICTORIA_LOGS_NODE_SELECTOR=""
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR='logs-only=true'
+  export VICTORIA_LOGS_PIN_TO_LONGHORN_CSI=false
+  export LONGHORN_NODE_SELECTOR=""
+  source "$kubeton"
+
+  local helm_log="$test_dir/restricted-collector-unconstrained-ton.helm"
+  : >"$helm_log"
+  cluster_is_k3d() { return 0; }
+  ensure_namespace() { :; }
+  ensure_helm_repo() { :; }
+  ensure_victoria_logs_access_service() { printf '%s' vlogs-access; }
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  helm() { printf '%s\n' "$*" >>"$helm_log"; }
+  kubectl() {
+    if [[ "$*" == "get storageclass longhorn" ]]; then
+      return 1
+    fi
+    if [[ "$*" == get\ nodes\ -l\ logs-only=true* ]]; then
+      printf '%s\n' node-a
+      return 0
+    fi
+    return 1
+  }
+
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=(node-a node-b)
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(node-a node-b)
+  KUBETON_NODE_CHECK_TON_SELECTOR=""
+  if ensure_victoria_logs_stack vm vlogs collector 9428 11d 12Gi 60 60 \
+      >"$test_dir/restricted-collector-unconstrained-ton.out" \
+      2>"$test_dir/restricted-collector-unconstrained-ton.stderr"; then
+    fail "unconstrained TON placement accepted a collector which omitted a checked node"
+  fi
+  assert_not_contains 'upgrade --install vlogs ' "$helm_log"
+  assert_not_contains 'upgrade --install collector ' "$helm_log"
+  assert_contains \
+    'TON placement is unconstrained, but VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR excludes part of the fresh preflight-approved set' \
+    "$test_dir/restricted-collector-unconstrained-ton.stderr"
+)
+
+test_victoria_logs_restricts_collector_before_backend_mutation() (
+  export VICTORIA_LOGS_STORAGE_CLASS=""
+  export VICTORIA_LOGS_NODE_SELECTOR=""
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR=""
+  export VICTORIA_LOGS_PIN_TO_LONGHORN_CSI=false
+  export LONGHORN_NODE_SELECTOR=""
+  source "$kubeton"
+
+  local helm_log="$test_dir/victoria-collector-before-backend.helm"
+  : >"$helm_log"
+  cluster_is_k3d() { return 0; }
+  ensure_namespace() { :; }
+  ensure_helm_repo() { :; }
+  ensure_victoria_logs_access_service() { printf '%s' vlogs-access; }
+  wait_victoria_logs_collector_ready_on_selected_nodes() { :; }
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  helm() {
+    printf '%s\n' "$*" >>"$helm_log"
+    # Model a backend failure. The already-existing collector must have been
+    # narrowed first, otherwise that failure leaves its old cluster-wide
+    # DaemonSet running on preflight-rejected nodes.
+    if [[ "${1:-}" == upgrade && "${2:-}" == --install && "${3:-}" == vlogs ]]; then
+      return 1
+    fi
+    return 0
+  }
+  kubectl() {
+    [[ "$*" == "get storageclass longhorn" ]] && return 1
+    return 0
+  }
+
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=(devnet-02)
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+  KUBETON_NODE_CHECK_TON_SELECTOR=""
+  if ensure_victoria_logs_stack vm vlogs collector 9428 11d 12Gi 60 60 \
+      >"$test_dir/victoria-collector-before-backend.out" \
+      2>"$test_dir/victoria-collector-before-backend.stderr"; then
+    fail "VictoriaLogs fixture unexpectedly accepted a failed backend upgrade"
+  fi
+  assert_contains 'upgrade --install collector ' "$helm_log"
+  assert_contains 'upgrade --install vlogs ' "$helm_log"
+  assert_order 'upgrade --install collector ' 'upgrade --install vlogs ' "$helm_log"
 )
 
 test_victoria_logs_collector_buffer_path_matches_early_and_full_install() (
@@ -1298,9 +1425,11 @@ test_victoria_logs_collector_buffer_path_matches_early_and_full_install() (
   source "$kubeton"
 
   local helm_log="$test_dir/victoria-buffer-path.helm"
+  local collector_overlays="$test_dir/victoria-buffer-path.collector-overlays.yaml"
   local expected_path=/var/lib/kubeton-vlogs-buffer-logs-ns-collector-release
   local -a observed_paths=()
   : >"$helm_log"
+  : >"$collector_overlays"
 
   require_bin() { :; }
   cluster_is_k3d() { return 0; }
@@ -1322,7 +1451,17 @@ test_victoria_logs_collector_buffer_path_matches_early_and_full_install() (
     "$@"
   }
   helm() {
+    local previous="" arg
     printf '%s\n' "$*" >>"$helm_log"
+    if [[ "${1:-}" == upgrade && "${2:-}" == --install && "${3:-}" == collector-release ]]; then
+      printf '%s\n' '--- collector-install' >>"$collector_overlays"
+      for arg in "$@"; do
+        if [[ "$previous" == -f ]]; then
+          sed -n '1,240p' "$arg" >>"$collector_overlays"
+        fi
+        previous="$arg"
+      done
+    fi
   }
   kubectl() {
     local args="$*"
@@ -1330,6 +1469,14 @@ test_victoria_logs_collector_buffer_path_matches_early_and_full_install() (
       return 1
     fi
     if [[ "$args" == *" rollout status "* ]]; then
+      return 0
+    fi
+    if [[ "$args" == *" get pod backend-statefulset-0 "* ]]; then
+      printf 'devnet-02\x1fRunning\x1f\x1fready'
+      return 0
+    fi
+    if [[ "$args" == get\ nodes\ -l\ ton-ready=true* ]]; then
+      printf '%s\n' devnet-02
       return 0
     fi
     if [[ "$args" == *" get daemonset collector-ds "* && "$args" == *"desiredNumberScheduled"* ]]; then
@@ -1343,6 +1490,8 @@ test_victoria_logs_collector_buffer_path_matches_early_and_full_install() (
     return 1
   }
 
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=(devnet-02)
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
   KUBETON_NODE_CHECK_TON_SELECTOR="ton-ready=true"
   ensure_start_victoria_logs_buffering_collector \
     >"$test_dir/victoria-buffer-early.out" 2>"$test_dir/victoria-buffer-early.stderr"
@@ -1365,6 +1514,11 @@ test_victoria_logs_collector_buffer_path_matches_early_and_full_install() (
     || fail "early and full collector hostPath mounts are not created on fresh nodes"
   [[ "$(grep -Fc 'remoteWrite[0].url=http://future-access:9428' "$helm_log")" == "2" ]] \
     || fail "early and full collector installs did not target the same future access Service"
+  [[ "$(grep -Fc -- '--- collector-install' "$collector_overlays")" == "2" ]] \
+    || fail "expected to capture both early and full collector overlays"
+  [[ "$(grep -Fc 'devnet-02' "$collector_overlays")" == "2" ]] \
+    || fail "early and full collectors were not both pinned to the exact checked hostname"
+  assert_not_contains 'devnet-01' "$collector_overlays"
 )
 
 test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
@@ -1401,6 +1555,8 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
   storage_class_is_longhorn() { return 1; }
   prepare_node_prerequisites_for_workload() {
     KUBETON_NODE_CHECK_REQUIRED_NODES=1
+    KUBETON_NODE_CHECK_COMPATIBLE_NODES=(node-a)
+    KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(node-a)
     if [[ "$mode" == "misscheduled-readiness" ]]; then
       KUBETON_NODE_CHECK_TON_SELECTOR=""
     else
@@ -1415,7 +1571,10 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
   should_use_sequential_ton_start() { return 1; }
   append_baremetal_key_overrides() { :; }
   ensure_auto_bootstrap_stack() { record_prebootstrap_event storage-bootstrap; }
-  ensure_start_victoria_logs() { record_prebootstrap_event full-logging-stack; }
+  ensure_start_victoria_logs() {
+    record_prebootstrap_event full-logging-stack
+    KUBETON_VICTORIA_LOGS_APPLIED_NODES="$(victoria_logs_eligible_nodes_csv)"
+  }
   delete_stale_ton_pvcs_before_fresh_start() { record_prebootstrap_event stale-pvc-cleanup; }
   verify_start_victoria_logs_collection_ready() { record_prebootstrap_event final-log-coverage; }
   append_helm_force_conflicts_if_supported() { :; }
@@ -1494,18 +1653,22 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
       return 0
     fi
     if [[ "$args" == get\ nodes\ -l\ ton-ready=true* ]]; then
-      printf '%s\n' node/node-a
+      if [[ "$args" == *" -o name"* ]]; then
+        printf '%s\n' node/node-a
+      else
+        printf '%s\n' node-a
+      fi
       return 0
     fi
-    if [[ "$mode" == "misscheduled-readiness" && "$args" == *" get pods "* ]]; then
-      record_prebootstrap_event misscheduled-pods-listed
-      printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-      printf 'node-c\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
-      return 0
-    fi
-    if [[ "$args" == *" get pods "* && "$args" == *"spec.nodeName=node-a"* ]]; then
-      record_prebootstrap_event collector-current-pod-ready
-      printf 'currenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
+    if [[ "$args" == *" get pods "* ]]; then
+      if [[ "$mode" == "misscheduled-readiness" ]]; then
+        record_prebootstrap_event misscheduled-pods-listed
+        printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
+        printf 'node-c\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
+      else
+        record_prebootstrap_event collector-current-pod-ready
+        printf 'node-a\x1fcurrenthash\x1fRunning\x1f\x1fready\x1fDaemonSet/collector-ds\x1fcollector-ds-uid\n'
+      fi
       return 0
     fi
     return 1
@@ -1586,12 +1749,12 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
   fi
   assert_order "collector-state-persisted" "collector-helm" "$misscheduled_failure_events"
   assert_order "collector-helm" "collector-generation-observed" "$misscheduled_failure_events"
-  assert_contains "collector-current-revision" "$misscheduled_failure_events"
+  assert_not_contains "collector-current-revision" "$misscheduled_failure_events"
   assert_not_contains "misscheduled-pods-listed" "$misscheduled_failure_events"
   assert_not_contains "storage-bootstrap" "$misscheduled_failure_events"
   assert_not_contains "full-logging-stack" "$misscheduled_failure_events"
   assert_not_contains "ton-helm" "$misscheduled_failure_events"
-  assert_contains "target set is not current (current=1, desired=2, misscheduled=1)" \
+  assert_contains "target set is not the current preflight-approved set (current=1, desired=2, approved=1, misscheduled=1)" \
     "$test_dir/prebootstrap-misscheduled-readiness.out"
 )
 
@@ -2076,6 +2239,8 @@ test_operator_cleanup_retains_namespace_containing_victoria_logs_guards() (
 )
 
 test_victoria_logs_state_mirrors_canonical_and_preserves_identity_records() (
+  export VICTORIA_LOGS_NODE_SELECTOR='logs-backend=true'
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR='logs-collector=true'
   source "$kubeton"
 
   local applied_objects="$test_dir/vlogs-state-applied-objects.tsv"
@@ -2106,6 +2271,7 @@ test_victoria_logs_state_mirrors_canonical_and_preserves_identity_records() (
   record_a="$(victoria_logs_state_record_name logs-ns backend-a collector-a)"
   record_b="$(victoria_logs_state_record_name logs-ns backend-b collector-b)"
   [[ "$record_a" != "$record_b" ]] || fail "distinct VictoriaLogs identities collided in the state ledger"
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
   write_victoria_logs_state operator-ns logs-ns backend-a collector-a access-a collector-ds-a
   write_victoria_logs_state operator-ns logs-ns backend-b collector-b access-b collector-ds-b
 
@@ -2123,6 +2289,9 @@ test_victoria_logs_state_mirrors_canonical_and_preserves_identity_records() (
   assert_contains 'releaseName: "backend-b"' "$manifests"
   assert_contains 'collectorBufferPath: "/var/lib/kubeton-vlogs-buffer-logs-ns-collector-a"' "$manifests"
   assert_contains 'collectorBufferPath: "/var/lib/kubeton-vlogs-buffer-logs-ns-collector-b"' "$manifests"
+  assert_contains 'eligibleNodes: "devnet-02"' "$manifests"
+  assert_contains 'backendNodeSelector: "logs-backend=true"' "$manifests"
+  assert_contains 'collectorNodeSelector: "logs-collector=true"' "$manifests"
   [[ "$(grep -c '^operator-ns$' "$namespaces")" == "2" \
     && "$(grep -c '^logs-ns$' "$namespaces")" == "2" ]] \
     || fail "VictoriaLogs cleanup state was not mirrored into both namespaces on every write"
@@ -2244,6 +2413,7 @@ test_victoria_logs_access_service_failure_blocks_collector() (
     return 1
   }
 
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(node-a)
   KUBETON_NODE_CHECK_TON_SELECTOR=""
   if ensure_victoria_logs_stack vm vlogs collector 9428 11d 12Gi 60 60 \
       >"$test_dir/victoria-access-failure.out" 2>"$test_dir/victoria-access-failure.stderr"; then
@@ -2300,6 +2470,7 @@ test_run_start_rechecks_log_coverage_immediately_before_helm() (
   local helm_log="$test_dir/start-final-log-gate.helm"
   local selector_file="$test_dir/start-final-log-gate-selector.yaml"
   local csi_wait_count=0
+  local logging_reconcile_count=0
   : >"$event_log"
   : >"$helm_log"
   : >"$selector_file"
@@ -2311,6 +2482,8 @@ test_run_start_rechecks_log_coverage_immediately_before_helm() (
   storage_class_is_longhorn() { return 1; }
   prepare_node_prerequisites_for_workload() {
     KUBETON_NODE_CHECK_REQUIRED_NODES=3
+    KUBETON_NODE_CHECK_COMPATIBLE_NODES=(node-a node-b node-c)
+    KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(node-a node-b node-c)
     KUBETON_NODE_CHECK_TON_SELECTOR="ton-ready=true"
     printf '%s\n' initial-node-preflight >>"$event_log"
   }
@@ -2325,13 +2498,18 @@ test_run_start_rechecks_log_coverage_immediately_before_helm() (
     printf 'csi-wait-%s\n' "$csi_wait_count" >>"$event_log"
   }
   ensure_start_victoria_logs() {
-    printf '%s\n' initial-log-coverage >>"$event_log"
+    logging_reconcile_count=$((logging_reconcile_count + 1))
+    printf 'logging-reconcile-%s eligible=%s\n' \
+      "$logging_reconcile_count" "${KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[*]:-}" >>"$event_log"
+    KUBETON_VICTORIA_LOGS_APPLIED_NODES="$(victoria_logs_eligible_nodes_csv)"
   }
   delete_stale_ton_pvcs_before_fresh_start() {
     printf '%s\n' stale-pvc-cleanup >>"$event_log"
   }
   run_node_prerequisite_check() {
     printf '%s\n' final-node-recheck >>"$event_log"
+    KUBETON_NODE_CHECK_COMPATIBLE_NODES=(node-d node-e node-f)
+    KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(node-d node-e node-f)
   }
   node_check_selector_is_all_compatible() {
     printf '%s\n' final-selector-recheck >>"$event_log"
@@ -2350,22 +2528,29 @@ test_run_start_rechecks_log_coverage_immediately_before_helm() (
   if run_start >"$test_dir/start-final-log-gate.out" 2>&1; then
     fail "run_start continued after final VictoriaLogs coverage disappeared"
   fi
-  assert_contains "initial-log-coverage" "$event_log"
-  assert_order "initial-log-coverage" "stale-pvc-cleanup" "$event_log"
+  assert_order "initial-node-preflight" "logging-reconcile-1" "$event_log"
+  assert_contains "logging-reconcile-1 eligible=node-a node-b node-c" "$event_log"
+  assert_order "logging-reconcile-1" "stale-pvc-cleanup" "$event_log"
   assert_order "stale-pvc-cleanup" "csi-wait-2" "$event_log"
   assert_order "csi-wait-2" "final-node-recheck" "$event_log"
   assert_order "final-node-recheck" "final-selector-recheck" "$event_log"
   assert_order "final-selector-recheck" "final-csi-probe" "$event_log"
-  assert_order "final-csi-probe" "final-log-coverage" "$event_log"
+  assert_order "final-csi-probe" "logging-reconcile-2" "$event_log"
+  assert_contains "logging-reconcile-2 eligible=node-d node-e node-f" "$event_log"
+  [[ "$(grep -c '^final-csi-probe$' "$event_log")" == "2" ]] \
+    || fail "run_start did not repeat the immediate CSI proof after VictoriaLogs reconciliation"
+  assert_order "logging-reconcile-2" "final-log-coverage" "$event_log"
+  [[ "$(grep -c '^logging-reconcile-' "$event_log")" == "2" ]] \
+    || fail "run_start did not reconcile VictoriaLogs before and after its final node preflight"
   [[ ! -s "$helm_log" ]] || fail "run_start invoked TON Helm after final log coverage disappeared"
   [[ ! -e "$selector_file" ]] || fail "run_start left its generated selector file after final log gate failure"
 )
 
-test_start_does_not_synthesize_collector_selector() (
+test_start_preserves_explicit_victoria_logs_selector_constraints() (
   export KUBETON_START_VICTORIA_LOGS_ENABLED=true
   export VICTORIA_LOGS_ENABLED=true
   export VICTORIA_LOGS_NODE_SELECTOR=logs-backend=true
-  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR=""
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR=logs-collector=true
   source "$kubeton"
 
   local selector_log="$test_dir/start-victoria-selectors.log"
@@ -2381,12 +2566,364 @@ test_start_does_not_synthesize_collector_selector() (
     printf 'access\tbackend\tcollector-ds\thttp://access:9428\t2\t3\n'
   }
 
-  KUBETON_NODE_CHECK_TON_SELECTOR="ton-ready=true"
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=(devnet-02)
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+  KUBETON_NODE_CHECK_TON_SELECTOR="${KUBETON_NODE_PREREQ_LABEL_KEY}=${KUBETON_NODE_PREREQ_LABEL_VALUE}"
   ensure_start_victoria_logs >"$test_dir/start-victoria.out" 2>"$test_dir/start-victoria.stderr"
-  assert_contains $'logs-backend=true\t' "$selector_log"
-  assert_not_contains "ton-ready=true" "$selector_log"
-  [[ "$(cut -f2 "$selector_log")" == "" ]] \
-    || fail "ensure_start_victoria_logs synthesized a collector selector from selected TON nodes"
+  [[ "$(cut -f1 "$selector_log")" == "logs-backend=true" ]] \
+    || fail "VictoriaLogs backend dropped or rewrote its explicit selector constraint"
+  [[ "$(cut -f2 "$selector_log")" == "logs-collector=true" ]] \
+    || fail "VictoriaLogs collector dropped or rewrote its explicit selector constraint"
+)
+
+test_standalone_victoria_metrics_install_refreshes_checked_hostnames() (
+  export VICTORIA_LOGS_ENABLED=true
+  export KUBETON_SKIP_NODE_PREREQ_CHECK=false
+  source "$kubeton"
+
+  local event_log="$test_dir/victoria-standalone-preflight.events"
+  : >"$event_log"
+
+  require_bin() { :; }
+  victoria_metrics_stack_name() { printf '%s' metrics-stack; }
+  victoria_logs_namespace() { printf '%s' logs-ns; }
+  victoria_logs_release_name() { printf '%s' backend-release; }
+  victoria_logs_collector_release_name() { printf '%s' collector-release; }
+  victoria_logs_access_service_name() { printf '%s' access-service; }
+  victoria_logs_collector_daemonset_name() { printf '%s' collector-ds; }
+  resolve_victoria_metrics_rollout_timeout_seconds() { printf '%s' 60; }
+  resolve_victoria_logs_helm_timeout_seconds() { printf '%s' 60; }
+  cleanup_victoria_logs_port_forwards() { :; }
+  ensure_victoria_metrics_operator() { printf 'v1.2.3\thttps://example.invalid/operator.yaml\n'; }
+  ensure_victoria_metrics_stack() { :; }
+  ensure_victoria_metrics_scrape_resources() {
+    local -n rows_ref="$1"
+    rows_ref=()
+  }
+  write_victoria_metrics_state() { :; }
+  write_victoria_logs_state() {
+    printf '%s\n' state-write >>"$event_log"
+  }
+  run_node_prerequisite_check_readonly() {
+    printf '%s\n' fresh-node-preflight >>"$event_log"
+    KUBETON_NODE_CHECK_COMPATIBLE_NODES=(devnet-02)
+    KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+    KUBETON_NODE_CHECK_TON_SELECTOR="${KUBETON_NODE_PREREQ_LABEL_KEY}=${KUBETON_NODE_PREREQ_LABEL_VALUE}"
+  }
+  ensure_victoria_logs_stack() {
+    printf 'logs-stack eligible=%s\n' "${KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[*]:-}" >>"$event_log"
+    # Stop the large standalone workflow after observing the placement input.
+    return 1
+  }
+
+  if run_victoria_metrics_install \
+      >"$test_dir/victoria-standalone-preflight.out" \
+      2>"$test_dir/victoria-standalone-preflight.stderr"; then
+    fail "standalone VictoriaMetrics fixture unexpectedly completed"
+  fi
+  assert_contains 'fresh-node-preflight' "$event_log"
+  assert_contains 'logs-stack eligible=devnet-02' "$event_log"
+  assert_order 'fresh-node-preflight' 'state-write' "$event_log"
+  assert_order 'state-write' 'logs-stack eligible=devnet-02' "$event_log"
+  assert_not_contains 'devnet-01' "$event_log"
+)
+
+test_failed_preflight_still_restricts_existing_collector() (
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
+  export KUBETON_SKIP_NODE_PREREQ_CHECK=false
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR=""
+  source "$kubeton"
+
+  local invocation=start
+  local helm_log="$test_dir/victoria-partial-pass.helm"
+  local start_overlay="$test_dir/victoria-partial-pass-start.yaml"
+  local standalone_overlay="$test_dir/victoria-partial-pass-standalone.yaml"
+  local overlay_file previous arg
+  : >"$helm_log"
+  : >"$start_overlay"
+  : >"$standalone_overlay"
+
+  require_bin() { :; }
+  resolve_ton_replicas_from_values_file() { printf '%s' 2; }
+  should_bootstrap_baremetal() { return 1; }
+  longhorn_manager_exists() { return 1; }
+  storage_class_is_longhorn() { return 1; }
+  prepare_node_prerequisites_for_workload() {
+    KUBETON_NODE_CHECK_COMPATIBLE_NODES=(devnet-02)
+    KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+    return 1
+  }
+  run_node_prerequisite_check_readonly() {
+    KUBETON_NODE_CHECK_COMPATIBLE_NODES=(devnet-02)
+    KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+    return 1
+  }
+  ensure_namespace() { :; }
+  ensure_helm_repo() { :; }
+  write_victoria_logs_state() { :; }
+  wait_victoria_logs_collector_ready_on_selected_nodes() { :; }
+  cleanup_victoria_logs_port_forwards() { :; }
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  kubectl() {
+    if [[ "$*" == *" get daemonset "*"victoria-logs-collector"* ]]; then
+      if [[ "$*" == *"--ignore-not-found"* ]]; then
+        printf '%s' "${VICTORIA_LOGS_COLLECTOR_RELEASE_NAME}-victoria-logs-collector"
+      fi
+      return 0
+    fi
+    return 1
+  }
+  helm() {
+    printf '%s %s\n' "$invocation" "$*" >>"$helm_log"
+    if [[ "${1:-}" == upgrade && "${2:-}" == --install \
+      && "${3:-}" == "$VICTORIA_LOGS_COLLECTOR_RELEASE_NAME" ]]; then
+      if [[ "$invocation" == start ]]; then
+        overlay_file="$start_overlay"
+      else
+        overlay_file="$standalone_overlay"
+      fi
+      previous=""
+      for arg in "$@"; do
+        if [[ "$previous" == -f ]]; then
+          sed -n '1,240p' "$arg" >>"$overlay_file"
+        fi
+        previous="$arg"
+      done
+    fi
+    return 0
+  }
+
+  if run_start >"$test_dir/victoria-partial-pass-start.out" 2>&1; then
+    fail "kubeton start accepted an insufficient partial PASS set"
+  fi
+  assert_contains "start upgrade --install ${VICTORIA_LOGS_COLLECTOR_RELEASE_NAME} " "$helm_log"
+  assert_not_contains "start upgrade --install ${VICTORIA_LOGS_RELEASE_NAME} " "$helm_log"
+  assert_not_contains "start upgrade ${RELEASE_NAME} " "$helm_log"
+  assert_contains 'kubernetes.io/hostname' "$start_overlay"
+  assert_contains 'devnet-02' "$start_overlay"
+  assert_not_contains 'devnet-01' "$start_overlay"
+
+  invocation=standalone
+  if run_victoria_metrics_install \
+      >"$test_dir/victoria-partial-pass-standalone.out" 2>&1; then
+    fail "standalone VictoriaMetrics install accepted an insufficient partial PASS set"
+  fi
+  assert_contains "standalone upgrade --install ${VICTORIA_LOGS_COLLECTOR_RELEASE_NAME} " "$helm_log"
+  assert_not_contains "standalone upgrade --install ${VICTORIA_LOGS_RELEASE_NAME} " "$helm_log"
+  assert_contains 'kubernetes.io/hostname' "$standalone_overlay"
+  assert_contains 'devnet-02' "$standalone_overlay"
+  assert_not_contains 'devnet-01' "$standalone_overlay"
+)
+
+test_completed_zero_pass_suspends_owned_victoria_logs_workloads() (
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
+  source "$kubeton"
+
+  local kubectl_log="$test_dir/victoria-zero-pass.kubectl"
+  local helm_log="$test_dir/victoria-zero-pass.helm"
+  local collector_first_pod_list="$test_dir/victoria-zero-pass.collector-first-list"
+  local backend_first_pod_list="$test_dir/victoria-zero-pass.backend-first-list"
+  : >"$kubectl_log"
+  : >"$helm_log"
+
+  victoria_logs_namespace() { printf '%s' logs-ns; }
+  victoria_logs_release_name() { printf '%s' backend-release; }
+  victoria_logs_collector_release_name() { printf '%s' collector-release; }
+  victoria_logs_collector_daemonset_name() { printf '%s' collector-ds; }
+  victoria_logs_service_name() { printf '%s' backend-sts; }
+  resolve_victoria_metrics_rollout_timeout_seconds() { printf '%s' 30; }
+  sleep() { :; }
+  helm() {
+    printf '%s\n' "$*" >>"$helm_log"
+    return 1
+  }
+  kubectl() {
+    local args="$*"
+    printf '%s\n' "$args" >>"$kubectl_log"
+
+    if [[ "$args" == *" get daemonset collector-ds --ignore-not-found "* ]]; then
+      printf 'collector-uid\x1fHelm\x1fcollector-release\x1fvictoria-logs-collector\x1fcollector-release\x1flogs-ns'
+      return 0
+    fi
+    if [[ "$args" == "get node kubeton-vlogs-suspended-collector-uid --ignore-not-found "* ]]; then
+      return 0
+    fi
+    if [[ "$args" == *" patch daemonset collector-ds --type=json "* ]]; then
+      return 0
+    fi
+    if [[ "$args" == *" get daemonset collector-ds -o go-template="* ]]; then
+      printf 'collector-uid\x1f2\x1f2\x1f0\x1f0\x1f0\x1f0\x1f0'
+      return 0
+    fi
+    if [[ "$args" == *" get statefulset backend-sts --ignore-not-found "* ]]; then
+      printf 'backend-uid\x1fHelm\x1fbackend-release\x1fvictoria-logs-single\x1fbackend-release\x1flogs-ns'
+      return 0
+    fi
+    if [[ "$args" == *" patch statefulset backend-sts --type=json "* ]]; then
+      return 0
+    fi
+    if [[ "$args" == *" get statefulset backend-sts -o go-template="* ]]; then
+      printf 'backend-uid\x1f0\x1f0\x1f0\x1f0'
+      return 0
+    fi
+    if [[ "$args" == *" get pods -o go-template="* ]]; then
+      if [[ ! -e "$backend_first_pod_list" ]] \
+        && grep -Fq 'patch statefulset backend-sts' "$kubectl_log"; then
+        : >"$backend_first_pod_list"
+        printf 'backend-pod\x1fStatefulSet\x1fbackend-sts\x1fbackend-uid\n'
+        printf 'unrelated-pod\x1fStatefulSet\x1fother-sts\x1fother-uid\n'
+      elif grep -Fq 'patch statefulset backend-sts' "$kubectl_log"; then
+        printf 'unrelated-pod\x1fStatefulSet\x1fother-sts\x1fother-uid\n'
+      elif [[ ! -e "$collector_first_pod_list" ]]; then
+        : >"$collector_first_pod_list"
+        printf 'collector-pod\x1fDaemonSet\x1fcollector-ds\x1fcollector-uid\n'
+        printf 'stale-same-name-pod\x1fDaemonSet\x1fcollector-ds\x1fstale-uid\n'
+      else
+        printf 'stale-same-name-pod\x1fDaemonSet\x1fcollector-ds\x1fstale-uid\n'
+      fi
+      return 0
+    fi
+    return 1
+  }
+
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=true
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=()
+  restrict_existing_victoria_logs_after_failed_preflight \
+    >"$test_dir/victoria-zero-pass.out" \
+    2>"$test_dir/victoria-zero-pass.stderr"
+
+  assert_contains 'patch daemonset collector-ds --type=json' "$kubectl_log"
+  assert_contains '"op":"test","path":"/metadata/uid","value":"collector-uid"' "$kubectl_log"
+  assert_contains '"path":"/spec/template/spec/affinity"' "$kubectl_log"
+  assert_contains '"key":"metadata.name"' "$kubectl_log"
+  assert_contains 'kubeton-vlogs-suspended-collector-uid' "$kubectl_log"
+  assert_contains 'patch statefulset backend-sts --type=json' "$kubectl_log"
+  assert_contains '"op":"test","path":"/metadata/uid","value":"backend-uid"' "$kubectl_log"
+  assert_contains '"path":"/spec/replicas","value":0' "$kubectl_log"
+  [[ "$(grep -c ' get pods -o go-template=' "$kubectl_log")" == 4 ]] \
+    || fail "VictoriaLogs fail-safe did not wait for every exact-owned Pod to disappear"
+  [[ ! -s "$helm_log" ]] || fail "zero-PASS fail-safe invoked Helm"
+  assert_not_contains ' delete ' "$kubectl_log"
+  assert_not_contains 'persistentvolumeclaim' "$kubectl_log"
+  assert_contains 'VictoriaLogs collector is suspended' "$test_dir/victoria-zero-pass.stderr"
+  assert_contains 'VictoriaLogs backend is quiesced' "$test_dir/victoria-zero-pass.stderr"
+)
+
+test_incomplete_empty_preflight_does_not_mutate_victoria_logs() (
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
+  source "$kubeton"
+
+  local mutation_log="$test_dir/victoria-incomplete-preflight.mutations"
+  : >"$mutation_log"
+
+  suspend_existing_owned_victoria_logs_collector() {
+    printf '%s\n' collector-suspended >>"$mutation_log"
+  }
+  quiesce_existing_owned_victoria_logs_backend() {
+    printf '%s\n' backend-quiesced >>"$mutation_log"
+  }
+
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=false
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=()
+  restrict_existing_victoria_logs_after_failed_preflight
+  [[ ! -s "$mutation_log" ]] \
+    || fail "incomplete empty preflight was treated as a conclusive zero-PASS result"
+
+  # An early read-only preflight failure must clear evidence left by an older,
+  # completed check before the fail-safe decides whether mutation is allowed.
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=true
+  resolve_ton_replicas_for_node_check() { printf '%s' 1; }
+  node_check_should_use_longhorn() { return 1; }
+  storage_class_is_longhorn() { return 1; }
+  resolve_workload_node_prerequisite_scope() { return 1; }
+  if run_node_prerequisite_check_readonly \
+      >"$test_dir/victoria-api-failed-preflight.out" \
+      2>"$test_dir/victoria-api-failed-preflight.stderr"; then
+    fail "read-only preflight fixture unexpectedly succeeded"
+  fi
+  [[ "$KUBETON_NODE_CHECK_EVALUATION_COMPLETE" == false ]] \
+    || fail "failed preflight retained a stale conclusive-evaluation marker"
+  restrict_existing_victoria_logs_after_failed_preflight
+  [[ ! -s "$mutation_log" ]] \
+    || fail "API-failed empty preflight mutated VictoriaLogs workloads"
+)
+
+test_partial_pass_collector_inventory_error_fails_safely() (
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
+  source "$kubeton"
+
+  local action_log="$test_dir/victoria-partial-inventory-error.actions"
+  : >"$action_log"
+
+  victoria_logs_namespace() { printf '%s' logs-ns; }
+  victoria_logs_release_name() { printf '%s' backend-release; }
+  victoria_logs_collector_release_name() { printf '%s' collector-release; }
+  victoria_logs_collector_daemonset_name() { printf '%s' collector-ds; }
+  ensure_start_victoria_logs_buffering_collector() {
+    printf '%s\n' collector-reconciled >>"$action_log"
+  }
+  quiesce_existing_owned_victoria_logs_backend() {
+    printf '%s\n' backend-quiesced >>"$action_log"
+  }
+  kubectl() {
+    if [[ "$*" == *" get daemonset collector-ds "* ]]; then
+      printf '%s\n' collector-inventory-error >>"$action_log"
+      return 1
+    fi
+    return 1
+  }
+
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=true
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+  if restrict_existing_victoria_logs_after_failed_preflight \
+      >"$test_dir/victoria-partial-inventory-error.out" \
+      2>"$test_dir/victoria-partial-inventory-error.stderr"; then
+    fail "collector inventory API error was treated as collector absence"
+  fi
+  assert_contains 'collector-inventory-error' "$action_log"
+  assert_not_contains 'collector-reconciled' "$action_log"
+  assert_contains 'backend-quiesced' "$action_log"
+  assert_contains 'cannot inventory VictoriaLogs collector' \
+    "$test_dir/victoria-partial-inventory-error.stderr"
+)
+
+test_partial_pass_quiesces_backend_when_collector_is_absent() (
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
+  source "$kubeton"
+
+  local action_log="$test_dir/victoria-collector-absent.actions"
+  : >"$action_log"
+
+  victoria_logs_namespace() { printf '%s' logs-ns; }
+  victoria_logs_release_name() { printf '%s' backend-release; }
+  victoria_logs_collector_release_name() { printf '%s' collector-release; }
+  victoria_logs_collector_daemonset_name() { printf '%s' collector-ds; }
+  ensure_start_victoria_logs_buffering_collector() {
+    printf '%s\n' collector-reconciled >>"$action_log"
+  }
+  quiesce_existing_owned_victoria_logs_backend() {
+    printf '%s\n' backend-quiesced >>"$action_log"
+  }
+  kubectl() {
+    if [[ "$*" == *" get daemonset collector-ds "* ]]; then
+      return 0
+    fi
+    return 1
+  }
+
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=true
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(devnet-02)
+  restrict_existing_victoria_logs_after_failed_preflight
+  assert_not_contains 'collector-reconciled' "$action_log"
+  assert_contains 'backend-quiesced' "$action_log"
 )
 
 test_launch_session_term_kills_command_tree
@@ -2409,9 +2946,11 @@ test_scheduled_pending_pod_reports_attach_failure
 test_bootstrap_wait_requires_every_replica
 test_bootstrap_wait_fails_repeated_crashloop
 test_victoria_logs_requires_ready_collector_per_selected_node
-test_clusterwide_collector_verify_requires_current_complete_rollout
-test_unconstrained_ton_rejects_restricted_collector_before_daemonset_query
 test_victoria_logs_helm_durability_settings
+test_victoria_logs_helm_affinity_uses_only_checked_hostnames
+test_victoria_logs_refuses_unknown_checked_hostname_set_before_upgrade
+test_unconstrained_ton_rejects_collector_selector_that_drops_checked_node
+test_victoria_logs_restricts_collector_before_backend_mutation
 test_victoria_logs_collector_buffer_path_matches_early_and_full_install
 test_prebootstrap_collector_is_ready_before_storage_bootstrap
 test_failed_victoria_logs_cleanup_retains_guards_and_generic_sweep_excludes_them
@@ -2427,6 +2966,12 @@ test_victoria_logs_state_mirrors_canonical_and_preserves_identity_records
 test_victoria_logs_access_network_policy_is_exact
 test_victoria_logs_access_service_failure_blocks_collector
 test_sequential_start_rechecks_log_coverage_before_each_scaleup
-test_start_does_not_synthesize_collector_selector
+test_start_preserves_explicit_victoria_logs_selector_constraints
+test_standalone_victoria_metrics_install_refreshes_checked_hostnames
+test_failed_preflight_still_restricts_existing_collector
+test_completed_zero_pass_suspends_owned_victoria_logs_workloads
+test_incomplete_empty_preflight_does_not_mutate_victoria_logs
+test_partial_pass_collector_inventory_error_fails_safely
+test_partial_pass_quiesces_backend_when_collector_is_absent
 
 echo "kubeton launch logging tests passed"

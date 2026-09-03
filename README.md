@@ -307,17 +307,38 @@ It prints state changes and one-minute heartbeats such as `FailedScheduling`,
 `complete`. Five repeated CrashLoop restarts with a non-zero exit fail the
 command early while leaving the Pods/PVCs intact for diagnosis.
 
-On a fresh infrastructure bootstrap, `start` installs the cluster-wide node
-collector before Longhorn or Vault. The collector queues those early container
-logs in a bounded, release-specific host directory under
+On a fresh infrastructure bootstrap, `start` installs the node collector before
+Longhorn or Vault. Both that collector and the VictoriaLogs backend are
+restricted to the exact node set accepted by the command's fresh deployment
+prerequisite preflight; this also applies to local k3d. A node rejected for
+disk, pressure, taint, readiness, CPU, memory, or host-port reasons is therefore
+not a VictoriaLogs target. The collector queues early container logs in a
+bounded, release-specific host directory under
 `/var/lib/kubeton-vlogs-buffer-*`; the queue flushes when the VictoriaLogs
 backend becomes available. Before the first TON Pod is created, `start` also
 installs or verifies that backend and refuses to deploy TON unless a
 non-terminating Ready collector of the current DaemonSet revision exists on
-every selected TON node. Unavailable unrelated nodes may leave the aggregate
-collector DaemonSet partially Ready, but do not block TON once the selected
-nodes are covered. Sequential local-volume staging rechecks coverage before
-each additional ordinal is created.
+every selected TON node. An upgrade also waits until collectors left on nodes
+that no longer pass the preflight have been removed; readiness on the remaining
+nodes cannot hide a stale or misscheduled collector. If TON preflight itself
+fails but an older stack already exists, `start` still narrows its collector to
+the partial PASS set and scales the exactly identified backend StatefulSet to
+zero before returning the TON failure; Helm state, PVC data, and bounded
+collector buffers are preserved. A conclusive zero-PASS result suspends the
+collector as well. An API/inventory failure that cannot prove a complete check
+does not perform this emergency mutation. The next successful reconcile restores
+the backend. Sequential local-volume staging rechecks coverage before each
+additional ordinal is created.
+
+`./kubeton victoria-metrics install` runs a fresh node prerequisite preflight
+before installing or reconciling VictoriaLogs, so running it separately cannot
+widen placement back to all cluster nodes. The base approved hostnames and
+configured selector overrides are retained with the VictoriaLogs state for
+audit and cleanup, but the effective intersections are recomputed—not trusted
+as current authority—on every reconcile.
+`VICTORIA_LOGS_NODE_SELECTOR` and
+`VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR` may only narrow the preflight-approved
+set; they never replace or widen it.
 VictoriaLogs is the durable source for container stdout/stderr across rapid
 restarts and an SSH/API interruption; the local bundle supplements it with
 control-plane Events and launch state that do not exist in container logs.
@@ -400,7 +421,9 @@ space measurement for that mount. Use a host-level disk monitor/probe as well.
 Useful overrides are `KUBETON_CHECK_MIN_CPU`,
 `KUBETON_CHECK_MIN_MEMORY`, and `KUBETON_CHECK_DISK_HEADROOM`; set
 `KUBETON_SKIP_NODE_PREREQ_CHECK=true` only when intentionally bypassing the
-gate.
+gate. Skipping the TON preflight does not authorize a cluster-wide
+VictoriaLogs deployment: `start` refuses automatic logging without a fresh
+safe set, while standalone `victoria-metrics install` runs its own fresh check.
 
 Security note:
 - bootstrap stores Vault init material in `vault/ton-vault-bootstrap`; rotate/restrict access after bootstrap.
@@ -821,10 +844,10 @@ Behavior:
 - applies/updates VictoriaMetrics operator in namespace `vm` (configurable)
 - deploys kubeton-managed VM stack resources with generated or user-provided auth credentials
 - creates/updates TonNode scrape resources so `VMAgent` starts scraping TonNode exporters
-- installs/updates VictoriaLogs backend (`victoria-logs-single`) and a stable cluster-wide collector (`victoria-logs-collector` DaemonSet) with `remoteWrite[0].url` pointed at VictoriaLogs
+- runs a fresh node prerequisite preflight, then installs/updates the VictoriaLogs backend (`victoria-logs-single`) and collector (`victoria-logs-collector` DaemonSet) only on the exact nodes that pass it, with `remoteWrite[0].url` pointed at VictoriaLogs
 - caps the collector's per-destination on-node buffer and sets explicit CPU, memory, and ephemeral-storage requests/limits
-- warns when unrelated cluster nodes leave the aggregate collector DaemonSet partially Ready; `kubeton start` strictly requires a Ready collector on every selected TON node
-- on bare-metal, pins VictoriaLogs single to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
+- waits for collectors on nodes removed from the approved set to disappear and strictly requires a Ready current-revision collector on every selected TON node
+- constrains VictoriaLogs single to the preflight-approved set and, on bare-metal, also to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
 - when using `longhorn` storageClass, also adds Longhorn CSI-based nodeAffinity fallback (from `CSINode`) so VictoriaLogs single cannot schedule to nodes without `driver.longhorn.io`
 - starts background `kubectl port-forward` to `VMAuth` and prints VMUI/targets URLs + credentials
 - exposes VictoriaLogs UI/query through VMAuth (`/select/vmui/`, `/select/logsql/query`) so the same VMAuth username/password is required
@@ -859,9 +882,12 @@ Main environment overrides:
 - `VICTORIA_LOGS_SINGLE_CHART_VERSION` (tested default `0.13.9`)
 - `VICTORIA_LOGS_COLLECTOR_CHART_VERSION` (tested default `0.3.7`)
 - `VICTORIA_LOGS_STORAGE_CLASS` (default auto; uses `longhorn` when available)
-- `VICTORIA_LOGS_NODE_SELECTOR` (default on bare-metal: `LONGHORN_NODE_SELECTOR`)
-- `VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR` (default empty, meaning cluster-wide;
-  set only when collector coverage is intentionally restricted)
+- `VICTORIA_LOGS_NODE_SELECTOR` (optional additional restriction for the
+  backend; it is intersected with the fresh preflight-approved placement and,
+  on bare-metal, the default Longhorn selector)
+- `VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR` (optional additional restriction for
+  collectors; it is intersected with the fresh preflight-approved placement
+  and can never restore rejected nodes)
 - `VICTORIA_LOGS_PIN_TO_LONGHORN_CSI` (default `true`; adds nodeAffinity to nodes exposing `driver.longhorn.io`)
 - `VICTORIA_LOGS_NETWORK_POLICY_ENABLED` (default `true`; isolates the unauthenticated backend so only the kubeton collector and VMAuth can connect; requires enforcement by the cluster CNI)
 - `VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS` (default `300`; keeps backend ingress protection and cleanup state when uninstall cannot prove that logging workloads are gone)

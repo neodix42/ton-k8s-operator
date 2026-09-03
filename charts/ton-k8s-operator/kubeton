@@ -177,6 +177,9 @@ MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-900s}"
 MAIN_WALLET_RUNTIME_TMPFS_SIZE="${MAIN_WALLET_RUNTIME_TMPFS_SIZE:-512Mi}"
 
 declare -a KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
+declare -a KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=()
+KUBETON_VICTORIA_LOGS_APPLIED_NODES=""
+KUBETON_NODE_CHECK_EVALUATION_COMPLETE=false
 declare -a KUBETON_NODE_CHECK_SCOPE_NODES=()
 declare -A KUBETON_NODE_CHECK_RESULT=()
 declare -A KUBETON_NODE_CHECK_REASON=()
@@ -2183,6 +2186,7 @@ node_check_selector_is_all_compatible() {
   fi
   while IFS= read -r node; do
     node="$(trim_whitespace "$node")"
+    node="${node#node/}"
     [[ -n "$node" ]] || continue
     [[ "${KUBETON_NODE_CHECK_RESULT[$node]:-FAIL}" == "PASS" ]] || return 1
   done <<<"$selector_rows"
@@ -2196,6 +2200,11 @@ run_node_prerequisite_check() {
   local basic_reason reason disk_bytes alloc_cpu_milli alloc_memory_bytes used_cpu used_memory free_cpu free_memory
   local target result cpu_display memory_display disk_display host_port_reason host_port_display
 
+  # Clear placement evidence before every attempt. Only the point after every
+  # node row has been evaluated marks a conclusive result, including zero PASS.
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=false
+  KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=()
   [[ "$required_nodes" =~ ^[1-9][0-9]*$ ]] || {
     echo "Error: invalid required TON node count '${required_nodes}'." >&2
     return 1
@@ -2206,7 +2215,6 @@ run_node_prerequisite_check() {
   collect_node_requested_resources || return 1
   node_check_collect_host_port_conflicts || return 1
 
-  KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
   KUBETON_NODE_CHECK_RESULT=()
   KUBETON_NODE_CHECK_REASON=()
   KUBETON_NODE_CHECK_FREE_CPU_MILLI=()
@@ -2328,6 +2336,11 @@ run_node_prerequisite_check() {
       printf '%020d\t%s\n' "${KUBETON_NODE_CHECK_FREE_DISK_BYTES[$node]:-0}" "$node"
     done | sort -r -n -k1,1 -k2,2 | awk -F'\t' 'NF >= 2 { print $2 }'
   )
+  # Keep even a partial PASS set available for fail-safe logging reconciliation.
+  # A failed TON preflight may still need to shrink an already-installed,
+  # formerly cluster-wide collector away from newly rejected nodes.
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=("${KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]}")
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=true
   echo "Compatible target nodes: ${#KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]}/${required_nodes} required."
   if (( ${#KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]} < required_nodes )); then
     echo "Error: not enough compatible nodes for ${required_nodes} TON replica(s)." >&2
@@ -2575,6 +2588,8 @@ node_check_should_use_longhorn() {
 run_node_prerequisite_check_readonly() {
   local replicas use_longhorn="false"
 
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=false
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=()
   replicas="$(resolve_ton_replicas_for_node_check || true)"
   if ! [[ "$replicas" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: cannot resolve tonNode.replicas from ${TON_VALUES_FILE}." >&2
@@ -2601,6 +2616,8 @@ prepare_node_prerequisites_for_workload() {
   local ton_selector prereq_selector
   local -a selected_nodes=()
 
+  KUBETON_NODE_CHECK_EVALUATION_COMPLETE=false
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=()
   KUBETON_NODE_CHECK_TON_SELECTOR=""
   KUBETON_LONGHORN_PLACEMENT_RECONFIGURE=0
   if is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
@@ -2635,6 +2652,7 @@ prepare_node_prerequisites_for_workload() {
 
   ton_selector="$KUBETON_NODE_CHECK_TON_VALUES_SELECTOR"
   if ! is_true "$use_longhorn" && ton_fleet_resources_exist; then
+    KUBETON_NODE_CHECK_TON_SELECTOR="$ton_selector"
     echo "[check] Existing TON resources found; preserving their current node selector and local-path placement."
     return 0
   fi
@@ -2643,6 +2661,10 @@ prepare_node_prerequisites_for_workload() {
     echo "Error: could not select ${KUBETON_NODE_CHECK_REQUIRED_NODES} compatible node(s)." >&2
     return 1
   }
+  # Fresh placement uses the selected subset, not every otherwise compatible
+  # host. Keep the early log collector and backend on precisely that bounded
+  # set as well.
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=("${selected_nodes[@]}")
   node_check_apply_managed_label selected_nodes || return 1
   prereq_selector="$(node_check_prereq_label_selector)"
 
@@ -4557,7 +4579,7 @@ write_victoria_logs_state() {
   local collector_release_name="$4"
   local service_name="$5"
   local collector_daemonset="$6"
-  local collector_buffer_path record_name target_state_ns
+  local collector_buffer_path record_name target_state_ns eligible_nodes_csv
   local -a state_namespaces=()
 
   if ! collector_buffer_path="$(victoria_logs_collector_buffer_path "$logs_namespace" "$collector_release_name")"; then
@@ -4568,6 +4590,7 @@ write_victoria_logs_state() {
     echo "Error: cannot derive a VictoriaLogs state-ledger record name." >&2
     return 1
   fi
+  eligible_nodes_csv="$(victoria_logs_eligible_nodes_csv)"
 
   state_namespaces+=("$state_ns")
   if [[ "$logs_namespace" != "$state_ns" ]]; then
@@ -4601,6 +4624,9 @@ data:
   serviceName: $(yaml_quote "$service_name")
   collectorDaemonSet: $(yaml_quote "$collector_daemonset")
   collectorBufferPath: $(yaml_quote "$collector_buffer_path")
+  eligibleNodes: $(yaml_quote "$eligible_nodes_csv")
+  backendNodeSelector: $(yaml_quote "$(trim_whitespace "${VICTORIA_LOGS_NODE_SELECTOR:-}")")
+  collectorNodeSelector: $(yaml_quote "$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")")
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -4617,6 +4643,9 @@ data:
   serviceName: $(yaml_quote "$service_name")
   collectorDaemonSet: $(yaml_quote "$collector_daemonset")
   collectorBufferPath: $(yaml_quote "$collector_buffer_path")
+  eligibleNodes: $(yaml_quote "$eligible_nodes_csv")
+  backendNodeSelector: $(yaml_quote "$(trim_whitespace "${VICTORIA_LOGS_NODE_SELECTOR:-}")")
+  collectorNodeSelector: $(yaml_quote "$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")")
 EOF
     then
       echo "Error: failed to persist VictoriaLogs state in namespace ${target_state_ns}." >&2
@@ -5450,7 +5479,9 @@ install_victoria_logs_collector_release() {
   local remote_write_url="$5"
   local helm_timeout_seconds="$6"
   local collector_node_selector="$7"
-  local collector_buffer_path vlc_selector_values_file=""
+  local require_ton_coverage="${8:-true}"
+  local collector_buffer_path vlc_selector_values_file="" vlc_affinity_values_file=""
+  local -a collector_allowed_nodes=()
   local -a vlc_cmd=()
 
   if ! collector_buffer_path="$(victoria_logs_collector_buffer_path "$ns" "$collector_release_name")"; then
@@ -5460,6 +5491,19 @@ install_victoria_logs_collector_release() {
   if [[ -n "$collector_node_selector" ]]; then
     vlc_selector_values_file="$(build_victoria_logs_collector_selector_values_file "$collector_node_selector")" || return 1
   fi
+  if ! victoria_logs_resolve_allowed_nodes "$collector_node_selector" false collector_allowed_nodes; then
+    [[ -z "$vlc_selector_values_file" ]] || rm -f "$vlc_selector_values_file" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if is_true "$require_ton_coverage" \
+    && ! victoria_logs_validate_ton_nodes_covered collector_allowed_nodes; then
+    [[ -z "$vlc_selector_values_file" ]] || rm -f "$vlc_selector_values_file" >/dev/null 2>&1 || true
+    return 1
+  fi
+  vlc_affinity_values_file="$(build_victoria_logs_collector_affinity_values_file collector_allowed_nodes)" || {
+    [[ -z "$vlc_selector_values_file" ]] || rm -f "$vlc_selector_values_file" >/dev/null 2>&1 || true
+    return 1
+  }
 
   # The release-specific host path survives collector restarts and allows an
   # early collector to queue logs before the VictoriaLogs Service exists.
@@ -5480,25 +5524,32 @@ install_victoria_logs_collector_release() {
   if [[ -n "$vlc_selector_values_file" ]]; then
     vlc_cmd+=(-f "$vlc_selector_values_file")
   fi
+  vlc_cmd+=(-f "$vlc_affinity_values_file")
   if [[ -n "$collector_chart_version" ]]; then
     vlc_cmd+=(--version "$collector_chart_version")
   fi
 
-  echo "[victoria-metrics] Installing/updating VictoriaLogs collector (${collector_release_name}); host buffer: ${collector_buffer_path}" >&2
+  echo "[victoria-metrics] Installing/updating VictoriaLogs collector (${collector_release_name}) on preflight-approved node(s): ${collector_allowed_nodes[*]}; host buffer: ${collector_buffer_path}" >&2
   if ! run_with_timeout "${helm_timeout_seconds}s" "${vlc_cmd[@]}" >/dev/null; then
     [[ -z "$vlc_selector_values_file" ]] || rm -f "$vlc_selector_values_file" >/dev/null 2>&1 || true
+    rm -f "$vlc_affinity_values_file" >/dev/null 2>&1 || true
     echo "Error: failed to install/upgrade VictoriaLogs collector release ${collector_release_name} in namespace ${ns}." >&2
     return 1
   fi
   [[ -z "$vlc_selector_values_file" ]] || rm -f "$vlc_selector_values_file" >/dev/null 2>&1 || true
+  rm -f "$vlc_affinity_values_file" >/dev/null 2>&1 || true
 }
 
 ensure_start_victoria_logs_buffering_collector() {
+  local require_ton_coverage="${1:-true}"
   local logs_ns logs_release_name collector_release_name remote_port timeout_seconds helm_timeout_seconds
   local repo_name repo_url collector_chart collector_chart_version collector_node_selector
   local access_service remote_write_url collector_daemonset
 
-  if ! is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" || ! is_true "$VICTORIA_LOGS_ENABLED"; then
+  if ! is_true "$VICTORIA_LOGS_ENABLED"; then
+    return 0
+  fi
+  if is_true "$require_ton_coverage" && ! is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED"; then
     return 0
   fi
   require_bin helm
@@ -5539,7 +5590,7 @@ ensure_start_victoria_logs_buffering_collector() {
     || ! helm repo update "$repo_name" >/dev/null \
     || ! install_victoria_logs_collector_release "$logs_ns" "$collector_release_name" \
       "$collector_chart" "$collector_chart_version" "$remote_write_url" \
-      "$helm_timeout_seconds" "$collector_node_selector"; then
+      "$helm_timeout_seconds" "$collector_node_selector" "$require_ton_coverage"; then
     echo "Error: the pre-bootstrap VictoriaLogs collector could not be installed; storage/key bootstrap was not started." >&2
     return 1
   fi
@@ -5547,9 +5598,237 @@ ensure_start_victoria_logs_buffering_collector() {
   # current, owned, non-terminating Ready collector on every DaemonSet target.
   # `kubectl rollout status` alone can briefly accept a Ready Pod which is
   # already terminating.
-  wait_victoria_logs_collector_ready_on_selected_nodes "$logs_ns" "$collector_release_name" \
-    "${KUBETON_NODE_CHECK_TON_SELECTOR:-}" "$timeout_seconds" || return 1
+  if is_true "$require_ton_coverage"; then
+    wait_victoria_logs_collector_ready_on_selected_nodes "$logs_ns" "$collector_release_name" \
+      "${KUBETON_NODE_CHECK_TON_SELECTOR:-}" "$timeout_seconds" || return 1
+  else
+    wait_victoria_logs_collector_ready_on_selected_nodes "$logs_ns" "$collector_release_name" \
+      "" "$timeout_seconds" || return 1
+  fi
   echo "[launch] Pre-bootstrap container-log buffering is active; queued logs will flush when VictoriaLogs becomes available." >&2
+}
+
+suspend_existing_owned_victoria_logs_collector() {
+  local ns="$1"
+  local release_name="$2"
+  local daemonset_name ds_row ds_uid managed_by instance app_name helm_release helm_namespace
+  local sentinel collision patch timeout_seconds deadline now status_row status_uid generation observed_generation
+  local desired_scheduled current_scheduled ready available misscheduled
+  local pod_rows pod_row pod_name owner_kind owner_name owner_uid exact_owned_pods
+
+  daemonset_name="$(victoria_logs_collector_daemonset_name "$release_name")"
+  if ! ds_row="$(kubectl -n "$ns" get daemonset "$daemonset_name" --ignore-not-found \
+      -o go-template='{{.metadata.uid}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/managed-by"}}{{end}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/instance"}}{{end}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/name"}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{index . "meta.helm.sh/release-name"}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{index . "meta.helm.sh/release-namespace"}}{{end}}' 2>/dev/null)"; then
+    echo "Warning: cannot inspect VictoriaLogs collector DaemonSet ${ns}/${daemonset_name} after the conclusive zero-PASS preflight." >&2
+    return 1
+  fi
+  [[ -n "$ds_row" ]] || return 0
+  IFS=$'\x1f' read -r ds_uid managed_by instance app_name helm_release helm_namespace <<<"$ds_row"
+  if [[ -z "$ds_uid" || "$managed_by" != "Helm" || "$instance" != "$release_name" \
+    || "$app_name" != "victoria-logs-collector" || "$helm_release" != "$release_name" \
+    || "$helm_namespace" != "$ns" ]]; then
+    echo "Warning: refusing to suspend DaemonSet ${ns}/${daemonset_name}: exact VictoriaLogs Helm ownership could not be proven." >&2
+    return 1
+  fi
+
+  sentinel="kubeton-vlogs-suspended-${ds_uid}"
+  if ! collision="$(kubectl get node "$sentinel" --ignore-not-found -o go-template='{{.metadata.name}}' 2>/dev/null)"; then
+    echo "Warning: cannot prove that the VictoriaLogs suspension node name '${sentinel}' is unused." >&2
+    return 1
+  fi
+  if [[ -n "$collision" ]]; then
+    echo "Warning: refusing to suspend VictoriaLogs collector because node ${sentinel} unexpectedly exists." >&2
+    return 1
+  fi
+  # Bind the suspension mutation to the exact DaemonSet UID proven above. An
+  # add operation replaces an existing affinity value and creates a missing
+  # one, while the leading test prevents patching a same-name replacement.
+  patch="[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"${ds_uid}\"},{\"op\":\"add\",\"path\":\"/spec/template/spec/affinity\",\"value\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchFields\":[{\"key\":\"metadata.name\",\"operator\":\"In\",\"values\":[\"${sentinel}\"]}]}]}}}}]"
+  echo "[launch] No node passed the completed TON preflight; suspending verified VictoriaLogs collector ${ns}/${daemonset_name}." >&2
+  if ! kubectl -n "$ns" patch daemonset "$daemonset_name" --type=json -p "$patch" >/dev/null; then
+    echo "Warning: failed to apply the no-node affinity to VictoriaLogs collector ${ns}/${daemonset_name}." >&2
+    return 1
+  fi
+
+  timeout_seconds="$(resolve_victoria_metrics_rollout_timeout_seconds)"
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 1 )); then
+    timeout_seconds=300
+  fi
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while :; do
+    if ! status_row="$(kubectl -n "$ns" get daemonset "$daemonset_name" \
+        -o go-template='{{.metadata.uid}}{{"\x1f"}}{{.metadata.generation}}{{"\x1f"}}{{if .status.observedGeneration}}{{.status.observedGeneration}}{{else}}0{{end}}{{"\x1f"}}{{if .status.desiredNumberScheduled}}{{.status.desiredNumberScheduled}}{{else}}0{{end}}{{"\x1f"}}{{if .status.currentNumberScheduled}}{{.status.currentNumberScheduled}}{{else}}0{{end}}{{"\x1f"}}{{if .status.numberReady}}{{.status.numberReady}}{{else}}0{{end}}{{"\x1f"}}{{if .status.numberAvailable}}{{.status.numberAvailable}}{{else}}0{{end}}{{"\x1f"}}{{if .status.numberMisscheduled}}{{.status.numberMisscheduled}}{{else}}0{{end}}' 2>/dev/null)"; then
+      echo "Warning: cannot verify VictoriaLogs collector DaemonSet ${ns}/${daemonset_name} after suspension." >&2
+      return 1
+    fi
+    IFS=$'\x1f' read -r status_uid generation observed_generation desired_scheduled current_scheduled ready available misscheduled <<<"$status_row"
+    if [[ "$status_uid" != "$ds_uid" || ! "$generation" =~ ^[0-9]+$ || ! "$observed_generation" =~ ^[0-9]+$ \
+      || ! "$desired_scheduled" =~ ^[0-9]+$ || ! "$current_scheduled" =~ ^[0-9]+$ \
+      || ! "$ready" =~ ^[0-9]+$ || ! "$available" =~ ^[0-9]+$ || ! "$misscheduled" =~ ^[0-9]+$ ]]; then
+      echo "Warning: cannot prove the suspended VictoriaLogs collector still has the expected identity and scheduling status." >&2
+      return 1
+    fi
+    if ! pod_rows="$(kubectl -n "$ns" get pods \
+        -o go-template='{{range .items}}{{.metadata.name}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}{{.kind}}{{"\x1f"}}{{.name}}{{"\x1f"}}{{.uid}}{{end}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+      echo "Warning: cannot inventory VictoriaLogs collector Pods owned by ${ns}/${daemonset_name}." >&2
+      return 1
+    fi
+    exact_owned_pods=0
+    while IFS= read -r pod_row; do
+      [[ -n "$pod_row" ]] || continue
+      IFS=$'\x1f' read -r pod_name owner_kind owner_name owner_uid <<<"$pod_row"
+      if [[ "$owner_kind" == "DaemonSet" && "$owner_name" == "$daemonset_name" && "$owner_uid" == "$ds_uid" ]]; then
+        exact_owned_pods=$((exact_owned_pods + 1))
+      fi
+    done <<<"$pod_rows"
+    if (( observed_generation >= generation && desired_scheduled == 0 && current_scheduled == 0 \
+      && ready == 0 && available == 0 && misscheduled == 0 && exact_owned_pods == 0 )); then
+      echo "[launch] VictoriaLogs collector is suspended; its Helm release and per-node host buffers were preserved." >&2
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      echo "Warning: VictoriaLogs collector ${ns}/${daemonset_name} did not fully suspend within ${timeout_seconds}s (desired=${desired_scheduled}, current=${current_scheduled}, ready=${ready}, available=${available}, misscheduled=${misscheduled}, ownedPods=${exact_owned_pods})." >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+quiesce_existing_owned_victoria_logs_backend() {
+  local ns="$1"
+  local release_name="$2"
+  local service_name sts_row sts_uid managed_by instance app_name helm_release helm_namespace
+  local timeout_seconds deadline now status_row status_uid desired_replicas status_replicas current_replicas ready_replicas
+  local pod_rows pod_row pod_name owner_kind owner_name owner_uid
+  local exact_owned_pods
+
+  service_name="$(victoria_logs_service_name "$release_name")"
+  if ! sts_row="$(kubectl -n "$ns" get statefulset "$service_name" --ignore-not-found \
+      -o go-template='{{.metadata.uid}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/managed-by"}}{{end}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/instance"}}{{end}}{{"\x1f"}}{{with .metadata.labels}}{{index . "app.kubernetes.io/name"}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{index . "meta.helm.sh/release-name"}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{index . "meta.helm.sh/release-namespace"}}{{end}}' 2>/dev/null)"; then
+    echo "Warning: cannot inspect VictoriaLogs backend StatefulSet ${ns}/${service_name} after the failed TON preflight." >&2
+    return 1
+  fi
+  if [[ -z "$sts_row" ]]; then
+    return 0
+  fi
+  IFS=$'\x1f' read -r sts_uid managed_by instance app_name helm_release helm_namespace <<<"$sts_row"
+  if [[ -z "$sts_uid" || "$managed_by" != "Helm" || "$instance" != "$release_name" \
+    || "$app_name" != "victoria-logs-single" || "$helm_release" != "$release_name" \
+    || "$helm_namespace" != "$ns" ]]; then
+    echo "Warning: refusing to scale StatefulSet ${ns}/${service_name}: exact VictoriaLogs Helm ownership could not be proven." >&2
+    return 1
+  fi
+
+  # The existing template may predate exact PASS-host affinity. Even if a
+  # current Pod happens to be on a PASS node, a restart could move it to a
+  # rejected node, so failed preflight quiesces the verified backend until the
+  # next successful Helm reconciliation applies fresh safe placement.
+  echo "[launch] TON preflight failed; scaling verified VictoriaLogs backend ${ns}/${service_name} to zero while collectors retain buffered logs." >&2
+  # Make the scale-to-zero decision atomic with the UID/ownership proof above;
+  # never mutate a same-name StatefulSet recreated between GET and PATCH.
+  if ! kubectl -n "$ns" patch statefulset "$service_name" --type=json \
+      -p "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"${sts_uid}\"},{\"op\":\"add\",\"path\":\"/spec/replicas\",\"value\":0}]" >/dev/null; then
+    echo "Warning: failed to scale VictoriaLogs backend StatefulSet ${ns}/${service_name} to zero." >&2
+    return 1
+  fi
+  timeout_seconds="$(resolve_victoria_metrics_rollout_timeout_seconds)"
+  if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 1 )); then
+    timeout_seconds=300
+  fi
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while :; do
+    if ! status_row="$(kubectl -n "$ns" get statefulset "$service_name" \
+        -o go-template='{{.metadata.uid}}{{"\x1f"}}{{.spec.replicas}}{{"\x1f"}}{{if .status.replicas}}{{.status.replicas}}{{else}}0{{end}}{{"\x1f"}}{{if .status.currentReplicas}}{{.status.currentReplicas}}{{else}}0{{end}}{{"\x1f"}}{{if .status.readyReplicas}}{{.status.readyReplicas}}{{else}}0{{end}}' 2>/dev/null)"; then
+      echo "Warning: cannot verify VictoriaLogs backend StatefulSet ${ns}/${service_name} after scaling it to zero." >&2
+      return 1
+    fi
+    IFS=$'\x1f' read -r status_uid desired_replicas status_replicas current_replicas ready_replicas <<<"$status_row"
+    if [[ "$status_uid" != "$sts_uid" || ! "$desired_replicas" =~ ^[0-9]+$ \
+      || ! "$status_replicas" =~ ^[0-9]+$ || ! "$current_replicas" =~ ^[0-9]+$ \
+      || ! "$ready_replicas" =~ ^[0-9]+$ ]]; then
+      echo "Warning: cannot prove the scaled VictoriaLogs backend still has the expected identity and replica status." >&2
+      return 1
+    fi
+    if ! pod_rows="$(kubectl -n "$ns" get pods \
+        -o go-template='{{range .items}}{{.metadata.name}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}{{.kind}}{{"\x1f"}}{{.name}}{{"\x1f"}}{{.uid}}{{end}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+      echo "Warning: cannot inventory VictoriaLogs backend Pods owned by ${ns}/${service_name}." >&2
+      return 1
+    fi
+    exact_owned_pods=0
+    while IFS= read -r pod_row; do
+      [[ -n "$pod_row" ]] || continue
+      IFS=$'\x1f' read -r pod_name owner_kind owner_name owner_uid <<<"$pod_row"
+      if [[ "$owner_kind" == "StatefulSet" && "$owner_name" == "$service_name" && "$owner_uid" == "$sts_uid" ]]; then
+        exact_owned_pods=$((exact_owned_pods + 1))
+      fi
+    done <<<"$pod_rows"
+    if (( desired_replicas == 0 && status_replicas == 0 && current_replicas == 0 \
+      && ready_replicas == 0 && exact_owned_pods == 0 )); then
+      echo "[launch] VictoriaLogs backend is quiesced; its StatefulSet, Helm release, and PVC data were preserved." >&2
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      echo "Warning: VictoriaLogs backend ${ns}/${service_name} did not fully quiesce within ${timeout_seconds}s (desired=${desired_replicas}, status=${status_replicas}, current=${current_replicas}, ready=${ready_replicas}, ownedPods=${exact_owned_pods}); its StatefulSet remains scaled to zero." >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+restrict_existing_victoria_logs_after_failed_preflight() {
+  local invocation="${1:-start}"
+  local logs_ns logs_release_name collector_release_name collector_daemonset collector_row=""
+  local failed="false"
+
+  if ! is_true "$VICTORIA_LOGS_ENABLED"; then
+    return 0
+  fi
+  if [[ "$invocation" == "start" ]] && ! is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED"; then
+    return 0
+  fi
+  if (( ${#KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]} == 0 )); then
+    # Empty evidence is destructive only when the complete node snapshot
+    # conclusively evaluated every target and found zero PASS nodes. API,
+    # parsing, or interrupted-check failures leave existing logging untouched.
+    if ! is_true "$KUBETON_NODE_CHECK_EVALUATION_COMPLETE"; then
+      return 0
+    fi
+    logs_ns="$(victoria_logs_namespace)"
+    logs_release_name="$(victoria_logs_release_name)"
+    collector_release_name="$(victoria_logs_collector_release_name)"
+    if ! suspend_existing_owned_victoria_logs_collector "$logs_ns" "$collector_release_name"; then
+      echo "Warning: failed to safely suspend the existing VictoriaLogs collector after the conclusive zero-PASS preflight; TON deployment remains blocked." >&2
+      failed="true"
+    fi
+    if ! quiesce_existing_owned_victoria_logs_backend "$logs_ns" "$logs_release_name"; then
+      echo "Warning: failed to safely quiesce the existing VictoriaLogs backend; TON deployment remains blocked." >&2
+      failed="true"
+    fi
+    [[ "$failed" != "true" ]]
+    return
+  fi
+  logs_ns="$(victoria_logs_namespace)"
+  logs_release_name="$(victoria_logs_release_name)"
+  collector_release_name="$(victoria_logs_collector_release_name)"
+  collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
+  if ! collector_row="$(kubectl -n "$logs_ns" get daemonset "$collector_daemonset" \
+      --ignore-not-found -o go-template='{{.metadata.name}}' 2>/dev/null)"; then
+    echo "Warning: cannot inventory VictoriaLogs collector ${logs_ns}/${collector_daemonset}; its placement could not be reconciled after failed preflight." >&2
+    failed="true"
+  elif [[ -n "$collector_row" ]]; then
+    echo "[launch] TON preflight failed; restricting the existing VictoriaLogs collector to the nodes which did PASS: ${KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[*]}" >&2
+    if ! ensure_start_victoria_logs_buffering_collector false; then
+      echo "Warning: failed to move the existing VictoriaLogs collector away from rejected nodes; TON deployment remains blocked." >&2
+      failed="true"
+    fi
+  fi
+  if ! quiesce_existing_owned_victoria_logs_backend "$logs_ns" "$logs_release_name"; then
+    echo "Warning: failed to safely quiesce the existing VictoriaLogs backend; TON deployment remains blocked." >&2
+    failed="true"
+  fi
+  [[ "$failed" != "true" ]]
 }
 
 ensure_victoria_logs_stack() {
@@ -5564,9 +5843,10 @@ ensure_victoria_logs_stack() {
   local repo_name repo_url single_chart collector_chart
   local single_chart_version collector_chart_version
   local logs_storage_class logs_node_selector collector_node_selector logs_pin_to_longhorn_csi
+  local logs_require_longhorn_csi="false"
   local vls_selector_values_file="" vls_affinity_values_file=""
   local matched_nodes=0
-  local -a longhorn_csi_nodes=()
+  local -a backend_allowed_nodes=() collector_allowed_nodes=()
   local service_name collector_daemonset access_service_name remote_write_url
   local ds_desired ds_ready
   local -a vls_cmd=()
@@ -5603,14 +5883,16 @@ ensure_victoria_logs_stack() {
   if [[ -z "$logs_storage_class" ]] && kubectl get storageclass longhorn >/dev/null 2>&1; then
     logs_storage_class="longhorn"
   fi
-  if [[ -n "$logs_node_selector" ]]; then
-    matched_nodes="$(kubectl get nodes -l "$logs_node_selector" --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
-    if ! [[ "$matched_nodes" =~ ^[0-9]+$ ]]; then
-      matched_nodes=0
+  if is_true "$logs_pin_to_longhorn_csi"; then
+    if [[ "$logs_storage_class" == "longhorn" ]] \
+      || { [[ -n "$logs_storage_class" ]] && storage_class_is_longhorn "$logs_storage_class"; }; then
+      logs_require_longhorn_csi="true"
     fi
   fi
-  if [[ "$logs_storage_class" == "longhorn" ]] && is_true "$logs_pin_to_longhorn_csi"; then
-    mapfile -t longhorn_csi_nodes < <(list_longhorn_csi_node_names)
+  if ! victoria_logs_resolve_allowed_nodes "$collector_node_selector" false collector_allowed_nodes \
+    || ! victoria_logs_validate_ton_nodes_covered collector_allowed_nodes; then
+    echo "Error: VictoriaLogs collector has no safe complete placement; Helm was not started." >&2
+    return 1
   fi
 
   if ! ensure_namespace "$ns"; then
@@ -5640,12 +5922,32 @@ ensure_victoria_logs_stack() {
     return 1
   fi
   remote_write_url="http://${access_service_name}:${remote_port}"
+  # Restrict the collector first. It can keep buffering while the backend is
+  # upgraded, and a backend/CSI failure must not leave the previous
+  # cluster-wide DaemonSet running on nodes rejected by the latest check.
+  if ! install_victoria_logs_collector_release "$ns" "$collector_release_name" \
+    "$collector_chart" "$collector_chart_version" "$remote_write_url" \
+    "$helm_timeout_seconds" "$collector_node_selector"; then
+    [[ -z "$vls_selector_values_file" ]] || rm -f "$vls_selector_values_file" >/dev/null 2>&1 || true
+    rm -f "$vls_affinity_values_file" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! wait_victoria_logs_collector_ready_on_selected_nodes "$ns" "$collector_release_name" \
+    "$KUBETON_NODE_CHECK_TON_SELECTOR" "$rollout_timeout_seconds"; then
+    [[ -z "$vls_selector_values_file" ]] || rm -f "$vls_selector_values_file" >/dev/null 2>&1 || true
+    rm -f "$vls_affinity_values_file" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if ! victoria_logs_resolve_allowed_nodes "$logs_node_selector" "$logs_require_longhorn_csi" backend_allowed_nodes; then
+    echo "Error: VictoriaLogs backend has no safe preflight-approved placement; its Helm release was not changed." >&2
+    return 1
+  fi
+  matched_nodes="${#backend_allowed_nodes[@]}"
   if [[ -n "$logs_node_selector" ]]; then
     vls_selector_values_file="$(build_victoria_logs_single_selector_values_file "$logs_node_selector")" || return 1
   fi
-  if [[ "${#longhorn_csi_nodes[@]}" -gt 0 ]]; then
-    vls_affinity_values_file="$(build_victoria_logs_single_affinity_values_file longhorn_csi_nodes)" || return 1
-  fi
+  vls_affinity_values_file="$(build_victoria_logs_single_affinity_values_file backend_allowed_nodes)" || return 1
   vls_cmd=(helm upgrade --install "$release_name" "$single_chart" -n "$ns" --create-namespace --wait --timeout "${helm_timeout_seconds}s" \
     --set-string "server.retentionPeriod=${retention_period}" \
     --set-string "server.persistentVolume.size=${pvc_size}" \
@@ -5656,9 +5958,7 @@ ensure_victoria_logs_stack() {
   if [[ -n "$vls_selector_values_file" ]]; then
     vls_cmd+=(-f "$vls_selector_values_file")
   fi
-  if [[ -n "$vls_affinity_values_file" ]]; then
-    vls_cmd+=(-f "$vls_affinity_values_file")
-  fi
+  vls_cmd+=(-f "$vls_affinity_values_file")
   if [[ -n "$single_chart_version" ]]; then
     vls_cmd+=(--version "$single_chart_version")
   fi
@@ -5670,10 +5970,9 @@ ensure_victoria_logs_stack() {
   if [[ -n "$logs_node_selector" ]]; then
     echo "[victoria-metrics] VictoriaLogs single nodeSelector: ${logs_node_selector} (matched ${matched_nodes} node(s))" >&2
   fi
-  if [[ "${#longhorn_csi_nodes[@]}" -gt 0 ]]; then
-    echo "[victoria-metrics] VictoriaLogs single Longhorn CSI nodeAffinity enabled for ${#longhorn_csi_nodes[@]} node(s)." >&2
-  elif [[ "$logs_storage_class" == "longhorn" ]] && is_true "$logs_pin_to_longhorn_csi"; then
-    echo "Warning: no Longhorn CSI nodes detected in CSINode objects; cannot apply VictoriaLogs CSI nodeAffinity fallback." >&2
+  echo "[victoria-metrics] VictoriaLogs single required hostname affinity: ${backend_allowed_nodes[*]}" >&2
+  if is_true "$logs_require_longhorn_csi"; then
+    echo "[victoria-metrics] VictoriaLogs single placement also requires registered, Ready Longhorn CSI." >&2
   fi
   if ! run_with_timeout "${helm_timeout_seconds}s" "${vls_cmd[@]}" >/dev/null; then
     if [[ -n "$vls_selector_values_file" ]]; then
@@ -5707,25 +6006,16 @@ ensure_victoria_logs_stack() {
     rm -f "$vls_affinity_values_file" >/dev/null 2>&1 || true
   fi
 
-  # Keep the collector cluster-wide by default. An unrelated cordoned or
-  # tainted node must not make Helm reject launch logging for healthy TON
-  # targets; selected TON nodes are verified individually below.
-  if ! install_victoria_logs_collector_release "$ns" "$collector_release_name" \
-    "$collector_chart" "$collector_chart_version" "$remote_write_url" \
-    "$helm_timeout_seconds" "$collector_node_selector"; then
+  if ! kubectl -n "$ns" rollout status "statefulset/${service_name}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
+    echo "Error: VictoriaLogs StatefulSet ${ns}/${service_name} is not Ready on an approved node." >&2
     return 1
   fi
-
-  if ! kubectl -n "$ns" rollout status "statefulset/${service_name}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
-    echo "Warning: VictoriaLogs StatefulSet ${ns}/${service_name} is not Ready yet." >&2
+  if ! victoria_logs_backend_ready_on_allowed_nodes "$ns" "$service_name" backend_allowed_nodes; then
+    return 1
   fi
-  if [[ -n "${KUBETON_NODE_CHECK_TON_SELECTOR:-}" ]]; then
-    if ! wait_victoria_logs_collector_ready_on_selected_nodes "$ns" "$collector_release_name" \
-      "$KUBETON_NODE_CHECK_TON_SELECTOR" "$rollout_timeout_seconds"; then
-      return 1
-    fi
-  elif ! kubectl -n "$ns" rollout status "daemonset/${collector_daemonset}" --timeout="${rollout_timeout_seconds}s" >/dev/null 2>&1; then
-    echo "Warning: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} is not fully Ready on every cluster node." >&2
+  if ! wait_victoria_logs_collector_ready_on_selected_nodes "$ns" "$collector_release_name" \
+    "$KUBETON_NODE_CHECK_TON_SELECTOR" "$rollout_timeout_seconds"; then
+    return 1
   fi
 
   ds_desired="$(kubectl -n "$ns" get daemonset "$collector_daemonset" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
@@ -5747,6 +6037,39 @@ ensure_victoria_logs_stack() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$access_service_name" "$service_name" "$collector_daemonset" "$remote_write_url" "$ds_ready" "$ds_desired"
 }
 
+victoria_logs_backend_ready_on_allowed_nodes() {
+  local ns="$1"
+  local service_name="$2"
+  local allowed_nodes_array_name="$3"
+  local -n allowed_nodes_ref="$allowed_nodes_array_name"
+  local pod_name="${service_name}-0"
+  local pod_row node phase terminating ready_condition allowed_node
+  local allowed="false"
+
+  if ! pod_row="$(kubectl -n "$ns" get pod "$pod_name" \
+    -o go-template='{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{if .metadata.deletionTimestamp}}terminating{{end}}{{"\x1f"}}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}ready{{end}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot inspect VictoriaLogs backend Pod ${ns}/${pod_name}." >&2
+    return 1
+  fi
+  IFS=$'\x1f' read -r node phase terminating ready_condition <<<"$pod_row"
+  node="$(trim_whitespace "$node")"
+  for allowed_node in "${allowed_nodes_ref[@]}"; do
+    if [[ "$node" == "$allowed_node" ]]; then
+      allowed="true"
+      break
+    fi
+  done
+  if [[ "$allowed" != "true" ]]; then
+    echo "Error: VictoriaLogs backend Pod ${ns}/${pod_name} is on '${node:-no node}', outside the fresh preflight-approved nodes (${allowed_nodes_ref[*]})." >&2
+    return 1
+  fi
+  if [[ "$phase" != "Running" || -n "$terminating" || "$ready_condition" != "ready" ]]; then
+    echo "Error: VictoriaLogs backend Pod ${ns}/${pod_name} on ${node} is not non-terminating and Ready." >&2
+    return 1
+  fi
+  echo "[victoria-metrics] VictoriaLogs backend is Ready on approved node ${node}." >&2
+}
+
 victoria_logs_collector_ready_on_selected_nodes() {
   local ns="$1"
   local collector_release_name="$2"
@@ -5755,12 +6078,19 @@ victoria_logs_collector_ready_on_selected_nodes() {
   local revision_rows revision_row revision_kind revision_owner revision_owner_uid revision_controller revision_number revision_name
   local newest_revision=-1
   local selected_node_rows pod_rows pod_row pod_node pod_revision pod_phase terminating ready_condition owner owner_uid
-  local ready_node_count=0
-  local -a selected_nodes=()
+  local -a selected_nodes=() allowed_nodes=()
+  local -A allowed_by_node=()
   local -A ready_by_node=()
   local node
 
   node_selector="$(trim_whitespace "$node_selector")"
+  if ! victoria_logs_resolve_allowed_nodes \
+      "$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")" false allowed_nodes; then
+    return 1
+  fi
+  for node in "${allowed_nodes[@]}"; do
+    allowed_by_node["$node"]=1
+  done
   collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
   if ! ds_row="$(kubectl -n "$ns" get daemonset "$collector_daemonset" \
     -o go-template='{{.metadata.generation}}{{"\x1f"}}{{.status.observedGeneration}}{{"\x1f"}}{{.metadata.uid}}{{"\x1f"}}{{.status.desiredNumberScheduled}}{{"\x1f"}}{{.status.currentNumberScheduled}}{{"\x1f"}}{{.status.numberMisscheduled}}' 2>/dev/null)"; then
@@ -5777,6 +6107,15 @@ victoria_logs_collector_ready_on_selected_nodes() {
   if ! [[ "$generation" =~ ^[1-9][0-9]*$ && "$observed_generation" == "$generation" ]] \
     || [[ -z "$daemonset_uid" ]]; then
     echo "Error: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} has not observed its current generation." >&2
+    return 1
+  fi
+  if ! [[ "$desired_scheduled" =~ ^[1-9][0-9]*$ \
+    && "$current_scheduled" =~ ^[0-9]+$ \
+    && "$misscheduled" =~ ^[0-9]+$ ]] \
+    || (( desired_scheduled != ${#allowed_nodes[@]} \
+      || current_scheduled != desired_scheduled \
+      || misscheduled != 0 )); then
+    echo "Error: VictoriaLogs collector target set is not the current preflight-approved set (current=${current_scheduled:-unknown}, desired=${desired_scheduled:-unknown}, approved=${#allowed_nodes[@]}, misscheduled=${misscheduled:-unknown})." >&2
     return 1
   fi
   # DaemonSetStatus has no updateRevision field. Resolve the newest
@@ -5807,90 +6146,61 @@ victoria_logs_collector_ready_on_selected_nodes() {
   fi
   update_revision="${update_revision#"${collector_daemonset}-"}"
 
-  # With no TON selector, placement is unconstrained. Aggregate DaemonSet
-  # status alone can still count a Ready Pod after deletionTimestamp is set,
-  # so prove that the current revision has one non-terminating Ready Pod on
-  # every desired DaemonSet node. Count unique node names to reject duplicate
-  # Pods on one host masking a missing collector elsewhere.
-  if [[ -z "$node_selector" ]]; then
-    if ! [[ "$desired_scheduled" =~ ^[1-9][0-9]*$ \
-      && "$current_scheduled" =~ ^[0-9]+$ \
-      && "$misscheduled" =~ ^[0-9]+$ ]] \
-      || (( current_scheduled != desired_scheduled || misscheduled != 0 )); then
-      echo "Error: VictoriaLogs collector DaemonSet ${ns}/${collector_daemonset} target set is not current (current=${current_scheduled:-unknown}, desired=${desired_scheduled:-unknown}, misscheduled=${misscheduled:-unknown})." >&2
-      return 1
-    fi
-    if ! pod_rows="$(kubectl -n "$ns" get pods \
-      -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" \
-      -o go-template='{{range .items}}{{.spec.nodeName}}{{"\x1f"}}{{with .metadata.labels}}{{index . "controller-revision-hash"}}{{end}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{if .metadata.deletionTimestamp}}terminating{{end}}{{"\x1f"}}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}ready{{end}}{{end}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}{{.kind}}{{"/"}}{{.name}}{{"\x1f"}}{{.uid}}{{end}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
-      echo "Error: cannot list VictoriaLogs collector Pods for ${ns}/${collector_daemonset}." >&2
-      return 1
-    fi
-    ready_by_node=()
-    while IFS= read -r pod_row; do
-      IFS=$'\x1f' read -r pod_node pod_revision pod_phase terminating ready_condition owner owner_uid <<<"$pod_row"
-      pod_node="$(trim_whitespace "$pod_node")"
-      if [[ -n "$pod_node" \
-        && "$pod_revision" == "$update_revision" \
-        && "$pod_phase" == "Running" \
-        && -z "$terminating" \
-        && "$ready_condition" == "ready" \
-        && "$owner" == "DaemonSet/${collector_daemonset}" \
-        && "$owner_uid" == "$daemonset_uid" ]]; then
-        ready_by_node["$pod_node"]=1
-      fi
-    done <<<"$pod_rows"
-    for node in "${!ready_by_node[@]}"; do
-      ready_node_count=$((ready_node_count + 1))
-    done
-    if (( ready_node_count != desired_scheduled )); then
-      echo "Error: TON placement is unconstrained and only ${ready_node_count}/${desired_scheduled} DaemonSet target node(s) have a non-terminating Ready VictoriaLogs collector of the current revision." >&2
-      return 1
-    fi
-    echo "[launch] VictoriaLogs collector is Ready on every DaemonSet target (${ready_node_count}/${desired_scheduled})." >&2
-    return 0
-  fi
-
-  if ! selected_node_rows="$(kubectl get nodes -l "$node_selector" -o name 2>/dev/null)"; then
-    echo "Error: cannot list nodes selected for TON while verifying VictoriaLogs coverage." >&2
+  # Inspect all exact-owner Pods in one snapshot. A Ready Pod on every wanted
+  # host is not sufficient if an old or misscheduled collector still runs on
+  # a node which the latest preflight rejected.
+  if ! pod_rows="$(kubectl -n "$ns" get pods \
+    -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" \
+    -o go-template='{{range .items}}{{.spec.nodeName}}{{"\x1f"}}{{with .metadata.labels}}{{index . "controller-revision-hash"}}{{end}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{if .metadata.deletionTimestamp}}terminating{{end}}{{"\x1f"}}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}ready{{end}}{{end}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}{{.kind}}{{"/"}}{{.name}}{{"\x1f"}}{{.uid}}{{end}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot list VictoriaLogs collector Pods for ${ns}/${collector_daemonset}." >&2
     return 1
   fi
-  mapfile -t selected_nodes < <(printf '%s\n' "$selected_node_rows" | sed 's#^node/##' | awk 'NF' | sort -u)
-  if (( ${#selected_nodes[@]} == 0 )); then
-    echo "Error: TON selector '${node_selector}' matches no nodes while verifying VictoriaLogs coverage." >&2
-    return 1
-  fi
-  # Use a direct per-node field selector for the authoritative coverage check
-  # instead of trusting aggregate DaemonSet counts. Require the current
-  # controller revision so an old Ready pod cannot satisfy a just-upgraded
-  # collector configuration.
   ready_by_node=()
-  for node in "${selected_nodes[@]}"; do
-    if pod_rows="$(kubectl -n "$ns" get pods \
-      -l "app.kubernetes.io/name=victoria-logs-collector,app.kubernetes.io/instance=${collector_release_name}" \
-      --field-selector "spec.nodeName=${node}" \
-      -o go-template='{{range .items}}{{with .metadata.labels}}{{index . "controller-revision-hash"}}{{end}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{if .metadata.deletionTimestamp}}terminating{{end}}{{"\x1f"}}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}ready{{end}}{{end}}{{"\x1f"}}{{range .metadata.ownerReferences}}{{if .controller}}{{.kind}}{{"/"}}{{.name}}{{"\x1f"}}{{.uid}}{{end}}{{end}}{{"\n"}}{{end}}' 2>/dev/null)"; then
-      while IFS= read -r pod_row; do
-        IFS=$'\x1f' read -r pod_revision pod_phase terminating ready_condition owner owner_uid <<<"$pod_row"
-        if [[ "$pod_revision" == "$update_revision" \
-          && "$pod_phase" == "Running" \
-          && -z "$terminating" \
-          && "$ready_condition" == "ready" \
-          && "$owner" == "DaemonSet/${collector_daemonset}" \
-          && "$owner_uid" == "$daemonset_uid" ]]; then
-          ready_by_node["$node"]=1
-          break
-        fi
-      done <<<"$pod_rows"
+  while IFS= read -r pod_row; do
+    IFS=$'\x1f' read -r pod_node pod_revision pod_phase terminating ready_condition owner owner_uid <<<"$pod_row"
+    pod_node="$(trim_whitespace "$pod_node")"
+    if [[ "$owner" != "DaemonSet/${collector_daemonset}" || "$owner_uid" != "$daemonset_uid" ]]; then
+      continue
     fi
-  done
-  for node in "${selected_nodes[@]}"; do
+    if [[ -n "$pod_node" && -z "${allowed_by_node[$pod_node]:-}" ]]; then
+      echo "Error: VictoriaLogs collector Pod remains on rejected node ${pod_node}; waiting for the restricted DaemonSet rollout to remove it." >&2
+      return 1
+    fi
+    if [[ -n "$pod_node" \
+      && "$pod_revision" == "$update_revision" \
+      && "$pod_phase" == "Running" \
+      && -z "$terminating" \
+      && "$ready_condition" == "ready" ]]; then
+      ready_by_node["$pod_node"]=1
+    fi
+  done <<<"$pod_rows"
+  for node in "${allowed_nodes[@]}"; do
     if [[ -z "${ready_by_node[$node]:-}" ]]; then
-      echo "Error: selected TON node ${node} has no Ready VictoriaLogs collector; refusing to create TON pods with incomplete restart-log coverage." >&2
+      echo "Error: preflight-approved node ${node} has no Ready VictoriaLogs collector of the current revision." >&2
       return 1
     fi
   done
-  echo "[launch] VictoriaLogs collector is Ready on every selected TON node (${#selected_nodes[@]} node(s))." >&2
+
+  # If TON has an independently rendered selector, prove that it cannot name a
+  # host outside the collector's exact approved set.
+  if [[ -n "$node_selector" ]]; then
+    if ! selected_node_rows="$(kubectl get nodes -l "$node_selector" -o name 2>/dev/null)"; then
+      echo "Error: cannot list nodes selected for TON while verifying VictoriaLogs coverage." >&2
+      return 1
+    fi
+    mapfile -t selected_nodes < <(printf '%s\n' "$selected_node_rows" | sed 's#^node/##' | awk 'NF' | sort -u)
+    if (( ${#selected_nodes[@]} == 0 )); then
+      echo "Error: TON selector '${node_selector}' matches no nodes while verifying VictoriaLogs coverage." >&2
+      return 1
+    fi
+    for node in "${selected_nodes[@]}"; do
+      if [[ -z "${allowed_by_node[$node]:-}" ]]; then
+        echo "Error: selected TON node ${node} is outside the VictoriaLogs preflight-approved placement." >&2
+        return 1
+      fi
+    done
+  fi
+  echo "[launch] VictoriaLogs collector is Ready only on the fresh preflight-approved nodes (${#allowed_nodes[@]} node(s))." >&2
 }
 
 wait_victoria_logs_collector_ready_on_selected_nodes() {
@@ -5969,58 +6279,31 @@ ensure_start_victoria_logs() {
     echo "Error: durable launch logging is running, but its cleanup/access state could not be persisted; TON deployment was not applied." >&2
     return 1
   fi
+  KUBETON_VICTORIA_LOGS_APPLIED_NODES="$(victoria_logs_eligible_nodes_csv)"
   echo "[launch] Durable container-log collection is active (${logs_ns}/${collector_daemonset}, ${ds_ready}/${ds_desired} Ready)." >&2
 }
 
 verify_start_victoria_logs_collection_ready() {
-  local logs_ns collector_release_name collector_daemonset ds_row
-  local generation observed_generation desired updated ready available
+  local logs_ns logs_release_name collector_release_name backend_service
+  local -a current_approved_nodes=()
 
   if ! is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" || ! is_true "$VICTORIA_LOGS_ENABLED"; then
     return 0
   fi
   logs_ns="$(victoria_logs_namespace)"
+  logs_release_name="$(victoria_logs_release_name)"
   collector_release_name="$(victoria_logs_collector_release_name)"
-  if [[ -n "${KUBETON_NODE_CHECK_TON_SELECTOR:-}" ]]; then
-    victoria_logs_collector_ready_on_selected_nodes \
-      "$logs_ns" "$collector_release_name" "$KUBETON_NODE_CHECK_TON_SELECTOR"
-    return $?
-  fi
-
-  if [[ -n "$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")" ]]; then
-    echo "Error: TON placement is unconstrained but VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR restricts log collection; kubeton cannot prove that every possible TON node is covered." >&2
-    echo "Error: remove the collector selector for cluster-wide coverage, provide a verified TON selector, or explicitly disable automatic VictoriaLogs launch capture." >&2
+  current_approved_nodes=("${KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]}")
+  if (( ${#current_approved_nodes[@]} == 0 )); then
+    echo "Error: the final VictoriaLogs readiness probe has no fresh preflight-approved node set." >&2
     return 1
   fi
-
-  # An explicitly skipped preflight or an existing fleet whose placement is
-  # intentionally preserved can leave TON placement unconstrained. In that
-  # case there is no smaller safe coverage set, so require every DaemonSet
-  # target to run the observed/current rollout and be Ready immediately before
-  # creating TON Pods.
-  collector_daemonset="$(victoria_logs_collector_daemonset_name "$collector_release_name")"
-  ds_row="$(kubectl -n "$logs_ns" get daemonset "$collector_daemonset" \
-    -o go-template='{{.metadata.generation}}{{"\x1f"}}{{.status.observedGeneration}}{{"\x1f"}}{{.status.desiredNumberScheduled}}{{"\x1f"}}{{.status.updatedNumberScheduled}}{{"\x1f"}}{{.status.numberReady}}{{"\x1f"}}{{.status.numberAvailable}}' 2>/dev/null || true)"
-  IFS=$'\x1f' read -r generation observed_generation desired updated ready available <<<"$ds_row"
-  generation="$(trim_whitespace "$generation")"
-  observed_generation="$(trim_whitespace "$observed_generation")"
-  desired="$(trim_whitespace "$desired")"
-  updated="$(trim_whitespace "$updated")"
-  ready="$(trim_whitespace "$ready")"
-  available="$(trim_whitespace "$available")"
-  if ! [[ "$generation" =~ ^[1-9][0-9]*$ \
-    && "$observed_generation" == "$generation" \
-    && "$desired" =~ ^[1-9][0-9]*$ \
-    && "$updated" =~ ^[0-9]+$ \
-    && "$ready" =~ ^[0-9]+$ \
-    && "$available" =~ ^[0-9]+$ ]] \
-    || (( updated != desired || ready != desired || available != desired )); then
-    echo "Error: TON placement is unconstrained and VictoriaLogs collector rollout is observed=${observed_generation:-unknown}/${generation:-unknown}, updated=${updated:-unknown}, ready=${ready:-unknown}, available=${available:-unknown}, desired=${desired:-unknown}; refusing to create TON pods with incomplete restart-log coverage." >&2
+  backend_service="$(victoria_logs_service_name "$logs_release_name")"
+  if ! victoria_logs_backend_ready_on_allowed_nodes "$logs_ns" "$backend_service" current_approved_nodes; then
     return 1
   fi
-  # DaemonSet status may transiently count a terminating Ready Pod. Resolve
-  # the current ControllerRevision and exact owning Pods as a final guard.
-  victoria_logs_collector_ready_on_selected_nodes "$logs_ns" "$collector_release_name" ""
+  victoria_logs_collector_ready_on_selected_nodes \
+    "$logs_ns" "$collector_release_name" "${KUBETON_NODE_CHECK_TON_SELECTOR:-}"
 }
 
 victoria_logs_port_forward_address() {
@@ -6412,6 +6695,146 @@ build_vault_csi_affinity_values_file() {
   printf '%s' "$values_file"
 }
 
+victoria_logs_eligible_nodes_csv() {
+  local node output=""
+  local -a nodes=()
+
+  for node in "${KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]}"; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] || continue
+    nodes+=("$node")
+  done
+  (( ${#nodes[@]} > 0 )) || return 0
+
+  # Treat placement as a set. Free-space ordering can legitimately change
+  # between consecutive preflight checks even when the approved hostnames do
+  # not; a stable sort avoids an unnecessary reconciliation or false failure.
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    output="${output}${output:+,}${node}"
+  done < <(printf '%s\n' "${nodes[@]}" | LC_ALL=C sort -u)
+  printf '%s' "$output"
+}
+
+victoria_logs_resolve_allowed_nodes() {
+  local node_selector="$1"
+  local require_longhorn_csi="$2"
+  local output_array_name="$3"
+  local -n output_nodes_ref="$output_array_name"
+  local selector_rows="" csi_rows="" plugin_rows="" node
+  local -A selector_nodes=()
+  local -A csi_nodes=()
+  local -A plugin_nodes=()
+  local -a resolved_nodes=()
+
+  output_nodes_ref=()
+  node_selector="$(trim_whitespace "$node_selector")"
+  if (( ${#KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]} == 0 )); then
+    echo "Error: VictoriaLogs has no fresh node-preflight PASS set; refusing an unconstrained deployment." >&2
+    echo "Error: rerun without KUBETON_SKIP_NODE_PREREQ_CHECK, or explicitly disable VictoriaLogs launch capture." >&2
+    return 1
+  fi
+
+  if [[ -n "$node_selector" ]]; then
+    if ! selector_rows="$(node_check_list_selector_nodes "$node_selector")"; then
+      echo "Error: cannot resolve VictoriaLogs node selector '${node_selector}'." >&2
+      return 1
+    fi
+    while IFS= read -r node; do
+      node="$(trim_whitespace "$node")"
+      [[ -n "$node" ]] && selector_nodes["$node"]=1
+    done <<<"$selector_rows"
+  fi
+
+  if is_true "$require_longhorn_csi"; then
+    if ! csi_rows="$(list_longhorn_csi_node_names_checked)"; then
+      echo "Error: cannot read CSINode registrations while constraining the VictoriaLogs backend." >&2
+      return 1
+    fi
+    if ! plugin_rows="$(list_ready_longhorn_csi_plugin_node_names_checked)"; then
+      echo "Error: cannot read Ready Longhorn CSI node-plugin Pods while constraining the VictoriaLogs backend." >&2
+      return 1
+    fi
+    while IFS= read -r node; do
+      node="$(trim_whitespace "$node")"
+      [[ -n "$node" ]] && csi_nodes["$node"]=1
+    done <<<"$csi_rows"
+    while IFS= read -r node; do
+      node="$(trim_whitespace "$node")"
+      [[ -n "$node" ]] && plugin_nodes["$node"]=1
+    done <<<"$plugin_rows"
+  fi
+
+  for node in "${KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]}"; do
+    node="$(trim_whitespace "$node")"
+    [[ -n "$node" ]] || continue
+    if [[ -n "$node_selector" && -z "${selector_nodes[$node]:-}" ]]; then
+      continue
+    fi
+    if is_true "$require_longhorn_csi" \
+      && { [[ -z "${csi_nodes[$node]:-}" ]] || [[ -z "${plugin_nodes[$node]:-}" ]]; }; then
+      continue
+    fi
+    resolved_nodes+=("$node")
+  done
+  mapfile -t output_nodes_ref < <(printf '%s\n' "${resolved_nodes[@]}" | awk 'NF' | sort -u)
+  if (( ${#output_nodes_ref[@]} == 0 )); then
+    if is_true "$require_longhorn_csi"; then
+      echo "Error: VictoriaLogs placement has no nodes after intersecting the fresh PASS set${node_selector:+ with '${node_selector}'} and Longhorn CSI readiness." >&2
+    else
+      echo "Error: VictoriaLogs placement has no nodes after intersecting the fresh PASS set${node_selector:+ with '${node_selector}'}." >&2
+    fi
+    return 1
+  fi
+}
+
+victoria_logs_validate_ton_nodes_covered() {
+  local allowed_nodes_array_name="$1"
+  local -n allowed_nodes_ref="$allowed_nodes_array_name"
+  local ton_selector selected_rows node
+  local -A allowed_by_node=()
+  local selected_count=0
+
+  ton_selector="$(trim_whitespace "${KUBETON_NODE_CHECK_TON_SELECTOR:-}")"
+  for node in "${allowed_nodes_ref[@]}"; do
+    allowed_by_node["$node"]=1
+  done
+  if [[ -z "$ton_selector" ]]; then
+    # With unconstrained TON placement, an additional collector selector may
+    # not silently drop any host from the fresh PASS set. The collector still
+    # remains fenced away from every failed node by its hostname affinity.
+    if (( ${#allowed_nodes_ref[@]} != ${#KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]} )); then
+      echo "Error: TON placement is unconstrained, but VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR excludes part of the fresh preflight-approved set." >&2
+      return 1
+    fi
+    for node in "${KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]}"; do
+      if [[ -z "${allowed_by_node[$node]:-}" ]]; then
+        echo "Error: TON placement is unconstrained, but VictoriaLogs collector placement excludes approved node ${node}." >&2
+        return 1
+      fi
+    done
+    return 0
+  fi
+  if ! selected_rows="$(node_check_list_selector_nodes "$ton_selector")"; then
+    echo "Error: cannot resolve TON node selector '${ton_selector}' while constraining VictoriaLogs." >&2
+    return 1
+  fi
+  while IFS= read -r node; do
+    node="$(trim_whitespace "$node")"
+    node="${node#node/}"
+    [[ -n "$node" ]] || continue
+    selected_count=$((selected_count + 1))
+    if [[ -z "${allowed_by_node[$node]:-}" ]]; then
+      echo "Error: VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR excludes selected TON node ${node}; refusing to install a collector with incomplete coverage." >&2
+      return 1
+    fi
+  done <<<"$selected_rows"
+  if (( selected_count == 0 )); then
+    echo "Error: TON selector '${ton_selector}' matches no nodes while constraining VictoriaLogs." >&2
+    return 1
+  fi
+}
+
 build_victoria_logs_single_selector_values_file() {
   local selector="$1"
   local -a selector_pairs=()
@@ -6448,6 +6871,36 @@ build_victoria_logs_collector_selector_values_file() {
   {
     echo "nodeSelector:"
     write_yaml_map_from_pairs selector_pairs 2
+  } >"$values_file"
+
+  printf '%s' "$values_file"
+}
+
+build_victoria_logs_collector_affinity_values_file() {
+  local input_nodes_array_name="$1"
+  local -n input_nodes_ref="$input_nodes_array_name"
+  local values_file node
+
+  if [[ ${#input_nodes_ref[@]} -eq 0 ]]; then
+    echo "Error: cannot build VictoriaLogs collector affinity values; preflight-approved node list is empty." >&2
+    return 1
+  fi
+
+  values_file="$(mktemp -t kubeton-victoria-logs-collector-affinity.XXXXXX.yaml)"
+  {
+    echo "affinity:"
+    echo "  nodeAffinity:"
+    echo "    requiredDuringSchedulingIgnoredDuringExecution:"
+    echo "      nodeSelectorTerms:"
+    echo "        - matchExpressions:"
+    echo "            - key: kubernetes.io/hostname"
+    echo "              operator: In"
+    echo "              values:"
+    for node in "${input_nodes_ref[@]}"; do
+      node="$(trim_whitespace "$node")"
+      [[ -z "$node" ]] && continue
+      printf '                - %s\n' "$(yaml_quote "$node")"
+    done
   } >"$values_file"
 
   printf '%s' "$values_file"
@@ -6598,7 +7051,7 @@ build_victoria_logs_single_affinity_values_file() {
   local values_file node
 
   if [[ ${#input_nodes_ref[@]} -eq 0 ]]; then
-    echo "Error: cannot build VictoriaLogs affinity values; Longhorn CSI node list is empty." >&2
+    echo "Error: cannot build VictoriaLogs affinity values; approved node list is empty." >&2
     return 1
   fi
 
@@ -13330,6 +13783,7 @@ sequential_start_ton_fleet() {
       # Refuse the next scale-up if durable log coverage disappeared while
       # the preceding ordinal was being prepared.
       if ! verify_start_victoria_logs_collection_ready; then
+        restrict_existing_victoria_logs_after_failed_preflight || true
         echo "Error: VictoriaLogs coverage was lost before TON ordinal ${ordinal}; the next Pod was not created." >&2
         return 1
       fi
@@ -14179,6 +14633,7 @@ run_start() {
   local sequential_start=0
   local bootstrap_required=0
   local preflight_uses_longhorn="false"
+  local vlogs_current_nodes="" vlogs_rechecked_nodes=""
 
   desired_replicas_for_start="$(resolve_ton_replicas_from_values_file "$TON_VALUES_FILE" || true)"
   if ! [[ "$desired_replicas_for_start" =~ ^[1-9][0-9]*$ ]]; then
@@ -14202,9 +14657,21 @@ run_start() {
     preflight_uses_longhorn="true"
   fi
   if is_true "$preflight_uses_longhorn"; then
-    prepare_node_prerequisites_for_workload "$desired_replicas_for_start" true || return 1
+    if ! prepare_node_prerequisites_for_workload "$desired_replicas_for_start" true; then
+      restrict_existing_victoria_logs_after_failed_preflight || true
+      return 1
+    fi
   else
-    prepare_node_prerequisites_for_workload "$desired_replicas_for_start" false || return 1
+    if ! prepare_node_prerequisites_for_workload "$desired_replicas_for_start" false; then
+      restrict_existing_victoria_logs_after_failed_preflight || true
+      return 1
+    fi
+  fi
+  if is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" && is_true "$VICTORIA_LOGS_ENABLED" \
+    && (( ${#KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES[@]} == 0 )); then
+    echo "Error: automatic VictoriaLogs logging requires a fresh successful node prerequisite check." >&2
+    echo "Error: KUBETON_SKIP_NODE_PREREQ_CHECK cannot produce a cluster-wide collector; unset it or explicitly set KUBETON_START_VICTORIA_LOGS_ENABLED=false." >&2
+    return 1
   fi
   if [[ -n "$KUBETON_NODE_CHECK_TON_SELECTOR" ]]; then
     ton_selector_values_file="$(build_ton_node_selector_values_file "$KUBETON_NODE_CHECK_TON_SELECTOR")" || return 1
@@ -14249,6 +14716,7 @@ run_start() {
     if ! is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
       echo "[check] Rechecking selected TON nodes after storage/key bootstrap ..."
       if ! run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+        restrict_existing_victoria_logs_after_failed_preflight || true
         echo "Error: selected TON nodes no longer meet bootstrap requirements; TON deployment was not applied." >&2
         if [[ -n "$ton_selector_values_file" ]]; then
           rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
@@ -14256,6 +14724,7 @@ run_start() {
         return 1
       fi
       if ! node_check_selector_is_all_compatible "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+        restrict_existing_victoria_logs_after_failed_preflight || true
         echo "Error: the selected TON node selector now includes a node that no longer meets bootstrap requirements; TON deployment was not applied." >&2
         node_check_print_failed_selector_nodes "$KUBETON_NODE_CHECK_TON_SELECTOR"
         if [[ -n "$ton_selector_values_file" ]]; then
@@ -14277,6 +14746,7 @@ run_start() {
   # the only safe interpretation of an unconstrained TON placement.
   if is_true "$preflight_uses_longhorn"; then
     if ! wait_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      restrict_existing_victoria_logs_after_failed_preflight || true
       if [[ -n "$ton_selector_values_file" ]]; then
         rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
       fi
@@ -14288,6 +14758,7 @@ run_start() {
   # created. Kubernetes only exposes one previous container generation, so a
   # logging stack installed after a failed bootstrap cannot reconstruct it.
   if ! ensure_start_victoria_logs; then
+    restrict_existing_victoria_logs_after_failed_preflight || true
     if [[ -n "$ton_selector_values_file" ]]; then
       rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
     fi
@@ -14306,6 +14777,7 @@ run_start() {
   # disappears while the resource/HostPort check is running.
   if is_true "$preflight_uses_longhorn"; then
     if ! wait_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      restrict_existing_victoria_logs_after_failed_preflight || true
       if [[ -n "$ton_selector_values_file" ]]; then
         rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
       fi
@@ -14315,6 +14787,7 @@ run_start() {
   if ! is_true "$KUBETON_SKIP_NODE_PREREQ_CHECK"; then
     echo "[check] Rechecking selected TON nodes immediately before TON deployment ..."
     if ! run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      restrict_existing_victoria_logs_after_failed_preflight || true
       echo "Error: selected TON nodes no longer meet deployment requirements; TON deployment was not applied." >&2
       if [[ -n "$ton_selector_values_file" ]]; then
         rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
@@ -14323,6 +14796,7 @@ run_start() {
     fi
     if [[ -n "$KUBETON_NODE_CHECK_TON_SELECTOR" ]] \
       && ! node_check_selector_is_all_compatible "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      restrict_existing_victoria_logs_after_failed_preflight || true
       echo "Error: the TON node selector includes a node that no longer meets deployment requirements; TON deployment was not applied." >&2
       node_check_print_failed_selector_nodes "$KUBETON_NODE_CHECK_TON_SELECTOR"
       if [[ -n "$ton_selector_values_file" ]]; then
@@ -14333,10 +14807,72 @@ run_start() {
   fi
   if is_true "$preflight_uses_longhorn"; then
     if ! verify_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+      restrict_existing_victoria_logs_after_failed_preflight || true
       if [[ -n "$ton_selector_values_file" ]]; then
         rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
       fi
       return 1
+    fi
+  fi
+  # The last node check may legitimately produce a different PASS set while
+  # still satisfying the replica count (for example, one node entered
+  # DiskPressure and another became available). Reconcile both VictoriaLogs
+  # workloads to that exact latest set before TON Helm. Otherwise their prior
+  # required affinity would retain the earlier, now-rejected hostnames.
+  if is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED" && is_true "$VICTORIA_LOGS_ENABLED"; then
+    vlogs_current_nodes="$(victoria_logs_eligible_nodes_csv)"
+    if [[ "$vlogs_current_nodes" != "$KUBETON_VICTORIA_LOGS_APPLIED_NODES" ]]; then
+      echo "[launch] The approved VictoriaLogs node set changed; reconciling it before TON deployment ..." >&2
+      if ! ensure_start_victoria_logs; then
+        restrict_existing_victoria_logs_after_failed_preflight || true
+        if [[ -n "$ton_selector_values_file" ]]; then
+          rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+        fi
+        return 1
+      fi
+      # A logging rollout can itself take minutes. Require the exact set to be
+      # stable across one more complete node check; if it moved again, leave
+      # TON blocked and safely narrow the existing collector to the newest
+      # partial PASS set.
+      echo "[check] Confirming node prerequisites after VictoriaLogs reconciliation ..."
+      if ! run_node_prerequisite_check "$KUBETON_NODE_CHECK_REQUIRED_NODES" "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+        restrict_existing_victoria_logs_after_failed_preflight || true
+        echo "Error: node prerequisites changed during VictoriaLogs reconciliation; TON deployment was not applied." >&2
+        if [[ -n "$ton_selector_values_file" ]]; then
+          rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+        fi
+        return 1
+      fi
+      if [[ -n "$KUBETON_NODE_CHECK_TON_SELECTOR" ]] \
+        && ! node_check_selector_is_all_compatible "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+        restrict_existing_victoria_logs_after_failed_preflight || true
+        echo "Error: selected TON nodes changed during VictoriaLogs reconciliation; TON deployment was not applied." >&2
+        if [[ -n "$ton_selector_values_file" ]]; then
+          rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+        fi
+        return 1
+      fi
+      # The VictoriaLogs rollout may have taken long enough for a selected
+      # node's CSI registration/plugin to disappear. Preserve the immediate
+      # attach-safety proof before allowing TON Helm to create Pods.
+      if is_true "$preflight_uses_longhorn"; then
+        if ! verify_ton_selected_nodes_longhorn_csi_ready "$KUBETON_NODE_CHECK_TON_SELECTOR"; then
+          restrict_existing_victoria_logs_after_failed_preflight || true
+          if [[ -n "$ton_selector_values_file" ]]; then
+            rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+          fi
+          return 1
+        fi
+      fi
+      vlogs_rechecked_nodes="$(victoria_logs_eligible_nodes_csv)"
+      if [[ "$vlogs_rechecked_nodes" != "$KUBETON_VICTORIA_LOGS_APPLIED_NODES" ]]; then
+        restrict_existing_victoria_logs_after_failed_preflight || true
+        echo "Error: VictoriaLogs placement did not remain stable across consecutive node checks; TON deployment was not applied. Rerun start after node pressure settles." >&2
+        if [[ -n "$ton_selector_values_file" ]]; then
+          rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+        fi
+        return 1
+      fi
     fi
   fi
   # Storage cleanup and readiness waits can take long enough for a collector
@@ -14344,6 +14880,7 @@ run_start() {
   # race with one final exact coverage probe immediately before Helm can
   # create or restart TON Pods.
   if ! verify_start_victoria_logs_collection_ready; then
+    restrict_existing_victoria_logs_after_failed_preflight || true
     if [[ -n "$ton_selector_values_file" ]]; then
       rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
     fi
@@ -15040,6 +15577,7 @@ run_start_stopped_fleet() {
   # collector after the caller's operator/PVC recovery work and before the
   # first stopped replica can be recreated.
   if ! verify_start_victoria_logs_collection_ready; then
+    restrict_existing_victoria_logs_after_failed_preflight || true
     echo "Error: VictoriaLogs coverage was lost before the stopped TON fleet could be restored." >&2
     return 1
   fi
@@ -16627,6 +17165,15 @@ run_victoria_metrics_install() {
     cleanup_victoria_logs_port_forwards
   fi
   logs_helm_timeout_seconds="$(resolve_victoria_logs_helm_timeout_seconds)"
+
+  if [[ "$logs_enabled" == "true" ]]; then
+    echo "[check] Refreshing node prerequisites for VictoriaLogs placement ..."
+    if ! run_node_prerequisite_check_readonly; then
+      restrict_existing_victoria_logs_after_failed_preflight standalone || true
+      echo "Error: VictoriaLogs was not installed because no safe fresh placement set could be proven." >&2
+      return 1
+    fi
+  fi
 
   if ! operator_row="$(ensure_victoria_metrics_operator "$operator_ns" "$stack_name")"; then
     return 1
