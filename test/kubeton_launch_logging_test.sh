@@ -1075,6 +1075,30 @@ test_running_without_commit_is_extracting() (
     || fail "committed bootstrap probe lost its success detail"
 )
 
+test_bootstrap_pod_status_template_closes_container_range() (
+  source "$kubeton"
+
+  local template_file="$test_dir/bootstrap-pod-status-template"
+  run_with_timeout() {
+    shift
+    "$@"
+  }
+  kubectl() {
+    local arg
+    for arg in "$@"; do
+      if [[ "$arg" == go-template=* ]]; then
+        printf '%s' "$arg" >"$template_file"
+      fi
+    done
+    printf '\x1fPending\x1fFalse\x1fUnschedulable\x1fno eligible nodes\x1f\x1f'
+  }
+
+  ton_pod_initial_bootstrap_state default tonnode-0 >/dev/null
+  [[ -s "$template_file" ]] || fail "bootstrap Pod status query did not use a Go template"
+  [[ "$(<"$template_file")" == *'{{end}}{{end}}{{end}}' ]] \
+    || fail "bootstrap Pod status template does not close the terminated-state condition, ton-node condition, and containerStatuses range"
+)
+
 test_running_pod_bootstrap_probe_failure_is_a_status_read_error() (
   source "$kubeton"
 
@@ -3412,6 +3436,7 @@ test_start_watchers_keep_container_streams_without_victoria_logs
 test_event_watchers_use_atomic_list_watch_without_replay_timeout
 test_launch_snapshot_captures_dependency_diagnostics_without_secrets
 test_running_without_commit_is_extracting
+test_bootstrap_pod_status_template_closes_container_range
 test_running_pod_bootstrap_probe_failure_is_a_status_read_error
 test_scheduled_pending_pod_reports_attach_failure
 test_bootstrap_status_read_failure_preserves_exit_reason

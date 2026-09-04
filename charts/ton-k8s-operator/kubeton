@@ -12057,7 +12057,7 @@ ton_pod_initial_bootstrap_state() {
     return 0
   fi
   pod_row="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pod "$pod" --ignore-not-found \
-    -o go-template='{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{range .status.conditions}}{{if eq .type "PodScheduled"}}{{.status}}{{"\x1f"}}{{.reason}}{{"\x1f"}}{{.message}}{{end}}{{end}}{{"\x1f"}}{{range .status.containerStatuses}}{{if eq .name "ton-node"}}{{.restartCount}}{{"\x1f"}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{"\x1f"}}{{if .lastState.terminated}}{{.lastState.terminated.exitCode}}{{end}}{{end}}' 2>"$status_error_file")" || pod_rc=$?
+    -o go-template='{{.spec.nodeName}}{{"\x1f"}}{{.status.phase}}{{"\x1f"}}{{range .status.conditions}}{{if eq .type "PodScheduled"}}{{.status}}{{"\x1f"}}{{.reason}}{{"\x1f"}}{{.message}}{{end}}{{end}}{{"\x1f"}}{{range .status.containerStatuses}}{{if eq .name "ton-node"}}{{.restartCount}}{{"\x1f"}}{{if .state.waiting}}{{.state.waiting.reason}}{{end}}{{"\x1f"}}{{if .lastState.terminated}}{{.lastState.terminated.exitCode}}{{end}}{{end}}{{end}}' 2>"$status_error_file")" || pod_rc=$?
   if (( pod_rc != 0 )); then
     status_error="$(captured_command_error_reason "$pod_rc" "$STATUS_EXEC_TIMEOUT" "$status_error_file")"
     rm -f "$status_error_file" >/dev/null 2>&1 || true
