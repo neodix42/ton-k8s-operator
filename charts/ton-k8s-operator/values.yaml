@@ -6,7 +6,7 @@ namespace:
 
 image:
   repository: ghcr.io/neodix42/ton-k8s-operator
-  tag: 0.2.8
+  tag: 0.3.0
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -60,10 +60,22 @@ tonNode:
   name: tonnode
   namespace: ""
   labels: {}
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.08-amd64
+  # MyTonCtrl runtime and the official TON binary exporter are versioned independently.
+  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
+  # Installation flags: mode, network, dump download, and relaxed minimum requirements.
+  args:
+    - -m
+    - liteserver
+    - -n
+    - mainnet
+    - -d
+    - -i
   replicas: 3
   storage:
     tonWorkSize: 700Gi
+    # Legacy PVCs remain declared to preserve existing StatefulSets and data.
+    # New MyTonCtrl state lives in ton-work; exported binaries use an ephemeral volume.
     tonSourceSize: 20Gi
     myTonCoreSize: 20Gi
     myTonCtrlSize: 20Gi
@@ -106,28 +118,17 @@ tonNode:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.08-amd64
+      # Empty inherits the MyTonCtrl runtime image above.
+      image: ""
       resources: {}
   env:
-    - name: NETWORK
-      value: mainnet
-    - name: TON_BRANCH
-      value: v2026.08
     - name: ARCHIVE_TTL
       value: "86400"
     - name: STATE_TTL
       value: "86400"
     - name: VERBOSITY
       value: "1"
-    - name: IGNORE_MINIMAL_REQS
-      value: "true"
     - name: TELEMETRY
       value: "true"
-    - name: MODE
-      value: liteserver
-    - name: DUMP
-      value: "true"
-    - name: MYTONCTRL_VERSION
-      value: master
     - name: CUSTOM_PARAMETERS
       value: ""

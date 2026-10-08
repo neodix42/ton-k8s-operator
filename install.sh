@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CHART_VERSION="0.2.8"
+CHART_VERSION="0.3.0"
 CHART_REF="${CHART_REF:-oci://ghcr.io/neodix42/charts/ton-k8s-operator}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD/ton-k8s-operator-$CHART_VERSION}"
 
@@ -67,6 +67,9 @@ a) Review default values files:
    ${EDITOR:-vi} operator-values.yaml
    ${EDITOR:-vi} tonnode-values.yaml
 
+   # tonNode.image selects MyTonCtrl; tonNode.tonImage selects official TON binaries.
+   # tonNode.args holds first-install flags, for example [-m, liteserver, -n, mainnet, -d, -i].
+
    # helper script for common TON fleet operations
    ./kubeton help
 
@@ -86,7 +89,7 @@ e) Stop TON pods (keeps TonNode/STS/PVC resources):
    ./kubeton start             # restore previous TON replicas
 
 f) Verify:
-   kubectl verify
+   ./kubeton verify
 
 g) Stop/remove TON manifests from Helm release
    ./kubeton stop

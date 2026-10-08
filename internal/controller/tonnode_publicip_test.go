@@ -332,10 +332,10 @@ func TestDesiredPodTemplateHoldOnFailure(t *testing.T) {
 		tpl := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil)
 		container := tpl.Spec.Containers[0]
 
-		if len(container.Command) != 2 || container.Command[0] != "bash" || container.Command[1] != "-lc" {
-			t.Fatalf("command = %v, want [bash -lc]", container.Command)
+		if len(container.Command) != 2 || container.Command[0] != "bash" || container.Command[1] != "-c" {
+			t.Fatalf("command = %v, want [bash -c]", container.Command)
 		}
-		if len(container.Args) != 1 || container.Args[0] != holdOnFailureEntrypointScript {
+		if len(container.Args) != 3 || container.Args[0] != holdOnFailureEntrypointScript || container.Args[2] != "run" {
 			t.Fatalf("args = %v, want hold-on-failure script", container.Args)
 		}
 	})
@@ -353,12 +353,12 @@ func TestDesiredPodTemplateNetworkEnv(t *testing.T) {
 		if !hasEnv(env, "NETWORK", "mainnet") {
 			t.Fatalf("missing NETWORK=mainnet in env: %#v", env)
 		}
-		if !hasEnv(env, "GLOBAL_CONFIG_URL", "https://ton.org/global.config.json") {
-			t.Fatalf("missing mainnet GLOBAL_CONFIG_URL in env: %#v", env)
+		if envVarValueByName(env, "GLOBAL_CONFIG_URL") != "" {
+			t.Fatalf("GLOBAL_CONFIG_URL must be selected by the image after parsing installer flags: %#v", env)
 		}
 	})
 
-	t.Run("derives testnet global config from network env", func(t *testing.T) {
+	t.Run("lets the runtime select testnet config from network env", func(t *testing.T) {
 		tonNode := &tonv1alpha1.TonNode{
 			Spec: tonv1alpha1.TonNodeSpec{
 				Env: []corev1.EnvVar{
@@ -373,8 +373,21 @@ func TestDesiredPodTemplateNetworkEnv(t *testing.T) {
 		if !hasEnv(env, "NETWORK", "testnet") {
 			t.Fatalf("missing NETWORK=testnet in env: %#v", env)
 		}
-		if !hasEnv(env, "GLOBAL_CONFIG_URL", "https://ton.org/testnet-global.config.json") {
-			t.Fatalf("missing testnet GLOBAL_CONFIG_URL in env: %#v", env)
+		if envVarValueByName(env, "GLOBAL_CONFIG_URL") != "" {
+			t.Fatalf("operator must not override the runtime's network config selection: %#v", env)
+		}
+	})
+	t.Run("preserves custom network configuration", func(t *testing.T) {
+		tonNode := &tonv1alpha1.TonNode{Spec: tonv1alpha1.TonNodeSpec{
+			Args: []string{"-m", "liteserver", "-n", "custom"},
+			Env:  []corev1.EnvVar{{Name: "GLOBAL_CONFIG_URL", Value: "https://example.com/global.json"}},
+		}}
+		env := reconciler.desiredPodTemplate(tonNode, labels, publicIP, nil).Spec.Containers[0].Env
+		if !hasEnv(env, "GLOBAL_CONFIG_URL", "https://example.com/global.json") {
+			t.Fatalf("custom global config was replaced: %#v", env)
+		}
+		if !hasEnv(env, "QUIC_PORT", "31001") {
+			t.Fatalf("QUIC_PORT must match the exposed UDP port: %#v", env)
 		}
 	})
 }
@@ -448,7 +461,7 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 	}{
 		{
 			name:  "versioned tag uses pull always",
-			image: "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64",
+			image: "ghcr.io/neodix42/mytonctrl:v1.0.0",
 			want:  corev1.PullAlways,
 		},
 		{
@@ -458,12 +471,12 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 		},
 		{
 			name:  "image without tag is treated as latest",
-			image: "ghcr.io/ton-blockchain/ton-docker-ctrl",
+			image: "ghcr.io/neodix42/mytonctrl",
 			want:  corev1.PullAlways,
 		},
 		{
 			name:  "digest pin uses if not present",
-			image: "ghcr.io/ton-blockchain/ton-docker-ctrl@sha256:0123456789abcdef",
+			image: "ghcr.io/neodix42/mytonctrl@sha256:0123456789abcdef",
 			want:  corev1.PullIfNotPresent,
 		},
 	}
@@ -500,7 +513,7 @@ func TestDesiredKeyAgentImagePullPolicy(t *testing.T) {
 				Spec: tonv1alpha1.TonNodeSpec{
 					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
 						Agent: tonv1alpha1.TonNodeKeyAgentSpec{
-							Image: "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64",
+							Image: "ghcr.io/neodix42/mytonctrl:v1.0.0",
 						},
 					},
 				},
@@ -513,7 +526,7 @@ func TestDesiredKeyAgentImagePullPolicy(t *testing.T) {
 				Spec: tonv1alpha1.TonNodeSpec{
 					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
 						Agent: tonv1alpha1.TonNodeKeyAgentSpec{
-							Image: "ghcr.io/ton-blockchain/ton-docker-ctrl@sha256:0123456789abcdef",
+							Image: "ghcr.io/neodix42/mytonctrl@sha256:0123456789abcdef",
 						},
 					},
 				},
@@ -658,8 +671,8 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	if len(tpl.Spec.Containers) != 2 {
 		t.Fatalf("expected two containers (ton + sidecar), got %d", len(tpl.Spec.Containers))
 	}
-	if len(tpl.Spec.InitContainers) != 2 {
-		t.Fatalf("expected two init containers (persistent layout + key-restore), got %d", len(tpl.Spec.InitContainers))
+	if len(tpl.Spec.InitContainers) != 4 {
+		t.Fatalf("expected four init containers (layout, exporter, binaries, key-restore), got %d", len(tpl.Spec.InitContainers))
 	}
 	if tpl.Spec.InitContainers[0].Name != persistentLayoutInitName {
 		t.Fatalf("expected first init container %q, got %q", persistentLayoutInitName, tpl.Spec.InitContainers[0].Name)
@@ -670,34 +683,25 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	if !hasMount(tpl.Spec.InitContainers[0].VolumeMounts, myTonCoreClaim, "/mnt/mytoncore") {
 		t.Fatalf("persistent layout init missing mytoncore mount")
 	}
-	if tpl.Spec.InitContainers[1].Name != "key-restore" {
-		t.Fatalf("expected init container key-restore, got %q", tpl.Spec.InitContainers[1].Name)
+	if tpl.Spec.InitContainers[3].Name != "key-restore" {
+		t.Fatalf("expected last init container key-restore, got %q", tpl.Spec.InitContainers[3].Name)
 	}
 	if tpl.Spec.Containers[1].Name != "key-backup" {
 		t.Fatalf("expected sidecar key-backup, got %q", tpl.Spec.Containers[1].Name)
 	}
 
 	main := tpl.Spec.Containers[0]
-	if !hasMount(main.VolumeMounts, myTonCoreClaim, "/usr/local/bin/mytoncore") {
-		t.Fatalf("main container missing persistent mytoncore mount")
-	}
-	if !hasMount(main.VolumeMounts, myTonCtrlClaim, myTonCtrlPath) {
-		t.Fatalf("main container missing persistent mytonctrl mount")
-	}
-	if !hasMount(main.VolumeMounts, tonSourceClaim, tonSourcePath) {
-		t.Fatalf("main container missing persistent TON source mount")
+	if !hasMount(main.VolumeMounts, tonWorkClaimName, "/var/ton-work") {
+		t.Fatalf("main container missing persistent node/controller work mount")
 	}
 	if !hasMount(main.VolumeMounts, keysTmpfsVolume, "/var/ton-work/keys") {
 		t.Fatalf("main container missing keys tmpfs mount")
 	}
-	if !hasMount(main.VolumeMounts, walletsTmpfsVolume, "/usr/local/bin/mytoncore/wallets") {
+	if !hasMount(main.VolumeMounts, walletsTmpfsVolume, controllerWalletsPath) {
 		t.Fatalf("main container missing wallets tmpfs mount")
 	}
 	if !hasMount(main.VolumeMounts, keyBundleClaim, keyBundleMountPath) {
 		t.Fatalf("main container missing key bundle mount")
-	}
-	if !hasEnv(main.Env, "GIT_CONFIG_KEY_0", "safe.directory") || !hasEnv(main.Env, "GIT_CONFIG_VALUE_0", tonSourcePath) {
-		t.Fatalf("main container missing git safe.directory env for persisted TON source")
 	}
 
 	if !hasMemoryVolume(tpl.Spec.Volumes, keysTmpfsVolume) {
@@ -755,6 +759,8 @@ func TestDesiredPodTemplateTerminationMessagePolicies(t *testing.T) {
 
 	wantInitContainers := map[string]bool{
 		persistentLayoutInitName: false,
+		tonExporterInitName:      false,
+		tonBinariesInitName:      false,
 		"key-restore":            false,
 		"bootstrap-config":       false,
 	}

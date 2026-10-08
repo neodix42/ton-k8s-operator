@@ -45,7 +45,8 @@ import (
 )
 
 const (
-	defaultImage                       = "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
+	defaultImage                       = "ghcr.io/neodix42/mytonctrl:v1.0.0"
+	defaultTonImage                    = "ghcr.io/ton-blockchain/ton:v2026.08-amd64"
 	defaultReplicas              int32 = 1
 	defaultTonWorkSize                 = "700Gi"
 	defaultTonSourceSize               = "20Gi"
@@ -56,14 +57,11 @@ const (
 	defaultCPULimit                    = "128000m"
 	defaultMemoryLimit                 = "256Gi"
 	defaultNetwork                     = "mainnet"
-	defaultGlobalConfigURL             = "https://ton.org/global.config.json"
-	testnetGlobalConfigURL             = "https://ton.org/testnet-global.config.json"
 	defaultValidatorPort         int32 = 30001
 	defaultLiteServerPort        int32 = 30003
 	defaultQuicPort              int32 = 31001
 	defaultConsolePort           int32 = 30002
 	defaultKeyProvider                 = "vault"
-	defaultKeyAgentImage               = "ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
 	defaultKeysTmpfsSize               = "128Mi"
 	defaultWalletsTmpfsSize            = "512Mi"
 	defaultKeyBundlePVCSize            = "5Gi"
@@ -76,8 +74,6 @@ const (
 	myTonCoreClaim   = "mytoncore"
 	myTonCtrlClaim   = "mytonctrl"
 	keyBundleClaim   = "keybundle"
-	tonSourcePath    = "/usr/src/ton"
-	myTonCtrlPath    = "/usr/local/bin/mytonctrl"
 
 	headlessServiceSuffix    = "headless"
 	bootstrapConfigVolume    = "bootstrap-config"
@@ -90,7 +86,7 @@ const (
 
 	readyConditionType = "Ready"
 
-	holdOnFailureEntrypointScript = `/scripts/entrypoint.sh; rc=$?; if [ "$rc" -ne 0 ]; then echo "ton-node entrypoint exited with rc=${rc}; sleeping for debug because spec.debug.holdOnFailure=true"; sleep infinity; fi; exit "$rc"`
+	holdOnFailureEntrypointScript = `/opt/mytonctrl/venv/bin/python /usr/local/lib/mytonctrl/entrypoint.py "$@"; rc=$?; if [ "$rc" -ne 0 ]; then echo "ton-node entrypoint exited with rc=${rc}; sleeping for debug because spec.debug.holdOnFailure=true"; sleep infinity; fi; exit "$rc"`
 
 	// kubetonPauseReplicasAnnotationKey stores the pre-pause replica count on TonNode/StatefulSet.
 	// When present with a parseable integer value, reconciliation keeps StatefulSet replicas at 0.
@@ -149,6 +145,13 @@ func (r *TonNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 	if message := validateKeyManagementSpec(&tonNode); message != "" {
+		if err := r.updateStatus(ctx, &tonNode, 0, "", false, "InvalidSpec", message); err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("TonNode spec is not reconcilable", "name", req.NamespacedName, "reason", message)
+		return ctrl.Result{}, nil
+	}
+	if message := validateRuntimeSpec(&tonNode); message != "" {
 		if err := r.updateStatus(ctx, &tonNode, 0, "", false, "InvalidSpec", message); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -587,7 +590,6 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	stickyNodeHostnames []string,
 ) corev1.PodTemplateSpec {
 	env := mergeEnvVars(defaultTonEnv(tonNode, publicIP), tonNode.Spec.Env)
-	env = reconcileNetworkEnv(env)
 	containerPorts := []corev1.ContainerPort{
 		{
 			Name:          "validator-udp",
@@ -624,14 +626,12 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
-		{Name: tonSourceClaim, MountPath: tonSourcePath},
-		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
-		{Name: myTonCtrlClaim, MountPath: myTonCtrlPath},
+		{Name: tonArtifactsVolume, MountPath: "/ton-artifacts", ReadOnly: true},
 	}
 	if keyManagementEnabled(tonNode) {
 		volumeMounts = append(volumeMounts,
 			corev1.VolumeMount{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
-			corev1.VolumeMount{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
+			corev1.VolumeMount{Name: walletsTmpfsVolume, MountPath: controllerWalletsPath},
 			corev1.VolumeMount{Name: keyBundleClaim, MountPath: keyBundleMountPath},
 		)
 	}
@@ -645,17 +645,30 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		Resources:                desiredResources(tonNode),
 		Ports:                    containerPorts,
 		VolumeMounts:             volumeMounts,
+		ReadinessProbe:           desiredRuntimeReadinessProbe(),
+	}
+	if len(tonNode.Spec.Args) > 0 {
+		container.Args = append([]string{"run"}, tonNode.Spec.Args...)
 	}
 	if holdOnFailureEnabled(tonNode) {
-		container.Command = []string{"bash", "-lc"}
-		container.Args = []string{holdOnFailureEntrypointScript}
+		container.Command = []string{"bash", "-c"}
+		container.Args = append([]string{holdOnFailureEntrypointScript, "mytonctrl", "run"}, tonNode.Spec.Args...)
 	}
 
 	podSpec := corev1.PodSpec{
-		NodeSelector:   desiredNodeSelector(tonNode),
-		Affinity:       requiredPodAntiAffinity(labels, stickyNodeHostnames),
-		InitContainers: []corev1.Container{desiredPersistentLayoutInitContainer(tonNode)},
-		Containers:     []corev1.Container{container},
+		NodeSelector:                  desiredNodeSelector(tonNode),
+		Affinity:                      requiredPodAntiAffinity(labels, stickyNodeHostnames),
+		TerminationGracePeriodSeconds: ptr.To[int64](75),
+		InitContainers: []corev1.Container{
+			desiredPersistentLayoutInitContainer(tonNode),
+			desiredTonExporterInitContainer(tonNode),
+			desiredTonBinariesInitContainer(tonNode),
+		},
+		Containers: []corev1.Container{container},
+		Volumes: []corev1.Volume{
+			{Name: tonExporterVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			{Name: tonArtifactsVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		},
 	}
 	if keyManagementEnabled(tonNode) {
 		podSpec.Volumes = append(podSpec.Volumes,
@@ -691,7 +704,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 			Command: []string{
 				"sh",
 				"-c",
-				"if [ -f /bootstrap/config.json ] && [ ! -f /var/ton-work/db/config.json ]; then cp /bootstrap/config.json /var/ton-work/db/config.json; fi",
+				"mkdir -p /var/ton-work/db; if [ -f /bootstrap/config.json ] && [ ! -f /var/ton-work/db/config.json ]; then cp /bootstrap/config.json /var/ton-work/db/config.json; fi",
 			},
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: bootstrapConfigVolume, MountPath: bootstrapConfigMountPath, ReadOnly: true},
@@ -876,12 +889,12 @@ func desiredKMSVendor(tonNode *tonv1alpha1.TonNode) string {
 
 func desiredKeyAgentImage(tonNode *tonv1alpha1.TonNode) string {
 	if tonNode.Spec.KeyManagement == nil {
-		return defaultKeyAgentImage
+		return desiredImage(tonNode)
 	}
 	if image := strings.TrimSpace(tonNode.Spec.KeyManagement.Agent.Image); image != "" {
 		return image
 	}
-	return defaultKeyAgentImage
+	return desiredImage(tonNode)
 }
 
 func desiredKeyAgentImagePullPolicy(tonNode *tonv1alpha1.TonNode) corev1.PullPolicy {
@@ -1017,34 +1030,20 @@ func desiredKeyAgentEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
 func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
-		{Name: tonSourceClaim, MountPath: tonSourcePath},
-		{Name: myTonCoreClaim, MountPath: "/usr/local/bin/mytoncore"},
-		{Name: myTonCtrlClaim, MountPath: myTonCtrlPath},
 		{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
-		{Name: walletsTmpfsVolume, MountPath: "/usr/local/bin/mytoncore/wallets"},
+		{Name: walletsTmpfsVolume, MountPath: controllerWalletsPath},
 		{Name: keyBundleClaim, MountPath: keyBundleMountPath},
 	}
 }
 
 func desiredPersistentLayoutInitContainer(tonNode *tonv1alpha1.TonNode) corev1.Container {
-	return corev1.Container{
+	container := corev1.Container{
 		Name:                     persistentLayoutInitName,
 		Image:                    desiredImage(tonNode),
 		ImagePullPolicy:          desiredImagePullPolicy(tonNode),
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
-		Command: []string{
-			"sh",
-			"-ec",
-			`mkdir -p /mnt/ton-src /mnt/mytonctrl
-if [ -d /mnt/ton-work/usr-src-ton ] && [ -z "$(ls -A /mnt/ton-src 2>/dev/null)" ]; then
-  cp -a /mnt/ton-work/usr-src-ton/. /mnt/ton-src/
-fi
-if [ -d /mnt/mytoncore/usr-local-bin-mytonctrl ] && [ -z "$(ls -A /mnt/mytonctrl 2>/dev/null)" ]; then
-  cp -a /mnt/mytoncore/usr-local-bin-mytonctrl/. /mnt/mytonctrl/
-fi
-chmod 755 /mnt/ton-src /mnt/mytonctrl || true`,
-		},
-		Resources: desiredKeyAgentResources(tonNode),
+		Command:                  []string{"sh", "-ec", persistentLayoutScript},
+		Resources:                desiredKeyAgentResources(tonNode),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: tonWorkClaimName, MountPath: "/mnt/ton-work"},
 			{Name: tonSourceClaim, MountPath: "/mnt/ton-src"},
@@ -1052,6 +1051,12 @@ chmod 755 /mnt/ton-src /mnt/mytonctrl || true`,
 			{Name: myTonCtrlClaim, MountPath: "/mnt/mytonctrl"},
 		},
 	}
+	if keyManagementEnabled(tonNode) {
+		container.VolumeMounts = append(container.VolumeMounts,
+			corev1.VolumeMount{Name: keyBundleClaim, MountPath: "/mnt/keybundle", ReadOnly: true},
+		)
+	}
+	return container
 }
 
 func desiredKeyRestoreInitContainer(tonNode *tonv1alpha1.TonNode) corev1.Container {
@@ -1082,21 +1087,89 @@ func desiredKeyBackupSidecar(tonNode *tonv1alpha1.TonNode) corev1.Container {
 	}
 }
 
-const keyRestoreScript = `
+// The encrypted pair is published with a durable rollback journal. Retain the
+// previous pair until both replacements have reached the PVC, so a failure or
+// interrupted sidecar cannot strand ciphertext with the wrong wrapped key.
+const keyBundlePublicationScript = `
+recover_key_bundle_publication() {
+  publication_dir="${BUNDLE_DIR}/.backup-publish"
+  [ -d "$publication_dir" ] || return 0
+  if [ -f "$publication_dir/rollback-required" ]; then
+    for component in bundle meta; do
+      if [ ! -f "$publication_dir/previous.$component" ] \
+        && [ ! -f "$publication_dir/previous.$component.absent" ]; then
+        echo "encrypted key bundle recovery journal is incomplete; existing files were preserved" >&2
+        return 1
+      fi
+    done
+    for component in bundle meta; do
+      case "$component" in
+        bundle) publication_target="$BUNDLE_FILE" ;;
+        meta) publication_target="$META_FILE" ;;
+      esac
+      if [ -f "$publication_dir/previous.$component" ]; then
+        cp "$publication_dir/previous.$component" "$publication_dir/restore.$component" \
+          && mv -f "$publication_dir/restore.$component" "$publication_target" || return 1
+      elif [ -f "$publication_dir/previous.$component.absent" ]; then
+        rm -f "$publication_target" || return 1
+      fi
+    done
+    sync || return 1
+    rm -f "$publication_dir/rollback-required" && sync || return 1
+    echo "recovered interrupted encrypted key bundle publication"
+  fi
+  rm -rf "$publication_dir" || return 1
+}
+
+publish_key_bundle() {
+  publication_source="$1"
+  recover_key_bundle_publication || return 1
+  publication_dir="${BUNDLE_DIR}/.backup-publish"
+  mkdir "$publication_dir" || return 1
+  cp "$publication_source/bundle.enc" "$publication_dir/new.bundle" \
+    && cp "$publication_source/bundle.meta" "$publication_dir/new.meta" || return 1
+  if [ -e "$BUNDLE_FILE" ]; then
+    cp "$BUNDLE_FILE" "$publication_dir/previous.bundle" || return 1
+  else
+    : > "$publication_dir/previous.bundle.absent" || return 1
+  fi
+  if [ -e "$META_FILE" ]; then
+    cp "$META_FILE" "$publication_dir/previous.meta" || return 1
+  else
+    : > "$publication_dir/previous.meta.absent" || return 1
+  fi
+  # Only encrypted bytes touch the PVC. Plaintext staging stays in /tmp.
+  chmod 600 "$publication_dir"/* && sync || return 1
+  : > "$publication_dir/rollback-required" || return 1
+  sync || return 1
+  if ! { mv -f "$publication_dir/new.bundle" "$BUNDLE_FILE" \
+    && mv -f "$publication_dir/new.meta" "$META_FILE" && sync; }; then
+    recover_key_bundle_publication || return 1
+    return 1
+  fi
+  rm -f "$publication_dir/rollback-required" && sync || return 1
+  rm -rf "$publication_dir" || return 1
+}
+`
+
+const keyRestoreScript = keyBundlePublicationScript + `
 set -eu
+umask 077
 
 KEYS_DIR="/var/ton-work/keys"
-MYTONCORE_DIR="/usr/local/bin/mytoncore"
-MYTONCTRL_DIR="/usr/local/bin/mytonctrl"
+CONTROLLER_DIR="/var/ton-work/controller"
+MYTONCORE_DIR="${CONTROLLER_DIR}/mytoncore"
+MYTONCTRL_DIR="${CONTROLLER_DIR}/mytonctrl"
 WALLETS_DIR="${MYTONCORE_DIR}/wallets"
 TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
 DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
-SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"
-MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"
+SYSTEMD_UNITS_DIR="${CONTROLLER_DIR}/services"
+MTC_DONE_FILE="${CONTROLLER_DIR}/initialized.json"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
+FORCE_RESTORE_FILE="${BUNDLE_DIR}/.restore-controller-state"
 
 need_bin() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -1205,9 +1278,8 @@ fix_validator_ownership() {
     return 0
   fi
 
-  chown -R validator:validator "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCTRL_DIR" || true
-  chown validator:validator "$DB_CONFIG_FILE" "$MTC_DONE_FILE" || true
-  chown -R validator:validator "$DB_KEYRING_DIR" "$SYSTEMD_UNITS_DIR" || true
+  chown -R validator:validator "$KEYS_DIR" "$DB_KEYRING_DIR" || true
+  chown validator:validator "$DB_CONFIG_FILE" || true
 }
 
 dir_has_payload() {
@@ -1219,38 +1291,31 @@ dir_has_payload() {
 bundle_has_complete_bootstrap() {
   unpacked_dir="$1"
   [ -s "$unpacked_dir/tondb/config.json" ] || return 1
-  [ -f "$unpacked_dir/tondb/mtc_done" ] || return 1
-  dir_has_payload "$unpacked_dir/tondb/systemd-units" || return 1
+  [ -s "$unpacked_dir/controller/initialized.json" ] || return 1
+  [ -s "$unpacked_dir/controller/mytoncore/mytoncore.db" ] || return 1
+  [ -s "$unpacked_dir/controller/services/validator.service" ] || return 1
+  [ -s "$unpacked_dir/controller/services/mytoncore.service" ] || return 1
 }
 
 current_bootstrap_complete() {
   [ -s "$DB_CONFIG_FILE" ] || return 1
-  [ -f "$MTC_DONE_FILE" ] || return 1
-  dir_has_payload "$SYSTEMD_UNITS_DIR" || return 1
-}
-
-clear_partial_bootstrap_state() {
-  find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-  find "$MYTONCTRL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-  find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-  rm -f "$DB_CONFIG_FILE" || true
-  rm -rf "$DB_KEYRING_DIR" || true
-  rm -rf "$SYSTEMD_UNITS_DIR" || true
-  rm -f "$MTC_DONE_FILE" || true
-}
-
-quarantine_incomplete_bundle() {
-  suffix=".invalid.$(date -u +%Y%m%dT%H%M%SZ)"
-  mv "$BUNDLE_FILE" "${BUNDLE_FILE}${suffix}" 2>/dev/null || true
-  mv "$META_FILE" "${META_FILE}${suffix}" 2>/dev/null || true
+  [ -s "$MTC_DONE_FILE" ] || return 1
+  [ -s "$MYTONCORE_DIR/mytoncore.db" ] || return 1
+  [ -s "$SYSTEMD_UNITS_DIR/validator.service" ] || return 1
+  [ -s "$SYSTEMD_UNITS_DIR/mytoncore.service" ] || return 1
 }
 
 need_bin tar
 need_bin openssl
 need_bin base64
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
+recover_key_bundle_publication
 
 if [ ! -s "$BUNDLE_FILE" ] || [ ! -s "$META_FILE" ]; then
+  if [ -f "$FORCE_RESTORE_FILE" ]; then
+    echo "explicit key restore requested but encrypted bundle files are missing; node state was preserved" >&2
+    exit 1
+  fi
   echo "no encrypted key bundle found; continuing without key restore"
   exit 0
 fi
@@ -1280,37 +1345,39 @@ mkdir -p "$work_dir/unpacked"
 tar -xzf "$work_dir/bundle.tar.gz" -C "$work_dir/unpacked"
 
 if ! bundle_has_complete_bootstrap "$work_dir/unpacked"; then
-  echo "encrypted key bundle is incomplete (missing config.json, mtc_done, or systemd-units); quarantining and continuing without key restore" >&2
-  quarantine_incomplete_bundle
-  if ! current_bootstrap_complete; then
-    echo "current bootstrap state is incomplete; clearing partial bootstrap artifacts before fresh startup" >&2
-    clear_partial_bootstrap_state
-  fi
-  exit 0
+  echo "encrypted key bundle lacks complete MyTonCtrl controller state; legacy ton-docker-ctrl bundles require migration with a native MyTonCtrl backup. Existing bundle and node state were preserved." >&2
+  exit 1
 fi
 
-clear_partial_bootstrap_state
+if [ -f "$FORCE_RESTORE_FILE" ]; then
+  # Only kubeton's explicit restore workflow writes this durable request.
+  # Preserve mountpoints while replacing their contents during the init phase.
+  find "$KEYS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  find "$WALLETS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 ! -name wallets -exec rm -rf {} +
+  find "$CONTROLLER_DIR" -mindepth 1 -maxdepth 1 ! -name mytoncore ! -name .container.lock -exec rm -rf {} +
+  rm -f "$DB_CONFIG_FILE"
+  rm -rf "$DB_KEYRING_DIR"
+fi
 
 if [ -d "$work_dir/unpacked/keys" ]; then
   cp -a "$work_dir/unpacked/keys/." "$KEYS_DIR/"
 fi
-if [ -d "$work_dir/unpacked/mytoncore" ]; then
-  cp -a "$work_dir/unpacked/mytoncore/." "$MYTONCORE_DIR/"
+# Existing committed settings and interrupted installation checkpoints are
+# authoritative. Restore only the tmpfs payload on an ordinary Pod restart.
+if [ -f "$FORCE_RESTORE_FILE" ] \
+  || { ! current_bootstrap_complete && [ ! -f "$CONTROLLER_DIR/.initializing" ]; }; then
+  cp -a "$work_dir/unpacked/controller/." "$CONTROLLER_DIR/"
 fi
-if [ -d "$work_dir/unpacked/mytonctrl" ]; then
-  cp -a "$work_dir/unpacked/mytonctrl/." "$MYTONCTRL_DIR/"
+if [ -d "$work_dir/unpacked/controller/mytoncore/wallets" ]; then
+  cp -a "$work_dir/unpacked/controller/mytoncore/wallets/." "$WALLETS_DIR/"
 fi
-if [ -f "$work_dir/unpacked/tondb/config.json" ]; then
+if [ ! -s "$DB_CONFIG_FILE" ]; then
   cp -a "$work_dir/unpacked/tondb/config.json" "$DB_CONFIG_FILE"
 fi
 if [ -d "$work_dir/unpacked/tondb/keyring" ]; then
-  cp -a "$work_dir/unpacked/tondb/keyring" "$DB_KEYRING_DIR"
-fi
-if [ -d "$work_dir/unpacked/tondb/systemd-units" ]; then
-  cp -a "$work_dir/unpacked/tondb/systemd-units" "$SYSTEMD_UNITS_DIR"
-fi
-if [ -f "$work_dir/unpacked/tondb/mtc_done" ]; then
-  cp -a "$work_dir/unpacked/tondb/mtc_done" "$MTC_DONE_FILE"
+  mkdir -p "$DB_KEYRING_DIR"
+  cp -a "$work_dir/unpacked/tondb/keyring/." "$DB_KEYRING_DIR/"
 fi
 
 chmod 700 "$KEYS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$WALLETS_DIR" || true
@@ -1320,21 +1387,24 @@ chmod 600 "$DB_CONFIG_FILE" || true
 chmod 600 "$MTC_DONE_FILE" || true
 chmod 600 "$KEYS_DIR/client" "$KEYS_DIR/client.pub" "$KEYS_DIR/server.pub" "$KEYS_DIR/liteserver.pub" 2>/dev/null || true
 fix_validator_ownership
+rm -f "$FORCE_RESTORE_FILE"
 echo "encrypted key bundle restored"
 `
 
-const keyBackupScript = `
+const keyBackupScript = keyBundlePublicationScript + `
 set -eu
+umask 077
 
 KEYS_DIR="/var/ton-work/keys"
-MYTONCORE_DIR="/usr/local/bin/mytoncore"
-MYTONCTRL_DIR="/usr/local/bin/mytonctrl"
+CONTROLLER_DIR="/var/ton-work/controller"
+MYTONCORE_DIR="${CONTROLLER_DIR}/mytoncore"
+MYTONCTRL_DIR="${CONTROLLER_DIR}/mytonctrl"
 WALLETS_DIR="${MYTONCORE_DIR}/wallets"
 TON_DB_DIR="/var/ton-work/db"
 DB_CONFIG_FILE="${TON_DB_DIR}/config.json"
 DB_KEYRING_DIR="${TON_DB_DIR}/keyring"
-SYSTEMD_UNITS_DIR="${TON_DB_DIR}/systemd-units"
-MTC_DONE_FILE="${TON_DB_DIR}/mtc_done"
+SYSTEMD_UNITS_DIR="${CONTROLLER_DIR}/services"
+MTC_DONE_FILE="${CONTROLLER_DIR}/initialized.json"
 BUNDLE_DIR="/var/ton-key-bundle"
 BUNDLE_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_FILE}"
 META_FILE="${BUNDLE_DIR}/${KEY_BUNDLE_META_FILE}"
@@ -1403,7 +1473,8 @@ kms_encrypt() {
       fi
       plain_file="$(mktemp)"
       printf '%s' "$data_key_b64" >"$plain_file"
-      aws kms encrypt --key-id "$KMS_KEY_ID" --plaintext "fileb://${plain_file}" --query CiphertextBlob --output text
+      aws kms encrypt --key-id "$KMS_KEY_ID" --plaintext "fileb://${plain_file}" --query CiphertextBlob --output text \
+        || { rm -f "$plain_file"; return 1; }
       rm -f "$plain_file"
       ;;
     gcp)
@@ -1421,7 +1492,7 @@ kms_encrypt() {
         --keyring "$KMS_KEY_RING" \
         --key "$KMS_KEY_ID" \
         --plaintext-file "$plain_file" \
-        --ciphertext-file "$cipher_file" >/dev/null
+        --ciphertext-file "$cipher_file" >/dev/null || { rm -f "$plain_file" "$cipher_file"; return 1; }
       base64 <"$cipher_file" | tr -d '\n'
       rm -f "$plain_file" "$cipher_file"
       ;;
@@ -1467,13 +1538,15 @@ key_material_present() {
 }
 
 complete_bootstrap_present() {
-  if [ ! -f "$MTC_DONE_FILE" ]; then
+  if [ ! -s "$MTC_DONE_FILE" ]; then
     return 1
   fi
   if [ ! -s "$DB_CONFIG_FILE" ]; then
     return 1
   fi
-  if ! dir_has_payload "$SYSTEMD_UNITS_DIR"; then
+  if [ ! -s "$MYTONCORE_DIR/mytoncore.db" ] \
+    || [ ! -s "$SYSTEMD_UNITS_DIR/validator.service" ] \
+    || [ ! -s "$SYSTEMD_UNITS_DIR/mytoncore.service" ]; then
     return 1
   fi
   return 0
@@ -1495,62 +1568,61 @@ perform_backup() {
   need_bin tar
   need_bin openssl
   need_bin base64
-  mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
+  mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$TON_DB_DIR" "$BUNDLE_DIR" || return 1
+  recover_key_bundle_publication || return 1
 
   if ! backup_sources_present; then
     echo "complete bootstrap state not present yet; backup skipped" >&2
     return 1
   fi
 
-  work_dir="$(mktemp -d)"
+  work_dir="$(mktemp -d)" || return 1
 
-  mkdir -p "$work_dir/stage/keys" "$work_dir/stage/mytoncore" "$work_dir/stage/mytonctrl" "$work_dir/stage/tondb"
-  cp -a "$KEYS_DIR/." "$work_dir/stage/keys/" 2>/dev/null || true
-  cp -a "$MYTONCORE_DIR/." "$work_dir/stage/mytoncore/" 2>/dev/null || true
-  cp -a "$MYTONCTRL_DIR/." "$work_dir/stage/mytonctrl/" 2>/dev/null || true
-  if [ -f "$DB_CONFIG_FILE" ]; then
-    cp -a "$DB_CONFIG_FILE" "$work_dir/stage/tondb/config.json"
+  # This function is called from an if condition, where POSIX shells disable
+  # errexit. Check every mandatory step before publishing any bundle files.
+  if ! { mkdir -p "$work_dir/stage/keys" "$work_dir/stage/controller" "$work_dir/stage/tondb" \
+    && cp -a "$KEYS_DIR/." "$work_dir/stage/keys/" \
+    && cp -a "$CONTROLLER_DIR/." "$work_dir/stage/controller/" \
+    && rm -f "$work_dir/stage/controller/.container.lock" \
+    && cp -a "$DB_CONFIG_FILE" "$work_dir/stage/tondb/config.json"; }; then
+    rm -rf "$work_dir"
+    return 1
   fi
   if [ -d "$DB_KEYRING_DIR" ]; then
-    cp -a "$DB_KEYRING_DIR" "$work_dir/stage/tondb/keyring"
+    cp -a "$DB_KEYRING_DIR" "$work_dir/stage/tondb/keyring" || { rm -rf "$work_dir"; return 1; }
   fi
-  if [ -d "$SYSTEMD_UNITS_DIR" ]; then
-    cp -a "$SYSTEMD_UNITS_DIR" "$work_dir/stage/tondb/systemd-units"
-  fi
-  if [ -f "$MTC_DONE_FILE" ]; then
-    cp -a "$MTC_DONE_FILE" "$work_dir/stage/tondb/mtc_done"
-  fi
-  tar -czf "$work_dir/bundle.tar.gz" -C "$work_dir/stage" .
+  tar -czf "$work_dir/bundle.tar.gz" -C "$work_dir/stage" . || { rm -rf "$work_dir"; return 1; }
 
-  DATA_KEY_B64="$(openssl rand -base64 48 | tr -d '\n')"
+  DATA_KEY_B64="$(openssl rand -base64 48)" || { rm -rf "$work_dir"; return 1; }
   export DATA_KEY_B64
-  wrapped_key="$(wrap_data_key "$DATA_KEY_B64")"
+  wrapped_key="$(wrap_data_key "$DATA_KEY_B64")" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
   if [ -z "$wrapped_key" ]; then
     echo "failed to wrap data key" >&2
+    unset DATA_KEY_B64
+    rm -rf "$work_dir"
     return 1
   fi
 
   openssl enc -aes-256-cbc -pbkdf2 -md sha256 \
     -pass env:DATA_KEY_B64 \
     -in "$work_dir/bundle.tar.gz" \
-    -out "$work_dir/bundle.enc"
+    -out "$work_dir/bundle.enc" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
 
   {
     echo "provider=${KEY_PROVIDER}"
     echo "wrapped_key=${wrapped_key}"
     echo "algorithm=aes-256-cbc-pbkdf2"
     echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } >"$work_dir/bundle.meta"
+  } >"$work_dir/bundle.meta" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
 
-  mv "$work_dir/bundle.enc" "$BUNDLE_FILE"
-  mv "$work_dir/bundle.meta" "$META_FILE"
-  chmod 600 "$BUNDLE_FILE" "$META_FILE" || true
+  publish_key_bundle "$work_dir" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
   unset DATA_KEY_B64
   rm -rf "$work_dir"
   echo "encrypted key bundle updated"
 }
 
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
+recover_key_bundle_publication
 rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
 echo "manual backup mode enabled"
 auto_backup_retries=0
@@ -2379,55 +2451,12 @@ func defaultTonEnv(tonNode *tonv1alpha1.TonNode, publicIP corev1.EnvVar) []corev
 	return []corev1.EnvVar{
 		publicIP,
 		{Name: "NETWORK", Value: defaultNetwork},
-		{Name: "GLOBAL_CONFIG_URL", Value: globalConfigURLForNetwork(defaultNetwork)},
 		{Name: "VALIDATOR_PORT", Value: strconv.Itoa(int(desiredValidatorPort(tonNode)))},
+		{Name: "QUIC_PORT", Value: strconv.Itoa(int(desiredQuicPort(tonNode)))},
 		{Name: "LITESERVER_PORT", Value: strconv.Itoa(int(desiredLiteServerPort(tonNode)))},
 		{Name: "VALIDATOR_CONSOLE_PORT", Value: strconv.Itoa(int(desiredConsolePort(tonNode)))},
-		// Default to true for local/dev clusters; override through spec.env for prod.
-		{Name: "IGNORE_MINIMAL_REQS", Value: "true"},
-		{Name: "GIT_CONFIG_COUNT", Value: "1"},
-		{Name: "GIT_CONFIG_KEY_0", Value: "safe.directory"},
-		{Name: "GIT_CONFIG_VALUE_0", Value: tonSourcePath},
+		{Name: "TON_ARTIFACTS_DIR", Value: "/ton-artifacts"},
 	}
-}
-
-func reconcileNetworkEnv(envVars []corev1.EnvVar) []corev1.EnvVar {
-	network := networkFromEnv(envVars)
-	envVars = upsertEnvVar(envVars, "NETWORK", network)
-	envVars = upsertEnvVar(envVars, "GLOBAL_CONFIG_URL", globalConfigURLForNetwork(network))
-	return envVars
-}
-
-func networkFromEnv(envVars []corev1.EnvVar) string {
-	raw := strings.ToLower(envVarValueByName(envVars, "NETWORK"))
-	switch raw {
-	case "mainnet", "testnet":
-		return raw
-	case "":
-		return defaultNetwork
-	default:
-		return raw
-	}
-}
-
-func globalConfigURLForNetwork(network string) string {
-	switch strings.ToLower(strings.TrimSpace(network)) {
-	case "testnet":
-		return testnetGlobalConfigURL
-	default:
-		return defaultGlobalConfigURL
-	}
-}
-
-func upsertEnvVar(envVars []corev1.EnvVar, name string, value string) []corev1.EnvVar {
-	for i := range envVars {
-		if envVars[i].Name == name {
-			envVars[i].Value = value
-			envVars[i].ValueFrom = nil
-			return envVars
-		}
-	}
-	return append(envVars, corev1.EnvVar{Name: name, Value: value})
 }
 
 func mergeEnvVars(base []corev1.EnvVar, extra []corev1.EnvVar) []corev1.EnvVar {

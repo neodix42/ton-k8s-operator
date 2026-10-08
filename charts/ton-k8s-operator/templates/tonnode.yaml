@@ -10,7 +10,12 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  image: {{ .Values.tonNode.image }}
+  image: {{ .Values.tonNode.image | quote }}
+  tonImage: {{ .Values.tonNode.tonImage | quote }}
+  {{- with .Values.tonNode.args }}
+  args:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   replicas: {{ .Values.tonNode.replicas }}
   storage:
     tonWorkSize: {{ .Values.tonNode.storage.tonWorkSize }}
@@ -85,12 +90,16 @@ spec:
       {{- end }}
       fileName: {{ .encryptedBundle.fileName }}
       metaFileName: {{ .encryptedBundle.metaFileName }}
+    {{- if or .agent.image .agent.resources }}
     agent:
-      image: {{ .agent.image }}
+      {{- with .agent.image }}
+      image: {{ . | quote }}
+      {{- end }}
       {{- with .agent.resources }}
       resources:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+    {{- end }}
   {{- end }}
   {{- end }}
   {{- with .Values.tonNode.env }}

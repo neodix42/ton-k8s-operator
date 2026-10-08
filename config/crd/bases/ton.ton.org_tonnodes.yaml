@@ -49,6 +49,14 @@ spec:
           spec:
             description: TonNodeSpec defines the desired state of TonNode.
             properties:
+              args:
+                description: |-
+                  Args contains MyTonCtrl installation flags passed after the run subcommand.
+                  For example: ["-m", "validator", "-n", "testnet", "-d"].
+                  When omitted, the image's default command and MYTONCTRL_ARGS are used.
+                items:
+                  type: string
+                type: array
               configRef:
                 description: |-
                   ConfigRef optionally points to a Secret containing a config.json key.
@@ -197,8 +205,9 @@ spec:
                   type: object
                 type: array
               image:
-                default: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
-                description: Image is the TON node container image.
+                default: ghcr.io/neodix42/mytonctrl:v1.0.0
+                description: Image is the MyTonCtrl runtime image, which installs
+                  and supervises the TON node.
                 type: string
               keyManagement:
                 description: KeyManagement enables secure key handling with in-memory
@@ -209,9 +218,9 @@ spec:
                       backup encrypted bundles.
                     properties:
                       image:
-                        default: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
-                        description: Image is the init/sidecar image used for key
-                          management scripts.
+                        description: |-
+                          Image is the init/sidecar image used for key management scripts.
+                          When omitted, the MyTonCtrl runtime image in spec.image is used.
                         type: string
                       resources:
                         description: Resources defines CPU and memory requests/limits
@@ -333,7 +342,7 @@ spec:
                       walletsSizeLimit:
                         default: 512Mi
                         description: WalletsSizeLimit is the tmpfs size limit for
-                          /usr/local/bin/mytoncore/wallets.
+                          /var/ton-work/controller/mytoncore/wallets.
                         type: string
                     type: object
                   kmsKeyID:
@@ -489,11 +498,15 @@ spec:
                     type: array
                   myTonCoreSize:
                     default: 20Gi
-                    description: MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore.
+                    description: |-
+                      MyTonCoreSize sizes the legacy mytoncore PVC, retained for StatefulSet compatibility.
+                      Deprecated: MyTonCtrl state is now stored under /var/ton-work/controller.
                     type: string
                   myTonCtrlSize:
                     default: 20Gi
-                    description: MyTonCtrlSize is the PVC size for /usr/local/bin/mytonctrl.
+                    description: |-
+                      MyTonCtrlSize sizes the legacy mytonctrl PVC, retained for StatefulSet compatibility.
+                      Deprecated: MyTonCtrl code is supplied by the runtime image.
                     type: string
                   storageClassName:
                     description: |-
@@ -502,13 +515,21 @@ spec:
                     type: string
                   tonSourceSize:
                     default: 20Gi
-                    description: TonSourceSize is the PVC size for /usr/src/ton.
+                    description: |-
+                      TonSourceSize sizes the legacy ton-src PVC, retained for StatefulSet compatibility.
+                      Deprecated: official TON binaries are staged in an ephemeral volume instead.
                     type: string
                   tonWorkSize:
                     default: 700Gi
                     description: TonWorkSize is the PVC size for /var/ton-work.
                     type: string
                 type: object
+              tonImage:
+                default: ghcr.io/ton-blockchain/ton:v2026.08-amd64
+                description: |-
+                  TonImage is the official TON image that exports the binaries and Fift libraries.
+                  It is independent of the MyTonCtrl runtime image.
+                type: string
             type: object
           status:
             description: TonNodeStatus defines the observed state of TonNode.

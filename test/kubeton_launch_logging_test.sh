@@ -233,6 +233,7 @@ test_install_waits_for_operator_rollout_inside_launch_session() (
   resolve_tonnode_name_from_values() { printf '%s' tonnode; }
   resolve_ton_replicas_from_values_file() { printf '%s' 1; }
   append_helm_force_conflicts_if_supported() { :; }
+  ensure_tonnode_crd_schema() { record_install_event schema-ready; }
   launch_session_start_watchers() {
     record_install_event watcher-start
     : >"$active_marker"
@@ -284,6 +285,7 @@ test_install_waits_for_operator_rollout_inside_launch_session() (
   run_with_launch_session install run_install \
     >"$test_dir/install-rollout-success.out" 2>"$test_dir/install-rollout-success.stderr"
   assert_order "watcher-start" "helm-applied" "$success_events"
+  assert_order "schema-ready" "helm-applied" "$success_events"
   assert_order "helm-applied" "deployment-resolved-by-release-labels" "$success_events"
   assert_order "deployment-resolved-by-release-labels" "rollout-started" "$success_events"
   assert_order "rollout-started" "rollout-ready" "$success_events"
@@ -1034,6 +1036,315 @@ test_launch_snapshot_captures_dependency_diagnostics_without_secrets() (
     || fail "duplicate Victoria namespaces were not deduplicated"
 )
 
+test_bundle_upload_refuses_unresolved_backup_publication() (
+  source "$kubeton"
+  local src_bundle_dir="$test_dir/pending-publication-source"
+  local call_log="$test_dir/pending-publication-source.kubectl"
+  mkdir -p "$src_bundle_dir/.backup-publish"
+  printf encrypted-payload >"$src_bundle_dir/keys.bundle.enc"
+  printf encrypted-metadata >"$src_bundle_dir/keys.bundle.meta"
+  : >"$call_log"
+  kubectl() { printf '%s\n' "$*" >>"$call_log"; return 1; }
+  local flow
+  for flow in checksums pvc running-pod; do
+    local rc=0
+    case "$flow" in
+      checksums) key_bundle_upload_checksums "$src_bundle_dir" \
+        >"$test_dir/pending-publication-${flow}.out" 2>&1 || rc=$? ;;
+      pvc) restore_bundle_to_pvc default keybundle-tonnode-0 "$src_bundle_dir" \
+        >"$test_dir/pending-publication-${flow}.out" 2>&1 || rc=$? ;;
+      running-pod) inject_bundle_into_running_pod default tonnode-0 "$src_bundle_dir" \
+        >"$test_dir/pending-publication-${flow}.out" 2>&1 || rc=$? ;;
+    esac
+    [[ "$rc" != 0 ]] || fail "$flow accepted a backup with an unresolved publication journal"
+    assert_contains 'unresolved .backup-publish journal' "$test_dir/pending-publication-${flow}.out"
+    assert_contains 'key-backup container to recover publication' "$test_dir/pending-publication-${flow}.out"
+  done
+  [[ ! -s "$call_log" ]] || fail "journal-bearing upload contacted Kubernetes before rejecting the source"
+)
+
+test_bundle_export_waits_for_recovered_backup_publication() (
+  source "$kubeton"
+  local mode output_root call_log
+  helper_pod_node_constraints_yaml() { :; }
+  kubectl() {
+    printf '%s\n' "$*" >>"$call_log"
+    if [[ "$*" == *" apply -f -"* ]]; then cat >/dev/null; return 0; fi
+    if [[ "$*" == *" get pvc "* || "$*" == *" wait "* || "$*" == *" delete pod "* ]]; then return 0; fi
+    if [[ "$*" == *" exec "* && "$*" == *'.backup-publish'* ]]; then
+      case "$mode" in
+        pending) printf pending ;;
+        api-failure) return 1 ;;
+        recovered) printf ready ;;
+      esac
+      return 0
+    fi
+    if [[ "$*" == *" cp "* ]]; then
+      while [[ "$1" != cp ]]; do shift; done
+      mkdir -p "$3"
+      printf exported-payload >"$3/keys.bundle.enc"
+      printf exported-metadata >"$3/keys.bundle.meta"
+      return 0
+    fi
+    return 1
+  }
+  for mode in pending api-failure recovered; do
+    output_root="$test_dir/publication-export-${mode}"
+    call_log="$test_dir/publication-export-${mode}.kubectl"
+    : >"$call_log"
+    local rc=0
+    export_bundle_from_pvc default tonnode 0 "$output_root" \
+      >"$test_dir/publication-export-${mode}.out" 2>&1 || rc=$?
+    if [[ "$mode" == recovered ]]; then
+      [[ "$rc" == 0 ]] || fail "export rejected a recovered encrypted publication"
+      [[ -s "$output_root/default/tonnode/0/SHA256SUMS" ]] || fail "recovered export did not produce a verified backup"
+    else
+      [[ "$rc" != 0 ]] || fail "export ignored $mode backup publication"
+      assert_not_contains ' cp ' "$call_log"
+      assert_contains ' delete pod ' "$call_log"
+      if [[ "$mode" == pending ]]; then
+        assert_contains 'key-backup container to recover publication' "$test_dir/publication-export-${mode}.out"
+      else
+        assert_contains 'cannot inspect backup publication state' "$test_dir/publication-export-${mode}.out"
+      fi
+    fi
+  done
+)
+
+test_tonnode_crd_schema_is_established_before_install_and_start_helm() (
+  source "$kubeton"
+  KUBETON_SKIP_NODE_PREREQ_CHECK=false
+  KUBETON_START_VICTORIA_LOGS_ENABLED=false
+  VICTORIA_LOGS_ENABLED=false
+  KUBETON_START_WAIT_FOR_BOOTSTRAP=false
+  CHART_DIR="$repo_root/charts/ton-k8s-operator"
+  local event_log mode flow
+  require_bin() { :; }
+  run_node_prerequisite_check_readonly() { printf 'preflight\n' >>"$event_log"; }
+  resolve_ton_replicas_from_values_file() { printf 1; }
+  resolve_operator_controller_deployment_name() { printf controller; }
+  should_bootstrap_baremetal() { return 1; }
+  longhorn_manager_exists() { return 1; }
+  storage_class_is_longhorn() { return 1; }
+  prepare_node_prerequisites_for_workload() {
+    KUBETON_NODE_CHECK_REQUIRED_NODES=1
+    KUBETON_NODE_CHECK_TON_SELECTOR=""
+    printf 'preflight\n' >>"$event_log"
+  }
+  run_node_prerequisite_check() { printf 'preflight\n' >>"$event_log"; }
+  fleet_has_stop_annotations() { return 1; }
+  ensure_ton_storage_class_available() { :; }
+  append_ton_storage_overrides() { :; }
+  should_use_sequential_ton_start() { return 1; }
+  validate_external_key_prereqs() { :; }
+  ensure_start_victoria_logs() { :; }
+  delete_stale_ton_pvcs_before_fresh_start() { :; }
+  verify_start_victoria_logs_collection_ready() { :; }
+  append_helm_force_conflicts_if_supported() { :; }
+  repair_pending_ton_placement_after_start() { :; }
+  helm() {
+    if [[ "$*" == *" status "* ]]; then return 1; fi
+    printf 'helm-applied\n' >>"$event_log"
+  }
+  kubectl() {
+    case "$*" in
+      "apply -f $CHART_DIR/crds/ton.ton.org_tonnodes.yaml")
+        printf 'schema-applied\n' >>"$event_log"
+        [[ "$mode" != apply-failure ]]
+        ;;
+      "wait --for=condition=Established crd/tonnodes.ton.ton.org --timeout=60s")
+        printf 'schema-established\n' >>"$event_log"
+        [[ "$mode" != wait-failure ]]
+        ;;
+      *" rollout status "*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  for flow in install start; do
+    for mode in success apply-failure wait-failure; do
+      event_log="$test_dir/schema-${flow}-${mode}.events"
+      : >"$event_log"
+      local rc=0
+      "run_${flow}" >"$test_dir/schema-${flow}-${mode}.out" 2>&1 || rc=$?
+      assert_order preflight schema-applied "$event_log"
+      if [[ "$mode" == success ]]; then
+        [[ "$rc" == 0 ]] || fail "$flow rejected an established TonNode schema"
+        assert_order schema-applied schema-established "$event_log"
+        assert_order schema-established helm-applied "$event_log"
+      else
+        [[ "$rc" != 0 ]] || fail "$flow ignored $mode while updating the TonNode schema"
+        assert_not_contains helm-applied "$event_log"
+        assert_contains 'Helm deployment was not applied' "$test_dir/schema-${flow}-${mode}.out"
+      fi
+    done
+  done
+)
+
+test_explicit_bundle_restore_requests_full_state_only_after_verified_upload() (
+  source "$kubeton"
+  local src_bundle_dir="$test_dir/explicit-restore-source"
+  local remote_bundle mode flow remote_path script arg source_dir destination
+  mkdir -p "$src_bundle_dir"
+  printf selected-encrypted-bundle >"$src_bundle_dir/keys.bundle.enc"
+  printf selected-encrypted-metadata >"$src_bundle_dir/keys.bundle.meta"
+  helper_pod_node_constraints_yaml() { :; }
+  kubectl() {
+    local args="$*"
+    if [[ "$args" == *" apply -f -"* ]]; then cat >/dev/null; return 0; fi
+    if [[ "$args" == *" get pod "* ]]; then printf 'ton-node key-backup'; return 0; fi
+    if [[ "$args" == *" wait "* || "$args" == *" delete pod "* ]]; then return 0; fi
+    if [[ "$args" == *" cp "* ]]; then
+      while [[ "$1" != cp ]]; do shift; done
+      source_dir="$2"
+      destination="${3#*:}"
+      case "$destination" in
+        /bundle/*) remote_path="${remote_bundle}${destination#/bundle}" ;;
+        /var/ton-key-bundle/*) remote_path="${remote_bundle}${destination#/var/ton-key-bundle}" ;;
+        *) fail "unexpected test upload target: $destination" ;;
+      esac
+      cp -a "$source_dir" "$remote_path"
+      [[ "$mode" != copy-failure ]] || return 17
+      if [[ "$mode" == corrupt ]]; then printf corrupted >>"$remote_path/keys.bundle.enc"; fi
+      return 0
+    fi
+    if [[ "$args" == *" exec "* ]]; then
+      while [[ "$1" != -ec ]]; do shift; done
+      shift
+      script="$1"
+      shift
+      if [[ "$script" == *KEY_BUNDLE_DIR* ]]; then printf /var/ton-key-bundle; return 0; fi
+      local -a mapped_args=()
+      for arg in "$@"; do
+        case "$arg" in
+          /bundle|/bundle/*) mapped_args+=("${remote_bundle}${arg#/bundle}") ;;
+          /var/ton-key-bundle|/var/ton-key-bundle/*) mapped_args+=("${remote_bundle}${arg#/var/ton-key-bundle}") ;;
+          *) mapped_args+=("$arg") ;;
+        esac
+      done
+      if [[ "$mode" == commit-failure ]]; then
+        script=$'mv() { case "$1" in */.restore-upload-*/keys.bundle.meta) return 23 ;; esac; command mv "$@"; }\n'"$script"
+      elif [[ "$mode" == request-sync-failure ]]; then
+        script=$'sync_count=0\nsync() { sync_count=$((sync_count + 1)); [ "$sync_count" != 2 ] || return 29; command sync; }\n'"$script"
+      fi
+      sh -ec "$script" "${mapped_args[@]}"
+      return $?
+    fi
+    return 1
+  }
+
+  for flow in pvc running-pod; do
+    for mode in success copy-failure corrupt commit-failure request-sync-failure; do
+      remote_bundle="$test_dir/explicit-restore-${flow}-${mode}"
+      mkdir -p "$remote_bundle"
+      printf original-encrypted-bundle >"$remote_bundle/keys.bundle.enc"
+      printf original-encrypted-metadata >"$remote_bundle/keys.bundle.meta"
+      local rc=0
+      if [[ "$flow" == pvc ]]; then
+        restore_bundle_to_pvc default keybundle-tonnode-0 "$src_bundle_dir" \
+          >"$test_dir/explicit-restore-${flow}-${mode}.out" 2>&1 || rc=$?
+      else
+        inject_bundle_into_running_pod default tonnode-0 "$src_bundle_dir" \
+          >"$test_dir/explicit-restore-${flow}-${mode}.out" 2>&1 || rc=$?
+      fi
+      if [[ "$mode" == success ]]; then
+        [[ "$rc" == 0 ]] || fail "$flow rejected a verified bundle upload"
+        [[ -f "$remote_bundle/.restore-controller-state" ]] || fail "$flow did not persist the explicit state-restore request"
+        [[ "$(stat -c '%a' "$remote_bundle/.restore-controller-state")" == 600 ]] || fail "$flow restore request permissions were not private"
+        cmp "$src_bundle_dir/keys.bundle.enc" "$remote_bundle/keys.bundle.enc" || fail "$flow committed the wrong encrypted bundle"
+        cmp "$src_bundle_dir/keys.bundle.meta" "$remote_bundle/keys.bundle.meta" || fail "$flow committed the wrong encrypted metadata"
+      else
+        [[ "$rc" != 0 ]] || fail "$flow ignored the $mode upload failure"
+        [[ ! -f "$remote_bundle/.restore-controller-state" ]] || fail "$flow requested state replacement before validating the uploaded bundle"
+        [[ "$(<"$remote_bundle/keys.bundle.enc")" == original-encrypted-bundle ]] || fail "$flow changed the old bundle after $mode"
+        [[ "$(<"$remote_bundle/keys.bundle.meta")" == original-encrypted-metadata ]] || fail "$flow changed the old metadata after $mode"
+      fi
+    done
+  done
+)
+
+test_main_wallet_image_uses_independent_ton_artifact_reference() (
+  source "$kubeton"
+  TON_VALUES_FILE="$test_dir/independent-images.yaml"
+  CHART_DIR="$test_dir/independent-chart"
+  mkdir -p "$CHART_DIR"
+  cat >"$TON_VALUES_FILE" <<'YAML'
+tonNode:
+  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
+YAML
+  local live_image=""
+  kubectl() {
+    if [[ "$*" == *'export-ton-binaries'* ]]; then
+      printf '%s' "$live_image"
+    fi
+    return 0
+  }
+  [[ "$(resolve_main_wallet_image)" == "ghcr.io/ton-blockchain/ton:v2026.08-amd64" ]] \
+    || fail "main-wallet borrowed the unrelated MyTonCtrl release tag"
+  live_image="ghcr.io/ton-blockchain/ton:v2026.07-amd64"
+  [[ "$(resolve_main_wallet_image)" == "$live_image" ]] \
+    || fail "main-wallet ignored the currently deployed TON artifact release"
+  live_image="ghcr.io/ton-blockchain/ton@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  [[ "$(resolve_main_wallet_image)" == "$live_image" ]] \
+    || fail "main-wallet dropped a pinned TON artifact digest"
+  MAIN_WALLET_IMAGE="registry.example/wallet:custom"
+  [[ "$(resolve_main_wallet_image)" == "$MAIN_WALLET_IMAGE" ]] \
+    || fail "explicit main-wallet image did not override TON artifacts"
+  MAIN_WALLET_IMAGE=""
+  MAIN_WALLET_IMAGE_REPOSITORY="registry.example/ton"
+  live_image="ghcr.io/ton-blockchain/ton:v2026.07-amd64"
+  [[ "$(resolve_main_wallet_image)" == "registry.example/ton:v2026.07-amd64" ]] \
+    || fail "main-wallet repository override did not retain the TON artifact tag"
+  live_image=""
+  TON_VALUES_FILE="$test_dir/only-mytonctrl-image.yaml"
+  printf 'tonNode:\n  image: ghcr.io/neodix42/mytonctrl:v1.0.0\n' >"$TON_VALUES_FILE"
+  if resolve_main_wallet_image >"$test_dir/missing-ton-image.out" 2>&1; then
+    fail "main-wallet accepted a controller image as the TON artifact image"
+  fi
+  assert_contains "set tonNode.tonImage or MAIN_WALLET_IMAGE" "$test_dir/missing-ton-image.out"
+)
+
+test_bootstrap_commit_requires_new_controller_state() (
+  source "$kubeton"
+  local -A committed_files=(
+    [/var/ton-work/controller/initialized.json]=complete
+    [/var/ton-work/db/config.json]=complete
+    [/var/ton-work/controller/mytoncore/mytoncore.db]=complete
+    [/var/ton-work/controller/services/validator.service]=complete
+    [/var/ton-work/controller/services/mytoncore.service]=complete
+  )
+  run_with_timeout() { shift; "$@"; }
+  kubectl() {
+    local arg script="" capture_script=false
+    if [[ "$*" == *" get pod tonnode-0 "* ]]; then
+      printf 'node-a\x1fRunning\x1fTrue\x1f\x1f\x1f0\x1f\x1f'
+      return 0
+    fi
+    for arg in "$@"; do
+      if [[ "$capture_script" == true ]]; then script="$arg"; break; fi
+      [[ "$arg" == -ec ]] && capture_script=true
+    done
+    if [[ "$script" == *initialized.json* ]]; then
+      # Execute the real observer script against a virtual durable filesystem.
+      test() { [[ "$1" == -s && "${committed_files[$2]:-}" == complete ]]; }
+      eval "$script"
+      return 0
+    fi
+    printf bootstrapping
+  }
+  local row state path
+  row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
+  IFS=$'\x1f' read -r state _ <<<"$row"
+  [[ "$state" == complete ]] || fail "complete upstream controller state was not accepted"
+  for path in "${!committed_files[@]}"; do
+    committed_files[$path]=pending
+    row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
+    IFS=$'\x1f' read -r state _ <<<"$row"
+    [[ "$state" == bootstrapping ]] || fail "missing required controller state '$path' was accepted as complete"
+    committed_files[$path]=complete
+  done
+)
+
 test_running_without_commit_is_extracting() (
   source "$kubeton"
 
@@ -1049,7 +1360,7 @@ test_running_without_commit_is_extracting() (
       printf 'node-a\x1fRunning\x1fTrue\x1f\x1f\x1f0\x1f\x1f'
       return 0
     fi
-    if [[ "$args" == *" exec tonnode-0 "* && "$args" == *"test -f /var/ton-work/db/mtc_done"* ]]; then
+    if [[ "$args" == *" exec tonnode-0 "* && "$args" == *"test -s /var/ton-work/controller/initialized.json"* ]]; then
       printf '%s' "$bootstrap_commit_state"
       return 0
     fi
@@ -1063,8 +1374,8 @@ test_running_without_commit_is_extracting() (
   local row state detail
   row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
   IFS=$'\x1f' read -r state _ _ _ _ detail <<<"$row"
-  [[ "$state" == "extracting" ]] || fail "Running pod without mtc_done was reported as '$state', expected extracting"
-  [[ "$detail" == *"mtc_done is not committed"* ]] || fail "missing uncommitted-bootstrap detail"
+  [[ "$state" == "extracting" ]] || fail "Running pod without initialized.json was reported as '$state', expected extracting"
+  [[ "$detail" == *"initialized.json is not committed"* ]] || fail "missing uncommitted-bootstrap detail"
 
   bootstrap_commit_state=complete
   row="$(ton_pod_initial_bootstrap_state default tonnode-0)"
@@ -1112,7 +1423,7 @@ test_running_pod_bootstrap_probe_failure_is_a_status_read_error() (
       printf 'node-a\x1fRunning\x1fTrue\x1f\x1f\x1f0\x1f\x1f'
       return 0
     fi
-    if [[ "$args" == *" exec tonnode-0 "* && "$args" == *"test -f /var/ton-work/db/mtc_done"* ]]; then
+    if [[ "$args" == *" exec tonnode-0 "* && "$args" == *"test -s /var/ton-work/controller/initialized.json"* ]]; then
       printf '%s\n' 'remote API proxy refused the exec stream' >&2
       return 124
     fi
@@ -1248,7 +1559,7 @@ test_bootstrap_wait_resets_status_read_error_count_after_successful_read() (
     calls="$(wc -l <"$calls_file")"
     case "$calls" in
       1|3) printf 'status-read-error\x1f-\x1f0\x1f\x1f\x1ftemporary API failure' ;;
-      2) printf 'extracting\x1fnode-a\x1f0\x1f\x1f\x1fmtc_done is not committed yet' ;;
+      2) printf 'extracting\x1fnode-a\x1f0\x1f\x1f\x1finitialized.json is not committed yet' ;;
       *) printf 'complete\x1fnode-a\x1f0\x1f\x1f\x1fcommitted' ;;
     esac
   }
@@ -1275,7 +1586,7 @@ test_bootstrap_wait_requires_every_replica() (
     if [[ "$pod" == "tonnode-0" ]]; then
       printf 'complete\x1fnode-a\x1f0\x1f\x1f\x1fcommitted'
     elif [[ "$(grep -c '^tonnode-1$' "$calls_file")" -eq 1 ]]; then
-      printf 'extracting\x1fnode-b\x1f0\x1f\x1f\x1fmtc_done is not committed yet'
+      printf 'extracting\x1fnode-b\x1f0\x1f\x1f\x1finitialized.json is not committed yet'
     else
       printf 'complete\x1fnode-b\x1f0\x1f\x1f\x1fcommitted'
     fi
@@ -1905,6 +2216,7 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
   }
   delete_stale_ton_pvcs_before_fresh_start() { record_prebootstrap_event stale-pvc-cleanup; }
   verify_start_victoria_logs_collection_ready() { record_prebootstrap_event final-log-coverage; }
+  ensure_tonnode_crd_schema() { record_prebootstrap_event schema-ready; }
   append_helm_force_conflicts_if_supported() { :; }
   repair_pending_ton_placement_after_start() { :; }
 
@@ -2916,6 +3228,7 @@ test_sequential_run_start_waits_for_final_controller_convergence() (
   ensure_start_victoria_logs() { :; }
   delete_stale_ton_pvcs_before_fresh_start() { :; }
   verify_start_victoria_logs_collection_ready() { :; }
+  ensure_tonnode_crd_schema() { printf 'schema-ready\n' >>"$event_log"; }
   append_helm_force_conflicts_if_supported() { :; }
   sequential_start_ton_fleet() { printf '%s\n' staged >>"$event_log"; }
   wait_ton_controller_reconciled_after_start() {
@@ -2930,6 +3243,7 @@ test_sequential_run_start_waits_for_final_controller_convergence() (
   }
 
   run_start >"$test_dir/sequential-final-convergence.out" 2>&1
+  assert_order "schema-ready" "helm-1" "$event_log"
   assert_order "helm-1" "staged" "$event_log"
   assert_order "staged" "helm-2" "$event_log"
   assert_order "helm-2" "converged ns=default name=tonnode replicas=3 timeout=3700" "$event_log"
@@ -3435,6 +3749,12 @@ test_start_watchers_use_victoria_logs_instead_of_container_streams
 test_start_watchers_keep_container_streams_without_victoria_logs
 test_event_watchers_use_atomic_list_watch_without_replay_timeout
 test_launch_snapshot_captures_dependency_diagnostics_without_secrets
+test_bundle_upload_refuses_unresolved_backup_publication
+test_bundle_export_waits_for_recovered_backup_publication
+test_tonnode_crd_schema_is_established_before_install_and_start_helm
+test_explicit_bundle_restore_requests_full_state_only_after_verified_upload
+test_main_wallet_image_uses_independent_ton_artifact_reference
+test_bootstrap_commit_requires_new_controller_state
 test_running_without_commit_is_extracting
 test_bootstrap_pod_status_template_closes_container_range
 test_running_pod_bootstrap_probe_failure_is_a_status_read_error

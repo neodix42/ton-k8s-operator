@@ -639,6 +639,7 @@ PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
     delete_stale_ton_pvcs_before_fresh_start() { printf "stale-cleanup\n" >>"$event_log"; }
     append_helm_force_conflicts_if_supported() { :; }
     repair_pending_ton_placement_after_start() { :; }
+    ensure_tonnode_crd_schema() { :; }
     run_start
   ' _ "$kubeton" "$k3d_start_events" >"$test_dir/k3d-start.out" 2>&1
 assert_contains "use-longhorn=false" "$k3d_start_events"
@@ -932,6 +933,7 @@ PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" KUBETON_TEST_H
     node_check_selector_is_all_compatible() { printf "final-selector-recheck\n" >>"$event_log"; }
     append_helm_force_conflicts_if_supported() { :; }
     repair_pending_ton_placement_after_start() { :; }
+    ensure_tonnode_crd_schema() { :; }
     run_start
   ' _ "$kubeton" "$start_gate_events" >"$test_dir/start-selector.out" 2>&1
 assert_contains "\"node.longhorn.io/create-default-disk\": \"true\"" "$start_selector_values"

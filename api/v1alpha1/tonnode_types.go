@@ -26,9 +26,20 @@ import (
 
 // TonNodeSpec defines the desired state of TonNode.
 type TonNodeSpec struct {
-	// Image is the TON node container image.
-	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
+	// Image is the MyTonCtrl runtime image, which installs and supervises the TON node.
+	// +kubebuilder:default:="ghcr.io/neodix42/mytonctrl:v1.0.0"
 	Image string `json:"image,omitempty"`
+
+	// TonImage is the official TON image that exports the binaries and Fift libraries.
+	// It is independent of the MyTonCtrl runtime image.
+	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton:v2026.08-amd64"
+	TonImage string `json:"tonImage,omitempty"`
+
+	// Args contains MyTonCtrl installation flags passed after the run subcommand.
+	// For example: ["-m", "validator", "-n", "testnet", "-d"].
+	// When omitted, the image's default command and MYTONCTRL_ARGS are used.
+	// +optional
+	Args []string `json:"args,omitempty"`
 
 	// Replicas is the desired number of TON nodes.
 	// +kubebuilder:validation:Minimum=1
@@ -74,15 +85,18 @@ type TonNodeStorageSpec struct {
 	// +kubebuilder:default:="700Gi"
 	TonWorkSize string `json:"tonWorkSize,omitempty"`
 
-	// TonSourceSize is the PVC size for /usr/src/ton.
+	// TonSourceSize sizes the legacy ton-src PVC, retained for StatefulSet compatibility.
+	// Deprecated: official TON binaries are staged in an ephemeral volume instead.
 	// +kubebuilder:default:="20Gi"
 	TonSourceSize string `json:"tonSourceSize,omitempty"`
 
-	// MyTonCoreSize is the PVC size for /usr/local/bin/mytoncore.
+	// MyTonCoreSize sizes the legacy mytoncore PVC, retained for StatefulSet compatibility.
+	// Deprecated: MyTonCtrl state is now stored under /var/ton-work/controller.
 	// +kubebuilder:default:="20Gi"
 	MyTonCoreSize string `json:"myTonCoreSize,omitempty"`
 
-	// MyTonCtrlSize is the PVC size for /usr/local/bin/mytonctrl.
+	// MyTonCtrlSize sizes the legacy mytonctrl PVC, retained for StatefulSet compatibility.
+	// Deprecated: MyTonCtrl code is supplied by the runtime image.
 	// +kubebuilder:default:="20Gi"
 	MyTonCtrlSize string `json:"myTonCtrlSize,omitempty"`
 
@@ -192,7 +206,7 @@ type TonNodeInMemoryKeySpec struct {
 	// +kubebuilder:default:="128Mi"
 	KeysSizeLimit string `json:"keysSizeLimit,omitempty"`
 
-	// WalletsSizeLimit is the tmpfs size limit for /usr/local/bin/mytoncore/wallets.
+	// WalletsSizeLimit is the tmpfs size limit for /var/ton-work/controller/mytoncore/wallets.
 	// +kubebuilder:default:="512Mi"
 	WalletsSizeLimit string `json:"walletsSizeLimit,omitempty"`
 }
@@ -224,7 +238,7 @@ type TonNodeEncryptedBundleSpec struct {
 // TonNodeKeyAgentSpec defines helper container settings for key restore/backup.
 type TonNodeKeyAgentSpec struct {
 	// Image is the init/sidecar image used for key management scripts.
-	// +kubebuilder:default:="ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64"
+	// When omitted, the MyTonCtrl runtime image in spec.image is used.
 	Image string `json:"image,omitempty"`
 
 	// Resources defines CPU and memory requests/limits for key helper containers.

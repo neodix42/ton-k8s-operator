@@ -18,7 +18,7 @@ Even with this model, plaintext key material exists in controlled windows:
 - the encrypted bundle is decrypted in memory/tmp files inside the init container.
 - plaintext keys are written into tmpfs mounts:
   - `/var/ton-work/keys`
-  - `/usr/local/bin/mytoncore/wallets`
+  - `/var/ton-work/controller/mytoncore/wallets`
 
 2. During node runtime:
 - validator and supporting processes keep keys in process memory.
@@ -49,7 +49,7 @@ When `spec.keyManagement.enabled=true`, operator configures:
 
 1. In-memory key mounts:
 - `emptyDir{medium: Memory}` on `/var/ton-work/keys`
-- `emptyDir{medium: Memory}` on `/usr/local/bin/mytoncore/wallets`
+- `emptyDir{medium: Memory}` on `/var/ton-work/controller/mytoncore/wallets`
 
 2. Encrypted bundle persistence:
 - dedicated PVC claim template: `keybundle`
@@ -91,7 +91,7 @@ spec:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.04-amd64
+      image: ghcr.io/neodix42/mytonctrl:v1.0.0
 ```
 
 Minimal KMS example:
@@ -177,16 +177,25 @@ Authentication should be done via Workload Identity or by mounting a service acc
 - KMS CLI decrypt.
 4. Decrypts encrypted tarball (`openssl`).
 5. Restores plaintext key files to tmpfs mounts.
+   Restores MyTonCtrl state to `/var/ton-work/controller` and TON DB key files to `/var/ton-work/db`.
 6. TON main container starts.
+
+Bundles from the former `ton-docker-ctrl` layout contain `mytoncore/` and `mytonctrl/`
+at the archive root. The new restore init container rejects that legacy layout with
+migration instructions and preserves the existing state. Import a native
+MyTonCtrl backup into a fresh work volume, then create a new encrypted bundle;
+renaming archive directories does not reconstruct the required controller state.
 
 ### 5.2 Backup path (manual trigger)
 
-1. `key-backup` scans tmpfs key folders.
+1. `key-backup` gathers tmpfs keys, MyTonCtrl controller state, and selected TON DB key files.
 2. Creates tarball in sidecar temp storage.
 3. Generates random data key.
 4. Wraps data key with Vault/KMS.
 5. Encrypts tarball with data key.
-6. Writes an encrypted bundle + metadata atomically to keybundle PVC.
+6. Publishes encrypted bundle + metadata using a durable rollback journal on
+   the keybundle PVC. Interrupted publication is recovered before backup or restore;
+   plaintext staging is never placed in that journal.
 7. Sidecar stays idle until an explicit backup trigger file is created.
 
 `kubeton stop` now issues this explicit trigger for each running TON pod before scaling TON down
@@ -208,14 +217,14 @@ Exact exported files per replica (`<output-dir>/<namespace>/<statefulset>/<ordin
 - `SHA256SUMS`
 - `keys.bundle.enc` decrypts to a tar archive with top-level folders:
 - `keys/` = all files from pod path `/var/ton-work/keys/**`
-- `mytoncore/` = all files from pod path `/usr/local/bin/mytoncore/**`
-- `mytonctrl/` = all files from pod path `/usr/local/bin/mytonctrl/**`
+- `controller/` = all state from pod path `/var/ton-work/controller/**`, including
+  MyTonCore wallets, MyTonCtrl state, enabled services, configuration, and initialization markers
 - `tondb/` = selected TON DB key files:
 - `tondb/config.json` from pod path `/var/ton-work/db/config.json`
 - `tondb/keyring/**` from pod path `/var/ton-work/db/keyring/**`
 - common examples included from `keys/`: `client.pub`, `liteserver.pub`, `client`, `server.pub`
-- common examples included from `mytoncore/`: `wallets/validator_wallet_001.pk` (and other mytoncore files)
-- common examples included from `mytonctrl/`: files created under `/usr/local/bin/mytonctrl`
+- common examples included from `controller/`: `mytoncore/wallets/validator_wallet_001.pk`
+  and `mytonctrl/` configuration files
 - `keys.bundle.meta` stores metadata fields used for restore: `provider`, `wrapped_key`, `algorithm`, `created_at`
 - TON DB data outside this set (`/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`, etc.) is not included.
 - if `spec.keyManagement.encryptedBundle.fileName` / `metaFileName` are customized, backup uses those exact filenames instead of defaults.

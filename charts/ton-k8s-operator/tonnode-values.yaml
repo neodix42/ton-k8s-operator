@@ -2,10 +2,19 @@ tonNode:
   enabled: true
   namespace: default
   name: tonnode
-  image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.08-amd64
+  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
+  # Installation flags: validator mode, testnet, and dump download.
+  args:
+    - -m
+    - validator
+    - -n
+    - testnet
+    - -d
   replicas: 3
   storage:
     tonWorkSize: 700Gi
+    # Retained legacy PVCs; MyTonCtrl now keeps state in ton-work/controller.
     tonSourceSize: 20Gi
     myTonCoreSize: 20Gi
     myTonCtrlSize: 20Gi
@@ -47,30 +56,18 @@ tonNode:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/ton-blockchain/ton-docker-ctrl:v2026.08-amd64
+      image: ""
       resources: {}
   env:
-    - name: NETWORK
-      value: testnet
-    - name: TON_BRANCH
-      value: v2026.08
     - name: ARCHIVE_TTL
       value: "86400"
     - name: STATE_TTL
       value: "86400"
     - name: VERBOSITY
       value: "1"
-    - name: IGNORE_MINIMAL_REQS
-      value: "false"
     - name: TELEMETRY
-      value: "true"
-    - name: MODE
-      value: validator
-    - name: DUMP
       value: "true"
     - name: DUMP_EXTRACT_THREADS
       value: "8"
-    - name: MYTONCTRL_VERSION
-      value: master
     - name: CUSTOM_PARAMETERS
       value: "--exporter-address 0.0.0.0:9777"

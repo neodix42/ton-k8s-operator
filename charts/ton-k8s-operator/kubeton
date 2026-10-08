@@ -3081,6 +3081,36 @@ resolve_tonnode_image() {
   return 1
 }
 
+# The runtime and TON artifact images have independent release tags. In
+# particular, the main-wallet helper must use TON binaries, not the MyTonCtrl
+# image tag carried by spec.image.
+resolve_tonnode_ton_image() {
+  local image ns tonnode_name
+
+  image="$(kubectl get statefulsets -A -l "$TON_POD_LABEL" \
+    -o jsonpath='{range .items[0].spec.template.spec.initContainers[?(@.name=="export-ton-binaries")]}{.image}{end}' 2>/dev/null || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  ns="$(resolve_tonnode_namespace_from_values)"
+  tonnode_name="$(resolve_tonnode_name_from_values)"
+  image="$(kubectl -n "$ns" get tonnodes.ton.ton.org "$tonnode_name" \
+    -o jsonpath='{.spec.tonImage}' 2>/dev/null || true)"
+  image="$(trim_whitespace "$image")"
+  if [[ -n "$image" ]]; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  image="$(resolve_effective_tonnode_path_scalar tonImage || true)"
+  image="$(trim_whitespace "$image")"
+  [[ -n "$image" ]] || return 1
+  printf '%s' "$image"
+}
+
 resolve_main_wallet_global_config_url() {
   local network="${1:-}"
   local url
@@ -3276,7 +3306,7 @@ extract_image_tag() {
 }
 
 resolve_main_wallet_image() {
-  local explicit_image tonnode_image tag
+  local explicit_image ton_image tag
 
   explicit_image="$(trim_whitespace "${MAIN_WALLET_IMAGE:-}")"
   if [[ -n "$explicit_image" ]]; then
@@ -3284,17 +3314,24 @@ resolve_main_wallet_image() {
     return 0
   fi
 
-  tonnode_image="$(resolve_tonnode_image || true)"
-  tonnode_image="$(trim_whitespace "$tonnode_image")"
-  if [[ -z "$tonnode_image" ]]; then
-    echo "Error: cannot resolve TonNode image; set MAIN_WALLET_IMAGE explicitly." >&2
+  ton_image="$(resolve_tonnode_ton_image || true)"
+  ton_image="$(trim_whitespace "$ton_image")"
+  if [[ -z "$ton_image" ]]; then
+    echo "Error: cannot resolve TonNode TON artifact image; set tonNode.tonImage or MAIN_WALLET_IMAGE explicitly." >&2
     return 1
   fi
 
-  tag="$(extract_image_tag "$tonnode_image" || true)"
+  # Preserve a pinned digest and alternate artifact registry unless a helper
+  # repository override was explicitly selected.
+  if [[ "$MAIN_WALLET_IMAGE_REPOSITORY" == "ghcr.io/ton-blockchain/ton" ]]; then
+    printf '%s' "$ton_image"
+    return 0
+  fi
+
+  tag="$(extract_image_tag "$ton_image" || true)"
   tag="$(trim_whitespace "$tag")"
   if [[ -z "$tag" ]]; then
-    echo "Error: cannot derive image tag from TonNode image '${tonnode_image}'. Set MAIN_WALLET_IMAGE explicitly." >&2
+    echo "Error: cannot derive a helper repository tag from TON artifact image '${ton_image}'. Set MAIN_WALLET_IMAGE explicitly." >&2
     return 1
   fi
   printf '%s:%s' "$MAIN_WALLET_IMAGE_REPOSITORY" "$tag"
@@ -10730,13 +10767,9 @@ resolve_tonnode_wallet_address_from_pod() {
   local wallet_name="$3"
   local output address
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
-    shopt -s expand_aliases
-    if [[ -f ~/.bashrc ]]; then
-      source ~/.bashrc >/dev/null 2>&1
-    fi
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if command -v mytonctrl >/dev/null 2>&1; then
-      echo wl | mytonctrl
+      mytonctrl --cmd wl
     fi
   ' 2>/dev/null || true)"
   output="$(strip_ansi_sequences "$output")"
@@ -10755,13 +10788,9 @@ resolve_tonnode_wallet_row_from_pod() {
   local wallet_name="$3"
   local output row
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
-    shopt -s expand_aliases
-    if [[ -f ~/.bashrc ]]; then
-      source ~/.bashrc >/dev/null 2>&1
-    fi
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if command -v mytonctrl >/dev/null 2>&1; then
-      echo wl | mytonctrl
+      mytonctrl --cmd wl
     fi
   ' 2>/dev/null || true)"
   output="$(strip_ansi_sequences "$output")"
@@ -10784,7 +10813,7 @@ list_tonnode_wallet_names_from_pod() {
   local output
 
   output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
-    wallet_dir="/usr/local/bin/mytoncore/wallets"
+    wallet_dir="/var/ton-work/controller/mytoncore/wallets"
     [[ -d "$wallet_dir" ]] || exit 0
     shopt -s nullglob
     for f in "$wallet_dir"/*.pk; do
@@ -10804,7 +10833,7 @@ read_tonnode_wallet_address_file_from_pod() {
 
   output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     wallet_name="$1"
-    wallet_dir="/usr/local/bin/mytoncore/wallets"
+    wallet_dir="/var/ton-work/controller/mytoncore/wallets"
     if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
       exit 2
     fi
@@ -10827,7 +10856,7 @@ read_tonnode_wallet_private_key_hex_from_pod() {
 
   output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     wallet_name="$1"
-    wallet_dir="/usr/local/bin/mytoncore/wallets"
+    wallet_dir="/var/ton-work/controller/mytoncore/wallets"
     if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
       echo "Error: invalid wallet name ${wallet_name}." >&2
       exit 2
@@ -11027,13 +11056,9 @@ activate_tonnode_wallet_in_pod() {
   local output
   local exec_rc=0
 
-  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     wallet_name="$1"
     mtc_cmd="aw ${wallet_name}"
-    shopt -s expand_aliases
-    if [[ -f ~/.bashrc ]]; then
-      source ~/.bashrc >/dev/null 2>&1 || true
-    fi
     if ! command -v mytonctrl >/dev/null 2>&1; then
       echo "Error: mytonctrl command not found." >&2
       exit 127
@@ -11198,97 +11223,24 @@ collect_tonnode_wallet_in_pod() {
   local output
   local exec_rc=0
 
-  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     wallet_name="$1"
     destination_address="$2"
     amount="$3"
     mtc_cmd="mg ${wallet_name} ${destination_address} ${amount}"
-    link_dir_contents() {
-      local source_dir="$1"
-      local target_dir="$2"
-      local f base target
-      [[ -d "$source_dir" ]] || return 0
-      mkdir -p "$target_dir" 2>/dev/null || return 1
-      for f in "$source_dir"/*; do
-        [[ -e "$f" ]] || continue
-        base="${f##*/}"
-        target="${target_dir}/${base}"
-        [[ "$f" == "$target" ]] && continue
-        if [[ ! -e "$target" ]]; then
-          rm -f "$target" 2>/dev/null || true
-          ln -s "$f" "$target" 2>/dev/null || cp -a "$f" "$target" 2>/dev/null || true
-        fi
-      done
-    }
     prepare_mytonctrl_fift_env() {
-      local expected_fift_dir="/usr/src/ton/crypto/fift/lib"
-      local expected_smart_dir="/usr/src/ton/crypto/smartcont"
-      local fift_file="" wallet_fif="" fift_dir="" smart_dir="" f
-
-      for f in \
-        "${expected_fift_dir}/Fift.fif" \
-        /usr/lib/fift/Fift.fif \
-        /usr/share/ton/fift/Fift.fif \
-        /usr/share/ton/crypto/fift/lib/Fift.fif \
-        /usr/local/lib/fift/Fift.fif \
-        /usr/local/share/ton/fift/Fift.fif \
-        /opt/ton/crypto/fift/lib/Fift.fif \
-        /var/ton-work/ton/crypto/fift/lib/Fift.fif; do
-        if [[ -f "$f" ]]; then
-          fift_file="$f"
-          break
-        fi
-      done
-      if [[ -z "$fift_file" ]]; then
-        fift_file="$(find /usr /opt /var/ton-work/ton -type f -name Fift.fif -print -quit 2>/dev/null || true)"
-      fi
-
-      for f in \
-        "${expected_smart_dir}/wallet.fif" \
-        /usr/share/ton/smartcont/wallet.fif \
-        /usr/share/ton/crypto/smartcont/wallet.fif \
-        /usr/local/share/ton/smartcont/wallet.fif \
-        /opt/ton/crypto/smartcont/wallet.fif \
-        /var/ton-work/ton/crypto/smartcont/wallet.fif; do
-        if [[ -f "$f" ]]; then
-          wallet_fif="$f"
-          break
-        fi
-      done
-      if [[ -z "$wallet_fif" ]]; then
-        wallet_fif="$(find /usr /opt /var/ton-work/ton -type f -name wallet.fif -print -quit 2>/dev/null || true)"
-      fi
-
-      if [[ -z "$fift_file" ]]; then
-        echo "Error: Fift.fif was not found in the ton-node container; mytonctrl mg can not build a transfer BOC." >&2
+      # Use the private TON snapshot selected by the running controller. The
+      # image owns compatibility links under /usr/src; console calls must not
+      # rewrite them or read a newer export from /ton-artifacts/current.
+      local fift_dir="/run/ton-active/fift"
+      local smart_dir="/run/ton-active/smartcont"
+      if [[ ! -f "${fift_dir}/Fift.fif" || ! -f "${smart_dir}/wallet.fif" ]]; then
+        echo "Error: the active TON snapshot is missing Fift.fif or wallet.fif; mytonctrl mg cannot build a transfer BOC." >&2
         return 90
       fi
-      if [[ -z "$wallet_fif" ]]; then
-        echo "Error: wallet.fif was not found in the ton-node container; mytonctrl mg can not build a transfer BOC." >&2
-        return 90
-      fi
-
-      fift_dir="${fift_file%/*}"
-      smart_dir="${wallet_fif%/*}"
-      link_dir_contents "$fift_dir" "$expected_fift_dir" || return 90
-      link_dir_contents "$smart_dir" "$expected_smart_dir" || return 90
-
-      if [[ ! -f "${expected_fift_dir}/Fift.fif" ]]; then
-        echo "Error: found Fift.fif at ${fift_file}, but could not expose it at ${expected_fift_dir}/Fift.fif." >&2
-        return 90
-      fi
-      if [[ ! -f "${expected_smart_dir}/wallet.fif" ]]; then
-        echo "Error: found wallet.fif at ${wallet_fif}, but could not expose it at ${expected_smart_dir}/wallet.fif." >&2
-        return 90
-      fi
-
-      export FIFTPATH="${expected_fift_dir}:${expected_smart_dir}:${fift_dir}:${smart_dir}:${FIFTPATH:-}"
+      export FIFTPATH="${fift_dir}:${smart_dir}:${FIFTPATH:-}"
       return 0
     }
-    shopt -s expand_aliases
-    if [[ -f ~/.bashrc ]]; then
-      source ~/.bashrc >/dev/null 2>&1 || true
-    fi
     if ! command -v mytonctrl >/dev/null 2>&1; then
       echo "Error: mytonctrl command not found." >&2
       exit 127
@@ -12127,10 +12079,11 @@ ton_pod_initial_bootstrap_state() {
   # local kubectl result therefore means transport, timeout, auth, or exec
   # failure rather than an ordinary not-yet-committed bootstrap.
   bootstrap_probe="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- sh -ec '
-      if test -f /var/ton-work/db/mtc_done \
+      if test -s /var/ton-work/controller/initialized.json \
         && test -s /var/ton-work/db/config.json \
-        && test -s /var/ton-work/db/systemd-units/validator.service \
-        && test -s /var/ton-work/db/systemd-units/mytoncore.service; then
+        && test -s /var/ton-work/controller/mytoncore/mytoncore.db \
+        && test -s /var/ton-work/controller/services/validator.service \
+        && test -s /var/ton-work/controller/services/mytoncore.service; then
         printf complete
       else
         printf pending
@@ -12171,7 +12124,7 @@ ton_pod_initial_bootstrap_state() {
     downloading|extracting|bootstrapping) ;;
     *) process_state="bootstrapping" ;;
   esac
-  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1fmtc_done is not committed yet' "$process_state" "$node" "$restart_count" "$waiting_reason" "$last_exit"
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1finitialized.json is not committed yet' "$process_state" "$node" "$restart_count" "$waiting_reason" "$last_exit"
 }
 
 wait_ton_initial_bootstrap_complete() {
@@ -13634,12 +13587,6 @@ run_recreate() {
   echo "Injecting encrypted backup bundle into ${ns}/${pod} ..."
   inject_bundle_into_running_pod "$ns" "$pod" "$bundle_dir"
 
-  echo "Clearing bootstrap marker in ${ns}/${pod} (/var/ton-work/db/mtc_done) ..."
-  if ! kubectl -n "$ns" exec "$pod" -c ton-node -- sh -ec 'rm -f /var/ton-work/db/mtc_done'; then
-    echo "Error: failed to clear /var/ton-work/db/mtc_done in ${ns}/${pod}." >&2
-    exit 1
-  fi
-
   echo "Restarting ${ns}/${pod} to restore keys and mytoncore from bundle ..."
   kubectl -n "$ns" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   wait_pod_ready "$ns" "$pod" 1800
@@ -14147,6 +14094,78 @@ pod_has_encrypted_bundle() {
   ' >/dev/null 2>&1
 }
 
+key_bundle_upload_checksums() {
+  local src_bundle_dir="$1"
+  [[ -d "$src_bundle_dir" ]] || return 1
+  if [[ -e "$src_bundle_dir/.backup-publish" || -L "$src_bundle_dir/.backup-publish" ]]; then
+    echo "Error: backup source ${src_bundle_dir} contains an unresolved .backup-publish journal; run or restart the source pod's key-backup container to recover publication, then export the backup again." >&2
+    return 1
+  fi
+  (
+    cd "$src_bundle_dir" || exit 1
+    find . -type f ! -name .restore-controller-state -print0 \
+      | sort -z | xargs -0 -r sha256sum
+  )
+}
+
+commit_uploaded_key_bundle() {
+  local ns="$1"
+  local pod="$2"
+  local bundle_mount="$3"
+  local staging_dir="$4"
+  local checksum_manifest="$5"
+  local container="${6:-}"
+  local -a container_args=()
+  [[ -n "$container" ]] && container_args=(-c "$container")
+
+  # Verify the staged bytes before touching the existing bundle. The durable
+  # request distinguishes an explicit state replacement from a normal restart.
+  # Roll back the original encrypted files if committing the upload/request
+  # fails, so a later restart cannot mix selected keys with current settings.
+  printf '%s\n' "$checksum_manifest" | kubectl -n "$ns" exec -i "$pod" "${container_args[@]}" -- sh -ec '
+    bundle_dir="$1"
+    staging_dir="$2"
+    cd "$staging_dir"
+    sha256sum -c - >/dev/null
+    find . -type f -exec chmod 600 {} +
+    rm -f .restore-controller-state
+    previous_dir="$(mktemp -d "$bundle_dir/.restore-previous.XXXXXX")"
+    replacing_payload=false
+    rollback() {
+      if [ "$replacing_payload" = true ]; then
+        find "$bundle_dir" -mindepth 1 -maxdepth 1 \
+          ! -name "${staging_dir##*/}" ! -name "${previous_dir##*/}" -exec rm -rf {} +
+      fi
+      for entry in "$previous_dir"/* "$previous_dir"/.[!.]* "$previous_dir"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        mv "$entry" "$bundle_dir/" || return 1
+      done
+      rmdir "$previous_dir"
+      sync
+    }
+    trap rollback EXIT
+    for entry in "$bundle_dir"/* "$bundle_dir"/.[!.]* "$bundle_dir"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      [ "$entry" = "$staging_dir" ] && continue
+      [ "$entry" = "$previous_dir" ] && continue
+      mv "$entry" "$previous_dir/"
+    done
+    replacing_payload=true
+    for entry in "$staging_dir"/* "$staging_dir"/.[!.]* "$staging_dir"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      mv "$entry" "$bundle_dir/"
+    done
+    sync
+    umask 077
+    : > "$bundle_dir/.restore-controller-state"
+    sync
+    trap - EXIT
+    cd "$bundle_dir"
+    rmdir "$staging_dir"
+    rm -rf "$previous_dir"
+  ' _ "$bundle_mount" "$staging_dir" >/dev/null
+}
+
 restore_bundle_to_pvc() {
   local ns="$1"
   local pvc="$2"
@@ -14154,6 +14173,11 @@ restore_bundle_to_pvc() {
   local preferred_node="${4:-}"
   local helper_pod="kubeton-restore-$RANDOM-$RANDOM"
   local node_constraints_yaml=""
+  local staging_dir="/bundle/.restore-upload-$RANDOM-$RANDOM"
+  local checksum_manifest
+
+  checksum_manifest="$(key_bundle_upload_checksums "$src_bundle_dir")" || return 1
+  [[ -n "$checksum_manifest" ]] || return 1
 
   node_constraints_yaml="$(helper_pod_node_constraints_yaml "$preferred_node")"
 
@@ -14183,15 +14207,19 @@ EOF
     kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
     return 1
   fi
-  if ! kubectl -n "$ns" exec "$helper_pod" -- sh -ec 'find /bundle -mindepth 1 -maxdepth 1 -exec rm -rf {} +' >/dev/null 2>&1; then
+  if ! kubectl -n "$ns" exec "$helper_pod" -- sh -ec 'mkdir -p "$1"' _ "$staging_dir" >/dev/null 2>&1; then
     kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
     return 1
   fi
-  if ! kubectl -n "$ns" cp "${src_bundle_dir}/." "${helper_pod}:/bundle" >/dev/null; then
+  if ! kubectl -n "$ns" cp "${src_bundle_dir}/." "${helper_pod}:${staging_dir}" >/dev/null; then
     kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
     return 1
   fi
-  kubectl -n "$ns" exec "$helper_pod" -- sh -ec 'find /bundle -type f -exec chmod 600 {} +' >/dev/null 2>&1 || true
+  if ! commit_uploaded_key_bundle "$ns" "$helper_pod" /bundle "$staging_dir" "$checksum_manifest"; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    echo "Error: could not verify and commit the explicit state-restore request for ${ns}/${pvc}." >&2
+    return 1
+  fi
   kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
 }
 
@@ -14201,6 +14229,7 @@ inject_bundle_into_running_pod() {
   local src_bundle_dir="$3"
   local bundle_mount=""
   local container_names=""
+  local staging_dir checksum_manifest
 
   if [[ ! -d "$src_bundle_dir" ]]; then
     echo "Error: bundle source directory not found: $src_bundle_dir" >&2
@@ -14210,6 +14239,8 @@ inject_bundle_into_running_pod() {
     echo "Error: bundle source directory is empty: $src_bundle_dir" >&2
     return 1
   fi
+  checksum_manifest="$(key_bundle_upload_checksums "$src_bundle_dir")" || return 1
+  [[ -n "$checksum_manifest" ]] || return 1
 
   container_names="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .spec.containers[*]}{.name}{" "}{end}' 2>/dev/null || true)"
   if ! grep -qw "key-backup" <<<"$container_names"; then
@@ -14222,12 +14253,18 @@ inject_bundle_into_running_pod() {
   if [[ -z "$bundle_mount" ]]; then
     bundle_mount="/var/ton-key-bundle"
   fi
+  if [[ "$bundle_mount" != /var/ton-key-bundle ]]; then
+    echo "Error: unexpected encrypted bundle mount '${bundle_mount}' in ${ns}/${pod}." >&2
+    return 1
+  fi
+  staging_dir="${bundle_mount}/.restore-upload-$RANDOM-$RANDOM"
 
-  kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec \
-    "mkdir -p \"$bundle_mount\"; find \"$bundle_mount\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +" >/dev/null
-  kubectl -n "$ns" cp "${src_bundle_dir}/." "${ns}/${pod}:${bundle_mount}" -c key-backup >/dev/null
-  kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec \
-    "find \"$bundle_mount\" -type f -exec chmod 600 {} +; sync" >/dev/null 2>&1 || true
+  kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec 'mkdir -p "$1"' _ "$staging_dir" >/dev/null || return 1
+  kubectl -n "$ns" cp "${src_bundle_dir}/." "${ns}/${pod}:${staging_dir}" -c key-backup >/dev/null || return 1
+  if ! commit_uploaded_key_bundle "$ns" "$pod" "$bundle_mount" "$staging_dir" "$checksum_manifest" key-backup; then
+    echo "Error: could not verify and commit the explicit state-restore request for ${ns}/${pod}." >&2
+    return 1
+  fi
 }
 
 restore_replica_from_backup() {
@@ -14279,6 +14316,7 @@ export_bundle_from_pvc() {
   local bundle_dir="$item_dir/bundle"
   local helper_pod="kubeton-backup-${sts}-${ordinal}-$RANDOM-$RANDOM"
   local node_constraints_yaml=""
+  local publication_state
 
   node_constraints_yaml="$(helper_pod_node_constraints_yaml "$preferred_node")"
 
@@ -14316,6 +14354,23 @@ EOF
     print_helper_pod_failure_context "$ns" "$helper_pod"
     kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
     echo "Error: helper pod ${ns}/${helper_pod} did not become Ready." >&2
+    return 1
+  fi
+
+  if ! publication_state="$(kubectl -n "$ns" exec "$helper_pod" -- sh -ec '
+    if [ -e /bundle/.backup-publish ] || [ -L /bundle/.backup-publish ]; then
+      printf pending
+    else
+      printf ready
+    fi
+  ')"; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    echo "Error: cannot inspect backup publication state on ${ns}/${pvc}; the encrypted bundle was not exported." >&2
+    return 1
+  fi
+  if [[ "$publication_state" != ready ]]; then
+    kubectl -n "$ns" delete pod "$helper_pod" --ignore-not-found >/dev/null 2>&1 || true
+    echo "Error: refusing to export ${ns}/${pvc} while .backup-publish is unresolved; run or restart the TON pod's key-backup container to recover publication, then retry backup-keys." >&2
     return 1
   fi
 
@@ -14632,13 +14687,9 @@ sync_value() {
   local sync=""
   local initial_sync_lag=""
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
-    shopt -s expand_aliases
-    if [[ -f ~/.bashrc ]]; then
-      source ~/.bashrc >/dev/null 2>&1
-    fi
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if command -v mytonctrl >/dev/null 2>&1; then
-      echo status | mytonctrl
+      mytonctrl --cmd status
     fi
   ' 2>/dev/null || true)"
   output="${output//$'\r'/}"
@@ -14678,13 +14729,9 @@ wallet_adnl_values() {
   local wallet=""
   local adnl=""
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
-    shopt -s expand_aliases
-    if [[ -f ~/.bashrc ]]; then
-      source ~/.bashrc >/dev/null 2>&1
-    fi
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if command -v mytonctrl >/dev/null 2>&1; then
-      echo status fast | mytonctrl
+      mytonctrl --cmd "status fast"
     fi
   ' 2>/dev/null || true)"
   output="${output//$'\r'/}"
@@ -14710,7 +14757,7 @@ validator_build_values() {
   local commit=""
   local build_date=""
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -- bash -lc '
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if [[ -x /usr/bin/ton/validator-engine/validator-engine ]]; then
       /usr/bin/ton/validator-engine/validator-engine -V 2>/dev/null | head -n1
     elif command -v validator-engine >/dev/null 2>&1; then
@@ -14781,6 +14828,25 @@ status_collect_row() {
     "$node_name" "$pod" "$commit_output" "$date_output" "$wallet_output" "$adnl_output" "$sync_output" "$cell_db_size" "$archive_db_size" >"$out_file"
 }
 
+ensure_tonnode_crd_schema() {
+  local crd_manifest="$CHART_DIR/crds/ton.ton.org_tonnodes.yaml"
+  if [[ ! -f "$crd_manifest" ]]; then
+    echo "Error: bundled TonNode CRD manifest is missing: ${crd_manifest}." >&2
+    return 1
+  fi
+  # Helm installs files under crds/ only once. Apply the bundled schema before
+  # an upgrade can submit tonImage/args to an API server with the old schema.
+  echo "[schema] Applying bundled TonNode CRD before Helm ..."
+  if ! kubectl apply -f "$crd_manifest"; then
+    echo "Error: cannot update the TonNode CRD schema; Helm deployment was not applied." >&2
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Established crd/tonnodes.ton.ton.org --timeout=60s; then
+    echo "Error: updated TonNode CRD did not become Established; Helm deployment was not applied." >&2
+    return 1
+  fi
+}
+
 run_install() {
   require_bin helm
   require_bin kubectl
@@ -14796,6 +14862,7 @@ run_install() {
   else
     run_node_prerequisite_check_readonly || return 1
   fi
+  ensure_tonnode_crd_schema || return 1
 
   local release_exists=0 operator_deployment=""
   local -a helm_cmd=()
@@ -15165,6 +15232,12 @@ run_start() {
   # create or restart TON Pods.
   if ! verify_start_victoria_logs_collection_ready; then
     restrict_existing_victoria_logs_after_failed_preflight || true
+    if [[ -n "$ton_selector_values_file" ]]; then
+      rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+  if ! ensure_tonnode_crd_schema; then
     if [[ -n "$ton_selector_values_file" ]]; then
       rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
     fi
@@ -18640,16 +18713,12 @@ run_exec_mtc() {
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns pod node_name <<<"$row"
 
-    if run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+    if run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
       mtc_cmd="$1"
-      shopt -s expand_aliases
-      if [[ -f ~/.bashrc ]]; then
-        source ~/.bashrc >/dev/null 2>&1
-      fi
       if ! command -v mytonctrl >/dev/null 2>&1; then
         exit 127
       fi
-      printf "%s\n" "$mtc_cmd" | mytonctrl
+      mytonctrl --cmd "$mtc_cmd"
     ' _ "$cmd" >/dev/null 2>&1; then
       exit_code=0
     else
