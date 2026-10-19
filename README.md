@@ -985,15 +985,24 @@ Cloud provider dashboards can help create the cluster and open Cloud Shell, but 
 
 ### Upgrade Workflow (When Image Changes)
 
-Use one of the dedicated release scripts:
+Use the dedicated scripts to update the operator release or an individual runtime image:
 
 ```bash
 # A) Operator release (bumps operator + chart versions; keeps both TON runtime image tags unchanged)
 ./upgrade-ton-operator.sh 0.3.1
 
-# B) TON image-only release (bumps chart version only; keeps operator appVersion/tag unchanged)
-./upgrade-ton-images-only.sh 0.3.1 v1.0.0 v2026.08-amd64
+# B) Update only the MyTonCtrl image tag
+./upgrade-ton-docker-ctrl-only.sh v1.0.0
 
+# C) Update only the official TON image tag
+./upgrade-ton-image-only.sh v2026.08-amd64
+```
+
+The image helpers update only their corresponding image tag in the chart values files. They leave chart and operator versions and installer release URLs unchanged.
+
+For an operator/chart release, commit and push the versioned changes:
+
+```bash
 # commit + push to main
 git add .
 git commit -m "release: 0.3.1"

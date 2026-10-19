@@ -1,14 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compatibility entrypoint for callers using the former combined-image helper.
-if [[ $# -ne 3 ]]; then
+usage() {
   printf '%s\n' \
-    'The TON runtime now uses separate MyTonCtrl and official TON images.' \
-    'Usage: ./upgrade-ton-docker-ctrl-only.sh <chart-version> <mytonctrl-tag> <ton-tag>' \
-    'Preferred: ./upgrade-ton-images-only.sh <chart-version> <mytonctrl-tag> <ton-tag>' >&2
+    'Usage: ./upgrade-ton-docker-ctrl-only.sh <mytonctrl-tag>' \
+    '' \
+    'Example:' \
+    '  ./upgrade-ton-docker-ctrl-only.sh v1.0.0' \
+    '' \
+    'Updates only the MyTonCtrl image tag in the chart values files.'
+}
+
+if [[ $# -ne 1 ]]; then
+  usage
+  exit 1
+fi
+
+TARGET_MYTONCTRL_TAG="$1"
+if ! [[ "$TARGET_MYTONCTRL_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+  printf "Error: invalid container image tag '%s'.\n" "$TARGET_MYTONCTRL_TAG" >&2
   exit 1
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "$ROOT_DIR/upgrade-ton-images-only.sh" "$@"
+MYTONCTRL_IMAGE="ghcr.io/neodix42/mytonctrl:${TARGET_MYTONCTRL_TAG}"
+VALUES_FILE="$ROOT_DIR/charts/ton-k8s-operator/values.yaml"
+TON_VALUES_FILE="$ROOT_DIR/charts/ton-k8s-operator/tonnode-values.yaml"
+
+for values_file in "$VALUES_FILE" "$TON_VALUES_FILE"; do
+  if [[ ! -f "$values_file" ]]; then
+    printf 'Error: required file not found: %s\n' "$values_file" >&2
+    exit 1
+  fi
+done
+
+for values_file in "$VALUES_FILE" "$TON_VALUES_FILE"; do
+  sed -E -i "s|^  image: ghcr\\.io/neodix42/mytonctrl:.*$|  image: ${MYTONCTRL_IMAGE}|" "$values_file"
+  grep -Fxq "  image: ${MYTONCTRL_IMAGE}" "$values_file"
+done
+
+printf 'Updated MyTonCtrl image: %s\n' "$MYTONCTRL_IMAGE"
