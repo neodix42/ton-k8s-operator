@@ -2,7 +2,7 @@ tonNode:
   enabled: true
   namespace: default
   name: tonnode
-  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  image: ghcr.io/neodix42/mytonctrl:v1.0.3
   tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
   # Installation flags: validator mode, testnet, and dump download.
   args:
