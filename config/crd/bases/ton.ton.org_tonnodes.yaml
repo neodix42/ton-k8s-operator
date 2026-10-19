@@ -205,7 +205,7 @@ spec:
                   type: object
                 type: array
               image:
-                default: ghcr.io/neodix42/mytonctrl:v1.0.0
+                default: ghcr.io/ton-blockchain/mytonctrl:dev
                 description: Image is the MyTonCtrl runtime image, which installs
                   and supervises the TON node.
                 type: string

@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: tonnode
 spec:
-  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  image: ghcr.io/ton-blockchain/mytonctrl:dev
   tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
   args: ["-m", "liteserver", "-n", "mainnet", "-d"]
   replicas: 3

@@ -101,13 +101,13 @@ func TestRuntimeImageDefaultsAndIndependentPullPolicies(t *testing.T) {
 		tonPolicy        corev1.PullPolicy
 	}{
 		{
-			name: "published defaults", wantImage: "ghcr.io/neodix42/mytonctrl:v1.0.0",
+			name: "published defaults", wantImage: "ghcr.io/ton-blockchain/mytonctrl:dev",
 			wantTonImage:     "ghcr.io/ton-blockchain/ton:v2026.08-amd64",
 			controllerPolicy: corev1.PullAlways, tonPolicy: corev1.PullAlways,
 		},
 		{
 			name: "only TON pinned", tonImage: " ghcr.io/ton-blockchain/ton" + digest + " ",
-			wantImage: "ghcr.io/neodix42/mytonctrl:v1.0.0", wantTonImage: "ghcr.io/ton-blockchain/ton" + digest,
+			wantImage: "ghcr.io/ton-blockchain/mytonctrl:dev", wantTonImage: "ghcr.io/ton-blockchain/ton" + digest,
 			controllerPolicy: corev1.PullAlways, tonPolicy: corev1.PullIfNotPresent,
 		},
 		{

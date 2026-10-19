@@ -1269,7 +1269,7 @@ test_main_wallet_image_uses_independent_ton_artifact_reference() (
   mkdir -p "$CHART_DIR"
   cat >"$TON_VALUES_FILE" <<'YAML'
 tonNode:
-  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  image: ghcr.io/ton-blockchain/mytonctrl:dev
   tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
 YAML
   local live_image=""
@@ -1297,7 +1297,7 @@ YAML
     || fail "main-wallet repository override did not retain the TON artifact tag"
   live_image=""
   TON_VALUES_FILE="$test_dir/only-mytonctrl-image.yaml"
-  printf 'tonNode:\n  image: ghcr.io/neodix42/mytonctrl:v1.0.0\n' >"$TON_VALUES_FILE"
+  printf 'tonNode:\n  image: ghcr.io/ton-blockchain/mytonctrl:dev\n' >"$TON_VALUES_FILE"
   if resolve_main_wallet_image >"$test_dir/missing-ton-image.out" 2>&1; then
     fail "main-wallet accepted a controller image as the TON artifact image"
   fi
@@ -3729,6 +3729,161 @@ test_partial_pass_quiesces_backend_when_collector_is_absent() (
   assert_contains 'backend-quiesced' "$action_log"
 )
 
+test_image_upgrade_tracks_official_mytonctrl_repository() (
+  local fixture="$test_dir/image-upgrade"
+  local chart="$fixture/charts/ton-k8s-operator"
+  mkdir -p "$chart"
+  cp "$repo_root/upgrade-ton-images-only.sh" "$fixture/"
+  printf 'version: 0.3.0\nappVersion: "0.2.9"\n' >"$chart/Chart.yaml"
+  printf 'https://example.invalid/releases/download/0.3.0/install.sh\n' >"$fixture/README.md"
+  printf 'CHART_VERSION="0.3.0"\n' >"$fixture/install.sh"
+  # An image upgrade also migrates values written by the previous registry owner.
+  printf 'tonNode:\n  image: ghcr.io/neodix42/mytonctrl:v1.0.0\n  tonImage: ghcr.io/ton-blockchain/ton:old\n' >"$chart/values.yaml"
+  printf 'tonNode:\n  image: ghcr.io/ton-blockchain/mytonctrl:old\n  tonImage: ghcr.io/ton-blockchain/ton:old\n' >"$chart/tonnode-values.yaml"
+
+  bash "$fixture/upgrade-ton-images-only.sh" 0.3.1 dev v2026.10-amd64 >"$test_dir/image-upgrade.out"
+  assert_contains 'version: 0.3.1' "$chart/Chart.yaml"
+  assert_contains 'appVersion: "0.2.9"' "$chart/Chart.yaml"
+  local values_file
+  for values_file in "$chart/values.yaml" "$chart/tonnode-values.yaml"; do
+    assert_contains '  image: ghcr.io/ton-blockchain/mytonctrl:dev' "$values_file"
+    assert_contains '  tonImage: ghcr.io/ton-blockchain/ton:v2026.10-amd64' "$values_file"
+  done
+)
+
+test_mytonctrl_wallet_commands_preserve_exit_status_without_retry() (
+  source "$kubeton"
+
+  local fake_bin="$test_dir/mytonctrl-bin"
+  local active_dir="$test_dir/ton-active"
+  mkdir -p "$fake_bin" "$active_dir/fift" "$active_dir/smartcont"
+  touch "$active_dir/fift/Fift.fif" "$active_dir/smartcont/wallet.fif"
+  cat >"$fake_bin/mytonctrl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MTC_TEST_LOG"
+printf 'console result %s\n' "$MTC_TEST_EXIT"
+exit "$MTC_TEST_EXIT"
+EOF
+  chmod +x "$fake_bin/mytonctrl"
+  export PATH="$fake_bin:$PATH"
+  export MTC_TEST_LOG="$test_dir/mytonctrl-command.log"
+  export MTC_TEST_EXIT=0
+
+  run_with_timeout() { shift; "$@"; }
+  kubectl() {
+    while [[ "$1" != -- ]]; do shift; done
+    shift
+    local shell="$1" options="$2" script="$3"
+    shift 3
+    script="${script//\/run\/ton-active/$active_dir}"
+    "$shell" "$options" "$script" "$@"
+  }
+
+  local expected_rc actual_rc operation output expected_command
+  for operation in activate collect; do
+    for expected_rc in 0 1 2; do
+      MTC_TEST_EXIT="$expected_rc"
+      : >"$MTC_TEST_LOG"
+      output="$test_dir/mytonctrl-${operation}-${expected_rc}.out"
+      actual_rc=0
+      if [[ "$operation" == activate ]]; then
+        expected_command='--cmd aw validator_wallet_001'
+        activate_tonnode_wallet_in_pod default tonnode-0 validator_wallet_001 >"$output" 2>&1 || actual_rc=$?
+      else
+        expected_command='--cmd mg validator_wallet_001 destination alld'
+        collect_tonnode_wallet_in_pod default tonnode-0 validator_wallet_001 destination alld >"$output" 2>&1 || actual_rc=$?
+      fi
+      [[ "$actual_rc" == "$expected_rc" ]] \
+        || fail "$operation returned $actual_rc instead of console exit status $expected_rc"
+      [[ "$(wc -l <"$MTC_TEST_LOG")" == 1 ]] \
+        || fail "$operation retried a console command after exit status $expected_rc"
+      [[ "$(cat "$MTC_TEST_LOG")" == "$expected_command" ]] \
+        || fail "$operation did not use the single-command console interface"
+      if (( expected_rc != 0 )); then
+        assert_contains "exit code ${expected_rc}" "$output"
+        assert_contains "console result ${expected_rc}" "$output"
+      fi
+    done
+  done
+)
+
+test_wallet_address_fallback_decodes_binary_public_address() (
+  source "$kubeton"
+  local wallet_dir="$test_dir/public-wallet-addresses"
+  mkdir -p "$wallet_dir"
+  python3 - "$wallet_dir" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+directory = Path(sys.argv[1])
+for workchain in (0, -1):
+    (directory / f"wallet_{workchain}.addr").write_bytes(bytes(range(32)) + struct.pack("<i", workchain))
+(directory / "text.addr").write_text("0:" + "ab" * 32 + "\n")
+(directory / "invalid.addr").write_bytes(b"invalid public address")
+PY
+  run_with_timeout() { shift; "$@"; }
+  kubectl() {
+    while [[ "$1" != -- ]]; do shift; done
+    shift
+    local shell="$1" options="$2" script="$3"
+    shift 3
+    script="${script//\/var\/ton-work\/controller\/mytoncore\/wallets/$wallet_dir}"
+    "$shell" "$options" "$script" "$@"
+  }
+
+  local workchain address
+  for workchain in 0 -1; do
+    address="$(read_tonnode_wallet_address_file_from_pod default tonnode-0 "wallet_${workchain}")"
+    [[ "$address" == "${workchain}:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" ]] \
+      || fail "binary wallet address decoded incorrectly: $address"
+  done
+  [[ "$(read_tonnode_wallet_address_file_from_pod default tonnode-0 text)" == '0:abababababababababababababababababababababababababababababababab' ]] \
+    || fail 'printable wallet address compatibility changed'
+  if read_tonnode_wallet_address_file_from_pod default tonnode-0 invalid; then
+    fail 'invalid wallet address file was accepted'
+  fi
+  if read_tonnode_wallet_address_file_from_pod default tonnode-0 ../invalid; then
+    fail 'invalid wallet name was accepted'
+  fi
+)
+
+test_sync_value_preserves_current_container_status_units() (
+  source "$kubeton"
+  run_with_timeout() { shift; "$@"; }
+  local console_output
+  kubectl() { printf '%s\n' "$console_output"; }
+
+  local details expected actual
+  while IFS=$'\t' read -r details expected; do
+    console_output="Local validator initial sync status: Syncing blocks, ${details}"
+    actual="$(sync_value default tonnode-0)"
+    [[ "$actual" == "$expected" ]] \
+      || fail "unexpected initial sync output: '$actual', expected '$expected'"
+  done <<'EOF'
+masterchain is 60 sec behind, shardchain is 9000 blocks behind	masterchain 60 sec behind, shardchain 9000 blocks behind
+masterchain is 60 sec behind	masterchain 60 sec behind
+shardchain is 9000 blocks behind	shardchain 9000 blocks behind
+EOF
+
+  console_output=$'Masterchain out of sync: n/a\nLocal validator initial sync status: Syncing blocks, shardchain is 9000 blocks behind'
+  [[ "$(sync_value default tonnode-0)" == 'shardchain 9000 blocks behind' ]] \
+    || fail 'unavailable masterchain lag hid the shardchain block count'
+  console_output='Local validator initial sync status: Syncing blocks, last known block was 600 s ago'
+  [[ "$(sync_value default tonnode-0)" == '600 s ago' ]] \
+    || fail 'legacy initial sync output is no longer recognized'
+  console_output=$'Local validator out of sync: 12\nMasterchain out of sync: 20 sec\nShardchain out of sync: 5 blocks'
+  [[ "$(sync_value default tonnode-0)" == '20 sec' ]] \
+    || fail 'normal masterchain sync lag changed'
+  console_output='Initialization status: initializing'
+  [[ "$(sync_value default tonnode-0)" == 'N/A' ]] \
+    || fail 'missing sync data was treated as a successful synchronization'
+)
+
+test_image_upgrade_tracks_official_mytonctrl_repository
+test_mytonctrl_wallet_commands_preserve_exit_status_without_retry
+test_wallet_address_fallback_decodes_binary_public_address
+test_sync_value_preserves_current_container_status_units
 test_launch_session_term_kills_command_tree
 test_launch_session_term_before_command_spawn_never_starts_command
 test_owned_process_tree_uses_ps_when_proc_is_unavailable

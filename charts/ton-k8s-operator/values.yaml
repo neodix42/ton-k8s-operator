@@ -61,7 +61,7 @@ tonNode:
   namespace: ""
   labels: {}
   # MyTonCtrl runtime and the official TON binary exporter are versioned independently.
-  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  image: ghcr.io/ton-blockchain/mytonctrl:dev
   tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
   # Installation flags: mode, network, dump download, and relaxed minimum requirements.
   args:

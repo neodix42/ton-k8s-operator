@@ -10839,7 +10839,24 @@ read_tonnode_wallet_address_file_from_pod() {
     fi
     addr_file="${wallet_dir}/${wallet_name}.addr"
     [[ -r "$addr_file" ]] || exit 1
-    LC_ALL=C tr -cd "[:print:]\n" < "$addr_file" | head -n1 | tr -d "\r\n"
+    python3 - "$addr_file" <<"PY"
+import re
+import struct
+import sys
+from pathlib import Path
+
+data = Path(sys.argv[1]).read_bytes()
+if len(data) == 36:
+    # MyTonCtrl/Fift stores the account hash followed by a signed workchain.
+    workchain = struct.unpack("<i", data[32:])[0]
+    print(f"{workchain}:{data[:32].hex()}")
+else:
+    # Retain support for older helpers that persisted a printable address.
+    address = data.decode("ascii").strip()
+    if not re.fullmatch(r"-?[0-9]+:[0-9a-fA-F]{64}|[A-Za-z0-9_+/\-]{48}", address):
+        raise ValueError("Invalid wallet address file")
+    print(address)
+PY
   ' _ "$wallet_name" 2>/dev/null || true)"
   output="$(strip_ansi_sequences "$output")"
   output="$(trim_whitespace "$output")"
@@ -11063,14 +11080,7 @@ activate_tonnode_wallet_in_pod() {
       echo "Error: mytonctrl command not found." >&2
       exit 127
     fi
-    set +e
     mytonctrl --cmd "$mtc_cmd"
-    mtc_rc=$?
-    if (( mtc_rc == 2 )); then
-      printf "%s\n" "$mtc_cmd" | mytonctrl
-    else
-      exit "$mtc_rc"
-    fi
   ' _ "$wallet_name" 2>&1)" || exec_rc=$?
   output="$(strip_ansi_sequences "$output")"
   if (( exec_rc != 0 )); then
@@ -11248,14 +11258,7 @@ collect_tonnode_wallet_in_pod() {
     if ! prepare_mytonctrl_fift_env; then
       exit 90
     fi
-    set +e
     mytonctrl --cmd "$mtc_cmd"
-    mtc_rc=$?
-    if (( mtc_rc == 2 )); then
-      printf "%s\n" "$mtc_cmd" | mytonctrl
-    else
-      exit "$mtc_rc"
-    fi
   ' _ "$wallet_name" "$destination_address" "$amount" 2>&1)" || exec_rc=$?
   output="$(strip_ansi_sequences "$output")"
   if (( exec_rc != 0 )); then
@@ -14706,7 +14709,24 @@ sync_value() {
   ')"
   sync="$(trim_whitespace "$sync")"
 
-  if [[ -z "$sync" ]]; then
+  if [[ -z "$sync" || "$sync" == "n/a" || "$sync" == "N/A" ]]; then
+    # Container status reports masterchain lag in seconds and shardchain lag
+    # in blocks. Keep both units instead of treating a block count as seconds.
+    initial_sync_lag="$(printf '%s\n' "$output" | sed -nE '
+      /Local validator initial sync status:.*Syncing blocks,.*(masterchain is|shardchain is)/ {
+        s/^[[:space:]]*Local validator initial sync status:.*Syncing blocks,[[:space:]]*//
+        s/masterchain is /masterchain /g
+        s/shardchain is /shardchain /g
+        p
+      }
+    ' | head -n1)"
+    initial_sync_lag="$(trim_whitespace "$initial_sync_lag")"
+    if [[ -n "$initial_sync_lag" ]]; then
+      sync="$initial_sync_lag"
+    fi
+  fi
+
+  if [[ -z "$sync" || "$sync" == "n/a" || "$sync" == "N/A" ]]; then
     initial_sync_lag="$(printf '%s\n' "$output" | sed -nE 's/^[[:space:]]*Local validator initial sync status:.*last known block was[[:space:]]*([0-9]+)[[:space:]]*s ago.*/\1 s ago/p' | head -n1)"
     initial_sync_lag="$(trim_whitespace "$initial_sync_lag")"
     if [[ -n "$initial_sync_lag" ]]; then

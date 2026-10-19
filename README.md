@@ -1,11 +1,13 @@
 # TON Kubernetes Operator
 
-Kubernetes operator for [MyTonCtrl](https://github.com/neodix42/mytonctrl), built with Go + Kubebuilder. Each TON pod uses two independently selected images:
+Kubernetes operator for [MyTonCtrl](https://github.com/ton-blockchain/mytonctrl), built with Go + Kubebuilder. Each TON pod uses two independently selected images:
 
-- `tonNode.image` / `spec.image`: `ghcr.io/neodix42/mytonctrl:v1.0.0`, which runs MyTonCtrl and supervises TON services.
+- `tonNode.image` / `spec.image`: `ghcr.io/ton-blockchain/mytonctrl:dev`, which runs MyTonCtrl and supervises TON services.
 - `tonNode.tonImage` / `spec.tonImage`: `ghcr.io/ton-blockchain/ton:v2026.08-amd64`, which supplies the official TON executables, Fift libraries and smart-contract scripts.
 
 The `stage-ton-exporter` init container takes the exporter script from the MyTonCtrl image. The `export-ton-binaries` init container runs it in the official TON image, bypassing that image's normal entrypoint, and exports its artifacts into a shared `emptyDir`. MyTonCtrl mounts `/ton-artifacts` read-only and selects a private `/run/ton-active` snapshot before starting services. Changing either image rolls the pod; application code and binaries are supplied by the images.
+
+The integration follows MyTonCtrl `dev` at `8081ef4` (2026-10-18). The default controller image tracks the upstream `dev` tag in its new `ton-blockchain` registry. Pin `tonNode.image` and `tonNode.tonImage` to published immutable digests for reproducible deployments, and select a TON image matching the worker architecture. Existing values files or TonNode resources with the former image reference must be updated explicitly; changing the CRD default does not replace a saved image setting. Tagged images are pulled on each pod start; refreshing a mutable tag also requires restarting the pods.
 
 This operator creates and manages:
 - `TonNode` custom resources (`ton.ton.org/v1alpha1`)
@@ -68,7 +70,7 @@ Set arguments as a YAML array; each flag and value is a separate element. This e
 
 ```yaml
 tonNode:
-  image: ghcr.io/neodix42/mytonctrl:v1.0.0
+  image: ghcr.io/ton-blockchain/mytonctrl:dev
   tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
   args: ["-m", "liteserver", "-n", "mainnet", "-d", "-i"]
 ```
@@ -83,15 +85,19 @@ tonNode:
 | `-t` | Disable telemetry. |
 | `-s` | Skip startup checks when opening the MyTonCtrl console. |
 
-If `spec.args` and `MYTONCTRL_ARGS` are omitted, upstream defaults select a mainnet validator without dump download. Installation options are applied when `/var/ton-work/controller/initialized.json` is first committed. Existing controller state retains its original installation settings; changing an argument does not reinstall a running node. Supplemental installation parameters such as `CUSTOM_PARAMETERS`, `DUMP_EXTRACT_THREADS` and `VERBOSITY` remain available through `tonNode.env`. The operator requires `/var/ton-work`: `-W /var/ton-work` is allowed, custom work directories and `-e` environment-file overrides are rejected. Host source-selection options (`-a`, `-r`, `-b`, `-g`, `-v`) are rejected by the container: select the desired MyTonCtrl and TON images instead. See the upstream [container startup documentation](https://github.com/neodix42/mytonctrl/blob/master/README.docker.md).
+If `spec.args` and `MYTONCTRL_ARGS` are omitted, upstream defaults select a mainnet validator without dump download. Installation options are applied when `/var/ton-work/controller/initialized.json` is first committed. Existing controller state retains its original installation settings; changing an argument does not reinstall a running node. Supplemental installation parameters such as `CUSTOM_PARAMETERS`, `DUMP_EXTRACT_THREADS` and `VERBOSITY` remain available through `tonNode.env`. The operator requires `/var/ton-work`: `-W /var/ton-work` is allowed, custom work directories and `-e` environment-file overrides are rejected. Host source-selection options (`-a`, `-r`, `-b`, `-g`, `-v`) are rejected by the container: select the desired MyTonCtrl and TON images instead. See the upstream [container startup documentation](https://github.com/ton-blockchain/mytonctrl/blob/dev/README.docker.md).
 
 The partial-service `-l` / `--only-node` and `-o` / `--only-mtc` modes are rejected because operator readiness requires both TON and MyTonCore services. With encrypted key management enabled, `-u` supports only `root` or `validator`, matching restored key ownership.
 
-Diagnostic `--help`, `-h`, `--print-env` and `MYTONCTRL_PRINT_ENV` settings are rejected because they exit without running services. `--archive`, `ARCHIVE` and `ARCHIVE_BLOCKS` are also unsupported with the standard official TON image because that mode requires the additional `tonutils-storage` binary.
+Diagnostic `--help`, `-h`, `--print-env` and `MYTONCTRL_PRINT_ENV` settings are rejected because they exit without running services. `--archive`, `ARCHIVE` and nonempty `ARCHIVE_BLOCKS` remain unsupported by this operator. Upstream's new Docker archive setup supplies a separate `tonutils-storage` executable through a Compose override; the standard official TON image does not include it.
+
+The reviewed dev code has further archive limitations: the [hardfork launcher](https://github.com/ton-blockchain/mytonctrl/blob/dev/mytoninstaller/archive_blocks.py) assumes `/usr/src/mytonctrl`, which is absent from the packaged controller image. The [hardfork worker](https://github.com/ton-blockchain/mytonctrl/blob/dev/mytoninstaller/scripts/process_hardforks.py) also removes pending hardforks from persisted configuration and retains them only in its unmanaged process; restarting the pod loses that pending work. Supplying the downloader alone would therefore not make archive synchronization reliable. Archive support needs an upstream image that persists and supervises that worker, plus downloader artifacts and persistent `/var/ton_storage` state in the operator. Normal validator/liteserver dump initialization uses the resumable workflow described below.
 
 ### Migrating an existing ton-docker-ctrl deployment
 
 Version 0.3.0 changes the persisted MyTonCtrl layout. A legacy `/var/ton-work/db/mtc_done` marker or old `mytoncore.db` without the new initialization marker makes startup fail with a migration message. The operator preserves those volumes; it does not initialize new identities over existing node data. Use the upstream MyTonCtrl backup/import migration into a separate `TonNode`, or initialize a fresh deployment after exporting the needed backups. The previous encrypted key-bundle format is also rejected; it must be migrated before restoration into this runtime.
+
+The upstream Docker helpers now live at [`docker/install.sh`](https://github.com/ton-blockchain/mytonctrl/blob/dev/docker/install.sh) and [`docker/migrate.sh`](https://github.com/ton-blockchain/mytonctrl/blob/dev/docker/migrate.sh). They prepare Docker/Compose deployments; use this operator's Helm and `kubeton` workflows for Kubernetes.
 
 The upstream `-p /var/ton-work/import/node-backup.tar.gz` option can import a native MyTonCtrl backup on first initialization. Populate that file on the new replica's work PVC before starting it; the operator does not automatically upload or mount an external backup file. Native MyTonCtrl backups and `kubeton` encrypted key bundles are different formats.
 
@@ -364,6 +370,15 @@ durable MyTonCtrl commit state:
 - a non-empty `/var/ton-work/controller/mytoncore/mytoncore.db`
 - persisted `validator.service` and `mytoncore.service` units in `/var/ton-work/controller/services`
 
+Current MyTonCtrl images resume interrupted initialization on the same work PVC. Keep `/var/ton-work/controller/.initializing`, `installer-progress.json`, the dump cache, and existing node keys/configuration. The checkpoint retains the original installation settings and selected ports; edited flags do not replace a pending installation. A verified cached dump is reused, and its compressed archive is reclaimed after initialization commits. Inspect progress while bootstrap is running with:
+
+```bash
+kubectl -n default exec tonnode-0 -c ton-node -- mytonctrl --cmd status
+kubectl -n default exec tonnode-0 -c ton-node -- cat /var/ton-work/controller/installer-progress.json
+```
+
+After correcting the reported cause, restart the pod with its existing PVCs to retry. Increasing a PVC requires support from its StorageClass; changing StatefulSet claim-template sizes alone is not an expansion workflow. Installer tracebacks are stored in `/var/ton-work/controller/mytoninstaller.log`; MyTonCore runtime logs are in `/var/ton-work/controller/mytoncore/mytoncore.log`.
+
 It prints state changes and one-minute heartbeats such as `FailedScheduling`,
 `FailedAttachVolume`, `downloading`, `extracting`, `CrashLoopBackOff`, and
 `complete`. Five repeated CrashLoop restarts with a non-zero exit fail the
@@ -576,6 +591,8 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton exec "sync"
 ./kubeton exec-mtc "set stake 1000000"
 ```
+
+`kubeton status` recognizes both older sync messages and the current masterchain delay in seconds and shardchain lag in blocks. Wallet commands preserve upstream argument errors without retrying the command through an interactive console. Wallet address-file fallback reads the native 36-byte binary format.
 
 `kubeton wallet create` only generates main-wallet files and the init BOC.
 Before `kubeton wallet deploy <mainnet|testnet> <name>` can deploy a new main
@@ -992,7 +1009,7 @@ Use one of the dedicated release scripts:
 ./upgrade-ton-operator.sh 0.3.1
 
 # B) TON image-only release (bumps chart version only; keeps operator appVersion/tag unchanged)
-./upgrade-ton-images-only.sh 0.3.1 v1.0.0 v2026.08-amd64
+./upgrade-ton-images-only.sh 0.3.1 dev v2026.08-amd64
 
 # commit + push to main
 git add .
@@ -1048,6 +1065,8 @@ helm upgrade ton-k8s-operator . \
 
 To update MyTonCtrl or TON independently, keep the operator version and set the corresponding image explicitly:
 
+Container `update` and `upgrade` console commands are disabled upstream. Upgrade the selected images through Helm/`kubeton`; keep the same work PVCs. If an image tag is unchanged, use `kubectl -n default rollout restart statefulset/tonnode` after publishing/pulling the intended image to trigger fresh init-container exports.
+
 ```bash
 kubectl apply -f crds/ton.ton.org_tonnodes.yaml
 kubectl wait --for=condition=Established crd/tonnodes.ton.ton.org --timeout=60s
@@ -1055,7 +1074,7 @@ helm upgrade ton-k8s-operator . \
   -n ton-k8s-operator-system \
   -f operator-values.yaml \
   -f tonnode-values.yaml \
-  --set-string tonNode.image=ghcr.io/neodix42/mytonctrl:<mytonctrl-tag> \
+  --set-string tonNode.image=ghcr.io/ton-blockchain/mytonctrl:<mytonctrl-tag> \
   --set-string tonNode.tonImage=ghcr.io/ton-blockchain/ton:<ton-tag> \
   --rollback-on-failure --wait --timeout 40m
 ```
@@ -1098,7 +1117,7 @@ helm upgrade ton-k8s-operator . \
   -n ton-k8s-operator-system \
   -f operator-values.yaml \
   -f tonnode-values.yaml \
-  --set-string tonNode.image=ghcr.io/neodix42/mytonctrl:<old-mytonctrl-tag> \
+  --set-string tonNode.image=ghcr.io/ton-blockchain/mytonctrl:<old-mytonctrl-tag> \
   --set-string tonNode.tonImage=ghcr.io/ton-blockchain/ton:<old-ton-tag> \
   --rollback-on-failure --wait --timeout 40m
 ```

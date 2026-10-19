@@ -112,12 +112,26 @@ func TestKeyBundleRoundTripRetainsControllerAndNodeIdentity(t *testing.T) {
 	if err := os.Remove(filepath.Join(restored, "controller/initialized.json")); err != nil {
 		t.Fatal(err)
 	}
-	writeKeyFixture(t, restored, "controller/.initializing", "resume-settings")
+	checkpoint := `{"version":1,"identity":{"MTC_USER":"root","BIN_DIR":"/usr/bin","SRC_DIR":"/usr/src","TON_WORK_DIR":"/var/ton-work"},"installer_environment":{"MODE":"validator","NETWORK":"testnet","DUMP":"true","VALIDATOR_PORT":"30001"}}`
+	recoveryFiles := map[string]string{
+		"controller/.initializing":           checkpoint,
+		"controller/installer-progress.json": `{"stage":"dump","status":"extracting"}`,
+		"dump-cache/pinned-dump.tar.lz":      "cached-dump-fixture",
+	}
+	for name, content := range recoveryFiles {
+		writeKeyFixture(t, restored, name, content)
+	}
 	if output, err := runKeyScript(t, keyRestoreScript, restored, bundle); err != nil {
 		t.Fatalf("restore during resumed installation: %v\n%s", err, output)
 	}
 	if _, err := os.Stat(filepath.Join(restored, "controller/initialized.json")); !os.IsNotExist(err) {
 		t.Errorf("restore falsely committed interrupted installation: %v", err)
+	}
+	for name, want := range recoveryFiles {
+		got, err := os.ReadFile(filepath.Join(restored, name))
+		if err != nil || string(got) != want {
+			t.Errorf("restore changed installation recovery state %s: got %q, err=%v", name, got, err)
+		}
 	}
 	got, _ := os.ReadFile(filepath.Join(restored, "controller/mytoncore/mytoncore.db"))
 	if string(got) != "updated-core-settings" {

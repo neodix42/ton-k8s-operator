@@ -91,7 +91,7 @@ spec:
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
     agent:
-      image: ghcr.io/neodix42/mytonctrl:v1.0.0
+      image: ghcr.io/ton-blockchain/mytonctrl:dev
 ```
 
 Minimal KMS example:

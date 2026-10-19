@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	defaultImage                       = "ghcr.io/neodix42/mytonctrl:v1.0.0"
+	defaultImage                       = "ghcr.io/ton-blockchain/mytonctrl:dev"
 	defaultTonImage                    = "ghcr.io/ton-blockchain/ton:v2026.08-amd64"
 	defaultReplicas              int32 = 1
 	defaultTonWorkSize                 = "700Gi"

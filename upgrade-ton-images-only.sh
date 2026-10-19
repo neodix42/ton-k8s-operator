@@ -7,7 +7,7 @@ usage() {
     '  ./upgrade-ton-images-only.sh <chart-version> <mytonctrl-tag> <ton-tag>' \
     '' \
     'Example:' \
-    '  ./upgrade-ton-images-only.sh 0.3.1 v1.0.0 v2026.08-amd64' \
+    '  ./upgrade-ton-images-only.sh 0.3.1 dev v2026.08-amd64' \
     '' \
     'Updates chart image defaults independently; operator appVersion and image stay unchanged.'
 }
@@ -33,7 +33,7 @@ for target_tag in "$TARGET_MYTONCTRL_TAG" "$TARGET_TON_TAG"; do
 done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MYTONCTRL_IMAGE="ghcr.io/neodix42/mytonctrl:${TARGET_MYTONCTRL_TAG}"
+MYTONCTRL_IMAGE="ghcr.io/ton-blockchain/mytonctrl:${TARGET_MYTONCTRL_TAG}"
 TON_IMAGE="ghcr.io/ton-blockchain/ton:${TARGET_TON_TAG}"
 CHART_FILE="$ROOT_DIR/charts/ton-k8s-operator/Chart.yaml"
 VALUES_FILE="$ROOT_DIR/charts/ton-k8s-operator/values.yaml"
@@ -55,7 +55,7 @@ CURRENT_APP_VERSION="$(awk -F': ' '/^appVersion:/{print $2; exit}' "$CHART_FILE"
 # Key agents inherit tonNode.image unless users explicitly choose a separate image.
 sed -E -i "s|^version: .*$|version: ${TARGET_CHART_VERSION}|" "$CHART_FILE"
 for values_file in "$VALUES_FILE" "$TON_VALUES_FILE"; do
-  sed -E -i "s|^  image: ghcr\\.io/neodix42/mytonctrl:.*$|  image: ${MYTONCTRL_IMAGE}|" "$values_file"
+  sed -E -i "s#^  image: ghcr\\.io/(ton-blockchain|neodix42)/mytonctrl:.*\$#  image: ${MYTONCTRL_IMAGE}#" "$values_file"
   sed -E -i "s|^  tonImage: ghcr\\.io/ton-blockchain/ton:.*$|  tonImage: ${TON_IMAGE}|" "$values_file"
 done
 

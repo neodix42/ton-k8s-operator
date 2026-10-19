@@ -27,7 +27,7 @@ import (
 // TonNodeSpec defines the desired state of TonNode.
 type TonNodeSpec struct {
 	// Image is the MyTonCtrl runtime image, which installs and supervises the TON node.
-	// +kubebuilder:default:="ghcr.io/neodix42/mytonctrl:v1.0.0"
+	// +kubebuilder:default:="ghcr.io/ton-blockchain/mytonctrl:dev"
 	Image string `json:"image,omitempty"`
 
 	// TonImage is the official TON image that exports the binaries and Fift libraries.

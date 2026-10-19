@@ -461,7 +461,7 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 	}{
 		{
 			name:  "versioned tag uses pull always",
-			image: "ghcr.io/neodix42/mytonctrl:v1.0.0",
+			image: "ghcr.io/ton-blockchain/mytonctrl:dev",
 			want:  corev1.PullAlways,
 		},
 		{
@@ -471,12 +471,12 @@ func TestDesiredImagePullPolicy(t *testing.T) {
 		},
 		{
 			name:  "image without tag is treated as latest",
-			image: "ghcr.io/neodix42/mytonctrl",
+			image: "ghcr.io/ton-blockchain/mytonctrl",
 			want:  corev1.PullAlways,
 		},
 		{
 			name:  "digest pin uses if not present",
-			image: "ghcr.io/neodix42/mytonctrl@sha256:0123456789abcdef",
+			image: "ghcr.io/ton-blockchain/mytonctrl@sha256:0123456789abcdef",
 			want:  corev1.PullIfNotPresent,
 		},
 	}
@@ -513,7 +513,7 @@ func TestDesiredKeyAgentImagePullPolicy(t *testing.T) {
 				Spec: tonv1alpha1.TonNodeSpec{
 					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
 						Agent: tonv1alpha1.TonNodeKeyAgentSpec{
-							Image: "ghcr.io/neodix42/mytonctrl:v1.0.0",
+							Image: "ghcr.io/ton-blockchain/mytonctrl:dev",
 						},
 					},
 				},
@@ -526,7 +526,7 @@ func TestDesiredKeyAgentImagePullPolicy(t *testing.T) {
 				Spec: tonv1alpha1.TonNodeSpec{
 					KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{
 						Agent: tonv1alpha1.TonNodeKeyAgentSpec{
-							Image: "ghcr.io/neodix42/mytonctrl@sha256:0123456789abcdef",
+							Image: "ghcr.io/ton-blockchain/mytonctrl@sha256:0123456789abcdef",
 						},
 					},
 				},
