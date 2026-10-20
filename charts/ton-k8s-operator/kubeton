@@ -238,7 +238,7 @@ Commands:
   uninstall            Full best-effort cleanup of kubeton-managed resources (with confirmation; keeps TonNode CRD).
   purge                Full best-effort cleanup + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
   verify               Verify operator and TON resources (deploy, pods with node/server, tonnodes, sts, pvc).
-  status               Run wallet/adnl/sync/db checks in each TON pod; print node/pod/wallet/adnl/sync/cell db/archive db.
+  status               Show each TON pod's image tags, build date, wallet, ADNL, sync, and database sizes.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
   exec-mtc <cmd>       Run a command in each TON pod inside mytonctrl and print table with node/pod/exit code.
 
@@ -14585,7 +14585,7 @@ print_aligned_table_8col() {
   done
 }
 
-print_aligned_table_9col() {
+print_aligned_table_10col() {
   local h1="$1"
   local h2="$2"
   local h3="$3"
@@ -14595,7 +14595,8 @@ print_aligned_table_9col() {
   local h7="$7"
   local h8="$8"
   local h9="$9"
-  shift 9
+  local h10="${10}"
+  shift 10
   local -a rows=("$@")
   local w1=${#h1}
   local w2=${#h2}
@@ -14606,10 +14607,11 @@ print_aligned_table_9col() {
   local w7=${#h7}
   local w8=${#h8}
   local w9=${#h9}
-  local row c1 c2 c3 c4 c5 c6 c7 c8 c9
+  local w10=${#h10}
+  local row c1 c2 c3 c4 c5 c6 c7 c8 c9 c10
 
   for row in "${rows[@]}"; do
-    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 <<<"$row"
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 <<<"$row"
     (( ${#c1} > w1 )) && w1=${#c1}
     (( ${#c2} > w2 )) && w2=${#c2}
     (( ${#c3} > w3 )) && w3=${#c3}
@@ -14619,16 +14621,17 @@ print_aligned_table_9col() {
     (( ${#c7} > w7 )) && w7=${#c7}
     (( ${#c8} > w8 )) && w8=${#c8}
     (( ${#c9} > w9 )) && w9=${#c9}
+    (( ${#c10} > w10 )) && w10=${#c10}
   done
 
-  printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
-    "$w1" "$h1" "$w2" "$h2" "$w3" "$h3" "$w4" "$h4" "$w5" "$h5" "$w6" "$h6" "$w7" "$h7" "$w8" "$h8" "$w9" "$h9"
-  printf "|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n" \
-    "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")" "$(dash_line "$w4")" "$(dash_line "$w5")" "$(dash_line "$w6")" "$(dash_line "$w7")" "$(dash_line "$w8")" "$(dash_line "$w9")"
+  printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+    "$w1" "$h1" "$w2" "$h2" "$w3" "$h3" "$w4" "$h4" "$w5" "$h5" "$w6" "$h6" "$w7" "$h7" "$w8" "$h8" "$w9" "$h9" "$w10" "$h10"
+  printf "|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|-%s-|\n" \
+    "$(dash_line "$w1")" "$(dash_line "$w2")" "$(dash_line "$w3")" "$(dash_line "$w4")" "$(dash_line "$w5")" "$(dash_line "$w6")" "$(dash_line "$w7")" "$(dash_line "$w8")" "$(dash_line "$w9")" "$(dash_line "$w10")"
   for row in "${rows[@]}"; do
-    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 <<<"$row"
-    printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
-      "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5" "$w6" "$c6" "$w7" "$c7" "$w8" "$c8" "$w9" "$c9"
+    IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 <<<"$row"
+    printf "| %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s |\n" \
+      "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4" "$w5" "$c5" "$w6" "$c6" "$w7" "$c7" "$w8" "$c8" "$w9" "$c9" "$w10" "$c10"
   done
 }
 
@@ -14752,11 +14755,33 @@ wallet_adnl_values() {
   printf '%s\t%s\n' "$wallet" "$adnl"
 }
 
-validator_build_values() {
+status_image_tag() {
+  local image tag
+  image="$(trim_whitespace "${1:-}")"
+  if [[ -z "$image" ]]; then
+    printf 'N/A'
+  elif tag="$(extract_image_tag "$image")"; then
+    printf '%s' "$tag"
+  elif [[ "$image" == *@* ]]; then
+    printf '%s' "${image##*@}"
+  else
+    printf latest
+  fi
+}
+
+pod_image_tag_values() {
+  local ns="$1" pod="$2" images ton_image mytonctrl_image
+  # Read each Pod, so a rolling upgrade can show old and new tags together.
+  images="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get pod "$pod" \
+    -o go-template='{{range .spec.initContainers}}{{if eq .name "export-ton-binaries"}}{{.image}}{{end}}{{end}}{{"\x1f"}}{{range .spec.containers}}{{if eq .name "ton-node"}}{{.image}}{{end}}{{end}}' 2>/dev/null || true)"
+  IFS=$'\x1f' read -r ton_image mytonctrl_image <<<"$images"
+  printf '%s\t%s\n' "$(status_image_tag "$ton_image")" "$(status_image_tag "$mytonctrl_image")"
+}
+
+validator_build_date() {
   local ns="$1"
   local pod="$2"
   local output=""
-  local commit=""
   local build_date=""
 
   output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
@@ -14773,21 +14798,14 @@ validator_build_values() {
   output="$(trim_whitespace "$output")"
 
   if [[ -n "$output" ]]; then
-    commit="$(printf '%s\n' "$output" | sed -n 's/.*Commit:[[:space:]]*\([0-9a-fA-F]\{7,\}\).*/\1/p' | head -n1)"
     build_date="$(printf '%s\n' "$output" | sed -n 's/.*Date:[[:space:]]*\([^]]*\)].*/\1/p' | head -n1)"
   fi
 
-  commit="$(trim_whitespace "$commit")"
   build_date="$(trim_whitespace "$build_date")"
-  if [[ -z "$commit" ]]; then
-    commit="N/A"
-  else
-    commit="${commit:0:7}"
-  fi
   if [[ -z "$build_date" ]]; then
     build_date="N/A"
   fi
-  printf '%s\t%s\n' "$commit" "$build_date"
+  printf '%s\n' "$build_date"
 }
 
 status_collect_row() {
@@ -14796,8 +14814,9 @@ status_collect_row() {
   local node_name="$3"
   local out_file="$4"
   local wallet_adnl=""
-  local validator_build=""
-  local commit_output="N/A"
+  local image_tags=""
+  local ton_image_output="N/A"
+  local mytonctrl_image_output="N/A"
   local date_output="N/A"
   local wallet_output="N/A"
   local adnl_output="N/A"
@@ -14809,16 +14828,18 @@ status_collect_row() {
   if [[ -n "$wallet_adnl" ]]; then
     IFS=$'\t' read -r wallet_output adnl_output <<<"$wallet_adnl"
   fi
-  validator_build="$(validator_build_values "$ns" "$pod")"
-  if [[ -n "$validator_build" ]]; then
-    IFS=$'\t' read -r commit_output date_output <<<"$validator_build"
+  image_tags="$(pod_image_tag_values "$ns" "$pod")"
+  if [[ -n "$image_tags" ]]; then
+    IFS=$'\t' read -r ton_image_output mytonctrl_image_output <<<"$image_tags"
   fi
+  date_output="$(validator_build_date "$ns" "$pod")"
   sync_output="$(sync_value "$ns" "$pod")"
   [[ -z "$node_name" ]] && node_name="N/A"
   cell_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/celldb")"
   archive_db_size="$(folder_size_gb "$ns" "$pod" "/var/ton-work/db/archive")"
 
-  commit_output="${commit_output//$'\t'/ }"
+  ton_image_output="${ton_image_output//$'\t'/ }"
+  mytonctrl_image_output="${mytonctrl_image_output//$'\t'/ }"
   date_output="${date_output//$'\t'/ }"
   wallet_output="${wallet_output//$'\t'/ }"
   adnl_output="${adnl_output//$'\t'/ }"
@@ -14826,8 +14847,8 @@ status_collect_row() {
   cell_db_size="${cell_db_size//$'\t'/ }"
   archive_db_size="${archive_db_size//$'\t'/ }"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$node_name" "$pod" "$commit_output" "$date_output" "$wallet_output" "$adnl_output" "$sync_output" "$cell_db_size" "$archive_db_size" >"$out_file"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$node_name" "$pod" "$ton_image_output" "$mytonctrl_image_output" "$date_output" "$wallet_output" "$adnl_output" "$sync_output" "$cell_db_size" "$archive_db_size" >"$out_file"
 }
 
 ensure_tonnode_crd_schema() {
@@ -17395,7 +17416,7 @@ run_status() {
     [[ -z "$node_name" ]] && node_name="N/A"
     result_file="${status_tmp_dir}/row-${i}.tsv"
     result_files[$i]="$result_file"
-    fallback_rows[$i]="$node_name"$'\t'"$pod"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"
+    fallback_rows[$i]="$node_name"$'\t'"$pod"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"$'\t'"N/A"
     status_collect_row "$ns" "$pod" "$node_name" "$result_file" &
     pids+=("$!")
   done
@@ -17415,7 +17436,7 @@ run_status() {
 
   rm -rf "$status_tmp_dir" >/dev/null 2>&1 || true
 
-  print_aligned_table_9col "server name" "pod name" "commit" "date" "wallet" "ADNL address" "sync" "cell db" "archive db" "${table_rows[@]}"
+  print_aligned_table_10col "server name" "pod name" "TON image" "MyTonCtrl image" "date" "wallet" "ADNL address" "sync" "cell db" "archive db" "${table_rows[@]}"
 }
 
 run_prometheus_start() {

@@ -516,7 +516,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.3.2/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.3.3/install.sh" | bash
 ```
 
 The script:
@@ -577,6 +577,10 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton exec "sync"
 ./kubeton exec-mtc "set stake 1000000"
 ```
+
+`kubeton status` shows separate `TON image` and `MyTonCtrl image` tag columns
+(for example, `v2026.08-amd64` and `v1.0.3`) from each pod's image references,
+alongside the validator build date, wallet, ADNL, sync, and database sizes.
 
 `kubeton wallet create` only generates main-wallet files and the init BOC.
 Before `kubeton wallet deploy <mainnet|testnet> <name>` can deploy a new main
@@ -1049,7 +1053,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.3.2/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.3.3/install.sh" | bash
 cd ./ton-k8s-operator-0.3.0
 
 # review values before upgrade
