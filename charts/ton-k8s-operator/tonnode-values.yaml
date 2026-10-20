@@ -9,7 +9,7 @@ tonNode:
     - -m
     - validator
     - -n
-    - testnet
+    - mainnet
     - -d
   replicas: 3
   storage:
@@ -68,6 +68,6 @@ tonNode:
     - name: TELEMETRY
       value: "true"
     - name: DUMP_EXTRACT_THREADS
-      value: "8"
+      value: "1"
     - name: CUSTOM_PARAMETERS
       value: "--exporter-address 0.0.0.0:9777"

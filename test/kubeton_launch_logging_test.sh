@@ -308,6 +308,109 @@ test_install_waits_for_operator_rollout_inside_launch_session() (
   assert_contains "did not become Ready" "$test_dir/install-rollout-failure.stderr"
 )
 
+test_operator_install_preserves_selected_live_ton_images() (
+  source "$kubeton"
+  OP_NAMESPACE=operator-ns
+  RELEASE_NAME=selected-release
+  TON_VALUES_FILE="$test_dir/install-live-image-values.yaml"
+  KUBETON_SKIP_NODE_PREREQ_CHECK=true
+  cat >"$TON_VALUES_FILE" <<'EOF'
+tonNode:
+  namespace: selected-ns
+  name: selected-ton
+  image: ghcr.io/example/controller:stale-local
+  tonImage: ghcr.io/example/ton:stale-local
+EOF
+
+  local mode helm_log query_log output rc
+  local live_controller=ghcr.io/example/controller@sha256:abcdef
+  local live_ton=ghcr.io/example/ton:updated
+  require_bin() { :; }
+  ensure_tonnode_crd_schema() { :; }
+  append_helm_force_conflicts_if_supported() { :; }
+  resolve_operator_controller_deployment_name() { printf controller; }
+  cluster_has_tonnodes() {
+    printf '%s\n' fleet-query >>"$query_log"
+    [[ "$mode" != no-nodes ]]
+  }
+  helm() {
+    if [[ "$*" == '-n operator-ns status selected-release' ]]; then
+      [[ "$mode" != fresh ]]
+      return
+    fi
+    printf '%s\n' "$@" >>"$helm_log"
+  }
+  kubectl() {
+    if [[ "$*" == '-n selected-ns get tonnodes.ton.ton.org selected-ton --ignore-not-found -o go-template='* ]]; then
+      printf '%s\n' selected-ton-query >>"$query_log"
+      case "$mode" in
+        missing|no-nodes) return 0 ;;
+        api-error) echo 'API access forbidden' >&2; return 1 ;;
+        foreign-release)
+          printf 'selected-ton\x1f%s\x1f%s\x1fother-release\x1foperator-ns' "$live_controller" "$live_ton"
+          ;;
+        foreign-namespace)
+          printf 'selected-ton\x1f%s\x1f%s\x1fselected-release\x1fother-operator-ns' "$live_controller" "$live_ton"
+          ;;
+        defaults) printf 'selected-ton\x1f\x1f\x1fselected-release\x1foperator-ns' ;;
+        *) printf 'selected-ton\x1f%s\x1f%s\x1fselected-release\x1foperator-ns' "$live_controller" "$live_ton" ;;
+      esac
+      return 0
+    fi
+    if [[ "$*" == '-n operator-ns rollout status deployment/controller '* ]]; then
+      return 0
+    fi
+    echo "Unexpected kubectl query during operator-only install: $*" >&2
+    return 1
+  }
+
+  for mode in owned defaults missing foreign-release foreign-namespace api-error no-nodes fresh; do
+    helm_log="$test_dir/install-live-images-${mode}.helm"
+    query_log="$test_dir/install-live-images-${mode}.queries"
+    output="$test_dir/install-live-images-${mode}.out"
+    : >"$helm_log"
+    : >"$query_log"
+    rc=0
+    run_install >"$output" 2>&1 || rc=$?
+    if [[ "$mode" == api-error ]]; then
+      [[ "$rc" != 0 ]] || fail 'operator install ignored a live TonNode API read failure'
+      [[ ! -s "$helm_log" ]] || fail 'operator install applied Helm after a live image query failed'
+      assert_contains 'refusing an operator-only upgrade' "$output"
+      continue
+    fi
+    [[ "$rc" == 0 ]] || fail "operator install rejected live image case ${mode}"
+    assert_not_contains tonNode.replicas "$helm_log"
+    assert_not_contains stale-local "$helm_log"
+    if [[ "$mode" == fresh ]]; then
+      [[ ! -s "$query_log" ]] || fail 'fresh install queried an existing TonNode for Helm image preservation'
+      assert_not_contains --reuse-values "$helm_log"
+    else
+      assert_contains selected-ton-query "$query_log"
+      assert_contains --reuse-values "$helm_log"
+    fi
+    case "$mode" in
+      owned)
+        assert_contains --set-string "$helm_log"
+        assert_contains "tonNode.image=${live_controller}" "$helm_log"
+        assert_contains "tonNode.tonImage=${live_ton}" "$helm_log"
+        assert_not_contains fleet-query "$query_log"
+        assert_not_contains tonNode.enabled=false "$helm_log"
+        ;;
+      defaults)
+        grep -Fxq 'tonNode.image=' "$helm_log" || fail 'operator install replaced the live default controller image'
+        grep -Fxq 'tonNode.tonImage=' "$helm_log" || fail 'operator install replaced the live default TON image'
+        ;;
+      *)
+        assert_not_contains tonNode.image= "$helm_log"
+        assert_not_contains tonNode.tonImage= "$helm_log"
+        ;;
+    esac
+    if [[ "$mode" == no-nodes ]]; then
+      assert_contains tonNode.enabled=false "$helm_log"
+    fi
+  done
+)
+
 test_launch_session_preserves_enabled_errexit() (
   export KUBETON_LAUNCH_LOGS_ENABLED=true
   export KUBETON_LAUNCH_LOG_ROOT="$test_dir/enabled-errexit-root"
@@ -3739,6 +3842,7 @@ test_run_with_launch_session_exit_and_evidence
 test_launch_session_keeps_transcript_pipes_outside_chart
 test_chart_ignores_default_launch_evidence
 test_install_waits_for_operator_rollout_inside_launch_session
+test_operator_install_preserves_selected_live_ton_images
 test_launch_session_preserves_enabled_errexit
 test_launch_session_preserves_errexit
 test_container_followers_reconnect_independently

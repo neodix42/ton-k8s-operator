@@ -544,6 +544,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton install
 ./kubeton bootstrap-baremetal
 ./kubeton start
+./kubeton upgrade
 ./kubeton prometheus start
 ./kubeton grafana start
 ./kubeton victoria-metrics install
@@ -617,6 +618,9 @@ The ephemeral main-wallet helper uses the deployed official TON artifact image f
 
 # start TON nodes (replicas from tonnode-values.yaml)
 ./kubeton start
+
+# apply changed MyTonCtrl/TON images from tonnode-values.yaml
+./kubeton upgrade
 
 # create/update Prometheus scrapers from TonNode CUSTOM_PARAMETERS --exporter-address
 # and start background local port-forward(s)
@@ -762,6 +766,7 @@ KUBETON_START_STATUS_INTERVAL_SECONDS
 KUBETON_START_FATAL_RESTART_COUNT
 KUBETON_START_STATUS_READ_ERROR_LIMIT
 KUBETON_START_VICTORIA_LOGS_ENABLED
+KUBETON_UPGRADE_TIMEOUT_SECONDS
 SKIP_STOP_KEY_BACKUP
 STATUS_EXEC_TIMEOUT
 HELPER_POD_READY_TIMEOUT
@@ -999,6 +1004,26 @@ Use the dedicated scripts to update the operator release or an individual runtim
 ```
 
 The image helpers update only their corresponding image tag in the chart values files. They leave chart and operator versions and installer release URLs unchanged.
+
+To apply image changes to an existing fleet, edit `tonNode.image` and/or
+`tonNode.tonImage` in the local `tonnode-values.yaml` (or `TON_VALUES_FILE`), then run:
+
+```bash
+./kubeton upgrade
+```
+
+This targets `tonNode.namespace`/`tonNode.name` and patches only changed image
+fields, preserving other configuration and the deployed replica count. It
+refreshes encrypted backups before replacing initialized pods. Stopped fleets
+remain stopped. If the deployed images already match, it prints
+`Nothing to upgrade.`; rerunning during a pending rollout resumes waiting.
+`KUBETON_UPGRADE_TIMEOUT_SECONDS` sets the total reconciliation and rollout wait
+(default `1800`).
+
+Changing either image recreates pods. Their init containers export the official
+TON binaries before MyTonCtrl starts, including after a MyTonCtrl-only change:
+the exported artifacts belong to each pod, so the same TON image is exported
+again. MyTonCtrl runs the exported TON binaries within its pod.
 
 For an operator/chart release, commit and push the versioned changes:
 
