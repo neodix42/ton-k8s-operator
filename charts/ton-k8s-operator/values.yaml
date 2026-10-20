@@ -6,7 +6,7 @@ namespace:
 
 image:
   repository: ghcr.io/neodix42/ton-k8s-operator
-  tag: 0.3.1
+  tag: 0.3.2
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -61,8 +61,8 @@ tonNode:
   namespace: ""
   labels: {}
   # MyTonCtrl runtime and the official TON binary exporter are versioned independently.
-  image: ghcr.io/neodix42/mytonctrl:v1.0.3
-  tonImage: ghcr.io/ton-blockchain/ton:v2026.08-amd64
+  image: ghcr.io/neodix42/mytonctrl:v1.0.5
+  tonImage: ghcr.io/ton-blockchain/ton:v2026.10-amd64
   # Installation flags: mode, network, dump download, and relaxed minimum requirements.
   args:
     - -m
