@@ -935,7 +935,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: ghcr.io/neodix42/ton-k8s-operator:0.3.3
+        image: ghcr.io/neodix42/ton-k8s-operator:0.3.4
         livenessProbe:
           httpGet:
             path: /healthz
