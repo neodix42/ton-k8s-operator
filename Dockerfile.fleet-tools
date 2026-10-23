@@ -1,0 +1,35 @@
+FROM python:3.12-slim-bookworm
+LABEL org.opencontainers.image.source="https://github.com/neodix42/ton-k8s-operator"
+
+ARG TARGETARCH=amd64
+ARG KUBECTL_VERSION=v1.35.9
+ARG HELM_VERSION=v4.3.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates coreutils curl diffutils findutils gawk gnupg grep \
+      gzip jq openssl procps sed tar util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --create-home validator
+RUN set -eux; \
+    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" -o /usr/local/bin/kubectl; \
+    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256" -o /tmp/kubectl.sha256; \
+    printf '%s  /usr/local/bin/kubectl\n' "$(cat /tmp/kubectl.sha256)" | sha256sum -c -; \
+    curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" -o /tmp/helm.tgz; \
+    curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz.sha256sum" -o /tmp/helm.sha256; \
+    printf '%s  /tmp/helm.tgz\n' "$(awk '{print $1}' /tmp/helm.sha256)" | sha256sum -c -; \
+    tar -xzf /tmp/helm.tgz -C /tmp; \
+    mv "/tmp/linux-${TARGETARCH}/helm" /usr/local/bin/helm; \
+    chmod 755 /usr/local/bin/kubectl /usr/local/bin/helm; \
+    rm -rf /tmp/helm* /tmp/kubectl.sha256 "/tmp/linux-${TARGETARCH}"
+
+COPY charts/ton-k8s-operator/Chart.yaml charts/ton-k8s-operator/values.yaml \
+     charts/ton-k8s-operator/operator-values.yaml charts/ton-k8s-operator/tonnode-values.yaml \
+     charts/ton-k8s-operator/kubeton charts/ton-k8s-operator/fleet.sh \
+     charts/ton-k8s-operator/fleet.py charts/ton-k8s-operator/fleet-crypto.sh \
+     charts/ton-k8s-operator/main-wallet.sh /opt/kubeton/
+COPY charts/ton-k8s-operator/templates /opt/kubeton/templates
+COPY charts/ton-k8s-operator/crds /opt/kubeton/crds
+RUN chmod 755 /opt/kubeton/kubeton
+ENV KUBETON_FLEET_RUNTIME=native PYTHONDONTWRITEBYTECODE=1
+WORKDIR /work
+ENTRYPOINT ["/bin/bash"]

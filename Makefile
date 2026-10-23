@@ -69,6 +69,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_upgrade_test.sh
 	bash test/kubeton_restore_keys_test.sh
 	python3 test/kubeton_fleet_test.py
+	python3 test/kubeton_fleet_tools_test.py
 	bash test/kubeton_status_test.sh
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.

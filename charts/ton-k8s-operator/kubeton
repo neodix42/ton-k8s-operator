@@ -9,6 +9,8 @@ TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
 TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
 TON_NAMESPACE="${TON_NAMESPACE:-default}"
 TON_STORAGE_CLASS_NAME="${TON_STORAGE_CLASS_NAME:-local-path}"
+KUBETON_FLEET_TOOLS_IMAGE="${KUBETON_FLEET_TOOLS_IMAGE:-ghcr.io/neodix42/ton-k8s-operator:fleet-tools-0.3.4}"
+KUBETON_FLEET_RUNTIME="${KUBETON_FLEET_RUNTIME:-pod}"
 
 AUTO_BAREMETAL_BOOTSTRAP="${AUTO_BAREMETAL_BOOTSTRAP:-true}"
 FORCE_BAREMETAL_BOOTSTRAP="${FORCE_BAREMETAL_BOOTSTRAP:-false}"
@@ -19010,11 +19012,11 @@ main() {
       ;;
     backup-fleet)
       source "$CHART_DIR/fleet.sh"
-      run_backup_fleet "$@"
+      run_fleet_command backup "$@"
       ;;
     restore-fleet)
       source "$CHART_DIR/fleet.sh"
-      run_restore_fleet "$@"
+      run_fleet_command restore "$@"
       ;;
     wallet)
       run_wallet "$@"

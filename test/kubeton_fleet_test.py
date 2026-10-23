@@ -153,7 +153,7 @@ class FleetTest(unittest.TestCase):
         self.home = self.root / "gnupg"
         self.home.mkdir(mode=0o700)
         self.env = dict(os.environ, GNUPGHOME=str(self.home), RECOVERY_KEY=KEY,
-                        KUBETON_LAUNCH_LOGS_ENABLED="false")
+                        KUBETON_LAUNCH_LOGS_ENABLED="false", KUBETON_FLEET_RUNTIME="native")
         spec = {"replicas": 2, "image": "example/mytonctrl:1", "tonImage": "example/ton:1",
                 "storage": {"storageClassName": "old-disk"},
                 "nodeSelector": {"kubernetes.io/hostname": "old-worker"},

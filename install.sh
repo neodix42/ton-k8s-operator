@@ -3,6 +3,7 @@ set -euo pipefail
 
 CHART_VERSION="0.3.4"
 CHART_REF="${CHART_REF:-oci://ghcr.io/neodix42/charts/ton-k8s-operator}"
+RELEASE_BASE_URL="${RELEASE_BASE_URL:-https://github.com/neodix42/ton-k8s-operator/releases/download/$CHART_VERSION}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD/ton-k8s-operator-$CHART_VERSION}"
 
 require_bin() {
@@ -15,6 +16,12 @@ require_bin() {
 
 require_bin helm
 require_bin tar
+if command -v curl >/dev/null 2>&1; then
+  download_file() { curl -fsSL "$1" -o "$2"; }
+else
+  require_bin wget
+  download_file() { wget -qO "$2" "$1"; }
+fi
 
 if [[ -d "$INSTALL_DIR" ]] && [[ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
   BACKUP_DIR="${INSTALL_DIR}-backup-$(date +%Y%m%d-%H%M%S)"
@@ -44,11 +51,21 @@ if [[ ! -f "$CHART_DIR/Chart.yaml" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$CHART_DIR/operator-values.yaml" || ! -f "$CHART_DIR/tonnode-values.yaml" || ! -f "$CHART_DIR/kubeton" ]]; then
-  echo "Error: downloaded chart does not include operator-values.yaml, tonnode-values.yaml and kubeton." >&2
+if [[ ! -f "$CHART_DIR/operator-values.yaml" || ! -f "$CHART_DIR/tonnode-values.yaml" ]]; then
+  echo "Error: downloaded chart does not include operator-values.yaml and tonnode-values.yaml." >&2
   echo "Publish a newer chart version from this repo, then run install.sh again." >&2
   exit 1
 fi
+# Release clients can be updated without replacing an already-published OCI
+# chart version. Download the matching CLI and all of its fleet helpers as one set.
+for client_file in kubeton fleet.sh fleet.py fleet-crypto.sh; do
+  echo "Downloading ${client_file} from release ${CHART_VERSION} ..."
+  download_file "$RELEASE_BASE_URL/$client_file" "$CHART_DIR/${client_file}.download"
+  [[ -s "$CHART_DIR/${client_file}.download" ]] || { echo "Error: empty release asset: $client_file" >&2; exit 1; }
+done
+for client_file in kubeton fleet.sh fleet.py fleet-crypto.sh; do
+  mv "$CHART_DIR/${client_file}.download" "$CHART_DIR/$client_file"
+done
 chmod +x "$CHART_DIR/kubeton"
 
 RESOLVED_VERSION="${ARCHIVE#ton-k8s-operator-}"
@@ -99,4 +116,10 @@ h) Drop TON nodes and storage (PVCs)
 
 i) Delete operator release + namespace
    ./kubeton uninstall
+
+j) Back up a portable fleet (prompts for a recovery passphrase):
+   ./kubeton backup-fleet
+
+   Restore the copied directory on a destination cluster:
+   ./kubeton restore-fleet ./fleet-backups/<timestamp> --bootstrap
 EOF
