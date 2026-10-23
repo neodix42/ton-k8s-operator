@@ -72,6 +72,7 @@ jobs:
           echo "repo=${image_repo}" >> "$GITHUB_OUTPUT"
           echo "tag=${image_tag}" >> "$GITHUB_OUTPUT"
           echo "ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          echo "tools_ref=${image_repo}:fleet-tools-${image_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Login to GHCR (Docker)
         uses: docker/login-action@v3
@@ -112,6 +113,29 @@ jobs:
             org.opencontainers.image.version=${{ steps.chart.outputs.app_version }}
             org.opencontainers.image.revision=${{ github.sha }}
 
+      - name: Check if fleet tools image already exists
+        id: check-tools-image
+        shell: bash
+        run: |
+          if docker manifest inspect "${{ steps.image.outputs.tools_ref }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push fleet tools image
+        if: steps.check-tools-image.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.fleet-tools
+          push: true
+          tags: ${{ steps.image.outputs.tools_ref }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.chart.outputs.app_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
       - name: Check if chart version already exists
         id: check
         shell: bash
@@ -141,7 +165,7 @@ jobs:
           set -euo pipefail
           helm push "dist/charts/${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.publish_version }}.tgz" "oci://ghcr.io/${{ steps.chart.outputs.owner }}/charts"
 
-      - name: Create/update GitHub release and upload install.sh
+      - name: Create/update GitHub release and upload installer and CLI helpers
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.chart.outputs.chart_version }}
@@ -150,6 +174,10 @@ jobs:
           make_latest: true
           files: |
             install.sh
+            charts/ton-k8s-operator/kubeton
+            charts/ton-k8s-operator/fleet.sh
+            charts/ton-k8s-operator/fleet.py
+            charts/ton-k8s-operator/fleet-crypto.sh
           overwrite_files: true
 
       - name: Publish workflow summary
@@ -175,3 +203,4 @@ jobs:
           echo "Chart.yaml appVersion: ${{ steps.chart.outputs.app_version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Publish version: ${{ steps.chart.outputs.publish_version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Release: ${release_url}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fleet tools image: ${{ steps.image.outputs.tools_ref }}" >> "$GITHUB_STEP_SUMMARY"

@@ -154,7 +154,7 @@ def claims(sts):
     return {"apiVersion": "v1", "kind": "List", "items": result}
 
 
-def helper(sts, pod_name, ordinal, session):
+def helper(sts, pod_name, ordinal, session, tools_image=None):
     template = sts["spec"]["template"]["spec"]
     agent = next(item for item in template["containers"] if item["name"] == "key-backup")
     main = next(item for item in template["containers"] if item["name"] == "ton-node")
@@ -167,7 +167,7 @@ def helper(sts, pod_name, ordinal, session):
         mounts.append({"name": name, "mountPath": "/bundle" if name == "keybundle" else f"/volumes/{name}"})
     volumes.append({"name": "recovery", "emptyDir": {"medium": "Memory"}})
     mounts.append({"name": "recovery", "mountPath": "/recovery"})
-    container = {"name": "restore", "image": agent["image"],
+    container = {"name": "restore", "image": tools_image or agent["image"],
                  "command": ["sh", "-c", "sleep 86400"], "env": agent.get("env", []),
                  "envFrom": agent.get("envFrom", []), "volumeMounts": mounts,
                  "resources": main.get("resources", {}), "ports": main.get("ports", [])}

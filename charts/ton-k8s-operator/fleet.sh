@@ -43,20 +43,217 @@ fleet_parse_args() {
         ;;
     esac
   done
-  [[ -n "$backup_dir" && -s "$passphrase_file" ]] || {
-    echo "Error: usage: kubeton ${action}-fleet <directory> --passphrase-file <file>" >&2
+  if [[ "$action" == backup && -z "$backup_dir" ]]; then
+    backup_dir="$PWD/fleet-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  [[ -n "$backup_dir" ]] || {
+    echo "Error: usage: kubeton ${action}-fleet <directory> [--passphrase-file <file>]" >&2
     return 1
   }
-  [[ -n "$(head -n 1 "$passphrase_file")" ]] || {
-    echo "Error: the first line of the passphrase file must not be empty." >&2
+  if [[ -n "$passphrase_file" && ! -s "$passphrase_file" ]]; then
+    echo "Error: passphrase file is missing or empty: $passphrase_file" >&2
+    return 1
+  fi
+}
+
+fleet_prompt_passphrase() {
+  local action="$1" confirmation
+  if [[ -n "$passphrase_file" ]]; then
+    IFS= read -r fleet_passphrase < "$passphrase_file" || [[ -n "$fleet_passphrase" ]]
+  elif [[ -n "${KUBETON_FLEET_PASSPHRASE_FD:-}" ]]; then
+    IFS= read -r -u "$KUBETON_FLEET_PASSPHRASE_FD" fleet_passphrase || [[ -n "$fleet_passphrase" ]]
+  else
+    if ! { IFS= read -r -s -p 'Fleet recovery passphrase: ' fleet_passphrase < /dev/tty; }; then
+      echo "Error: no terminal is available; use --passphrase-file for automation." >&2
+      return 1
+    fi
+    printf '\n' > /dev/tty
+    if [[ "$action" == backup ]]; then
+      IFS= read -r -s -p 'Confirm recovery passphrase: ' confirmation < /dev/tty
+      printf '\n' > /dev/tty
+      [[ "$fleet_passphrase" == "$confirmation" ]] || { echo "Error: passphrases do not match." >&2; return 1; }
+    fi
+  fi
+  [[ -n "$fleet_passphrase" ]] || {
+    echo "Error: the recovery passphrase must not be empty." >&2
     return 1
   }
 }
 
 fleet_gpg() {
   gpg --no-options --batch --yes --pinentry-mode loopback --no-symkey-cache \
-    --passphrase-file "$passphrase_file" "$@"
+    --passphrase-fd 3 "$@" 3<<< "$fleet_passphrase"
 }
+
+run_fleet_command() {
+  local action="$1"
+  shift
+  case "$KUBETON_FLEET_RUNTIME" in
+    native) "run_${action}_fleet" "$@" ;;
+    pod) run_fleet_in_pod "$action" "$@" ;;
+    *) echo "Error: KUBETON_FLEET_RUNTIME must be pod or native." >&2; return 1 ;;
+  esac
+}
+
+run_fleet_in_pod() (
+  set -euo pipefail
+  umask 077
+  local action="$1"
+  shift
+  local backup_dir="" passphrase_file="${KUBETON_FLEET_PASSPHRASE_FILE:-}" fleet_passphrase=""
+  local data_class="$TON_STORAGE_CLASS_NAME" bundle_class="$ENCRYPTED_SC_NAME"
+  local node_selector="" public_ips="" bootstrap=0
+  fleet_parse_args "$action" "$@"
+  require_bin kubectl
+  require_bin tar
+  if [[ "$action" == backup ]]; then
+    [[ ! -e "$backup_dir" && ! -L "$backup_dir" ]] || { echo "Error: backup destination already exists: $backup_dir" >&2; exit 1; }
+  else
+    backup_dir="$(cd "$backup_dir" && pwd)"
+    [[ -s "$backup_dir/fleet.json" && -s "$backup_dir/recovery.gpg" ]] || { echo "Error: incomplete fleet backup directory." >&2; exit 1; }
+  fi
+  fleet_prompt_passphrase "$action"
+  confirm_or_exit "${action^} fleet on the current Kubernetes context using a temporary tools pod? Backup restarts TON pods; stop source validators before restoring their identities."
+
+  local ns="${KUBETON_FLEET_TOOLS_NAMESPACE:-default}" name="kubeton-fleet-$RANDOM-$RANDOM"
+  local local_stage="" operation_active=0 keep_tools=0
+  cleanup_fleet_tools() {
+    if (( operation_active == 1 )) && ! kubectl -n "$ns" exec "$name" -- test -f /work/runner.done >/dev/null 2>&1; then
+      # A lost exec connection can leave the command running. Ask its Bash
+      # subshell to run its own restore/cleanup traps before revoking access.
+      kubectl -n "$ns" exec "$name" -- sh -c 'test ! -s /work/runner.pid || kill -TERM "$(cat /work/runner.pid)"' >/dev/null 2>&1 || true
+      local attempt
+      for attempt in {1..30}; do
+        if kubectl -n "$ns" exec "$name" -- test -f /work/runner.done >/dev/null 2>&1; then break; fi
+        sleep 2
+      done
+      if ! kubectl -n "$ns" exec "$name" -- test -f /work/runner.done >/dev/null 2>&1; then
+        keep_tools=1
+        echo "Error: fleet cleanup has not finished. Retaining tools pod ${ns}/${name} and its RBAC; inspect it before deleting pod/serviceaccount ${name} and clusterrolebinding/clusterrole ${name}." >&2
+      fi
+    fi
+    if (( keep_tools == 0 )); then
+      kubectl -n "$ns" delete pod "$name" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+      kubectl delete clusterrolebinding "$name" --ignore-not-found >/dev/null 2>&1 || true
+      if [[ "$action" == backup ]]; then kubectl delete clusterrole "$name" --ignore-not-found >/dev/null 2>&1 || true; fi
+      kubectl -n "$ns" delete serviceaccount "$name" --ignore-not-found >/dev/null 2>&1 || true
+    fi
+    [[ -z "$local_stage" ]] || rm -rf -- "$local_stage"
+  }
+  trap cleanup_fleet_tools EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Use the caller's kubectl credentials only to launch the tools pod. Its
+  # short-lived service account avoids copying kubeconfig or cloud credentials.
+  kubectl -n "$ns" create serviceaccount "$name" >/dev/null
+  local role_name=cluster-admin
+  if [[ "$action" == backup ]]; then
+    role_name="$name"
+    cat <<EOF | kubectl create -f - >/dev/null
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ${name}
+rules:
+  - apiGroups: ["ton.ton.org"]
+    resources: ["tonnodes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumeclaims", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+EOF
+  fi
+  kubectl create clusterrolebinding "$name" --clusterrole="$role_name" --serviceaccount="$ns:$name" >/dev/null
+  {
+    cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${name}
+  namespace: ${ns}
+  labels:
+    app.kubernetes.io/name: kubeton-fleet-tools
+spec:
+  serviceAccountName: ${name}
+  restartPolicy: Never
+  containers:
+    - name: tools
+      image: $(yaml_quote "$KUBETON_FLEET_TOOLS_IMAGE")
+      command: ["bash", "-c", "mkdir -p /tmp/gnupg; chmod 700 /tmp/gnupg; exec sleep 86400"]
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits: {memory: $(yaml_quote "${KUBETON_FLEET_TOOLS_MEMORY:-2Gi}")}
+      volumeMounts:
+        - {name: work, mountPath: /work}
+        - {name: scratch, mountPath: /tmp}
+      env:
+        - {name: GNUPGHOME, value: /tmp/gnupg}
+        - {name: KUBETON_FLEET_RUNTIME, value: native}
+        - {name: KUBETON_FLEET_PASSPHRASE_FD, value: "0"}
+        - {name: KUBETON_FLEET_PID_FILE, value: /work/runner.pid}
+        - {name: CHART_DIR, value: /work/chart}
+        - {name: OP_VALUES_FILE, value: /work/operator-values.yaml}
+        - {name: TON_VALUES_FILE, value: /work/tonnode-values.yaml}
+EOF
+    local variable
+    for variable in RELEASE_NAME OP_NAMESPACE TON_POD_LABEL TON_NAMESPACE TON_STORAGE_CLASS_NAME \
+      ENCRYPTED_SC_NAME TON_VAULT_CREDS_SECRET VAULT_TRANSIT_KEY VAULT_NAMESPACE VAULT_RELEASE_NAME \
+      VAULT_ADDR_INTERNAL LONGHORN_NODE_SELECTOR LOCALDEV_BASE_SC KUBETON_FLEET_TOOLS_IMAGE \
+      KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS HELPER_POD_READY_TIMEOUT; do
+      printf '        - {name: %s, value: %s}\n' "$variable" "$(yaml_quote "${!variable}")"
+    done
+    cat <<EOF
+  volumes:
+    - name: work
+      emptyDir: {medium: Memory}
+    - name: scratch
+      emptyDir: {medium: Memory}
+EOF
+  } | kubectl create -f - >/dev/null
+  kubectl -n "$ns" wait --for=condition=Ready "pod/$name" --timeout="${KUBETON_FLEET_TOOLS_READY_TIMEOUT:-300s}" >/dev/null
+  tar -C "$CHART_DIR" -cf - Chart.yaml values.yaml templates crds kubeton fleet.sh fleet.py fleet-crypto.sh main-wallet.sh \
+    | kubectl -n "$ns" exec -i "$name" -- sh -c 'mkdir -p /work/chart; tar -xf - -C /work/chart'
+  kubectl -n "$ns" cp "$OP_VALUES_FILE" "$name:/work/operator-values.yaml" >/dev/null
+  kubectl -n "$ns" cp "$TON_VALUES_FILE" "$name:/work/tonnode-values.yaml" >/dev/null
+  local -a remote_args=("${action}-fleet" /work/backup)
+  if [[ "$action" == restore ]]; then
+    kubectl -n "$ns" exec "$name" -- mkdir -p /work/backup
+    kubectl -n "$ns" cp "$backup_dir/." "$name:/work/backup" >/dev/null
+    remote_args+=(--storage-class "$data_class" --bundle-storage-class "$bundle_class")
+    [[ -z "$node_selector" ]] || remote_args+=(--node-selector "$node_selector")
+    if [[ -n "$public_ips" ]]; then
+      kubectl -n "$ns" cp "$public_ips" "$name:/work/public-ips.json" >/dev/null
+      remote_args+=(--public-ips /work/public-ips.json)
+    fi
+    (( bootstrap == 0 )) || remote_args+=(--bootstrap)
+  fi
+  operation_active=1
+  local command_rc=0
+  printf '%s\n' "$fleet_passphrase" | kubectl -n "$ns" exec -i "$name" -- bash -c '
+    trap "touch /work/runner.done" EXIT
+    source /work/chart/kubeton
+    confirm_or_exit() { :; }
+    main "$@"
+  ' _ "${remote_args[@]}" || command_rc=$?
+  if (( command_rc != 0 )); then exit "$command_rc"; fi
+  operation_active=0
+  if [[ "$action" == backup ]]; then
+    mkdir -p "$(dirname "$backup_dir")"
+    local_stage="$(mktemp -d "${backup_dir}.partial.XXXXXX")"
+    kubectl -n "$ns" cp "$name:/work/backup/." "$local_stage" >/dev/null
+    chmod 700 "$local_stage"
+    [[ ! -e "$backup_dir" && ! -L "$backup_dir" ]]
+    mv -T "$local_stage" "$backup_dir"
+    local_stage=""
+    echo "Fleet backup saved to $backup_dir. Keep its recovery passphrase separately."
+  fi
+)
 
 fleet_recovery_key() {
   local root="$1" identity="${2:-}"
@@ -77,8 +274,11 @@ run_backup_fleet() (
   set -euo pipefail
   umask 077
   local backup_dir="" passphrase_file="${KUBETON_FLEET_PASSPHRASE_FILE:-}"
+  local fleet_passphrase=""
+  [[ -z "${KUBETON_FLEET_PID_FILE:-}" ]] || printf '%s\n' "$BASHPID" > "$KUBETON_FLEET_PID_FILE"
   fleet_parse_args backup "$@"
   fleet_require_tools
+  fleet_prompt_passphrase backup
   [[ ! -e "$backup_dir" && ! -L "$backup_dir" ]] || {
     echo "Error: backup destination already exists: $backup_dir" >&2
     exit 1
@@ -130,10 +330,13 @@ run_restore_fleet() (
   set -euo pipefail
   umask 077
   local backup_dir="" passphrase_file="${KUBETON_FLEET_PASSPHRASE_FILE:-}"
+  local fleet_passphrase=""
+  [[ -z "${KUBETON_FLEET_PID_FILE:-}" ]] || printf '%s\n' "$BASHPID" > "$KUBETON_FLEET_PID_FILE"
   local data_class="$TON_STORAGE_CLASS_NAME" bundle_class="$ENCRYPTED_SC_NAME"
   local node_selector="" public_ips="" bootstrap=0
   fleet_parse_args restore "$@"
   fleet_require_tools
+  fleet_prompt_passphrase restore
   require_bin helm
   [[ "$data_class" != auto ]] || { echo "Error: restore-fleet needs an explicit data StorageClass." >&2; exit 1; }
   backup_dir="$(cd "$backup_dir" && pwd)"
@@ -254,7 +457,7 @@ run_restore_fleet() (
   while IFS=$'\t' read -r ns name ordinal enc meta; do
     helper="kubeton-fleet-$RANDOM-$RANDOM"
     helpers+=("$ns/$helper")
-    python3 "$CHART_DIR/fleet.py" helper "$helper" "$ordinal" "$session" \
+    python3 "$CHART_DIR/fleet.py" helper "$helper" "$ordinal" "$session" "$KUBETON_FLEET_TOOLS_IMAGE" \
       < "$work_dir/${ns}--${name}.sts.json" | kubectl create -f - >/dev/null
     if ! kubectl -n "$ns" wait --for=condition=Ready "pod/$helper" --timeout="$HELPER_POD_READY_TIMEOUT"; then
       print_helper_pod_failure_context "$ns" "$helper"

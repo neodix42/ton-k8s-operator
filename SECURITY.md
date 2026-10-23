@@ -35,11 +35,13 @@ Even with this model, plaintext key material exists in controlled windows:
 ### 1.2 Fleet migration recovery keys
 
 Fleet migration adds another controlled exposure window: `backup-fleet` unwraps
-each bundle's data key using the source Vault and streams it into GnuPG on the
-administrator's machine. `recovery.gpg` protects those data keys with a separate
+each bundle's data key using the source Vault and streams it into GnuPG inside
+a temporary tools pod. `recovery.gpg` protects those data keys with a separate
 passphrase and binds them to the fleet manifest and bundle checksums. Recovery
 keys exist in process memory and pipes; no plaintext recovery-key file is
-created locally. The live TonNode specification in `fleet.json` is not encrypted
+created. The passphrase is entered at a hidden terminal prompt and streamed
+over kubectl exec stdin; it is not stored in Pod env or command arguments.
+The live TonNode specification in `fleet.json` is not encrypted
 and can contain literal environment values, so the backup directory is private
 (`0700`) and must be handled as sensitive operational data.
 
@@ -50,6 +52,14 @@ the recovery trust model. Destination helpers decrypt/rebind bundles on an
 Vault, verify encryption/decryption and copied ciphertext, and persist only
 encrypted bundles on the destination bundle PVCs. Neither Vault root tokens nor
 unseal keys are included in the portable backup.
+
+The tools ServiceAccount and RBAC are temporary. Backup has resource-specific
+permissions for workload scaling, pod exec/copy and reads. Restore requires a
+temporary cluster-admin binding to install CRDs, operator RBAC and prerequisites.
+The caller must have the corresponding Kubernetes privileges. Tool scratch
+volumes use memory. If remote cleanup cannot be confirmed after a lost
+connection, the tools pod and binding remain available for cleanup and kubeton
+prints their names; they must be removed once that cleanup finishes.
 
 ### 1.3 Can an admin still extract plaintext keys?
 

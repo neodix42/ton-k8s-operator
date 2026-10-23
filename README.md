@@ -163,24 +163,27 @@ StatefulSets and PVCs and uses the saved replica counts. It installs the operato
 using the destination `operator-values.yaml`; `replicaCount` in that file
 controls operator pods, not the saved TON replica counts.
 
-The commands require Bash, `kubectl`, Python 3.9+, GnuPG (`gpg`), and
-`sha256sum`; restore also requires Helm. Keep `fleet.sh`, `fleet.py`, and
-`fleet-crypto.sh` alongside `kubeton`. The current format supports fleets with
-Vault key management. KMS-backed fleets and external `configRef` or
-`env.valueFrom` dependencies are rejected rather than producing an incomplete
-migration backup.
+The installer downloads `kubeton`, `fleet.sh`, `fleet.py`, and `fleet-crypto.sh`
+together from the selected GitHub release. The fleet commands need only Bash,
+`kubectl`, and `tar` on the machine running them. They launch a temporary tools
+pod using `ghcr.io/neodix42/ton-k8s-operator:fleet-tools-0.3.4`, which includes
+Python, GnuPG, OpenSSL, kubectl, Helm, curl, jq, and the shell utilities used by
+backup and restore. Destination migration helpers use the same image. The
+installer itself also needs Helm and either curl or wget.
 
-Custom key-agent images used by destination helpers must provide `python3`,
-`openssl`, `curl`, `jq`, `tar`, and `cmp`; the default MyTonCtrl image does.
-
-On the source cluster, create a passphrase file outside the backup directory:
+On the source cluster, run:
 
 ```bash
-umask 077
-openssl rand -base64 48 > /secure/fleet.passphrase
-./kubeton backup-fleet ./fleet-backups/migration \
-  --passphrase-file /secure/fleet.passphrase
+./kubeton backup-fleet
+# Or choose the output directory:
+./kubeton backup-fleet ./fleet-backups/migration
 ```
+
+Enter a recovery passphrase twice when prompted, and keep it in your password
+manager. No passphrase-generation command or local passphrase file is required.
+With no directory argument, the backup is saved under
+`./fleet-backups/<UTC timestamp>`. Passphrase input is hidden and is passed to
+the tools pod over `kubectl exec` stdin, not in command arguments or Pod env.
 
 The source fleets must be running and initialized, with matching TonNode and
 StatefulSet replica counts. Backup restarts the source pods, using the existing
@@ -191,7 +194,7 @@ published only after every bundle and recovery key has been verified.
 `fleet.json` records the specifications, counts and bundle checksums.
 `recovery.gpg` contains passphrase-encrypted recovery keys and authenticates the
 manifest and bundle inventory. Recovery keys are streamed through GnuPG; they
-are not written to plaintext files on the machine running `kubeton`. The
+are not written to plaintext files; GnuPG runs inside the tools pod. The
 backup and its passphrase together can recover the validator identities.
 Transfer the directory and keep its passphrase separately. Do not change
 `fleet.json` or the bundle files after backup.
@@ -208,11 +211,12 @@ can bootstrap the prerequisites:
 
 ```bash
 ./kubeton restore-fleet ./fleet-backups/migration \
-  --passphrase-file /secure/fleet.passphrase \
   --storage-class local-path \
   --bundle-storage-class encrypted-sc \
   --bootstrap
 ```
+
+Enter the same recovery passphrase when prompted.
 
 For an existing storage/Vault setup, omit `--bootstrap`. Each restored namespace
 must already contain `TON_VAULT_CREDS_SECRET` (default `ton-vault-creds`) with
@@ -222,6 +226,28 @@ allow encrypt/decrypt on the destination `VAULT_TRANSIT_KEY` (default
 and rewraps each replica's recovery key. **The destination Vault may be entirely
 new; the original Vault is not required once fleet backup has completed.**
 Vault root/unseal credentials and source Kubernetes Secrets are not exported.
+
+Tools pods use short-lived ServiceAccounts. Backup receives a role limited to
+the resource reads, pod exec/copy and workload scaling needed by the backup
+workflow. Restore temporarily binds its tools ServiceAccount to `cluster-admin`
+because it installs CRDs, operator RBAC, storage/Vault prerequisites and fleet
+resources. The caller must already be allowed to create those bindings. The
+pod, ServiceAccount and bindings are removed after the command finishes. If a
+connection is lost and remote cleanup cannot be confirmed, `kubeton` reports
+the retained pod and binding names so cleanup can finish before access is revoked.
+
+Use `KUBETON_FLEET_TOOLS_NAMESPACE` to select the tools namespace (default
+`default`), `KUBETON_FLEET_TOOLS_IMAGE` to override the image, and
+`KUBETON_FLEET_TOOLS_MEMORY` to change the tools pod memory limit (default `2Gi`).
+The published tools image targets Linux amd64, matching the default TON image.
+The tools namespace must allow its pod to reach the Kubernetes API.
+
+For automation, `--passphrase-file /secure/fleet.passphrase` remains available;
+the file is read locally and its contents are streamed to the pod. For an
+explicit local execution with all tools already installed, set
+`KUBETON_FLEET_RUNTIME=native`. The current backup format supports Vault-backed
+fleets; KMS-backed fleets and external `configRef` or `env.valueFrom` dependencies
+are rejected to avoid an incomplete migration backup.
 
 Destination data and bundle StorageClasses are independent. Defaults come from
 `TON_STORAGE_CLASS_NAME` (`local-path`) and `ENCRYPTED_SC_NAME` (`encrypted-sc`);
@@ -637,6 +663,7 @@ The script:
 - creates a local folder named `ton-k8s-operator-<chart-version>` by default
 - downloads chart from `oci://ghcr.io/neodix42/charts/ton-k8s-operator`
 - extracts the chart and prints next commands
+- downloads the matching `kubeton` and all three fleet helpers from release assets
 
 The extracted chart already includes:
 - `values.yaml`
@@ -648,7 +675,7 @@ The extracted chart already includes:
 Then follow:
 
 ```bash
-cd ./ton-k8s-operator-0.3.0
+cd ./ton-k8s-operator-0.3.4
 
 # review defaults
 ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
