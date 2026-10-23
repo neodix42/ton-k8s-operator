@@ -232,6 +232,8 @@ Commands:
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
   restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
+  backup-fleet         Back up fleet specifications, replica bundles, and passphrase-protected recovery keys.
+  restore-fleet        Restore a fleet onto fresh destination storage and Vault: see README for options.
   wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|collect|show|export> [args...]
   stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
@@ -19001,6 +19003,14 @@ main() {
       ;;
     restore-keys)
       run_restore_keys "$@"
+      ;;
+    backup-fleet)
+      source "$CHART_DIR/fleet.sh"
+      run_backup_fleet "$@"
+      ;;
+    restore-fleet)
+      source "$CHART_DIR/fleet.sh"
+      run_restore_fleet "$@"
       ;;
     wallet)
       run_wallet "$@"

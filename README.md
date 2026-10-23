@@ -154,6 +154,119 @@ Restore prerequisites:
 
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
 
+### Moving a fleet to another Kubernetes cluster
+
+`backup-fleet` and `restore-fleet` move TON identities and controller state to
+fresh storage on another cluster. Fleet restore creates the TonNode resources,
+StatefulSets and PVCs and uses the saved replica counts. It installs the operator
+using the destination `operator-values.yaml`; `replicaCount` in that file
+controls operator pods, not the saved TON replica counts.
+
+The commands require Bash, `kubectl`, Python 3.9+, GnuPG (`gpg`), and
+`sha256sum`; restore also requires Helm. Keep `fleet.sh`, `fleet.py`, and
+`fleet-crypto.sh` alongside `kubeton`. The current format supports fleets with
+Vault key management. KMS-backed fleets and external `configRef` or
+`env.valueFrom` dependencies are rejected rather than producing an incomplete
+migration backup.
+
+Custom key-agent images used by destination helpers must provide `python3`,
+`openssl`, `curl`, `jq`, `tar`, and `cmp`; the default MyTonCtrl image does.
+
+On the source cluster, create a passphrase file outside the backup directory:
+
+```bash
+umask 077
+openssl rand -base64 48 > /secure/fleet.passphrase
+./kubeton backup-fleet ./fleet-backups/migration \
+  --passphrase-file /secure/fleet.passphrase
+```
+
+The source fleets must be running and initialized, with matching TonNode and
+StatefulSet replica counts. Backup restarts the source pods, using the existing
+`backup-keys` workflow, and captures all TonNode specifications and replica
+bundles. The output directory must not already exist. The directory is
+published only after every bundle and recovery key has been verified.
+
+`fleet.json` records the specifications, counts and bundle checksums.
+`recovery.gpg` contains passphrase-encrypted recovery keys and authenticates the
+manifest and bundle inventory. Recovery keys are streamed through GnuPG; they
+are not written to plaintext files on the machine running `kubeton`. The
+backup and its passphrase together can recover the validator identities.
+Transfer the directory and keep its passphrase separately. Do not change
+`fleet.json` or the bundle files after backup.
+
+Stop the source validators before starting their restored identities:
+
+```bash
+./kubeton stop
+```
+
+On the destination, select its Kubernetes context and provision the desired
+StorageClasses. For the default bare-metal/k3d storage and Vault setup, restore
+can bootstrap the prerequisites:
+
+```bash
+./kubeton restore-fleet ./fleet-backups/migration \
+  --passphrase-file /secure/fleet.passphrase \
+  --storage-class local-path \
+  --bundle-storage-class encrypted-sc \
+  --bootstrap
+```
+
+For an existing storage/Vault setup, omit `--bootstrap`. Each restored namespace
+must already contain `TON_VAULT_CREDS_SECRET` (default `ton-vault-creds`) with
+`VAULT_ADDR`, `VAULT_TOKEN`, and optionally `VAULT_NAMESPACE`. Its token must
+allow encrypt/decrypt on the destination `VAULT_TRANSIT_KEY` (default
+`ton-validator`). Fleet restore verifies encryption/decryption with that Vault
+and rewraps each replica's recovery key. **The destination Vault may be entirely
+new; the original Vault is not required once fleet backup has completed.**
+Vault root/unseal credentials and source Kubernetes Secrets are not exported.
+
+Destination data and bundle StorageClasses are independent. Defaults come from
+`TON_STORAGE_CLASS_NAME` (`local-path`) and `ENCRYPTED_SC_NAME` (`encrypted-sc`);
+the command flags override them. An explicit data class is required; `auto`
+is not accepted. Both classes must support the requested claim sizes and
+scheduling all of a replica's volumes onto the same worker. The destination
+needs enough eligible workers, CPU, memory and disk for the saved workload.
+One replica of each fleet is allowed per worker; host ports can require more
+workers when multiple fleets share their port numbers.
+
+Source node selectors, node names and explicit public IP settings are discarded.
+Use `--node-selector 'pool=validators'` to restrict destination placement. Helper
+pods reserve the TON resources and host ports while the scheduler provisions
+all five PVCs per replica. Restore chooses the worker's `ExternalIP`, falling
+back to its host IP, and updates the saved validator advertised IPv4 addresses
+and any service `--ip` argument. Ports and validator identities are retained.
+For NAT/private workers, supply publicly forwarded addresses explicitly:
+
+```json
+{
+  "default/tonnode/0": "203.0.113.10",
+  "default/tonnode/1": "203.0.113.11"
+}
+```
+
+Pass that JSON file with `--public-ips /path/to/public-ips.json`; keys are
+`namespace/TonNode-name/ordinal`. Configured ports must be reachable at those
+addresses. Unknown replica names and invalid IPv4 addresses are rejected.
+
+Restore validates the passphrase, authenticated manifest and all bundle hashes
+before any cluster writes. It refuses existing TonNode resources, TON
+StatefulSets or matching PVCs. Every identity is staged and re-encrypted before
+any TON process starts, and replicas start on their newly selected workers.
+On failure, restore attempts to stop destination fleets and retains PVCs for
+inspection. If those stop requests fail, it leaves the operator paused and
+reports the need to check replica counts before resuming reconciliation. Remove
+the partial destination fleets before retrying.
+
+Bulk blockchain databases and `kubeton wallet`'s separate main-wallet bundle
+are excluded. TON must synchronize blockchain data on its fresh volumes.
+The restored TonNodes are created directly rather than owned by a Helm chart.
+Before using `kubeton start` for later changes, align destination
+`tonnode-values.yaml` (or `TON_VALUES_FILE`) with the restored names, namespace,
+replica count, images and storage choices; the local values file is not
+rewritten by restore. For multiple TonNodes, manage each specification explicitly.
+
 For full design, threat model, provider requirements, and hardening steps, see:
 - `SECURITY.md`
 
@@ -529,6 +642,7 @@ The extracted chart already includes:
 - `operator-values.yaml`
 - `tonnode-values.yaml`
 - `kubeton`
+- `fleet.sh`, `fleet.py`, and `fleet-crypto.sh` for fleet migration
 
 Then follow:
 

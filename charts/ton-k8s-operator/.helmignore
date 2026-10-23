@@ -3,6 +3,8 @@
 # Helm must never traverse them while loading this directory as a chart.
 kubeton-launch-logs/
 key-backups/
+fleet-backups/
+__pycache__/
 
 # Common local/package artifacts.
 *.tgz
