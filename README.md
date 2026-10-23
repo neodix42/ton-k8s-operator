@@ -138,6 +138,7 @@ Restore prerequisites:
 - An ordinary pod restart refills tmpfs keys and wallets while keeping the committed controller state and any interrupted installation checkpoint. An explicit `restore-keys` or `recreate` verifies uploaded bytes, then records `.restore-controller-state` on the encrypted bundle PVC so startup replaces controller state, validator configuration and keyring together from that selected bundle. The request is removed only after restoration succeeds; a failed restoration keeps it for retry.
 - Interrupted encrypted-bundle publication leaves a `.backup-publish` journal; run or restart `key-backup` to recover it before exporting a backup, and export again rather than restoring a directory that still contains that journal.
 - if the backup directory is missing for some replica ordinal, restore reports it and continues with other replicas.
+- If a replica restore fails (for example, checksum verification, missing PVC, or upload failure), `restore-keys` restores the previous replica counts and operator reconciliation, prints the restore summary, and exits non-zero without printing a completion message. Missing backup directories remain reported skips.
 - for one-by-one scaling, use:
 - `./kubeton add` to add one replica.
 - `./kubeton del` to remove one replica; it always removes the highest ordinal (tail) pod and does not accept a pod name.

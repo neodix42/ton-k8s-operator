@@ -15990,6 +15990,10 @@ run_restore_keys() {
   restore_required=0
   trap - EXIT INT TERM
   echo "Restore summary: restored=${restored_count}, skipped_missing=${skipped_missing_count}, failed=${failed_count}"
+  if (( failed_count > 0 )); then
+    echo "Error: encrypted key bundle restore failed for ${failed_count} replica(s)." >&2
+    return 1
+  fi
   if (( restored_count == 0 )); then
     echo "Warning: no replica bundles were restored."
   fi
