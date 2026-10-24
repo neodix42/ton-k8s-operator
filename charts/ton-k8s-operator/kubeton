@@ -243,6 +243,7 @@ Commands:
   purge                Full best-effort cleanup + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
   verify               Verify operator and TON resources (deploy, pods with node/server, tonnodes, sts, pvc).
   status               Show each TON pod's image tags, build date, wallet, ADNL, sync, and database sizes.
+  logs                 Show the last 20 log lines from each TON pod and the VictoriaLogs server address.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
   exec-mtc <cmd>       Run a command in each TON pod inside mytonctrl and print table with node/pod/exit code.
 
@@ -17400,6 +17401,102 @@ run_verify() {
   kubectl -n "$TON_NAMESPACE" get pvc
 }
 
+print_logs_victoria_logs_info() {
+  local backend_rows metrics_rows
+  local logs_ns logs_service logs_port auth_ns stack_name target_urls target_url target_paths auth_port
+  local path_pattern path_regex route_matches
+  local -a route_patterns=()
+  local access_ns access_service access_port access_note
+
+  echo "[logs] Full logs can be found on the VictoriaLogs server (within its configured retention)."
+  if ! backend_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get services -A \
+    -l 'app.kubernetes.io/name=kubeton-victoria-logs-access,app.kubernetes.io/managed-by=kubeton' \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.ports[0].port}{"\n"}{end}' 2>/dev/null)"; then
+    echo "[logs] VictoriaLogs address unavailable: could not read logging Services."
+    return 0
+  fi
+  if [[ -z "$backend_rows" ]]; then
+    echo "[logs] VictoriaLogs server was not found in this cluster."
+    return 0
+  fi
+
+  # Discover installed stacks rather than assuming the current environment
+  # matches the names and ports used when logging was installed.
+  metrics_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get configmaps -A \
+    -l 'app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton' \
+    -o jsonpath='{range .items[*]}{.data.stackNamespace}{"\t"}{.data.stackName}{"\n"}{end}' 2>/dev/null || true)"
+  while IFS=$'\t' read -r logs_ns logs_service logs_port; do
+    [[ -n "$logs_ns" && -n "$logs_service" && "$logs_port" =~ ^[0-9]+$ ]] || continue
+    access_ns="$logs_ns"
+    access_service="$logs_service"
+    access_port="$logs_port"
+    access_note=""
+    while IFS=$'\t' read -r auth_ns stack_name; do
+      [[ -n "$auth_ns" && -n "$stack_name" ]] || continue
+      target_urls="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$auth_ns" get vmuser "$stack_name" \
+        -o jsonpath='{range .spec.targetRefs[*]}{.static.url}{"\t"}{.paths[*]}{"\n"}{end}' 2>/dev/null || true)"
+      while IFS=$'\t' read -r target_url target_paths; do
+        [[ "${target_url%/}" == "http://${logs_service}.${logs_ns}.svc:${logs_port}" ]] || continue
+        read -r -a route_patterns <<<"$target_paths"
+        route_matches=false
+        for path_pattern in "${route_patterns[@]}"; do
+          path_regex="^(${path_pattern})$"
+          if [[ '/select/vmui/' =~ $path_regex ]]; then
+            route_matches=true
+            break
+          fi
+        done
+        [[ "$route_matches" == true ]] || continue
+        auth_port="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$auth_ns" get service "vmauth-${stack_name}" \
+          -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
+        [[ "$auth_port" =~ ^[0-9]+$ ]] || continue
+        access_ns="$auth_ns"
+        access_service="vmauth-${stack_name}"
+        access_port="$auth_port"
+        access_note="; use your existing VMAuth credentials"
+        break
+      done <<<"$target_urls"
+      [[ -z "$access_note" ]] || break
+    done <<<"$metrics_rows"
+
+    printf '[logs] VictoriaLogs UI (in-cluster only%s): http://%s.%s.svc:%s/select/vmui/\n' \
+      "$access_note" "$access_service" "$access_ns" "$access_port"
+    printf '[logs] Access from this machine: kubectl -n %s port-forward --address 127.0.0.1 service/%s %s:%s\n' \
+      "$access_ns" "$access_service" "$access_port" "$access_port"
+    printf '[logs] VictoriaLogs UI after port-forward: http://127.0.0.1:%s/select/vmui/\n' "$access_port"
+  done <<<"$backend_rows"
+}
+
+run_logs() {
+  if [[ $# -ne 0 ]]; then
+    echo "Error: usage: kubeton logs" >&2
+    return 1
+  fi
+  require_bin kubectl
+  print_logs_victoria_logs_info
+
+  local pod_rows ns pod node_name failed=0
+  if ! pod_rows="$(list_ton_pods)"; then
+    echo "Error: could not list TON pods for logs." >&2
+    return 1
+  fi
+  if [[ -z "$pod_rows" ]]; then
+    echo "No TON pods found."
+    return 0
+  fi
+
+  while IFS=$'\t' read -r ns pod node_name; do
+    [[ -n "$ns" && -n "$pod" ]] || continue
+    printf '\n=== %s/%s (server: %s; last 20 lines) ===\n' "$ns" "$pod" "${node_name:-N/A}"
+    if ! run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" logs "$pod" -c ton-node --tail=20; then
+      echo "Error: could not read logs from ${ns}/${pod}." >&2
+      failed=1
+    fi
+    printf '\n'
+  done <<<"$pod_rows"
+  return "$failed"
+}
+
 run_status() {
   require_bin kubectl
   mapfile -t pod_rows < <(list_ton_pods)
@@ -19042,6 +19139,9 @@ main() {
       ;;
     status)
       run_status
+      ;;
+    logs)
+      run_logs "$@"
       ;;
     exec)
       run_exec "$@"

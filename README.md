@@ -716,6 +716,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton wallet export tonnode-0 validator_wallet_001
 ./kubeton verify
 ./kubeton status
+./kubeton logs
 ./kubeton exec "sync"
 ./kubeton exec-mtc "set stake 1000000"
 ```
@@ -723,6 +724,18 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 `kubeton status` shows separate `TON image` and `MyTonCtrl image` tag columns
 (for example, `v2026.08-amd64` and `v1.0.3`) from each pod's image references,
 alongside the validator build date, wallet, ADNL, sync, and database sizes.
+
+`kubeton logs` prints a snapshot of the last 20 lines from each TON pod's
+`ton-node` container across namespaces, selected by `TON_POD_LABEL`. Each pod's
+output has a namespace, pod, and node heading. If a pod's logs cannot be read,
+the command still tries the remaining pods and exits with a nonzero status.
+
+The initial message points to VictoriaLogs for full historical container logs.
+It discovers installed Services, including custom names and ports, and prefers
+VMAuth when its VictoriaLogs routes exist; otherwise it shows the internal
+backend. In-cluster URLs are labeled accordingly, with a manual port-forward
+command and the localhost UI URL to open after forwarding. The command does
+not start the port-forward. Missing VictoriaLogs does not block pod log output.
 
 `kubeton wallet create` only generates main-wallet files and the init BOC.
 Before `kubeton wallet deploy <mainnet|testnet> <name>` can deploy a new main
