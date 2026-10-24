@@ -693,16 +693,16 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton wallet create main-wallet
-./kubeton wallet deploy testnet
-./kubeton wallet deploy testnet main-wallet
-./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10.
-./kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10. -n
-./kubeton wallet send testnet main-wallet 10.
-./kubeton wallet collect testnet main-wallet
-./kubeton wallet collect testnet main-wallet 10.
-./kubeton wallet collect testnet main-wallet tonnode-0
-./kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 10.
-./kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 alld
+./kubeton wallet deploy
+./kubeton wallet deploy main-wallet
+./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10.
+./kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10. -n
+./kubeton wallet send main-wallet 10.
+./kubeton wallet collect main-wallet
+./kubeton wallet collect main-wallet 10.
+./kubeton wallet collect main-wallet tonnode-0
+./kubeton wallet collect main-wallet tonnode-0 validator_wallet_001 10.
+./kubeton wallet collect main-wallet tonnode-0 validator_wallet_001 alld
 ./kubeton wallet activate
 ./kubeton wallet activate tonnode-0
 ./kubeton wallet activate tonnode-0 validator_wallet_001
@@ -738,28 +738,46 @@ command and the localhost UI URL to open after forwarding. The command does
 not start the port-forward. Missing VictoriaLogs does not block pod log output.
 
 `kubeton wallet create` only generates main-wallet files and the init BOC.
-Before `kubeton wallet deploy <mainnet|testnet> <name>` can deploy a new main
+Before `kubeton wallet deploy <name>` can deploy a new main
 wallet, send funds to the
 non-bounceable init address printed by `wallet create`, wait until the funding
 transaction is visible on-chain, then rerun
-`kubeton wallet deploy <mainnet|testnet> <name>`.
+`kubeton wallet deploy <name>`.
 After topping up mytonctrl wallets inside TON pods with split mode, for example
-`kubeton wallet send testnet main-wallet 2`, activate those pod wallets with
+`kubeton wallet send main-wallet 2`, activate those pod wallets with
 `kubeton wallet activate [tonnode-name] [wallet-name]`. The
 activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
 pod and does not send a BOC payload to the network.
 `kubeton wallet collect` reads the same `mytonctrl wl` status and only runs
 `mg` for source wallets that are already `active`; activate funded pod wallets
 before collecting from them.
+
 `kubeton wallet deploy`, `kubeton wallet send`, and `kubeton wallet collect`
-require an explicit `mainnet` or `testnet` argument. For deploy/send that
-argument selects both the lite-server global config and TONCenter endpoint. By
-default wallet BOC sending uses
+detect the network from `/var/ton-work/controller/global.config.json` in every
+TON pod. Detection matches both zero-state root and file hashes against the
+known mainnet and testnet identities. Deploy/send use that active global
+configuration for lite-client and the matching TONCenter endpoint. Local
+Python 3 is required for detection; it uses only the standard library.
+
+Transactions stop before sending if there are no TON pods, any active config
+cannot be read or identified, or pods use different networks. Desired
+`NETWORK`, installer arguments and configuration URLs do not replace this
+check: restored PVCs may retain a different configuration. A legacy leading
+`mainnet` or `testnet` argument is accepted only when it matches detection;
+it cannot select another network. The optional final `-n` on `wallet send`
+still means no-bounce.
+
+Create and export do not require an active blockchain network. Create saves
+the detected network when available, and deploy/send/collect reject a wallet whose
+saved network differs from the active network. `kubeton wallet show [name]`
+prints addresses and metadata even when detection is unavailable; balance and
+seqno are shown only with a readable, consistent active network that matches
+the wallet, otherwise they are unknown. A successful deploy also records the
+wallet network in the encrypted main-wallet metadata.
+
+By default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
-After a successful `kubeton wallet deploy <mainnet|testnet> <name>`, kubeton
-stores the wallet network in the encrypted main-wallet metadata, and
-`kubeton wallet show [name]` also prints balance and seqno from that network.
 `kubeton wallet activate ...` and `kubeton wallet show balance ...` run against
 `mytonctrl` inside TON pods; `mytonctrl` already has the network configured.
 `kubeton wallet export` prints private key material to stdout after confirmation:

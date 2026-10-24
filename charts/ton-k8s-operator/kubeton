@@ -3177,6 +3177,76 @@ normalize_wallet_network() {
   esac
 }
 
+wallet_network_from_global_config() {
+  # Stable chain identities from the official TON global configurations:
+  # https://ton-blockchain.github.io/{global.config,testnet-global.config}.json
+  python3 -c '
+import json
+import sys
+
+try:
+    state = json.load(sys.stdin)["validator"]["zero_state"]
+    if not isinstance(state, dict):
+        raise ValueError("invalid zero-state object")
+    if any(type(state.get(key)) is not int or state[key] != expected
+           for key, expected in (("workchain", -1), ("shard", -9223372036854775808), ("seqno", 0))):
+        raise ValueError("invalid zero-state block identity")
+    identities = {
+        ("F6OpKZKqvqeFp6CQmFomXNMfMj2EnaUSOXN+Mh+wVWk=",
+         "XplPz01CXAps5qeSWUtxcyBfdAo5zVb1N979KLSKD24="): "mainnet",
+        ("gj+B8wb/AmlPk1z1AhVI484rhrUpgSr2oSFIh56VoSg=",
+         "Z+IKwYS54DmmJmesw/nAD5DzWadnOCMzee+kdgSYDOg="): "testnet",
+    }
+    print(identities[(state["root_hash"], state["file_hash"])])
+except (ValueError, KeyError, TypeError):
+    sys.exit("Error: global.config.json does not identify a supported TON mainnet or testnet.")
+'
+}
+
+read_tonnode_global_config() {
+  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$1" exec "$2" -c ton-node -- \
+    cat /var/ton-work/controller/global.config.json
+}
+
+resolve_wallet_fleet_config() {
+  local pod_rows ns pod node_name config network selected_network="" selected_config=""
+  KUBETON_WALLET_NETWORK=""
+  KUBETON_WALLET_GLOBAL_CONFIG_JSON=""
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required to detect the wallet network from global.config.json." >&2
+    return 1
+  fi
+  if ! pod_rows="$(list_ton_pods)"; then
+    echo "Error: cannot list TON pods to detect the wallet network." >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r ns pod node_name; do
+    [[ -n "$ns" && -n "$pod" ]] || continue
+    if ! config="$(read_tonnode_global_config "$ns" "$pod")"; then
+      echo "Error: cannot read the active global.config.json in ${ns}/${pod}." >&2
+      return 1
+    fi
+    if ! network="$(printf '%s' "$config" | wallet_network_from_global_config)"; then
+      echo "Error: cannot detect the active network in ${ns}/${pod}." >&2
+      return 1
+    fi
+    if [[ -n "$selected_network" && "$selected_network" != "$network" ]]; then
+      echo "Error: TON pods use different networks (${selected_network} and ${network}); select a single fleet with TON_POD_LABEL." >&2
+      return 1
+    fi
+    if [[ -z "$selected_network" ]]; then
+      selected_network="$network"
+      selected_config="$config"
+    fi
+  done <<<"$pod_rows"
+  if [[ -z "$selected_network" ]]; then
+    echo "Error: no TON pods with an active global.config.json were found; start the fleet before deploying or transferring funds." >&2
+    return 1
+  fi
+  KUBETON_WALLET_NETWORK="$selected_network"
+  KUBETON_WALLET_GLOBAL_CONFIG_JSON="$selected_config"
+}
+
 ton_nano_to_gram_amount() {
   local nano="$1"
   local whole frac
@@ -11187,7 +11257,7 @@ run_wallet_activate() {
 resolve_main_wallet_receive_address() {
   local wallet_network="$1"
   local wallet_name="$2"
-  local output address
+  local output address address_row saved_network
 
   wallet_name="$(trim_whitespace "$wallet_name")"
   [[ -n "$wallet_name" ]] || return 1
@@ -11198,19 +11268,29 @@ resolve_main_wallet_receive_address() {
     return "$rc"
   }
   output="$(strip_ansi_sequences "$output")"
-  address="$(printf '%s\n' "$output" | awk -v wallet_name="$wallet_name" '
-    $3 == wallet_name {
-      if ($5 != "" && $5 != "unknown") {
-        print $5
-      } else if ($4 != "" && $4 != "unknown") {
-        print $4
+  address_row="$(printf '%s\n' "$output" | awk -v wallet_name="$wallet_name" '
+    $1 == "workchain" && $2 == "wallet-id" {
+      for (i = 1; i <= NF; i++) column[$i] = i
+      next
+    }
+    column["wallet-name"] && $(column["wallet-name"]) == wallet_name {
+      network = column["network"] ? $(column["network"]) : "unknown"
+      address = $(column["non-bounceable"])
+      if (address == "" || address == "unknown") {
+        address = $(column["wallet-address"])
       }
+      if (address != "" && address != "unknown") print network "\t" address
       exit
     }
   ')"
+  IFS=$'\t' read -r saved_network address <<<"$address_row"
   address="$(trim_whitespace "$address")"
   if [[ -z "$address" ]]; then
     echo "Error: cannot resolve receive address for main wallet '${wallet_name}'." >&2
+    return 1
+  fi
+  if [[ -n "$saved_network" && "$saved_network" != unknown && "$saved_network" != "$wallet_network" ]]; then
+    echo "Error: main wallet '${wallet_name}' is saved for ${saved_network}, but the active fleet uses ${wallet_network}." >&2
     return 1
   fi
   if ! ton_address_valid_for_network "$address" "$wallet_network"; then
@@ -11332,7 +11412,7 @@ run_wallet_collect() {
       amount="$(trim_whitespace "$3")"
       ;;
     *)
-      echo "Error: usage: kubeton wallet collect <mainnet|testnet> <main-wallet-name> [from-tonnode-name] [wallet-name] [amount]" >&2
+      echo "Error: usage: kubeton wallet collect <main-wallet-name> [from-tonnode-name] [wallet-name] [amount]" >&2
       return 1
       ;;
   esac
@@ -18439,7 +18519,7 @@ run_wallet() {
     echo "  create <workchain> <subwallet-id> <wallet-name>"
     echo "    Legacy explicit form."
     echo
-    echo "  deploy <mainnet|testnet> [name]"
+    echo "  deploy [name]"
     echo "    Deploy one main wallet by sending its generated BOC."
     echo "    If [name] is omitted, deploys all wallet BOCs after confirmation."
     echo
@@ -18450,7 +18530,7 @@ run_wallet() {
     echo
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
-    echo "    After deploy, also shows balance and seqno using the saved wallet network."
+    echo "    Shows balance and seqno on the active fleet network when it matches saved metadata."
     echo
     echo "  show balance [to-tonnode-name] [wallet-name]"
     echo "    Show mytonctrl wallet balance inside one TON pod, or all TON pods if omitted."
@@ -18465,31 +18545,31 @@ run_wallet() {
     echo "  export <to-tonnode-name> <wallet-name>"
     echo "    Export one mytonctrl wallet address and private key from the selected TON pod."
     echo
-    echo "  send <mainnet|testnet> <from-wallet-name> <amount> [-n]"
+    echo "  send <from-wallet-name> <amount> [-n]"
     echo "    Split mode: divides <amount> equally across all TON pods"
     echo "    using MAIN_WALLET_TARGET_WALLET_NAME (default: validator_wallet_001)."
     echo
-    echo "  send <mainnet|testnet> <from-wallet-name> <destination-address> <amount> [-n]"
+    echo "  send <from-wallet-name> <destination-address> <amount> [-n]"
     echo "    Send from main wallet to an explicit TON address on the selected network."
     echo
-    echo "  send <mainnet|testnet> <from-wallet-name> <to-tonnode-name> <amount> [-n]"
+    echo "  send <from-wallet-name> <to-tonnode-name> <amount> [-n]"
     echo "    Send to default target wallet name on selected TON pod."
     echo
-    echo "  send <mainnet|testnet> <from-wallet-name> <to-tonnode-name> <wallet-name> <amount> [-n]"
+    echo "  send <from-wallet-name> <to-tonnode-name> <wallet-name> <amount> [-n]"
     echo "    Send to explicit target wallet name on selected TON pod."
     echo
-    echo "  collect <mainnet|testnet> <main-wallet-name> [amount]"
+    echo "  collect <main-wallet-name> [amount]"
     echo "    Collect from all TON pods using validator_wallet_001 into the named main wallet."
     echo "    If [amount] is omitted, mytonctrl mg receives 'alld'."
     echo
-    echo "  collect <mainnet|testnet> <main-wallet-name> <from-tonnode-name> [wallet-name] [amount]"
+    echo "  collect <main-wallet-name> <from-tonnode-name> [wallet-name] [amount]"
     echo "    Collect from one TON pod into the named main wallet."
     echo "    If [wallet-name] is omitted, validator_wallet_001 is used; if [amount] is omitted, 'alld' is used."
     echo
     echo "Notes:"
-    echo "  - deploy/send/collect require an explicit network."
-    echo "  - deploy/send use the network to select lite-server and TONCenter endpoints."
-    echo "  - deploy records the wallet network so show can query balance and seqno later."
+    echo "  - deploy/send/collect detect the network from the active global.config.json in TON pods."
+    echo "  - deploy/send reuse the active global config and select the matching TONCenter endpoint."
+    echo "  - A legacy network argument must match detection; it cannot override the active network."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
     echo "  - activate/show balance use mytonctrl inside TON pods; mytonctrl already has its network configured."
     echo "  - export prints private key material to stdout; treat the output as a secret."
@@ -18503,8 +18583,8 @@ run_wallet() {
     echo "  kubeton wallet create"
     echo "  kubeton wallet create main-wallet"
     echo "  kubeton wallet create 0 42 main-wallet"
-    echo "  kubeton wallet deploy testnet"
-    echo "  kubeton wallet deploy testnet main-wallet"
+    echo "  kubeton wallet deploy"
+    echo "  kubeton wallet deploy main-wallet"
     echo "  kubeton wallet activate"
     echo "  kubeton wallet activate tonnode-0"
     echo "  kubeton wallet activate tonnode-0 validator_wallet_001"
@@ -18516,15 +18596,15 @@ run_wallet() {
     echo "  kubeton wallet export"
     echo "  kubeton wallet export main-wallet"
     echo "  kubeton wallet export tonnode-0 validator_wallet_001"
-    echo "  kubeton wallet send testnet main-wallet 10."
-    echo "  kubeton wallet send testnet main-wallet <destination-address> 10."
-    echo "  kubeton wallet send testnet main-wallet tonnode-0 10."
-    echo "  kubeton wallet send testnet main-wallet tonnode-0 10. -n"
-    echo "  kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10."
-    echo "  kubeton wallet send testnet main-wallet tonnode-0 validator_wallet_001 10. -n"
-    echo "  kubeton wallet collect testnet main-wallet"
-    echo "  kubeton wallet collect testnet main-wallet 10."
-    echo "  kubeton wallet collect testnet main-wallet tonnode-0 validator_wallet_001 alld"
+    echo "  kubeton wallet send main-wallet 10."
+    echo "  kubeton wallet send main-wallet <destination-address> 10."
+    echo "  kubeton wallet send main-wallet tonnode-0 10."
+    echo "  kubeton wallet send main-wallet tonnode-0 10. -n"
+    echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10."
+    echo "  kubeton wallet send main-wallet tonnode-0 validator_wallet_001 10. -n"
+    echo "  kubeton wallet collect main-wallet"
+    echo "  kubeton wallet collect main-wallet 10."
+    echo "  kubeton wallet collect main-wallet tonnode-0 validator_wallet_001 alld"
   }
 
   local action="${1:-}"
@@ -18553,8 +18633,28 @@ run_wallet() {
   local row target_ns target_pod target_node_name target_wallet_name destination_address amount
   local from_wallet_name to_tonnode_name
   local wallet_network=""
+  local legacy_network=""
+  local KUBETON_WALLET_NETWORK="" KUBETON_WALLET_GLOBAL_CONFIG_JSON=""
   local -a table_rows=()
   local -a destination_addresses=()
+  case "$action" in
+    deploy|send|collect)
+      # Older invocations may assert the network, but cannot select a network
+      # different from the global configuration actually used by the fleet.
+      if (( $# > 0 )) && legacy_network="$(normalize_wallet_network "$1")"; then
+        shift
+      else
+        legacy_network=""
+      fi
+      resolve_wallet_fleet_config || return 1
+      wallet_network="$KUBETON_WALLET_NETWORK"
+      if [[ -n "$legacy_network" && "$legacy_network" != "$wallet_network" ]]; then
+        echo "Error: requested ${legacy_network}, but the active TON fleet uses ${wallet_network}." >&2
+        return 1
+      fi
+      echo "[wallet] Using ${wallet_network} from the TON pods' active global.config.json." >&2
+      ;;
+  esac
   case "$action" in
     create)
       case "$#" in
@@ -18576,15 +18676,10 @@ run_wallet() {
       esac
       ;;
     deploy)
-      if (( $# < 1 || $# > 2 )); then
-        echo "Error: usage: kubeton wallet deploy <mainnet|testnet> [name]" >&2
+      if (( $# > 1 )); then
+        echo "Error: usage: kubeton wallet deploy [name]" >&2
         return 1
       fi
-      if ! wallet_network="$(normalize_wallet_network "$1")"; then
-        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
-        return 1
-      fi
-      shift || true
       action_args=("$@")
       if (( ${#action_args[@]} == 0 )); then
         confirm_or_exit "This will deploy (send BOC) for ALL wallets on ${wallet_network}. Continue?"
@@ -18604,15 +18699,10 @@ run_wallet() {
       return $?
       ;;
     collect)
-      if (( $# < 2 || $# > 5 )); then
-        echo "Error: usage: kubeton wallet collect <mainnet|testnet> <main-wallet-name> [from-tonnode-name] [wallet-name] [amount]" >&2
+      if (( $# < 1 || $# > 4 )); then
+        echo "Error: usage: kubeton wallet collect <main-wallet-name> [from-tonnode-name] [wallet-name] [amount]" >&2
         return 1
       fi
-      if ! wallet_network="$(normalize_wallet_network "$1")"; then
-        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
-        return 1
-      fi
-      shift || true
       run_wallet_collect "$wallet_network" "$@"
       return $?
       ;;
@@ -18665,15 +18755,10 @@ run_wallet() {
       ;;
     send)
       local send_no_bounce_flag=""
-      if (( $# < 1 )); then
-        echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
+      if (( $# < 2 )); then
+        echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
         return 1
       fi
-      if ! wallet_network="$(normalize_wallet_network "$1")"; then
-        echo "Error: unsupported wallet network '$1'. Use mainnet or testnet." >&2
-        return 1
-      fi
-      shift || true
       local -a send_args=("$@")
       local send_last_index send_last_arg send_item
       if (( ${#send_args[@]} > 0 )); then
@@ -18698,7 +18783,7 @@ run_wallet() {
           from_wallet_name="$(trim_whitespace "${send_args[0]}")"
           amount="$(trim_whitespace "${send_args[1]}")"
           if [[ -z "$from_wallet_name" || -z "$amount" ]]; then
-            echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [amount] [-n]" >&2
+            echo "Error: usage: kubeton wallet send [from-wallet-name] [amount] [-n]" >&2
             return 1
           fi
           if ! [[ "$amount" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
@@ -18769,7 +18854,7 @@ run_wallet() {
           from_wallet_name="$(trim_whitespace "${send_args[0]}")"
           to_tonnode_name="$(trim_whitespace "${send_args[1]}")"
           if [[ -z "$from_wallet_name" || -z "$to_tonnode_name" ]]; then
-            echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
+            echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
             return 1
           fi
           if (( ${#send_args[@]} == 3 )) && looks_like_ton_address "$to_tonnode_name"; then
@@ -18835,13 +18920,21 @@ run_wallet() {
           fi
           ;;
         *)
-          echo "Error: usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
-          echo "       usage: kubeton wallet send <mainnet|testnet> [from-wallet-name] [amount] [-n]" >&2
+          echo "Error: usage: kubeton wallet send [from-wallet-name] [to-tonnode-name] [wallet-name] [amount] [-n]" >&2
+          echo "       usage: kubeton wallet send [from-wallet-name] [amount] [-n]" >&2
           return 1
           ;;
       esac
       ;;
   esac
+
+  if [[ -z "$wallet_network" ]]; then
+    if resolve_wallet_fleet_config 2>/dev/null; then
+      wallet_network="$KUBETON_WALLET_NETWORK"
+    elif [[ "$action" == show ]]; then
+      echo "[wallet] Active fleet network unavailable; showing wallet metadata without chain queries." >&2
+    fi
+  fi
 
   if should_bootstrap_baremetal; then
     ensure_auto_bootstrap_stack_if_needed
@@ -18880,7 +18973,12 @@ run_wallet() {
   wallet_node_affinity_yaml="$(main_wallet_pod_longhorn_csi_affinity_yaml "$bundle_storage_class")" || return 1
 
   image="$(resolve_main_wallet_image)"
-  global_config_url="$(resolve_main_wallet_global_config_url "$wallet_network")"
+  # Pass the exact active configuration to the helper; a fresh upstream
+  # download could have different lite servers from the installed fleet.
+  global_config_url=""
+  if [[ -n "$KUBETON_WALLET_GLOBAL_CONFIG_JSON" ]]; then
+    global_config_url="/var/ton-work/controller/global.config.json"
+  fi
   toncenter_url="$(resolve_main_wallet_toncenter_url "$wallet_network")"
   timeout_seconds="$(main_wallet_timeout_seconds)"
 
@@ -18925,6 +19023,8 @@ run_wallet() {
     printf '          value: %s\n' "$(yaml_quote "$wallet_network")"
     echo "        - name: GLOBAL_CONFIG_URL"
     printf '          value: %s\n' "$(yaml_quote "$global_config_url")"
+    echo "        - name: GLOBAL_CONFIG_JSON"
+    printf '          value: %s\n' "$(json_quote "$KUBETON_WALLET_GLOBAL_CONFIG_JSON")"
     echo "        - name: TONCENTER_URL"
     printf '          value: %s\n' "$(yaml_quote "$toncenter_url")"
     if [[ -n "$MAIN_WALLET_TONCENTER_API_KEY" ]]; then

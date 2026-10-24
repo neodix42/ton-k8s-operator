@@ -3,11 +3,10 @@ set -euo pipefail
 
 MODE="${MODE:-auto}"
 WALLET_NETWORK="${WALLET_NETWORK:-}"
-GLOBAL_CONFIG_URL="${GLOBAL_CONFIG_URL:-https://ton.org/global.config.json}"
+GLOBAL_CONFIG_URL="${GLOBAL_CONFIG_URL-https://ton.org/global.config.json}"
+GLOBAL_CONFIG_JSON="${GLOBAL_CONFIG_JSON:-}"
 TONCENTER_URL="${TONCENTER_URL:-https://testnet.toncenter.com}"
 TONCENTER_API_KEY="${TONCENTER_API_KEY:-}"
-MAIN_WALLET_MAINNET_GLOBAL_CONFIG_URL="${MAIN_WALLET_MAINNET_GLOBAL_CONFIG_URL:-https://ton.org/global.config.json}"
-MAIN_WALLET_TESTNET_GLOBAL_CONFIG_URL="${MAIN_WALLET_TESTNET_GLOBAL_CONFIG_URL:-https://ton.org/testnet-global.config.json}"
 
 MAIN_WALLET_DIR="${MAIN_WALLET_DIR:-/var/main-wallet/runtime}"
 MAIN_WALLET_BUNDLE_DIR="${MAIN_WALLET_BUNDLE_DIR:-/var/main-wallet/bundle}"
@@ -32,10 +31,12 @@ Usage:
   main-wallet.sh export <wallet-name>
   main-wallet.sh run <create|deploy|send|show|export> [args...]
 
-Required env for deploy:
+Required env for deploy/send and balance queries:
+  WALLET_NETWORK=mainnet|testnet (detected from the active fleet by kubeton)
   MODE=auto|liteserver|toncenter
-  GLOBAL_CONFIG_URL=https://ton.org/global.config.json
-  TONCENTER_URL=https://testnet.toncenter.com (or mainnet URL)
+  GLOBAL_CONFIG_URL=<active global config URL or file>
+  GLOBAL_CONFIG_JSON=<optional exact active config contents>
+  TONCENTER_URL=<API URL for the active network>
 
 Required env for encrypted persistence:
   KEY_PROVIDER=vault
@@ -161,42 +162,34 @@ normalize_wallet_network_name() {
   esac
 }
 
-wallet_network_global_config_url() {
-  local network="$1"
-
-  case "$network" in
-    mainnet)
-      printf '%s' "$MAIN_WALLET_MAINNET_GLOBAL_CONFIG_URL"
-      ;;
-    testnet)
-      printf '%s' "$MAIN_WALLET_TESTNET_GLOBAL_CONFIG_URL"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+resolve_current_wallet_network() {
+  # Only the network checked against the active fleet config is authoritative.
+  # Saved wallet metadata and default URLs cannot identify the running chain.
+  normalize_wallet_network_name "${WALLET_NETWORK:-}"
 }
 
-resolve_current_wallet_network() {
-  local network combined
+require_wallet_network_match() {
+  local wallet_name="$1"
+  local meta_file="${MAIN_WALLET_DIR}/${wallet_name}.wallet.meta"
+  local active_network saved_network saved_raw
 
-  network="$(normalize_wallet_network_name "${WALLET_NETWORK:-}" 2>/dev/null || true)"
-  network="$(trim_whitespace "$network")"
-  if [[ -n "$network" ]]; then
-    printf '%s' "$network"
-    return 0
+  active_network="$(resolve_current_wallet_network || true)"
+  if [[ -z "$active_network" ]]; then
+    echo "Error: cannot determine the active fleet network for wallet '${wallet_name}'." >&2
+    return 1
   fi
-
-  combined="$(printf '%s %s' "${GLOBAL_CONFIG_URL:-}" "${TONCENTER_URL:-}" | tr '[:upper:]' '[:lower:]')"
-  if [[ "$combined" == *testnet* ]]; then
-    printf '%s' "testnet"
-    return 0
+  [[ -f "$meta_file" ]] || return 0
+  saved_raw="$(trim_whitespace "$(read_meta_value network "$meta_file")")"
+  [[ -n "$saved_raw" && "$saved_raw" != unknown ]] || return 0
+  saved_network="$(normalize_wallet_network_name "$saved_raw" || true)"
+  if [[ -z "$saved_network" ]]; then
+    echo "Error: wallet '${wallet_name}' has an unrecognized saved network '${saved_raw}'." >&2
+    return 1
   fi
-  if [[ "$combined" == *"toncenter.com"* || "$combined" == *"ton.org/global.config.json"* ]]; then
-    printf '%s' "mainnet"
-    return 0
+  if [[ "$saved_network" != "$active_network" ]]; then
+    echo "Error: wallet '${wallet_name}' is saved for ${saved_network}, but the active fleet uses ${active_network}." >&2
+    return 1
   fi
-  return 1
 }
 
 extract_json_string() {
@@ -583,6 +576,15 @@ send_boc_toncenter() {
 resolve_local_global_config_path() {
   local global_config_source global_config_path temp_config_file=""
 
+  if [[ -n "$GLOBAL_CONFIG_JSON" ]]; then
+    # Config files in a TON pod may use paths that do not exist in this helper
+    # pod. Use the exact active config bytes copied by the host CLI.
+    temp_config_file="$(mktemp)"
+    printf '%s' "$GLOBAL_CONFIG_JSON" >"$temp_config_file"
+    printf '%s\t%s' "$temp_config_file" "$temp_config_file"
+    return 0
+  fi
+
   if [[ -z "$GLOBAL_CONFIG_URL" ]]; then
     echo "Error: GLOBAL_CONFIG_URL is empty." >&2
     return 1
@@ -615,15 +617,18 @@ resolve_local_global_config_path() {
 }
 
 warn_liteserver_toncenter_network_mismatch() {
-  local global_config_lower toncenter_lower
+  local network toncenter_lower toncenter_network=""
 
-  global_config_lower="$(printf '%s' "$GLOBAL_CONFIG_URL" | tr '[:upper:]' '[:lower:]')"
+  network="$(resolve_current_wallet_network || true)"
   toncenter_lower="$(printf '%s' "$TONCENTER_URL" | tr '[:upper:]' '[:lower:]')"
-
-  if [[ "$toncenter_lower" == *testnet* && "$global_config_lower" != *testnet* ]]; then
-    echo "Warning: lite-server GLOBAL_CONFIG_URL=${GLOBAL_CONFIG_URL} does not look like testnet, but TONCENTER_URL=${TONCENTER_URL} does." >&2
-    echo "Warning: if the wallet is funded on testnet, lite-client sendfile is being sent to the wrong network." >&2
-    echo "Warning: use 'kubeton wallet deploy testnet ...' or 'kubeton wallet send testnet ...' for testnet sends." >&2
+  if [[ "$toncenter_lower" == https://testnet.toncenter.com || "$toncenter_lower" == https://testnet.toncenter.com/* ]]; then
+    toncenter_network=testnet
+  elif [[ "$toncenter_lower" == https://toncenter.com || "$toncenter_lower" == https://toncenter.com/* ]]; then
+    toncenter_network=mainnet
+  fi
+  if [[ -n "$network" && -n "$toncenter_network" && "$network" != "$toncenter_network" ]]; then
+    echo "Warning: the active fleet uses ${network}, but TONCENTER_URL=${TONCENTER_URL} uses ${toncenter_network}." >&2
+    echo "Warning: configure TONCenter for the active fleet network before using the API fallback." >&2
   fi
 }
 
@@ -746,7 +751,7 @@ print_wallet_deploy_failure_hint() {
   if [[ -n "$bounceable" && "$bounceable" != "unknown" ]]; then
     echo "Hint: after deployment, use the bounceable address: ${bounceable}" >&2
   fi
-  echo "Hint: rerun 'kubeton wallet deploy <mainnet|testnet> ${wallet_name}' after the funding transaction is visible on-chain." >&2
+  echo "Hint: rerun 'kubeton wallet deploy ${wallet_name}' after the funding transaction is visible on-chain." >&2
 }
 
 deploy_boc_with_mode() {
@@ -838,6 +843,11 @@ main_wallet_create() {
     echo "wallet_address=${wallet_address}"
     echo "non_bounceable=${non_bounceable}"
     echo "bounceable=${bounceable}"
+    if [[ -n "$WALLET_NETWORK" ]]; then
+      local network
+      network="$(resolve_current_wallet_network || true)"
+      [[ -z "$network" ]] || echo "network=${network}"
+    fi
   } > "$meta_file"
   chmod 600 "$meta_file"
 }
@@ -846,28 +856,25 @@ wallet_show_chain_state() {
   local wallet_name="$1"
   local wallet_address="$2"
   local wallet_network="$3"
-  local old_global_config_url config_url query_address balance_nano balance seqno
+  local active_network query_address balance_nano balance seqno
 
   balance="unknown"
   seqno="unknown"
   wallet_network="$(normalize_wallet_network_name "$wallet_network" 2>/dev/null || true)"
-  wallet_network="$(trim_whitespace "$wallet_network")"
+  active_network="$(resolve_current_wallet_network || true)"
   query_address="$(ton_address_to_hex "$wallet_address" 2>/dev/null || true)"
   query_address="$(trim_whitespace "$query_address")"
-  if [[ -z "$wallet_network" || ! "$query_address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]]; then
+  if [[ -z "$active_network" || ! "$query_address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]]; then
     printf '%s\t%s' "$balance" "$seqno"
     return 0
   fi
 
-  config_url="$(wallet_network_global_config_url "$wallet_network" || true)"
-  config_url="$(trim_whitespace "$config_url")"
-  if [[ -z "$config_url" ]]; then
+  if [[ -n "$wallet_network" && "$wallet_network" != "$active_network" ]]; then
+    echo "Warning: wallet '${wallet_name}' is saved for ${wallet_network}, but the active fleet uses ${active_network}; balance and seqno are unknown." >&2
     printf '%s\t%s' "$balance" "$seqno"
     return 0
   fi
-
-  old_global_config_url="${GLOBAL_CONFIG_URL:-}"
-  GLOBAL_CONFIG_URL="$config_url"
+  wallet_network="$active_network"
 
   balance_nano="$(wallet_balance_nano "$query_address" 2>/dev/null || true)"
   balance_nano="$(trim_whitespace "$balance_nano")"
@@ -886,7 +893,6 @@ wallet_show_chain_state() {
     seqno="unknown"
   fi
 
-  GLOBAL_CONFIG_URL="$old_global_config_url"
   printf '%s\t%s' "$balance" "$seqno"
 }
 
@@ -929,7 +935,10 @@ main_wallet_show() {
     [[ -z "$wallet_address" ]] && wallet_address="unknown"
     [[ -z "$non_bounceable" ]] && non_bounceable="unknown"
     [[ -z "$bounceable" ]] && bounceable="unknown"
-    [[ -z "$network" ]] && network="unknown"
+    if [[ -z "$network" ]]; then
+      network="$(resolve_current_wallet_network || true)"
+      [[ -n "$network" ]] || network=unknown
+    fi
 
     chain_state="$(wallet_show_chain_state "$wallet_name" "$wallet_address" "$network" || true)"
     IFS=$'\t' read -r balance seqno <<<"$chain_state"
@@ -958,7 +967,11 @@ main_wallet_show() {
       workchain="$(trim_whitespace "${wallet_address%%:*}")"
       [[ -z "$workchain" ]] && workchain="unknown"
     fi
-    rows+=("${workchain}"$'\t'"unknown"$'\t'"${wallet_name}"$'\t'"unknown"$'\t'"unknown"$'\t'"unknown"$'\t'"${wallet_address:-unknown}"$'\t'"unknown"$'\t'"unknown")
+    network="$(resolve_current_wallet_network || true)"
+    [[ -n "$network" ]] || network=unknown
+    chain_state="$(wallet_show_chain_state "$wallet_name" "$wallet_address" "$network" || true)"
+    IFS=$'\t' read -r balance seqno <<<"$chain_state"
+    rows+=("${workchain}"$'\t'"unknown"$'\t'"${wallet_name}"$'\t'"${network}"$'\t'"${balance:-unknown}"$'\t'"${seqno:-unknown}"$'\t'"${wallet_address:-unknown}"$'\t'"unknown"$'\t'"unknown")
   done
   shopt -u nullglob
 
@@ -1113,6 +1126,7 @@ main_wallet_deploy() {
       echo "Error: missing BOC file ${boc_file}. Run create first." >&2
       return 1
     fi
+    require_wallet_network_match "$wallet_name" || return $?
     deploy_boc_with_mode "$wallet_name" "$boc_file" "$normalized_mode" || return $?
     record_wallet_deploy_network "$wallet_name"
     return 0
@@ -1130,6 +1144,12 @@ main_wallet_deploy() {
     echo "Error: no wallet query BOC files found in ${MAIN_WALLET_DIR}. Run create first." >&2
     return 1
   fi
+
+  # Check the complete set before publishing any deployment messages.
+  for file in "${boc_files[@]}"; do
+    base="${file##*/}"
+    require_wallet_network_match "${base%-query.boc}" || return $?
+  done
 
   for file in "${boc_files[@]}"; do
     base="${file##*/}"
@@ -1506,6 +1526,7 @@ main_wallet_send() {
     return 1
   fi
 
+  require_wallet_network_match "$from_wallet" || return $?
   normalized_mode="$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')"
   source_wallet_address="$(resolve_wallet_address_by_name "$from_wallet" || true)"
   source_wallet_address="$(trim_whitespace "$source_wallet_address")"
@@ -1688,4 +1709,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
