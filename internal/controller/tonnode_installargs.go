@@ -139,7 +139,7 @@ func validateInstallationArgs(node *tonv1alpha1.TonNode) string {
 			break
 		}
 		if !strings.HasPrefix(arg, "-") || arg == "-" || arg == "--" {
-			return fmt.Sprintf("unexpected installation argument %q; spec.args contains MyTonCtrl installer flags after run", arg)
+			return fmt.Sprintf("unexpected installation argument at position %d; expected MyTonCtrl installer flags after run", index+1)
 		}
 		if strings.HasPrefix(arg, "--") {
 			name, value, attached := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
@@ -168,7 +168,7 @@ func validateInstallationArgs(node *tonv1alpha1.TonNode) string {
 					}
 				}
 			default:
-				return fmt.Sprintf("unsupported MyTonCtrl installation option %q", arg)
+				return fmt.Sprintf("unsupported MyTonCtrl installation option at position %d", index+1)
 			}
 			if name == "ton-work-dir" {
 				work, workDynamic = value, false
@@ -210,7 +210,7 @@ func validateInstallationArgs(node *tonv1alpha1.TonNode) string {
 				}
 				position = len(arg)
 			default:
-				return fmt.Sprintf("unsupported MyTonCtrl installation option -%c", name)
+				return fmt.Sprintf("unsupported MyTonCtrl installation option at argument %d, character %d", index+1, position+1)
 			}
 		}
 	}

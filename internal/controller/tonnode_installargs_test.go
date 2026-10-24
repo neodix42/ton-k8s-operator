@@ -167,3 +167,51 @@ func TestInstallationArgsValidateDynamicTopology(t *testing.T) {
 		})
 	}
 }
+
+func TestInstallationArgsDiagnosticsOmitSensitiveValues(t *testing.T) {
+	const secret = "SYNTHETIC_CREDENTIAL_MUST_NOT_BE_LOGGED"
+	for _, tt := range []struct {
+		name      string
+		args      []string
+		literal   string
+		env       []corev1.EnvVar
+		keyMgmt   bool
+		wantError string
+	}{
+		{name: "positional credential", args: []string{secret}, wantError: "argument at position 1"},
+		{name: "positional authenticated URL", args: []string{"-i", "https://user:" + secret + "@example.invalid/config"}, wantError: "argument at position 2"},
+		{name: "unknown option attached token", args: []string{"--password=" + secret}, wantError: "option at position 1"},
+		{name: "unknown option name", args: []string{"--" + secret}, wantError: "option at position 1"},
+		{name: "unknown grouped short option", args: []string{"-id?" + secret}, wantError: "argument 1, character 4"},
+		{name: "literal flags attached token", literal: "--token=" + secret, wantError: "option at position 1"},
+		{name: "literal positional credential", literal: "-i '" + secret + "'", wantError: "argument at position 2"},
+		{name: "literal invalid quoting", literal: "-c '" + secret, wantError: "invalid quoting"},
+		{name: "known source option URL", args: []string{"--repo=https://user:" + secret + "@example.invalid"}, wantError: "--repo selects sources"},
+		{name: "known flag attached value", args: []string{"--dump=" + secret}, wantError: "--dump is a flag"},
+		{name: "known value option missing value", args: []string{"--backup", "--" + secret}, wantError: "--backup requires a value"},
+		{name: "work directory argument", args: []string{"--ton-work-dir=/secrets/" + secret}, wantError: "must remain /var/ton-work"},
+		{name: "user argument", args: []string{"--user=" + secret}, keyMgmt: true, wantError: "must be root or validator"},
+		{name: "work directory environment", env: []corev1.EnvVar{{Name: "TON_WORK_DIR", Value: "/secrets/" + secret}}, wantError: "must remain /var/ton-work"},
+		{name: "user environment", env: []corev1.EnvVar{{Name: "MTC_USER", Value: secret}}, keyMgmt: true, wantError: "must be root or validator"},
+		{name: "split mode environment", env: []corev1.EnvVar{{Name: "ONLY_NODE", Value: secret}}, wantError: "ONLY_NODE must be a boolean"},
+		{name: "print environment setting", env: []corev1.EnvVar{{Name: "MYTONCTRL_PRINT_ENV", Value: secret}}, wantError: "MYTONCTRL_PRINT_ENV must be a boolean"},
+		{name: "archive environment setting", env: []corev1.EnvVar{{Name: "ARCHIVE", Value: secret}}, wantError: "ARCHIVE must be a boolean"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			node := &tonv1alpha1.TonNode{Spec: tonv1alpha1.TonNodeSpec{Args: tt.args, Env: tt.env}}
+			if tt.literal != "" {
+				node.Spec.Env = append(node.Spec.Env, corev1.EnvVar{Name: "MYTONCTRL_ARGS", Value: tt.literal})
+			}
+			if tt.keyMgmt {
+				node.Spec.KeyManagement = &tonv1alpha1.TonNodeKeyManagementSpec{Enabled: true}
+			}
+			message := validateInstallationArgs(node)
+			if !strings.Contains(message, tt.wantError) {
+				t.Errorf("validation did not reject with the expected option/index context %q", tt.wantError)
+			}
+			if strings.Contains(message, secret) {
+				t.Error("validation diagnostic exposes a supplied credential")
+			}
+		})
+	}
+}

@@ -547,21 +547,38 @@ test_main_wallet_show_network_and_config() (
   assert_contains 'savings' "$case_dir/mismatch"
   assert_contains 'unknown' "$case_dir/mismatch"
   assert_contains 'active fleet uses testnet' "$case_dir/mismatch.stderr"
-  [[ ! -s "$events" ]] || fail "show queried a mismatched wallet network"
+  assert_not_contains 'balance <' "$events"
+  assert_not_contains 'seqno <' "$events"
+  assert_not_contains unexpected-network "$events"
 
+  : >"$events"
   WALLET_NETWORK=""
   main_wallet_show savings >"$case_dir/offline"
   assert_contains 'savings' "$case_dir/offline"
   assert_contains 'unknown' "$case_dir/offline"
-  [[ ! -s "$events" ]] || fail "offline show performed chain queries"
+  assert_not_contains 'balance <' "$events"
+  assert_not_contains 'seqno <' "$events"
+  assert_not_contains unexpected-network "$events"
 )
 
 test_collect_receive_address_from_real_show_table() (
   setup_main_wallet_case collect-real-show-table
   write_wallet_fixture savings testnet
-  fixture_receive_address="U$(printf '%047d' 1)"
+  IFS=$'\t' read -r fixture_receive_address fixture_bounceable_address < <(python3 - "$fixture_wallet_address" <<'PY'
+import base64
+import binascii
+import sys
+
+workchain, account = sys.argv[1].split(":")
+addresses = []
+for tag in (0x51, 0x11):
+    body = bytes([tag, int(workchain) & 0xff]) + bytes.fromhex(account)
+    addresses.append(base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode())
+print("\t".join(addresses))
+PY
+)
   printf 'workchain=0\nwallet_id=42\nnon_bounceable=%s\nbounceable=%s\n' \
-    "$fixture_receive_address" "E$(printf '%047d' 1)" >>"$MAIN_WALLET_DIR/savings.wallet.meta"
+    "$fixture_receive_address" "$fixture_bounceable_address" >>"$MAIN_WALLET_DIR/savings.wallet.meta"
   wallet_balance_nano() { printf 2500000000; }
   fixture_show_table="$(main_wallet_show savings)"
   assert_contains 'wallet-address' <(printf '%s\n' "$fixture_show_table")

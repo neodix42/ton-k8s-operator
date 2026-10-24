@@ -73,6 +73,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_status_test.sh
 	bash test/kubeton_logs_test.sh
 	bash test/kubeton_wallet_network_test.sh
+	bash test/kubeton_wallet_export_test.sh
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.

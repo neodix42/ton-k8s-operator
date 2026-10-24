@@ -210,6 +210,7 @@ file_bytes_to_hex() {
 
 ton_address_to_hex() {
   local address normalized decoded_hex wc_hex wc_dec account_hex
+  local crc=0 byte_offset bit byte_value
 
   address="$(trim_whitespace "${1:-}")"
   if [[ "$address" =~ ^(-?[0-9]+):([0-9A-Fa-f]{64})$ ]]; then
@@ -233,6 +234,24 @@ ton_address_to_hex() {
   if [[ ${#decoded_hex} -ne 72 ]]; then
     return 1
   fi
+  case "${decoded_hex:0:2}" in
+    11|51|91|d1) ;;
+    *) return 1 ;;
+  esac
+  # Friendly TON addresses carry a CRC16-XMODEM over the tag, workchain,
+  # and 32-byte account. Do not present damaged metadata as a valid address.
+  for ((byte_offset=0; byte_offset<68; byte_offset+=2)); do
+    byte_value=$((16#${decoded_hex:byte_offset:2}))
+    crc=$((crc ^ (byte_value << 8)))
+    for ((bit=0; bit<8; bit++)); do
+      if (( crc & 0x8000 )); then
+        crc=$((((crc << 1) ^ 0x1021) & 0xffff))
+      else
+        crc=$(((crc << 1) & 0xffff))
+      fi
+    done
+  done
+  [[ "$(printf '%04x' "$crc")" == "${decoded_hex:68:4}" ]] || return 1
   wc_hex="${decoded_hex:2:2}"
   account_hex="${decoded_hex:4:64}"
   if ! [[ "$wc_hex" =~ ^[0-9A-Fa-f]{2}$ && "$account_hex" =~ ^[0-9A-Fa-f]{64}$ ]]; then
@@ -244,6 +263,46 @@ ton_address_to_hex() {
     wc_dec=$((wc_dec - 256))
   fi
   printf '%s:%s' "$wc_dec" "$account_hex"
+}
+
+wallet_address_file_text() {
+  local file="$1" candidate nontext_bytes
+
+  [[ -r "$file" && -s "$file" ]] || return 1
+  # Validate before putting file contents in a Bash variable: .addr usually
+  # contains binary data, including NUL bytes and arbitrary printable bytes.
+  nontext_bytes="$(LC_ALL=C tr -d '\11\12\15\40-\176' <"$file" | wc -c)"
+  (( nontext_bytes == 0 )) || return 1
+  candidate="$(trim_whitespace "$(cat "$file")")"
+  ton_address_to_hex "$candidate" >/dev/null || return 1
+  printf '%s' "$candidate"
+}
+
+wallet_address_file_to_hex() {
+  local file="$1" data_hex account_hex wc_hex wc_dec candidate
+
+  data_hex="$(file_bytes_to_hex "$file")" || return 1
+  # Fift TonUtil.fif save-address writes the 256-bit account followed by a
+  # signed 32-bit big-endian workchain. load-address also accepts the legacy
+  # account-only format, whose workchain is zero.
+  case "${#data_hex}" in
+    64)
+      printf '0:%s' "$data_hex"
+      return 0
+      ;;
+    72)
+      account_hex="${data_hex:0:64}"
+      wc_hex="${data_hex:64:8}"
+      wc_dec=$((16#$wc_hex))
+      if (( wc_dec >= 2147483648 )); then
+        wc_dec=$((wc_dec - 4294967296))
+      fi
+      printf '%s:%s' "$wc_dec" "$account_hex"
+      return 0
+      ;;
+  esac
+  candidate="$(wallet_address_file_text "$file")" || return 1
+  ton_address_to_hex "$candidate"
 }
 
 vault_encrypt_data_key() {
@@ -831,9 +890,12 @@ main_wallet_create() {
   bounceable="$(sed -n 's/^Bounceable address (for later access):[[:space:]]*\(.*\)$/\1/p' "$create_log" | tail -n1)"
   rm -f "$create_log"
 
+  wallet_address="$(ton_address_to_hex "$wallet_address" || true)"
   if [[ -z "$wallet_address" && -s "$MAIN_WALLET_DIR/${wallet_name}.addr" ]]; then
-    wallet_address="$(head -n1 "$MAIN_WALLET_DIR/${wallet_name}.addr" | tr -d '\r\n')"
+    wallet_address="$(wallet_address_file_to_hex "$MAIN_WALLET_DIR/${wallet_name}.addr" || true)"
   fi
+  ton_address_to_hex "$non_bounceable" >/dev/null || non_bounceable=""
+  ton_address_to_hex "$bounceable" >/dev/null || bounceable=""
 
   meta_file="$MAIN_WALLET_DIR/${wallet_name}.wallet.meta"
   {
@@ -924,9 +986,11 @@ main_wallet_show() {
 
     workchain="$(trim_whitespace "$(read_meta_value workchain "$meta_file")")"
     wallet_id="$(trim_whitespace "$(read_meta_value wallet_id "$meta_file")")"
-    wallet_address="$(trim_whitespace "$(read_meta_value wallet_address "$meta_file")")"
+    wallet_address="$(resolve_wallet_address_by_name "$wallet_name" || true)"
     non_bounceable="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
     bounceable="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
+    ton_address_to_hex "$non_bounceable" >/dev/null || non_bounceable=""
+    ton_address_to_hex "$bounceable" >/dev/null || bounceable=""
     network="$(normalize_wallet_network_name "$(read_meta_value network "$meta_file")" 2>/dev/null || true)"
     network="$(trim_whitespace "$network")"
 
@@ -957,11 +1021,8 @@ main_wallet_show() {
     if [[ -f "$MAIN_WALLET_DIR/${wallet_name}.wallet.meta" ]]; then
       continue
     fi
-    wallet_address="$(LC_ALL=C tr -cd '[:print:]\n' < "$addr_file" | head -n1 | tr -d '\r\n')"
-    wallet_address="$(trim_whitespace "$wallet_address")"
-    if ! [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]+$ ]]; then
-      wallet_address="unknown"
-    fi
+    wallet_address="$(wallet_address_file_to_hex "$addr_file" || true)"
+    [[ -n "$wallet_address" ]] || wallet_address=unknown
     workchain="unknown"
     if [[ "$wallet_address" == *:* ]]; then
       workchain="$(trim_whitespace "${wallet_address%%:*}")"
@@ -1013,7 +1074,7 @@ main_wallet_show() {
 
 main_wallet_export() {
   local wallet_name="${1:-}"
-  local pk_file addr_file meta_file candidate address address_hex private_key_hex
+  local pk_file addr_file meta_file candidate candidate_hex address address_hex private_key_hex
   local subwallet_id
   local -a candidates=()
 
@@ -1035,9 +1096,11 @@ main_wallet_export() {
     return 1
   fi
 
+  address_hex="$(wallet_address_file_to_hex "$addr_file" || true)"
+  address="${address_hex:-unknown}"
+  address_hex="${address_hex:-unknown}"
   if [[ -s "$addr_file" ]]; then
-    candidate="$(LC_ALL=C tr -cd '[:print:]\n' < "$addr_file" | head -n1 | tr -d '\r\n')"
-    candidate="$(trim_whitespace "$candidate")"
+    candidate="$(wallet_address_file_text "$addr_file" || true)"
     [[ -n "$candidate" ]] && candidates+=("$candidate")
   fi
   if [[ -s "$meta_file" ]]; then
@@ -1049,23 +1112,23 @@ main_wallet_export() {
     [[ -n "$candidate" ]] && candidates+=("$candidate")
   fi
 
-  address="unknown"
-  address_hex="unknown"
   for candidate in "${candidates[@]}"; do
     candidate="$(trim_whitespace "$candidate")"
     [[ -z "$candidate" || "$candidate" == "unknown" ]] && continue
-    if address_hex="$(ton_address_to_hex "$candidate" || true)"; then
-      address_hex="$(trim_whitespace "$address_hex")"
-      if [[ -n "$address_hex" ]]; then
-        address="$candidate"
-        break
-      fi
+    candidate_hex="$(ton_address_to_hex "$candidate" || true)"
+    [[ -n "$candidate_hex" ]] || continue
+    # A valid .addr file is authoritative. Old metadata must not replace its
+    # account with another address; matching friendly addresses can be shown.
+    if [[ "$address_hex" != unknown && "$candidate_hex" != "$address_hex" ]]; then
+      continue
+    fi
+    address_hex="$candidate_hex"
+    [[ "$address" != unknown ]] || address="$candidate_hex"
+    if [[ "$candidate" != *:* ]]; then
+      address="$candidate"
+      break
     fi
   done
-  if [[ "$address" == "unknown" && ${#candidates[@]} -gt 0 ]]; then
-    address="$(trim_whitespace "${candidates[0]}")"
-    [[ -z "$address" ]] && address="unknown"
-  fi
 
   private_key_hex="$(file_bytes_to_hex "$pk_file" || true)"
   private_key_hex="$(trim_whitespace "$private_key_hex")"
@@ -1172,24 +1235,20 @@ resolve_wallet_address_by_name() {
   local wallet_name="$1"
   local wallet_meta="$MAIN_WALLET_DIR/${wallet_name}.wallet.meta"
   local wallet_addr_file="$MAIN_WALLET_DIR/${wallet_name}.addr"
-  local wallet_address=""
+  local wallet_address="" key
 
-  if [[ -f "$wallet_meta" ]]; then
-    wallet_address="$(read_meta_value wallet_address "$wallet_meta")"
-    wallet_address="$(trim_whitespace "$wallet_address")"
-    if [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]+$ ]]; then
-      printf '%s' "$wallet_address"
-      return 0
-    fi
+  if wallet_address="$(wallet_address_file_to_hex "$wallet_addr_file")"; then
+    printf '%s' "$wallet_address"
+    return 0
   fi
 
-  if [[ -f "$wallet_addr_file" ]]; then
-    wallet_address="$(LC_ALL=C tr -cd '[:print:]\n' < "$wallet_addr_file" | sed -n 's/^\([-0-9][0-9]*:[0-9A-Fa-f][0-9A-Fa-f]*\)$/\1/p' | head -n1)"
-    wallet_address="$(trim_whitespace "$wallet_address")"
-    if [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]+$ ]]; then
+  if [[ -f "$wallet_meta" ]]; then
+    for key in wallet_address non_bounceable bounceable; do
+      wallet_address="$(ton_address_to_hex "$(read_meta_value "$key" "$wallet_meta")" || true)"
+      [[ -n "$wallet_address" ]] || continue
       printf '%s' "$wallet_address"
       return 0
-    fi
+    done
   fi
 
   return 1

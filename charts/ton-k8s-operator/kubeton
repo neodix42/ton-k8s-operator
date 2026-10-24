@@ -120,6 +120,7 @@ VICTORIA_METRICS_OPERATOR_NAMESPACE="${VICTORIA_METRICS_OPERATOR_NAMESPACE:-vm}"
 VICTORIA_METRICS_OPERATOR_DEPLOYMENT="${VICTORIA_METRICS_OPERATOR_DEPLOYMENT:-vm-operator}"
 VICTORIA_METRICS_ROLLOUT_TIMEOUT_SECONDS="${VICTORIA_METRICS_ROLLOUT_TIMEOUT_SECONDS:-300}"
 VICTORIA_METRICS_AUTH_PORT="${VICTORIA_METRICS_AUTH_PORT:-8427}"
+VICTORIA_METRICS_NODEPORT_ENABLED="${VICTORIA_METRICS_NODEPORT_ENABLED:-false}"
 VICTORIA_METRICS_AUTH_LOCAL_PORT_BASE="${VICTORIA_METRICS_AUTH_LOCAL_PORT_BASE:-8427}"
 VICTORIA_METRICS_API_PROXY_LOCAL_PORT_BASE="${VICTORIA_METRICS_API_PROXY_LOCAL_PORT_BASE:-18427}"
 VICTORIA_METRICS_PORT_FORWARD_DIR="${VICTORIA_METRICS_PORT_FORWARD_DIR:-${TMPDIR:-/tmp}/kubeton-victoria-metrics-port-forward}"
@@ -3335,6 +3336,7 @@ ton_address_valid_for_network() {
 
 ton_address_to_hex() {
   local address normalized decoded_hex wc_hex wc_dec account_hex
+  local crc=0 byte_offset bit byte_value
 
   address="$(trim_whitespace "${1:-}")"
   if [[ "$address" =~ ^(-?[0-9]+):([0-9A-Fa-f]{64})$ ]]; then
@@ -3358,6 +3360,22 @@ ton_address_to_hex() {
   if [[ ${#decoded_hex} -ne 72 ]]; then
     return 1
   fi
+  case "${decoded_hex:0:2}" in
+    11|51|91|d1) ;;
+    *) return 1 ;;
+  esac
+  for ((byte_offset=0; byte_offset<68; byte_offset+=2)); do
+    byte_value=$((16#${decoded_hex:byte_offset:2}))
+    crc=$((crc ^ (byte_value << 8)))
+    for ((bit=0; bit<8; bit++)); do
+      if (( crc & 0x8000 )); then
+        crc=$((((crc << 1) ^ 0x1021) & 0xffff))
+      else
+        crc=$(((crc << 1) & 0xffff))
+      fi
+    done
+  done
+  [[ "$(printf '%04x' "$crc")" == "${decoded_hex:68:4}" ]] || return 1
   wc_hex="${decoded_hex:2:2}"
   account_hex="${decoded_hex:4:64}"
   if ! [[ "$wc_hex" =~ ^[0-9A-Fa-f]{2}$ && "$account_hex" =~ ^[0-9A-Fa-f]{64}$ ]]; then
@@ -3369,6 +3387,37 @@ ton_address_to_hex() {
     wc_dec=$((wc_dec - 256))
   fi
   printf '%s:%s' "$wc_dec" "$account_hex"
+}
+
+ton_wallet_address_file_hex_to_hex() {
+  local data_hex="${1,,}" wc_dec candidate="" byte_offset byte_value character
+  [[ -n "$data_hex" && "$data_hex" =~ ^([0-9a-f]{2})+$ ]] || return 1
+  # Fift save-address stores the account's 32 bytes followed by a signed
+  # big-endian workchain. Legacy account-only files imply workchain zero.
+  case "${#data_hex}" in
+    64) printf '0:%s' "$data_hex"; return 0 ;;
+    72)
+      wc_dec=$((16#${data_hex:64:8}))
+      (( wc_dec < 2147483648 )) || wc_dec=$((wc_dec - 4294967296))
+      printf '%s:%s' "$wc_dec" "${data_hex:0:64}"
+      return 0
+      ;;
+  esac
+  # Text compatibility: reject non-address bytes before decoding, so binary
+  # NULs or control characters never enter a Bash variable or table cell.
+  for ((byte_offset=0; byte_offset<${#data_hex}; byte_offset+=2)); do
+    byte_value=$((16#${data_hex:byte_offset:2}))
+    if ! (( (byte_value >= 48 && byte_value <= 57) ||
+            (byte_value >= 65 && byte_value <= 90) ||
+            (byte_value >= 97 && byte_value <= 122) ||
+            byte_value == 45 || byte_value == 95 || byte_value == 58 ||
+            byte_value == 32 || byte_value == 9 || byte_value == 10 || byte_value == 13 )); then
+      return 1
+    fi
+    printf -v character '%b' "\\x${data_hex:byte_offset:2}"
+    candidate+="$character"
+  done
+  ton_address_to_hex "$(trim_whitespace "$candidate")"
 }
 
 extract_image_tag() {
@@ -5217,11 +5266,6 @@ victoria_metrics_port_forward_address() {
     return 0
   fi
 
-  if cluster_is_baremetal && ! cluster_is_k3d; then
-    printf '%s' "0.0.0.0"
-    return 0
-  fi
-
   printf '%s' "127.0.0.1"
 }
 
@@ -5466,6 +5510,14 @@ ensure_victoria_metrics_api_proxy() {
   done
 }
 
+ensure_victoria_metrics_nodeport_access_if_enabled() {
+  if is_true "$VICTORIA_METRICS_NODEPORT_ENABLED"; then
+    ensure_victoria_metrics_nodeport_access "$@"
+  else
+    echo "[victoria-metrics] Public NodePort access is disabled; use the local proxy or an SSH tunnel."
+  fi
+}
+
 ensure_victoria_metrics_nodeport_access() {
   local ns="$1"
   local stack_name="$2"
@@ -5649,6 +5701,24 @@ victoria_logs_collector_buffer_path() {
   printf '/var/lib/kubeton-vlogs-buffer-%s-%s' "$safe_ns" "$safe_release"
 }
 
+victoria_logs_collector_exclude_filter() {
+  local pod_name='"kubernetes.pod_name"'
+  local app='"kubernetes.pod_labels.app.kubernetes.io/name"'
+  local managed_by='"kubernetes.pod_labels.app.kubernetes.io/managed-by"'
+  local namespace='"kubernetes.pod_namespace"' container='"kubernetes.container_name"'
+  local control_plane='"kubernetes.pod_labels.control-plane"' storage_app='"kubernetes.pod_labels.app"'
+  local ton_containers storage_apps
+
+  # Exclude before reading container files. Helpers can print private keys,
+  # and arbitrary workloads/metadata have not been reviewed for collection.
+  ton_containers='^(ton-node|prepare-persistent-layout|stage-ton-exporter|export-ton-binaries)$'
+  storage_apps='^(longhorn-manager|longhorn-driver-deployer|longhorn-csi-plugin|csi-attacher|csi-provisioner|csi-resizer|csi-snapshotter|instance-manager|engine-image)$'
+  printf '%s:=%%{HOSTNAME} or not ((%s:="ton-node" and %s:="ton-k8s-operator" and %s:~"%s") or (%s:=%s and %s:="controller-manager" and %s:="manager") or (%s:=%s and %s:~"%s"))' \
+    "$pod_name" "$app" "$managed_by" "$container" "$ton_containers" \
+    "$namespace" "$(json_quote "$OP_NAMESPACE")" "$control_plane" "$container" \
+    "$namespace" "$(json_quote "$LONGHORN_NAMESPACE")" "$storage_app" "$storage_apps"
+}
+
 install_victoria_logs_collector_release() {
   local ns="$1"
   local collector_release_name="$2"
@@ -5689,7 +5759,11 @@ install_victoria_logs_collector_release() {
   vlc_cmd=(helm upgrade --install "$collector_release_name" "$collector_chart" -n "$ns" --create-namespace --timeout "${helm_timeout_seconds}s" \
     --set-string "remoteWrite[0].url=${remote_write_url}" \
     --set-string "remoteWrite[0].maxDiskUsagePerURL=${VICTORIA_LOGS_COLLECTOR_BUFFER_SIZE}" \
-    --set-string "collector.excludeFilter=kubernetes.pod_name:=%{HOSTNAME}" \
+    --set-string "collector.excludeFilter=$(victoria_logs_collector_exclude_filter)" \
+    --set "collector.includePodLabels=false" \
+    --set "collector.includePodAnnotations=false" \
+    --set "collector.includeNodeLabels=false" \
+    --set "collector.includeNodeAnnotations=false" \
     --set-string "extraArgs.tmpDataPath=${collector_buffer_path}" \
     --set-string "persistence.volume.hostPath.path=${collector_buffer_path}" \
     --set-string "persistence.volume.hostPath.type=DirectoryOrCreate" \
@@ -6489,11 +6563,6 @@ victoria_logs_port_forward_address() {
   configured="$(trim_whitespace "${VICTORIA_LOGS_PORT_FORWARD_ADDRESS:-}")"
   if [[ -n "$configured" ]]; then
     printf '%s' "$configured"
-    return 0
-  fi
-
-  if cluster_is_baremetal && ! cluster_is_k3d; then
-    printf '%s' "0.0.0.0"
     return 0
   fi
 
@@ -10916,12 +10985,9 @@ read_tonnode_wallet_address_file_from_pod() {
     fi
     addr_file="${wallet_dir}/${wallet_name}.addr"
     [[ -r "$addr_file" ]] || exit 1
-    LC_ALL=C tr -cd "[:print:]\n" < "$addr_file" | head -n1 | tr -d "\r\n"
+    LC_ALL=C od -An -tx1 -v "$addr_file" | tr -d " \n"
   ' _ "$wallet_name" 2>/dev/null || true)"
-  output="$(strip_ansi_sequences "$output")"
-  output="$(trim_whitespace "$output")"
-  [[ -n "$output" ]] || return 1
-  printf '%s' "$output"
+  ton_wallet_address_file_hex_to_hex "$output"
 }
 
 read_tonnode_wallet_private_key_hex_from_pod() {
@@ -10970,7 +11036,7 @@ run_wallet_export_tonnode() {
   local target_pod_name="${1:-}"
   local target_wallet_name="${2:-}"
   local row target_ns target_pod target_node_name wallet_name wallet_row
-  local status balance version workchain address address_hex private_key_hex
+  local status balance version workchain address address_hex listed_address_hex file_address private_key_hex
   local rc=0
   local -a pod_rows=()
   local -a wallet_names=()
@@ -11035,18 +11101,19 @@ run_wallet_export_tonnode() {
         IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
       fi
       address="$(trim_whitespace "$address")"
-      if [[ -z "$address" ]]; then
-        address="$(read_tonnode_wallet_address_file_from_pod "$target_ns" "$target_pod" "$wallet_name" || true)"
-        address="$(trim_whitespace "$address")"
-      fi
-      if [[ -z "$address" ]]; then
+      listed_address_hex="$(ton_address_to_hex "$address" || true)"
+      file_address="$(read_tonnode_wallet_address_file_from_pod "$target_ns" "$target_pod" "$wallet_name" || true)"
+      if [[ -n "$file_address" ]]; then
+        address_hex="$file_address"
+        # Retain a friendly representation only when it names the account
+        # actually recorded in the wallet file.
+        [[ "$listed_address_hex" == "$file_address" ]] || address="$file_address"
+      elif [[ -n "$listed_address_hex" ]]; then
+        address_hex="$listed_address_hex"
+      else
         address="unknown"
         address_hex="unknown"
         echo "Warning: cannot resolve wallet address for '${wallet_name}' in ${target_ns}/${target_pod}; exporting private key with unknown address." >&2
-      else
-        address_hex="$(ton_address_to_hex "$address" || true)"
-        address_hex="$(trim_whitespace "$address_hex")"
-        [[ -z "$address_hex" ]] && address_hex="unknown"
       fi
       candidate_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${address}"$'\t'"${address_hex}")
     done
@@ -17481,6 +17548,27 @@ run_verify() {
   kubectl -n "$TON_NAMESPACE" get pvc
 }
 
+print_logs_ssh_access() {
+  local port="$1" ssh_target='ssh-user@public-host-running-kubeton'
+  local client_address client_port server_address server_port extra
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    read -r client_address client_port server_address server_port extra <<<"$SSH_CONNECTION"
+    if [[ -z "$extra" && "$server_address" =~ ^[A-Za-z0-9:.%-]+$ \
+      && "${USER:-}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      ssh_target="${USER}@${server_address}"
+    fi
+  fi
+  echo "[logs] Remote browser: keep that port-forward running here, then run this on your computer:"
+  printf '[logs] ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:%s:127.0.0.1:%s %s\n' \
+    "$port" "$port" "$(shell_quote "$ssh_target")"
+  if [[ "$ssh_target" == ssh-user@public-host-running-kubeton ]]; then
+    echo "[logs] Replace ssh-user@public-host-running-kubeton with this server's public SSH destination."
+  else
+    echo "[logs] The SSH destination comes from this session; use its public SSH hostname instead if it is behind NAT."
+  fi
+  printf '[logs] VictoriaLogs UI after SSH tunnel: http://127.0.0.1:%s/select/vmui/\n' "$port"
+}
+
 print_logs_victoria_logs_info() {
   local backend_rows metrics_rows
   local logs_ns logs_service logs_port auth_ns stack_name target_urls target_url target_paths auth_port
@@ -17544,6 +17632,7 @@ print_logs_victoria_logs_info() {
     printf '[logs] Access from this machine: kubectl -n %s port-forward --address 127.0.0.1 service/%s %s:%s\n' \
       "$access_ns" "$access_service" "$access_port" "$access_port"
     printf '[logs] VictoriaLogs UI after port-forward: http://127.0.0.1:%s/select/vmui/\n' "$access_port"
+    print_logs_ssh_access "$access_port"
   done <<<"$backend_rows"
 }
 
@@ -18066,7 +18155,7 @@ run_victoria_metrics_install() {
         fi
       fi
     fi
-    ensure_victoria_metrics_nodeport_access "$ns" "$stack_name" "$remote_port" || true
+    ensure_victoria_metrics_nodeport_access_if_enabled "$ns" "$stack_name" "$remote_port" || true
   else
     metrics_port_forward_ok=1
     IFS=$'\t' read -r pf_ns pf_service local_port _pid log_file <<<"${forwarded_rows[0]}"
