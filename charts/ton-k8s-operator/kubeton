@@ -5707,16 +5707,17 @@ victoria_logs_collector_exclude_filter() {
   local managed_by='"kubernetes.pod_labels.app.kubernetes.io/managed-by"'
   local namespace='"kubernetes.pod_namespace"' container='"kubernetes.container_name"'
   local control_plane='"kubernetes.pod_labels.control-plane"' storage_app='"kubernetes.pod_labels.app"'
-  local ton_containers storage_apps
+  local ton_containers storage_apps storage_containers
 
   # Exclude before reading container files. Helpers can print private keys,
   # and arbitrary workloads/metadata have not been reviewed for collection.
   ton_containers='^(ton-node|prepare-persistent-layout|stage-ton-exporter|export-ton-binaries)$'
   storage_apps='^(longhorn-manager|longhorn-driver-deployer|longhorn-csi-plugin|csi-attacher|csi-provisioner|csi-resizer|csi-snapshotter|instance-manager|engine-image)$'
-  printf '%s:=%%{HOSTNAME} or not ((%s:="ton-node" and %s:="ton-k8s-operator" and %s:~"%s") or (%s:=%s and %s:="controller-manager" and %s:="manager") or (%s:=%s and %s:~"%s"))' \
+  storage_containers='^(longhorn-manager|longhorn-driver-deployer|longhorn-csi-plugin|node-driver-registrar|longhorn-liveness-probe|csi-attacher|csi-provisioner|csi-resizer|csi-snapshotter|instance-manager|engine-image(-[a-z0-9-]+)?)$'
+  printf '%s:=%%{HOSTNAME} or not ((%s:="ton-node" and %s:="ton-k8s-operator" and %s:~"%s") or (%s:=%s and %s:="controller-manager" and %s:="manager") or (%s:=%s and %s:~"%s" and %s:~"%s"))' \
     "$pod_name" "$app" "$managed_by" "$container" "$ton_containers" \
     "$namespace" "$(json_quote "$OP_NAMESPACE")" "$control_plane" "$container" \
-    "$namespace" "$(json_quote "$LONGHORN_NAMESPACE")" "$storage_app" "$storage_apps"
+    "$namespace" "$(json_quote "$LONGHORN_NAMESPACE")" "$storage_app" "$storage_apps" "$container" "$storage_containers"
 }
 
 install_victoria_logs_collector_release() {
@@ -17550,16 +17551,22 @@ run_verify() {
 
 print_logs_ssh_access() {
   local port="$1" ssh_target='ssh-user@public-host-running-kubeton'
-  local client_address client_port server_address server_port extra
+  local client_address client_port server_address server_port extra ssh_port=''
   if [[ -n "${SSH_CONNECTION:-}" ]]; then
     read -r client_address client_port server_address server_port extra <<<"$SSH_CONNECTION"
     if [[ -z "$extra" && "$server_address" =~ ^[A-Za-z0-9:.%-]+$ \
-      && "${USER:-}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      && "${USER:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
       ssh_target="${USER}@${server_address}"
+      if [[ "$server_port" =~ ^[0-9]{1,5}$ ]] \
+        && (( 10#$server_port > 0 && 10#$server_port <= 65535 && 10#$server_port != 22 )); then
+        ssh_port="$((10#$server_port))"
+      fi
     fi
   fi
   echo "[logs] Remote browser: keep that port-forward running here, then run this on your computer:"
-  printf '[logs] ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:%s:127.0.0.1:%s %s\n' \
+  printf '[logs] ssh -N -o ExitOnForwardFailure=yes'
+  [[ -z "$ssh_port" ]] || printf ' -p %s' "$ssh_port"
+  printf ' -L 127.0.0.1:%s:127.0.0.1:%s %s\n' \
     "$port" "$port" "$(shell_quote "$ssh_target")"
   if [[ "$ssh_target" == ssh-user@public-host-running-kubeton ]]; then
     echo "[logs] Replace ssh-user@public-host-running-kubeton with this server's public SSH destination."

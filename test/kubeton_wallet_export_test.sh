@@ -308,6 +308,57 @@ test_main_wallet_export_files() (
   assert_not_contains 'invalid|' "$test_dir/helper-metadata.out"
 )
 
+test_show_and_collect_ignore_stale_metadata() (
+  source "$repo_root/charts/ton-k8s-operator/main-wallet.sh"
+  MAIN_WALLET_DIR="$test_dir/pods/tonnode-0"
+  WALLET_NETWORK=""
+  cp "$MAIN_WALLET_DIR/binary_zero.addr" "$MAIN_WALLET_DIR/stale_show.addr"
+  cp "$MAIN_WALLET_DIR/binary_zero.pk" "$MAIN_WALLET_DIR/stale_show.pk"
+  fixture_file_address="$(wallet_address_file_to_hex "$MAIN_WALLET_DIR/stale_show.addr")"
+  python3 - "$MAIN_WALLET_DIR/stale_show.wallet.meta" <<'PY'
+import base64
+import binascii
+import pathlib
+import sys
+
+account = bytes([153] * 32)
+friendly = []
+for tag in (0x51, 0x11):
+    body = bytes([tag, 0]) + account
+    friendly.append(base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode())
+pathlib.Path(sys.argv[1]).write_text(
+    "wallet_name=stale_show\nworkchain=0\nwallet_id=42\nnetwork=testnet\n"
+    f"wallet_address=0:{account.hex()}\nnon_bounceable={friendly[0]}\nbounceable={friendly[1]}\n"
+)
+PY
+  main_wallet_show stale_show >"$test_dir/stale-show.out"
+  main_wallet_export stale_show >"$test_dir/stale-helper-export.out"
+  python3 - "$test_dir/stale-show.out" "$test_dir/stale-helper-export.out" "$fixture_file_address" <<'PY'
+import pathlib
+import sys
+
+show_rows = [line.split() for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+row = next(row for row in show_rows if len(row) == 9 and row[2] == "stale_show")
+assert row[6] == sys.argv[3], "show ignored the authoritative .addr account"
+assert row[7:] == ["unknown", "unknown"], "show retained another account's friendly metadata"
+export_rows = [line.split() for line in pathlib.Path(sys.argv[2]).read_text().splitlines()]
+row = next(row for row in export_rows if row and row[0] == "stale_show")
+assert row[2:4] == [sys.argv[3], sys.argv[3]], "helper export retained stale address metadata"
+PY
+
+  # Collect consumes this exact nine-column show table, preferring the
+  # non-bounceable column when present. It must fall back to the file account.
+  fixture_show_table="$(cat "$test_dir/stale-show.out")"
+  source "$kubeton"
+  run_wallet() {
+    [[ "$*" == 'show stale_show' ]] || fail "unexpected nested wallet command"
+    printf '%s\n' "$fixture_show_table"
+  }
+  fixture_collect_address="$(resolve_main_wallet_receive_address testnet stale_show)"
+  [[ "$fixture_collect_address" == "$fixture_file_address" ]] \
+    || fail "collect resolved stale friendly metadata instead of the .addr account"
+)
+
 test_invalid_file_export_stays_structured() (
   setup_pod_mock invalid-file
   cp "$test_dir/invalid-short.addr" "$test_dir/pods/tonnode-0/invalid.addr"
@@ -340,6 +391,7 @@ test_export_selected_wallets
 test_main_wallet_file_decoder
 test_friendly_address_validation
 test_main_wallet_export_files
+test_show_and_collect_ignore_stale_metadata
 test_invalid_file_export_stays_structured
 
 echo "kubeton wallet export tests passed"

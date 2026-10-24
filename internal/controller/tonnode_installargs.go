@@ -133,6 +133,8 @@ func validateInstallationArgs(node *tonv1alpha1.TonNode) string {
 		return "spec.env ARCHIVE_BLOCKS is unsupported; it requires an extra tonutils-storage executable that the standard official TON image does not provide"
 	}
 
+	// These diagnostics reach status and operator logs. Argument values may
+	// contain credentials, so report positions and known option names only.
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		if arg == "--" && index == len(args)-1 {

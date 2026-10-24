@@ -989,8 +989,14 @@ main_wallet_show() {
     wallet_address="$(resolve_wallet_address_by_name "$wallet_name" || true)"
     non_bounceable="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
     bounceable="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
-    ton_address_to_hex "$non_bounceable" >/dev/null || non_bounceable=""
-    ton_address_to_hex "$bounceable" >/dev/null || bounceable=""
+    # The .addr account is authoritative. A valid but stale friendly address
+    # must not become a transfer destination when collect reads this table.
+    if [[ -z "$wallet_address" || "$(ton_address_to_hex "$non_bounceable" || true)" != "$wallet_address" ]]; then
+      non_bounceable=""
+    fi
+    if [[ -z "$wallet_address" || "$(ton_address_to_hex "$bounceable" || true)" != "$wallet_address" ]]; then
+      bounceable=""
+    fi
     network="$(normalize_wallet_network_name "$(read_meta_value network "$meta_file")" 2>/dev/null || true)"
     network="$(trim_whitespace "$network")"
 

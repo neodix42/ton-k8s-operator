@@ -72,6 +72,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	python3 test/kubeton_fleet_tools_test.py
 	bash test/kubeton_status_test.sh
 	bash test/kubeton_logs_test.sh
+	bash test/kubeton_logs_access_test.sh
 	bash test/kubeton_wallet_network_test.sh
 	bash test/kubeton_wallet_export_test.sh
 
