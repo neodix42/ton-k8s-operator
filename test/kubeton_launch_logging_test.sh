@@ -1240,6 +1240,8 @@ test_tonnode_crd_schema_is_established_before_install_and_start_helm() (
   append_ton_storage_overrides() { :; }
   should_use_sequential_ton_start() { return 1; }
   validate_external_key_prereqs() { :; }
+  ensure_start_victoria_metrics() { :; }
+  ensure_victoria_metrics_scrape_resources() { :; }
   ensure_start_victoria_logs() { :; }
   delete_stale_ton_pvcs_before_fresh_start() { :; }
   verify_start_victoria_logs_collection_ready() { :; }
@@ -2313,6 +2315,8 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
   should_use_sequential_ton_start() { return 1; }
   append_baremetal_key_overrides() { :; }
   ensure_auto_bootstrap_stack() { record_prebootstrap_event storage-bootstrap; }
+  ensure_start_victoria_metrics() { :; }
+  ensure_victoria_metrics_scrape_resources() { :; }
   ensure_start_victoria_logs() {
     record_prebootstrap_event full-logging-stack
     KUBETON_VICTORIA_LOGS_APPLIED_NODES="$(victoria_logs_eligible_nodes_csv)"
@@ -3328,6 +3332,8 @@ test_sequential_run_start_waits_for_final_controller_convergence() (
   append_ton_storage_overrides() { :; }
   should_use_sequential_ton_start() { return 0; }
   validate_external_key_prereqs() { :; }
+  ensure_start_victoria_metrics() { :; }
+  ensure_victoria_metrics_scrape_resources() { :; }
   ensure_start_victoria_logs() { :; }
   delete_stale_ton_pvcs_before_fresh_start() { :; }
   verify_start_victoria_logs_collection_ready() { :; }
@@ -3403,6 +3409,8 @@ test_run_start_rechecks_log_coverage_immediately_before_helm() (
     csi_wait_count=$((csi_wait_count + 1))
     printf 'csi-wait-%s\n' "$csi_wait_count" >>"$event_log"
   }
+  ensure_start_victoria_metrics() { :; }
+  ensure_victoria_metrics_scrape_resources() { :; }
   ensure_start_victoria_logs() {
     logging_reconcile_count=$((logging_reconcile_count + 1))
     printf 'logging-reconcile-%s eligible=%s\n' \
@@ -3522,7 +3530,7 @@ test_standalone_victoria_metrics_install_refreshes_checked_hostnames() (
     return 1
   }
 
-  if run_victoria_metrics_install \
+  if ensure_start_victoria_metrics \
       >"$test_dir/victoria-standalone-preflight.out" \
       2>"$test_dir/victoria-standalone-preflight.stderr"; then
     fail "standalone VictoriaMetrics fixture unexpectedly completed"
@@ -3614,7 +3622,7 @@ test_failed_preflight_still_restricts_existing_collector() (
   assert_not_contains 'devnet-01' "$start_overlay"
 
   invocation=standalone
-  if run_victoria_metrics_install \
+  if ensure_start_victoria_metrics \
       >"$test_dir/victoria-partial-pass-standalone.out" 2>&1; then
     fail "standalone VictoriaMetrics install accepted an insufficient partial PASS set"
   fi

@@ -537,10 +537,10 @@ does not perform this emergency mutation. The next successful reconcile restores
 the backend. Sequential local-volume staging rechecks coverage before each
 additional ordinal is created.
 
-`./kubeton victoria-metrics install` runs a fresh node prerequisite preflight
-before installing or reconciling VictoriaLogs, so running it separately cannot
-widen placement back to all cluster nodes. The base approved hostnames and
-configured selector overrides are retained with the VictoriaLogs state for
+`./kubeton start` runs a fresh node prerequisite preflight before installing
+or reconciling VictoriaLogs and the VictoriaMetrics access stack. Logging
+placement cannot widen beyond the nodes approved by that check. The approved
+hostnames and configured selector overrides are retained with the VictoriaLogs state for
 audit and cleanup, but the effective intersections are recomputed—not trusted
 as current authority—on every reconcile.
 `VICTORIA_LOGS_NODE_SELECTOR` and
@@ -624,9 +624,9 @@ grep -R -E 'Download complete|Starting extraction|MyTonCtrl ready|initialized.js
   kubeton-launch-logs/<run>/pods/
 ```
 
-For durable history after the launching shell exits, install the authenticated
-VictoriaMetrics access layer with `./kubeton victoria-metrics install`, or use
-a temporary direct port-forward and open
+The authenticated VictoriaMetrics access layer is installed automatically by
+`./kubeton start`. Run `./kubeton logs` for its access instructions. You can
+also use a temporary direct port-forward and open
 `http://127.0.0.1:9428/select/vmui/` on the machine running kubectl:
 
 ```bash
@@ -636,18 +636,26 @@ LOG_SERVICE=$(kubectl -n vm get service \
 kubectl -n vm port-forward --address 127.0.0.1 "service/${LOG_SERVICE}" 9428:9428
 ```
 
-For a browser on another computer, keep that command running on the cluster
-administration server and create an SSH tunnel from your computer:
+For external browser access, run this on the server with cluster access:
 
 ```bash
-ssh -N -o ExitOnForwardFailure=yes \
-  -L 127.0.0.1:9428:127.0.0.1:9428 ssh-user@public-ssh-host
+./kubeton logs expose
+# Explicit hostname/NAT address or a different listening port:
+./kubeton logs expose --public-host logs.example.com --port 18427
 ```
 
-Then open `http://127.0.0.1:9428/select/vmui/` on your computer. The public
-address is the server's SSH destination; the unauthenticated VictoriaLogs
-port stays bound to loopback. Use the actual service port printed by
-`./kubeton logs` if it differs from this example.
+The command starts a background `kubectl port-forward --address 0.0.0.0`
+to VMAuth and prints the external dashboard URL, for example
+`http://203.0.113.10:8427/select/vmui/`. It discovers this server's public IPv4
+address using [ipify](https://www.ipify.org/); use `--public-host` when NAT, proxies, or DNS require a
+different advertised address. Permit inbound TCP to the printed port in the
+server firewall and any upstream NAT. It requires the authenticated access
+stack installed by `kubeton start` and never publishes the bare VictoriaLogs
+backend. Use the VMAuth credentials in the printed Kubernetes Secret.
+
+VMAuth's port-forward serves HTTP Basic Auth. Public HTTP does not encrypt
+credentials or responses; use an HTTPS reverse proxy when encrypted public
+access is required. `kubeton uninstall`/`purge` stop the managed forward.
 
 A host filesystem is relevant only after the replica's local-path PV
 `nodeAffinity` or `local.path.provisioner/selected-node` points to that host.
@@ -660,7 +668,8 @@ Useful overrides are `KUBETON_CHECK_MIN_CPU`,
 `KUBETON_SKIP_NODE_PREREQ_CHECK=true` only when intentionally bypassing the
 gate. Skipping the TON preflight does not authorize a cluster-wide
 VictoriaLogs deployment: `start` refuses automatic logging without a fresh
-safe set, while standalone `victoria-metrics install` runs its own fresh check.
+safe set. Metrics and authenticated access are reconciled within the same
+`start` lifecycle.
 
 Security note:
 - bootstrap stores Vault init material in `vault/ton-vault-bootstrap`; rotate/restrict access after bootstrap.
@@ -713,7 +722,6 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton upgrade
 ./kubeton prometheus start
 ./kubeton grafana start
-./kubeton victoria-metrics install
 ./kubeton backup-keys
 ./kubeton restore-keys ./key-backups/<timestamp>
 ./kubeton wallet create main-wallet
@@ -741,6 +749,7 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton verify
 ./kubeton status
 ./kubeton logs
+./kubeton logs expose
 ./kubeton exec "sync"
 ./kubeton exec-mtc "set stake 1000000"
 ```
@@ -759,10 +768,8 @@ It discovers installed Services, including custom names and ports, and prefers
 VMAuth when its VictoriaLogs routes exist; otherwise it shows the internal
 backend. In-cluster URLs are labeled accordingly, with a manual port-forward
 command and the localhost UI URL to open after forwarding. The command does
-not start the port-forward. For a remote browser, it also prints an SSH tunnel
-command and the localhost URL to open on your computer. The SSH destination is
-taken from the current SSH session when available; replace it with the public
-SSH hostname when needed, or fill in the printed placeholder. Missing
+not start a forward. Run `kubeton logs expose` to start a public background
+port-forward through VMAuth and print its external dashboard URL. Missing
 VictoriaLogs does not block pod log output.
 
 `kubeton wallet create` only generates main-wallet files and the init BOC.
@@ -845,14 +852,10 @@ The ephemeral main-wallet helper uses the deployed official TON artifact image f
 # remove kubeton-managed Grafana resources and background port-forward(s)
 ./kubeton grafana stop
 
-# install VictoriaMetrics operator stack, auto-create TonNode scrape resources,
-# install VictoriaLogs single + collector (enabled by default),
-# start background VMAuth port-forward, expose VictoriaLogs via VMAuth auth routes,
-# and print endpoints/credentials
-./kubeton victoria-metrics install
-
-# remove kubeton-managed VictoriaMetrics/VictoriaLogs resources and background port-forward(s)
-./kubeton victoria-metrics uninstall
+# kubeton start also manages VictoriaLogs, the VictoriaMetrics operator,
+# metrics scraping, and authenticated access with a local VMAuth port-forward.
+# kubeton logs prints browser access instructions.
+./kubeton logs
 
 # scale by one replica
 ./kubeton add
@@ -1130,9 +1133,18 @@ Main environment overrides:
 - `GRAFANA_DASHBOARD_UID`
 - `GRAFANA_DASHBOARD_TITLE`
 
-### kubeton victoria-metrics
+### Automatic VictoriaLogs and VictoriaMetrics
 
-`kubeton victoria-metrics install` installs VictoriaMetrics operator (QuickStart-style `install-no-webhook` manifest), deploys `VMSingle` + `VMAgent` + `VMAuth` + `VMUser`, auto-generates TonNode scrape resources (`Service` + `VMServiceScrape`) from TonNode `CUSTOM_PARAMETERS --exporter-address`, and installs/updates the same VictoriaLogs stack that `kubeton start` ensures before TON bootstrap.
+`kubeton install` installs the TON operator. `kubeton start` automatically
+installs or updates VictoriaLogs, the VictoriaMetrics operator, and
+`VMSingle` + `VMAgent` + `VMAuth` + `VMUser` before deploying TON pods. It
+refreshes TonNode scrape resources (`Service` + `VMServiceScrape`) from
+`CUSTOM_PARAMETERS --exporter-address` after applying the fleet, including the
+first start when no TonNode existed during metrics setup.
+
+Use `kubeton logs` for access instructions. `kubeton uninstall` and
+`kubeton purge` remove the managed logging/metrics resources and local
+port-forwards.
 
 Behavior:
 - applies/updates VictoriaMetrics operator in namespace `vm` (configurable)
@@ -1143,7 +1155,7 @@ Behavior:
 - waits for collectors on nodes removed from the approved set to disappear and strictly requires a Ready current-revision collector on every selected TON node
 - constrains VictoriaLogs single to the preflight-approved set and, on bare-metal, also to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
 - when using `longhorn` storageClass, also adds Longhorn CSI-based nodeAffinity fallback (from `CSINode`) so VictoriaLogs single cannot schedule to nodes without `driver.longhorn.io`
-- starts background `kubectl port-forward` to `VMAuth` on `127.0.0.1` and prints VMUI/targets URLs + credentials
+- starts background `kubectl port-forward` to `VMAuth` on `127.0.0.1` and prints VMUI/targets URLs and the credentials Secret reference
 - exposes VictoriaLogs UI/query through VMAuth (`/select/vmui/`, `/select/logsql/query`) so the same VMAuth username/password is required
 - does not expose unauthenticated external `:9428` by default; remote logs access uses the VMAuth endpoint/port
 - if `port-forward` is unavailable, starts a local `kubectl proxy` fallback and prints localhost VMUI/targets/query URLs via API proxy
@@ -1160,7 +1172,7 @@ Main environment overrides:
 - `VICTORIA_METRICS_OPERATOR_NAMESPACE`
 - `VICTORIA_METRICS_OPERATOR_DEPLOYMENT`
 - `VICTORIA_METRICS_AUTH_PORT`
-- `VICTORIA_METRICS_NODEPORT_ENABLED` (default `false`; opting in publishes VMAuth over HTTP on node ports, including Basic Auth credentials and log responses; use an SSH tunnel for remote access)
+- `VICTORIA_METRICS_NODEPORT_ENABLED` (default `false`; opting in publishes VMAuth over HTTP on node ports, including Basic Auth credentials and log responses; use `kubeton logs expose` for an explicit dashboard port-forward)
 - `VICTORIA_METRICS_AUTH_LOCAL_PORT_BASE`
 - `VICTORIA_METRICS_PORT_FORWARD_ADDRESS`
 - `VICTORIA_LOGS_ENABLED` (default `true`)

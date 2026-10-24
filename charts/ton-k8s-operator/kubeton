@@ -222,14 +222,12 @@ Commands:
   check                Check schedulable nodes against TON CPU, memory, disk, and pressure prerequisites.
   install              Install or upgrade operator and retain a local launch evidence bundle.
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
-  start                Start TON fleet, archive launch evidence, and wait for completed MyTonCtrl bootstrap.
+  start                Ensure VictoriaLogs/metrics, start TON fleet, archive launch evidence, and wait for completed MyTonCtrl bootstrap.
   upgrade              Upgrade changed MyTonCtrl/TON images from tonnode-values.yaml and wait for rollout.
   prometheus start     Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
   prometheus stop      Stop/drop kubeton-managed Prometheus resources and local background port-forward(s).
   grafana start        Create/update Grafana, provision kubeton Prometheus datasource(s) and starter dashboard(s), and start local background port-forward.
   grafana stop         Stop/drop kubeton-managed Grafana resources and local background port-forward(s).
-  victoria-metrics install    Install VictoriaMetrics operator + VMSingle/VMAgent/VMAuth stack, configure TonNode scraping, enable VictoriaLogs collector, and start local background port-forward(s).
-  victoria-metrics uninstall  Remove kubeton-managed VictoriaMetrics/VictoriaLogs resources and local background port-forward(s).
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
@@ -245,6 +243,7 @@ Commands:
   verify               Verify operator and TON resources (deploy, pods with node/server, tonnodes, sts, pvc).
   status               Show each TON pod's image tags, build date, wallet, ADNL, sync, and database sizes.
   logs                 Show the last 20 log lines from each TON pod and the VictoriaLogs server address.
+  logs expose          Expose the authenticated VictoriaLogs dashboard with a background public port-forward.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
   exec-mtc <cmd>       Run a command in each TON pod inside mytonctrl and print table with node/pod/exit code.
 
@@ -5514,7 +5513,7 @@ ensure_victoria_metrics_nodeport_access_if_enabled() {
   if is_true "$VICTORIA_METRICS_NODEPORT_ENABLED"; then
     ensure_victoria_metrics_nodeport_access "$@"
   else
-    echo "[victoria-metrics] Public NodePort access is disabled; use the local proxy or an SSH tunnel."
+    echo "[victoria-metrics] Public NodePort access is disabled; use the local proxy or kubeton logs expose for the dashboard."
   fi
 }
 
@@ -15496,6 +15495,13 @@ run_start() {
     return 1
   fi
 
+  if ! ensure_start_victoria_metrics true; then
+    if [[ -n "$ton_selector_values_file" ]]; then
+      rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+
   if (( restore_from_stop_metadata == 0 )); then
     delete_stale_ton_pvcs_before_fresh_start
   fi
@@ -15689,6 +15695,11 @@ run_start() {
   fi
 
   repair_pending_ton_placement_after_start || return 1
+
+  # The initial metrics setup can precede the first TonNode CR. Refresh
+  # discovery now so new fleets and changed exporter ports are scraped.
+  local -a start_scrape_rows=()
+  ensure_victoria_metrics_scrape_resources start_scrape_rows || return 1
 
   if is_true "$KUBETON_START_WAIT_FOR_BOOTSTRAP"; then
     local target_ns target_name
@@ -17549,49 +17560,19 @@ run_verify() {
   kubectl -n "$TON_NAMESPACE" get pvc
 }
 
-print_logs_ssh_access() {
-  local port="$1" ssh_target='ssh-user@public-host-running-kubeton'
-  local client_address client_port server_address server_port extra ssh_port=''
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    read -r client_address client_port server_address server_port extra <<<"$SSH_CONNECTION"
-    if [[ -z "$extra" && "$server_address" =~ ^[A-Za-z0-9:.%-]+$ \
-      && "${USER:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
-      ssh_target="${USER}@${server_address}"
-      if [[ "$server_port" =~ ^[0-9]{1,5}$ ]] \
-        && (( 10#$server_port > 0 && 10#$server_port <= 65535 && 10#$server_port != 22 )); then
-        ssh_port="$((10#$server_port))"
-      fi
-    fi
-  fi
-  echo "[logs] Remote browser: keep that port-forward running here, then run this on your computer:"
-  printf '[logs] ssh -N -o ExitOnForwardFailure=yes'
-  [[ -z "$ssh_port" ]] || printf ' -p %s' "$ssh_port"
-  printf ' -L 127.0.0.1:%s:127.0.0.1:%s %s\n' \
-    "$port" "$port" "$(shell_quote "$ssh_target")"
-  if [[ "$ssh_target" == ssh-user@public-host-running-kubeton ]]; then
-    echo "[logs] Replace ssh-user@public-host-running-kubeton with this server's public SSH destination."
-  else
-    echo "[logs] The SSH destination comes from this session; use its public SSH hostname instead if it is behind NAT."
-  fi
-  printf '[logs] VictoriaLogs UI after SSH tunnel: http://127.0.0.1:%s/select/vmui/\n' "$port"
-}
-
-print_logs_victoria_logs_info() {
+list_logs_dashboard_access() {
   local backend_rows metrics_rows
   local logs_ns logs_service logs_port auth_ns stack_name target_urls target_url target_paths auth_port
   local path_pattern path_regex route_matches
   local -a route_patterns=()
   local access_ns access_service access_port access_note
 
-  echo "[logs] Full logs can be found on the VictoriaLogs server (within its configured retention)."
   if ! backend_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get services -A \
     -l 'app.kubernetes.io/name=kubeton-victoria-logs-access,app.kubernetes.io/managed-by=kubeton' \
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.ports[0].port}{"\n"}{end}' 2>/dev/null)"; then
-    echo "[logs] VictoriaLogs address unavailable: could not read logging Services."
-    return 0
+    return 1
   fi
   if [[ -z "$backend_rows" ]]; then
-    echo "[logs] VictoriaLogs server was not found in this cluster."
     return 0
   fi
 
@@ -17634,16 +17615,122 @@ print_logs_victoria_logs_info() {
       [[ -z "$access_note" ]] || break
     done <<<"$metrics_rows"
 
+    if [[ -n "$access_note" ]]; then
+      printf '%s\t%s\t%s\tauth\t%s\n' "$access_ns" "$access_service" "$access_port" "$stack_name"
+    else
+      printf '%s\t%s\t%s\tbackend\t-\n' "$access_ns" "$access_service" "$access_port"
+    fi
+  done <<<"$backend_rows"
+}
+
+print_logs_victoria_logs_info() {
+  local access_rows access_ns access_service access_port access_mode stack_name access_note
+  echo "[logs] Full logs can be found on the VictoriaLogs server (within its configured retention)."
+  if ! access_rows="$(list_logs_dashboard_access)"; then
+    echo "[logs] VictoriaLogs address unavailable: could not read logging Services."
+    return 0
+  fi
+  if [[ -z "$access_rows" ]]; then
+    echo "[logs] VictoriaLogs server was not found in this cluster."
+    return 0
+  fi
+  while IFS=$'\t' read -r access_ns access_service access_port access_mode stack_name; do
+    access_note=""
+    [[ "$access_mode" != auth ]] || access_note="; use your existing VMAuth credentials"
     printf '[logs] VictoriaLogs UI (in-cluster only%s): http://%s.%s.svc:%s/select/vmui/\n' \
       "$access_note" "$access_service" "$access_ns" "$access_port"
     printf '[logs] Access from this machine: kubectl -n %s port-forward --address 127.0.0.1 service/%s %s:%s\n' \
       "$access_ns" "$access_service" "$access_port" "$access_port"
     printf '[logs] VictoriaLogs UI after port-forward: http://127.0.0.1:%s/select/vmui/\n' "$access_port"
-    print_logs_ssh_access "$access_port"
-  done <<<"$backend_rows"
+  done <<<"$access_rows"
+  echo "[logs] Expose the dashboard externally: ./kubeton logs expose"
+}
+
+resolve_logs_public_host() {
+  local host="" octet
+  local -a octets=()
+  if command -v curl >/dev/null 2>&1; then
+    host="$(curl -4 -fsS --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  [[ "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"$host"
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+  printf '%s' "$host"
+}
+
+run_logs_expose() {
+  local port="${VICTORIA_METRICS_AUTH_LOCAL_PORT_BASE:-8427}" public_host=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --port|--public-host)
+        if (( $# < 2 )); then
+          echo "Error: $1 requires a value." >&2
+          return 1
+        fi
+        if [[ "$1" == --port ]]; then port="$2"; else public_host="$2"; fi
+        shift 2
+        ;;
+      *)
+        echo "Error: usage: kubeton logs expose [--port PORT] [--public-host HOST]" >&2
+        return 1
+        ;;
+    esac
+  done
+  if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+    echo "Error: dashboard port must be between 1 and 65535." >&2
+    return 1
+  fi
+  port="$((10#$port))"
+  require_bin kubectl
+  require_bin nohup
+  if [[ -z "$public_host" ]]; then
+    if ! public_host="$(resolve_logs_public_host)"; then
+      echo "Error: cannot discover this server's public IP; use kubeton logs expose --public-host <public-IP-or-hostname>." >&2
+      return 1
+    fi
+  fi
+  if ! [[ "$public_host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    || [[ "$public_host" == 0.0.0.0 ]] \
+    || is_loopback_host "$public_host"; then
+    echo "Error: --public-host must be the external IPv4 address or hostname of the machine running kubeton." >&2
+    return 1
+  fi
+
+  local access_rows ns service remote_port mode stack_name forward_row
+  local forwarded_ns forwarded_service local_port pid log_file
+  if ! access_rows="$(list_logs_dashboard_access)"; then
+    echo "Error: cannot discover the authenticated VictoriaLogs dashboard." >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r ns service remote_port mode stack_name; do
+    [[ "$mode" == auth ]] || continue
+    if ! forward_row="$(ensure_victoria_metrics_port_forward "$ns" "$service" "$port" "$remote_port" 0.0.0.0)"; then
+      echo "Error: dashboard port-forward failed; use --port to choose another local port." >&2
+      return 1
+    fi
+    IFS=$'\t' read -r forwarded_ns forwarded_service local_port pid log_file <<<"$forward_row"
+    if [[ "$forwarded_ns" != "$ns" || "$forwarded_service" != "$service" || "$local_port" != "$port" ]]; then
+      echo "Error: dashboard port-forward did not report the requested endpoint." >&2
+      return 1
+    fi
+    echo "[logs] VictoriaLogs dashboard is now exposed externally: http://${public_host}:${local_port}/select/vmui/"
+    echo "[logs] VMAuth authentication is required. Credentials Secret: ${ns}/vmuser-${stack_name}"
+    echo "[logs] Background port-forward: PID ${pid}; log: ${log_file}"
+    echo "[logs] Allow inbound TCP ${local_port} to this server through its firewall/NAT."
+    return 0
+  done <<<"$access_rows"
+  echo "Error: authenticated VictoriaLogs access is not installed; run kubeton start first." >&2
+  return 1
 }
 
 run_logs() {
+  if [[ "${1:-}" == expose ]]; then
+    shift
+    run_logs_expose "$@"
+    return $?
+  fi
   if [[ $# -ne 0 ]]; then
     echo "Error: usage: kubeton logs" >&2
     return 1
@@ -17970,20 +18057,17 @@ run_grafana() {
   esac
 }
 
-run_victoria_metrics_install() {
+ensure_start_victoria_metrics() {
   require_bin kubectl
   require_bin nohup
-  if [[ $# -ne 0 ]]; then
-    echo "Error: usage: kubeton victoria-metrics install" >&2
-    exit 1
-  fi
+  local reuse_start_logs="${1:-false}"
 
   local ns operator_ns stack_name auth_username auth_password
   local timeout_seconds operator_row operator_version operator_manifest_url
   local -a scrape_rows=()
   local auth_service_name auth_deploy_name
   local credentials_row credentials_secret username password
-  local base_port local_port remote_port bind_address remote_access_host api_proxy_base_port
+  local base_port local_port remote_port bind_address remote_access_host="" api_proxy_base_port
   local api_proxy_row api_proxy_port api_proxy_log
   local vmsingle_service vmagent_service
   local forward_row log_file pf_ns pf_service
@@ -17993,8 +18077,8 @@ run_victoria_metrics_install() {
   local logs_ns logs_release_name logs_collector_release_name
   local logs_retention_period logs_pvc_size logs_remote_port
   local logs_stack_row logs_helm_timeout_seconds logs_auth_static_url=""
-  local logs_access_service logs_backend_service logs_collector_daemonset logs_remote_write_url
-  local logs_ds_ready logs_ds_desired
+  local logs_access_service logs_backend_service logs_collector_daemonset logs_remote_write_url=""
+  local logs_ds_ready="" logs_ds_desired=""
 
   ns="$(trim_whitespace "${VICTORIA_METRICS_NAMESPACE:-vm}")"
   if [[ -z "$ns" ]]; then
@@ -18012,7 +18096,7 @@ run_victoria_metrics_install() {
   auth_password="$(trim_whitespace "${VICTORIA_METRICS_AUTH_PASSWORD:-}")"
   timeout_seconds="$(resolve_victoria_metrics_rollout_timeout_seconds)"
   logs_enabled_raw="$(trim_whitespace "${VICTORIA_LOGS_ENABLED:-true}")"
-  if is_true "$logs_enabled_raw"; then
+  if is_true "$logs_enabled_raw" && is_true "$KUBETON_START_VICTORIA_LOGS_ENABLED"; then
     logs_enabled="true"
     require_bin helm
   fi
@@ -18039,11 +18123,17 @@ run_victoria_metrics_install() {
   fi
   logs_helm_timeout_seconds="$(resolve_victoria_logs_helm_timeout_seconds)"
 
-  if [[ "$logs_enabled" == "true" ]]; then
+  if [[ "$logs_enabled" == "true" ]] && ! is_true "$reuse_start_logs"; then
     echo "[check] Refreshing node prerequisites for VictoriaLogs placement ..."
     if ! run_node_prerequisite_check_readonly; then
       restrict_existing_victoria_logs_after_failed_preflight standalone || true
       echo "Error: VictoriaLogs was not installed because no safe fresh placement set could be proven." >&2
+      return 1
+    fi
+  elif [[ "$logs_enabled" == "true" ]]; then
+    if [[ -z "$KUBETON_VICTORIA_LOGS_APPLIED_NODES" \
+      || "$KUBETON_VICTORIA_LOGS_APPLIED_NODES" != "$(victoria_logs_eligible_nodes_csv)" ]]; then
+      echo "Error: metrics setup requires VictoriaLogs on the current preflight-approved nodes; rerun kubeton start." >&2
       return 1
     fi
   fi
@@ -18056,11 +18146,11 @@ run_victoria_metrics_install() {
   operator_manifest_url="$(trim_whitespace "$operator_manifest_url")"
 
   echo "[victoria-metrics] Applying VMSingle/VMAgent/VMAuth/VMUser stack ..."
-  ensure_victoria_metrics_stack "$ns" "$stack_name" "$auth_username" "$auth_password" "$timeout_seconds" "$logs_auth_static_url"
-  ensure_victoria_metrics_scrape_resources scrape_rows
-  write_victoria_metrics_state "$operator_ns" "$stack_name" "$ns" "$operator_ns" "$operator_version" "$operator_manifest_url"
+  ensure_victoria_metrics_stack "$ns" "$stack_name" "$auth_username" "$auth_password" "$timeout_seconds" "$logs_auth_static_url" || return 1
+  ensure_victoria_metrics_scrape_resources scrape_rows || return 1
+  write_victoria_metrics_state "$operator_ns" "$stack_name" "$ns" "$operator_ns" "$operator_version" "$operator_manifest_url" || return 1
 
-  if [[ "$logs_enabled" == "true" ]]; then
+  if [[ "$logs_enabled" == "true" ]] && ! is_true "$reuse_start_logs"; then
     logs_collector_daemonset="$(victoria_logs_collector_daemonset_name "$logs_collector_release_name")"
     if ! write_victoria_logs_state "$OP_NAMESPACE" "$logs_ns" "$logs_release_name" \
         "$logs_collector_release_name" "$logs_access_service" "$logs_collector_daemonset"; then
@@ -18139,7 +18229,7 @@ run_victoria_metrics_install() {
     metrics_port_forward_ok=0
     echo "Warning: failed to start background port-forward for VictoriaMetrics auth service ${ns}/${auth_service_name}." >&2
     echo "Warning: VictoriaMetrics stack is installed, but local VMAuth access is unavailable (kubelet proxy likely returned 502)." >&2
-    echo "Warning: check node/kubelet reachability (kubectl get nodes -o wide) and retry: ./kubeton victoria-metrics install" >&2
+    echo "Warning: check node/kubelet reachability (kubectl get nodes -o wide) and retry: ./kubeton start" >&2
     if api_proxy_row="$(ensure_victoria_metrics_api_proxy "$api_proxy_base_port" || true)"; then
       api_proxy_row="$(trim_whitespace "$api_proxy_row")"
       if [[ -n "$api_proxy_row" ]]; then
@@ -18195,7 +18285,6 @@ run_victoria_metrics_install() {
   fi
 
   echo "[victoria-metrics] Username: ${username}"
-  echo "[victoria-metrics] Password: ${password}"
   echo "[victoria-metrics] Credentials secret: ${ns}/${credentials_secret}"
   echo "[victoria-metrics] In-cluster VMAuth URL (pod/cluster only): http://${auth_service_name}.${ns}.svc:${remote_port}/"
   echo "[victoria-metrics] In-cluster query endpoint (pod/cluster only): http://${auth_service_name}.${ns}.svc:${remote_port}/api/v1/query"
@@ -18217,46 +18306,12 @@ run_victoria_metrics_install() {
       echo "[victoria-metrics] VictoriaLogs collector remoteWrite URL: ${logs_remote_write_url}"
     fi
   else
-    echo "[victoria-metrics] VictoriaLogs enabled: false (set VICTORIA_LOGS_ENABLED=true to enable)"
+    echo "[victoria-metrics] VictoriaLogs enabled: false (controlled by VICTORIA_LOGS_ENABLED and KUBETON_START_VICTORIA_LOGS_ENABLED)"
   fi
   if (( metrics_port_forward_ok == 0 )); then
     echo "[victoria-metrics] Query endpoint: unavailable via direct port-forward; use fallback URLs above."
   fi
   echo "[victoria-metrics] TonNode scrape resources configured: ${#scrape_rows[@]}"
-}
-
-run_victoria_metrics_uninstall() {
-  require_bin kubectl
-  if [[ $# -ne 0 ]]; then
-    echo "Error: usage: kubeton victoria-metrics uninstall" >&2
-    exit 1
-  fi
-
-  cleanup_victoria_metrics_resources
-  echo "[victoria-metrics] kubeton-managed VictoriaMetrics/VictoriaLogs resources and local port-forward(s) removed."
-}
-
-run_victoria_metrics() {
-  local subcommand="${1:-}"
-  case "$subcommand" in
-    install)
-      shift
-      run_victoria_metrics_install "$@"
-      ;;
-    uninstall)
-      shift
-      run_victoria_metrics_uninstall "$@"
-      ;;
-    "")
-      echo "Error: usage: kubeton victoria-metrics <install|uninstall>" >&2
-      exit 1
-      ;;
-    *)
-      echo "Error: unknown victoria-metrics subcommand '$subcommand'." >&2
-      echo "Usage: kubeton victoria-metrics <install|uninstall>" >&2
-      exit 1
-      ;;
-  esac
 }
 
 main_wallet_timeout_seconds() {
@@ -19284,9 +19339,6 @@ main() {
       ;;
     grafana)
       run_grafana "$@"
-      ;;
-    victoria-metrics)
-      run_victoria_metrics "$@"
       ;;
     add)
       run_add "$@"

@@ -12,40 +12,7 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
 
 (
   source "$kubeton"
-  kubectl() { fail 'access instructions must not invoke kubectl'; }
-  unset SSH_CONNECTION
-  print_logs_ssh_access 9428 >"$test_dir/ssh-placeholder"
-  assert_contains "ssh-user@public-host-running-kubeton" "$test_dir/ssh-placeholder"
-  assert_contains '-L 127.0.0.1:9428:127.0.0.1:9428' "$test_dir/ssh-placeholder"
-  assert_contains 'after SSH tunnel: http://127.0.0.1:9428/select/vmui/' "$test_dir/ssh-placeholder"
-  assert_not_contains '0.0.0.0' "$test_dir/ssh-placeholder"
-
-  SSH_CONNECTION='198.51.100.18 50123 203.0.113.27 22'
-  USER=logviewer
-  print_logs_ssh_access 18427 >"$test_dir/ssh-session"
-  assert_contains "'logviewer@203.0.113.27'" "$test_dir/ssh-session"
-  assert_contains '-L 127.0.0.1:18427:127.0.0.1:18427' "$test_dir/ssh-session"
-  assert_contains 'after SSH tunnel: http://127.0.0.1:18427/select/vmui/' "$test_dir/ssh-session"
-  assert_contains 'behind NAT' "$test_dir/ssh-session"
-
-  SSH_CONNECTION='198.51.100.18 50123 203.0.113.27 2222'
-  print_logs_ssh_access 9428 >"$test_dir/ssh-custom-port"
-  assert_contains '-p 2222 -L 127.0.0.1:9428:127.0.0.1:9428' "$test_dir/ssh-custom-port"
-
-  USER=-option
-  print_logs_ssh_access 9428 >"$test_dir/ssh-invalid-user"
-  assert_contains 'ssh-user@public-host-running-kubeton' "$test_dir/ssh-invalid-user"
-
-  SSH_CONNECTION='not a valid session with extra fields'
-  print_logs_ssh_access 9428 >"$test_dir/ssh-malformed"
-  assert_contains 'ssh-user@public-host-running-kubeton' "$test_dir/ssh-malformed"
-)
-
-(
-  source "$kubeton"
   run_with_timeout() { shift; "$@"; }
-  SSH_CONNECTION='198.51.100.18 50123 203.0.113.27 2222'
-  USER=logviewer
   banner_mode=backend
   kubectl() {
     case "$1/$2" in
@@ -68,15 +35,74 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
   print_logs_victoria_logs_info >"$test_dir/backend-banner"
   assert_contains 'in-cluster only): http://custom-backend.private-logs.svc:19428/select/vmui/' "$test_dir/backend-banner"
   assert_contains 'port-forward --address 127.0.0.1 service/custom-backend 19428:19428' "$test_dir/backend-banner"
-  assert_contains '-p 2222 -L 127.0.0.1:19428:127.0.0.1:19428' "$test_dir/backend-banner"
+  assert_contains './kubeton logs expose' "$test_dir/backend-banner"
+  assert_not_contains 'SSH' "$test_dir/backend-banner"
   assert_not_contains 'http://203.0.113.27' "$test_dir/backend-banner"
 
   banner_mode=auth
   print_logs_victoria_logs_info >"$test_dir/auth-banner"
   assert_contains 'VMAuth credentials' "$test_dir/auth-banner"
   assert_contains 'port-forward --address 127.0.0.1 service/vmauth-custom-stack 18427:18427' "$test_dir/auth-banner"
-  assert_contains '-p 2222 -L 127.0.0.1:18427:127.0.0.1:18427' "$test_dir/auth-banner"
+  assert_contains './kubeton logs expose' "$test_dir/auth-banner"
+  assert_not_contains 'SSH' "$test_dir/auth-banner"
   assert_not_contains 'http://203.0.113.27' "$test_dir/auth-banner"
+
+  require_bin() { :; }
+  resolve_logs_public_host() { printf 203.0.113.10; }
+  forward_fails=false
+  ensure_victoria_metrics_port_forward() {
+    [[ "$forward_fails" == false ]] || return 1
+    printf '%s\n' "$*" >"$test_dir/public-forward"
+    printf '%s\t%s\t%s\t1234\t/tmp/synthetic-forward.log\n' "$1" "$2" "$3"
+  }
+  run_logs expose >"$test_dir/exposed"
+  [[ "$(cat "$test_dir/public-forward")" == 'auth-ns vmauth-custom-stack 8427 18427 0.0.0.0' ]] \
+    || fail 'expose did not forward the authenticated service on all interfaces'
+  assert_contains 'now exposed externally: http://203.0.113.10:8427/select/vmui/' "$test_dir/exposed"
+  assert_contains 'Credentials Secret: auth-ns/vmuser-custom-stack' "$test_dir/exposed"
+  assert_not_contains 'custom-backend' "$test_dir/exposed"
+  assert_not_contains 'SSH' "$test_dir/exposed"
+
+  resolve_logs_public_host() { fail 'explicit public host must skip IP lookup'; }
+  run_logs expose --public-host logs.example.com --port 19427 >"$test_dir/exposed-custom"
+  [[ "$(cat "$test_dir/public-forward")" == 'auth-ns vmauth-custom-stack 19427 18427 0.0.0.0' ]] \
+    || fail 'custom listen port was not used'
+  assert_contains 'http://logs.example.com:19427/select/vmui/' "$test_dir/exposed-custom"
+
+  for args in '--port 0' '--port 65536' '--port bad' '--port' '--unexpected' '--public-host http://example.com' '--public-host localhost' '--public-host 2001:db8::10'; do
+    if run_logs expose $args >"$test_dir/invalid" 2>&1; then
+      fail "expose accepted invalid arguments: $args"
+    fi
+    assert_not_contains 'now exposed externally' "$test_dir/invalid"
+  done
+  forward_fails=true
+  if run_logs expose --public-host logs.example.com >"$test_dir/forward-failed" 2>&1; then
+    fail 'expose ignored a failed port-forward'
+  fi
+  assert_not_contains 'now exposed externally' "$test_dir/forward-failed"
+  forward_fails=false
+  banner_mode=backend
+  if run_logs expose --public-host logs.example.com >"$test_dir/no-auth" 2>&1; then
+    fail 'expose published the unauthenticated backend'
+  fi
+  assert_contains 'run kubeton start first' "$test_dir/no-auth"
+  assert_not_contains 'now exposed externally' "$test_dir/no-auth"
+)
+
+(
+  source "$kubeton"
+  curl() {
+    [[ "$*" == '-4 -fsS --connect-timeout 3 --max-time 5 https://api.ipify.org' ]] \
+      || fail 'unexpected public address discovery request'
+    printf '%s' "$fixture_ip"
+  }
+  fixture_ip=203.0.113.10
+  [[ "$(resolve_logs_public_host)" == "$fixture_ip" ]] || fail 'public IP lookup failed'
+  for fixture_ip in unavailable 999.999.999.999 '<html>error</html>'; do
+    if resolve_logs_public_host >"$test_dir/bad-ip"; then
+      fail 'invalid public IP lookup result was accepted'
+    fi
+  done
 )
 
 (

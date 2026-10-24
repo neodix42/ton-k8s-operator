@@ -524,6 +524,8 @@ post_bootstrap_selector="$test_dir/post-bootstrap-selector.yaml"
 if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
   bash -c '
     source "$1"
+    ensure_start_victoria_metrics() { :; }
+    ensure_victoria_metrics_scrape_resources() { :; }
     event_log="$2"
     selector_path="$3"
     require_bin() { :; }
@@ -570,6 +572,8 @@ existing_csi_gate_selector="$test_dir/existing-csi-gate-selector.yaml"
 if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
   bash -c '
     source "$1"
+    ensure_start_victoria_metrics() { :; }
+    ensure_victoria_metrics_scrape_resources() { :; }
     event_log="$2"
     selector_path="$3"
     require_bin() { :; }
@@ -614,6 +618,8 @@ k3d_start_events="$test_dir/k3d-start-events.out"
 PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
   bash -c '
     source "$1"
+    ensure_start_victoria_metrics() { :; }
+    ensure_victoria_metrics_scrape_resources() { :; }
     event_log="$2"
     require_bin() { :; }
     resolve_ton_replicas_from_values_file() { printf "3"; }
@@ -661,6 +667,8 @@ final_recheck_selector="$test_dir/final-recheck-selector.yaml"
 if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
   bash -c '
     source "$1"
+    ensure_start_victoria_metrics() { :; }
+    ensure_victoria_metrics_scrape_resources() { :; }
     event_log="$2"
     selector_path="$3"
     require_bin() { :; }
@@ -704,6 +712,8 @@ selector_drift_events="$test_dir/selector-drift-events.out"
 if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
   bash -c '
     source "$1"
+    ensure_start_victoria_metrics() { :; }
+    ensure_victoria_metrics_scrape_resources() { :; }
     event_log="$2"
     require_bin() { :; }
     resolve_ton_replicas_from_values_file() { printf "3"; }
@@ -905,6 +915,8 @@ start_gate_events="$test_dir/start-gate-events.out"
 PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" KUBETON_TEST_HELM_VALUES_LOG="$start_selector_values" \
   bash -c '
     source "$1"
+    ensure_start_victoria_metrics() { :; }
+    ensure_victoria_metrics_scrape_resources() { :; }
     event_log="$2"
     csi_call_count=0
     require_bin() { :; }
