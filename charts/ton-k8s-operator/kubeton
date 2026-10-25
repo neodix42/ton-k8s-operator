@@ -4084,19 +4084,44 @@ port_forward_process_matches() {
   local local_port="$4"
   local remote_port="$5"
   local bind_address="$6"
-  local cmdline
+  local proc_root="${KUBETON_PROCESS_PROC_ROOT:-/proc}" cmdline arg pending=""
+  local actual_namespace="" actual_bind="" command_found=false service_found=false ports_found=false
+  local -a process_args=()
 
-  cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-  [[ -z "$cmdline" ]] && return 1
-  [[ "$cmdline" == *"kubectl"* ]] || return 1
-  [[ "$cmdline" == *"port-forward"* ]] || return 1
-  [[ "$cmdline" == *"svc/${service_name}"* ]] || return 1
-  [[ "$cmdline" == *"${local_port}:${remote_port}"* ]] || return 1
-  if [[ -n "$bind_address" && "$cmdline" != *"--address"* ]]; then
-    return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  if [[ -r "${proc_root}/${pid}/cmdline" ]]; then
+    # Linux exposes the original argument boundaries, including embedded spaces.
+    while IFS= read -r -d '' arg; do process_args+=("$arg"); done <"${proc_root}/${pid}/cmdline"
+  else
+    # Kubernetes identifiers and this command's generated arguments contain no
+    # spaces. On systems without /proc, fail closed for ambiguous executable paths.
+    cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    read -r -a process_args <<<"$cmdline"
   fi
-  [[ "$cmdline" == *"-n ${ns}"* || "$cmdline" == *"--namespace ${ns}"* || "$cmdline" == *"--namespace=${ns}"* ]] || return 1
-  return 0
+  (( ${#process_args[@]} > 0 )) || return 1
+  [[ "${process_args[0]##*/}" == kubectl ]] || return 1
+  for arg in "${process_args[@]:1}"; do
+    if [[ -n "$pending" ]]; then
+      case "$pending" in
+        namespace) actual_namespace="$arg" ;;
+        address) actual_bind="$arg" ;;
+      esac
+      pending=""
+      continue
+    fi
+    case "$arg" in
+      -n|--namespace) pending=namespace ;;
+      --namespace=*) actual_namespace="${arg#*=}" ;;
+      --address) pending=address ;;
+      --address=*) actual_bind="${arg#*=}" ;;
+      port-forward) command_found=true ;;
+      "svc/${service_name}"|"service/${service_name}") service_found=true ;;
+      "${local_port}:${remote_port}") ports_found=true ;;
+    esac
+  done
+  [[ -z "$pending" && "$command_found" == true && "$service_found" == true \
+    && "$ports_found" == true && "$actual_namespace" == "$ns" ]] || return 1
+  [[ -z "$bind_address" || "$actual_bind" == "$bind_address" ]]
 }
 
 wait_prometheus_http_ready() {
@@ -5119,14 +5144,13 @@ resolve_victoria_metrics_credentials() {
   local stack_name="$2"
   local default_username="$3"
   local default_password="$4"
+  local request_timeout="${5:-${STATUS_EXEC_TIMEOUT:-20s}}"
   local secret_name username password
 
   secret_name="vmuser-${stack_name}"
-  if kubectl -n "$ns" get secret "$secret_name" >/dev/null 2>&1; then
-    username="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-    password="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-    username="$(trim_whitespace "$username")"
-    password="$(trim_whitespace "$password")"
+  if kubectl -n "$ns" get secret "$secret_name" --request-timeout="$request_timeout" >/dev/null 2>&1; then
+    username="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.username}' --request-timeout="$request_timeout" 2>/dev/null | base64 -d 2>/dev/null || true)"
+    password="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.password}' --request-timeout="$request_timeout" 2>/dev/null | base64 -d 2>/dev/null || true)"
     if [[ -n "$username" && -n "$password" ]]; then
       printf '%s\t%s\t%s\n' "$secret_name" "$username" "$password"
       return 0
@@ -5334,7 +5358,22 @@ ensure_victoria_metrics_port_forward() {
           return 0
         fi
       fi
-      kill "$existing_pid" >/dev/null 2>&1 || true
+      # A saved PID may have been reused. Only replace a process which still
+      # forwards this exact endpoint, including when its bind address changes.
+      if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" ''; then
+        kill "$existing_pid" >/dev/null 2>&1 || true
+        deadline=$(( $(date +%s) + wait_seconds ))
+        while kill -0 "$existing_pid" >/dev/null 2>&1 \
+          && port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" ''; do
+          if (( $(date +%s) >= deadline )); then
+            if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
+              echo "Warning: previous port-forward for ${ns}/${service_name} did not stop before rebinding localhost:${local_port}." >&2
+            fi
+            return 1
+          fi
+          sleep 0.1
+        done
+      fi
     fi
     rm -f "$pid_file" >/dev/null 2>&1 || true
   fi
@@ -17780,6 +17819,65 @@ EOF
   printf '%s\t%s\t%s\tauth\t%s\n' "$ns" "vmauth-${stack_name}" "$auth_port" "$stack_name"
 }
 
+verify_logs_dashboard_auth() {
+  local ns="$1" stack_name="$2" local_port="$3"
+  local verify_seconds="${VICTORIA_METRICS_PORT_FORWARD_VERIFY_SECONDS:-20}"
+  local deadline credentials_row secret_name username password token anonymous_status auth_status=000 result=1
+  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]] || (( verify_seconds <= 0 )); then
+    verify_seconds=20
+  fi
+  deadline=$(( $(date +%s) + verify_seconds ))
+  while :; do
+    credentials_row="$(resolve_victoria_metrics_credentials "$ns" "$stack_name" '' '' "${verify_seconds}s")" || return 1
+    IFS=$'\t' read -r secret_name username password <<<"$credentials_row"
+    [[ -n "$username" && -n "$password" ]] || return 1
+    # Never put a credential in curl's argv, environment, URL, or a file.
+    # Disable curlrc/proxies/redirects and send it only over the local forward.
+    token="$(printf '%s:%s' "$username" "$password" | base64 | tr -d '\r\n')"
+    anonymous_status="$(curl --disable --noproxy '*' --connect-timeout 2 --max-time 3 -s \
+      -o /dev/null -w '%{http_code}' "http://127.0.0.1:${local_port}/select/vmui/" || true)"
+    if [[ "$anonymous_status" == 200 ]]; then
+      echo "Error: VictoriaLogs dashboard accepted an unauthenticated request; public access was refused." >&2
+      return 3
+    fi
+    if [[ "$anonymous_status" == 401 || "$anonymous_status" == 403 ]]; then
+      auth_status="$(printf 'header = "Authorization: Basic %s"\n' "$token" \
+        | curl --disable --noproxy '*' --connect-timeout 2 --max-time 3 -s --config - \
+          -o /dev/null -w '%{http_code}' "http://127.0.0.1:${local_port}/select/vmui/" || true)"
+      [[ "$auth_status" != 200 ]] || return 0
+      result=1
+      [[ "$auth_status" != 401 && "$auth_status" != 403 ]] || result=2
+    else
+      auth_status="$anonymous_status"
+      result=1
+    fi
+    if (( $(date +%s) >= deadline )); then
+      echo "Error: VictoriaLogs dashboard login check failed (HTTP ${auth_status}; credentials Secret ${ns}/vmuser-${stack_name})." >&2
+      return "$result"
+    fi
+    sleep 1
+  done
+}
+
+reconcile_logs_dashboard_auth() {
+  local ns="$1" stack_name="$2" owner
+  owner="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get vmauth "$stack_name" \
+    -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}')" || return 1
+  [[ "$owner" == kubeton ]] || return 1
+  echo "[logs] Refreshing VMAuth configuration from its existing credentials Secret ..." >&2
+  # VMAuth watches metadata updates; VMUser filters out annotation-only updates.
+  # Regenerate the auth config without changing passwords or restarting TON.
+  kubectl -n "$ns" annotate vmauth "$stack_name" \
+    "ton.ton.org/auth-reconcile-at=$(date -u +%Y-%m-%dT%H:%M:%S.%N)" --overwrite >/dev/null
+}
+
+print_logs_dashboard_login_instructions() {
+  local ns="$1" stack_name="$2"
+  local template='{{printf "Username: %s\nPassword: %s\n" (.data.username | base64decode) (.data.password | base64decode)}}'
+  printf '[logs] Read the browser login: kubectl -n %s get secret vmuser-%s -o go-template=%s\n' \
+    "$ns" "$stack_name" "$(shell_quote "$template")"
+}
+
 print_logs_victoria_logs_info() {
   local access_rows access_ns access_service access_port access_mode stack_name access_note
   echo "[logs] Full logs can be found on the VictoriaLogs server (within its configured retention)."
@@ -17842,6 +17940,8 @@ run_logs_expose() {
   port="$((10#$port))"
   require_bin kubectl
   require_bin nohup
+  require_bin curl
+  require_bin base64
   if [[ -z "$public_host" ]]; then
     if ! public_host="$(resolve_logs_public_host)"; then
       echo "Error: cannot discover this server's public IP; use kubeton logs expose --public-host <public-IP-or-hostname>." >&2
@@ -17856,7 +17956,7 @@ run_logs_expose() {
   fi
 
   local access_rows ns service remote_port mode stack_name forward_row
-  local forwarded_ns forwarded_service local_port pid log_file
+  local forwarded_ns forwarded_service local_port pid log_file auth_result
   if ! access_rows="$(list_logs_dashboard_access)"; then
     echo "Error: cannot discover the authenticated VictoriaLogs dashboard." >&2
     return 1
@@ -17874,6 +17974,27 @@ run_logs_expose() {
   fi
   while IFS=$'\t' read -r ns service remote_port mode stack_name; do
     [[ "$mode" == auth ]] || continue
+    # Prove both authentication and backend access before binding publicly.
+    if ! forward_row="$(ensure_victoria_metrics_port_forward "$ns" "$service" "$port" "$remote_port" 127.0.0.1)"; then
+      echo "Error: dashboard verification port-forward failed; use --port to choose another local port." >&2
+      return 1
+    fi
+    IFS=$'\t' read -r forwarded_ns forwarded_service local_port pid log_file <<<"$forward_row"
+    if [[ "$forwarded_ns" != "$ns" || "$forwarded_service" != "$service" || "$local_port" != "$port" ]]; then
+      echo "Error: dashboard verification port-forward did not report the requested endpoint." >&2
+      return 1
+    fi
+    auth_result=0
+    verify_logs_dashboard_auth "$ns" "$stack_name" "$port" || auth_result=$?
+    if (( auth_result == 2 )) && reconcile_logs_dashboard_auth "$ns" "$stack_name"; then
+      auth_result=0
+      verify_logs_dashboard_auth "$ns" "$stack_name" "$port" || auth_result=$?
+    fi
+    if (( auth_result != 0 )); then
+      echo "Error: VictoriaLogs authentication could not be verified; the forward remains local only." >&2
+      print_logs_dashboard_login_instructions "$ns" "$stack_name" >&2
+      return 1
+    fi
     if ! forward_row="$(ensure_victoria_metrics_port_forward "$ns" "$service" "$port" "$remote_port" 0.0.0.0)"; then
       echo "Error: dashboard port-forward failed; use --port to choose another local port." >&2
       return 1
@@ -17883,8 +18004,24 @@ run_logs_expose() {
       echo "Error: dashboard port-forward did not report the requested endpoint." >&2
       return 1
     fi
+    if ! verify_logs_dashboard_auth "$ns" "$stack_name" "$port"; then
+      # The Service may have selected another Pod when the forward restarted.
+      # Withdraw a failed public forward instead of announcing a broken login.
+      if ensure_victoria_metrics_port_forward "$ns" "$service" "$port" "$remote_port" 127.0.0.1 >/dev/null; then
+        echo "Error: dashboard login failed after public forwarding; public access was withdrawn." >&2
+      else
+        if [[ "$pid" =~ ^[0-9]+$ ]] \
+          && port_forward_process_matches "$pid" "$ns" "$service" "$port" "$remote_port" 0.0.0.0; then
+          kill "$pid" >/dev/null 2>&1 || true
+        fi
+        echo "Error: dashboard login failed; local access could not be restored. Check that public forward PID ${pid} has stopped." >&2
+      fi
+      print_logs_dashboard_login_instructions "$ns" "$stack_name" >&2
+      return 1
+    fi
     echo "[logs] VictoriaLogs dashboard is now exposed externally: http://${public_host}:${local_port}/select/vmui/"
     echo "[logs] VMAuth authentication is required. Credentials Secret: ${ns}/vmuser-${stack_name}"
+    print_logs_dashboard_login_instructions "$ns" "$stack_name"
     echo "[logs] Background port-forward: PID ${pid}; log: ${log_file}"
     echo "[logs] Allow inbound TCP ${local_port} to this server through its firewall/NAT."
     return 0

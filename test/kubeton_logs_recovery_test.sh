@@ -34,10 +34,12 @@ test_recovery() (
     printf 'v1\thttps://example.invalid/operator.yaml\n'
   }
   ensure_victoria_metrics_port_forward() {
-    [[ "$*" == "$fixture_ns vmauth-$fixture_stack 8427 18427 0.0.0.0" ]] || unexpected "forward $*"
-    record forward
+    [[ "$1 $2 $3 $4" == "$fixture_ns vmauth-$fixture_stack 8427 18427" \
+      && ( "$5" == 0.0.0.0 || "$5" == 127.0.0.1 ) ]] || unexpected "forward $*"
+    [[ "$5" != 0.0.0.0 ]] || record forward
     printf '%s\t%s\t8427\t1234\t/tmp/synthetic.log\n' "$fixture_ns" "vmauth-$fixture_stack"
   }
+  verify_logs_dashboard_auth() { :; }
   kubectl() {
     local kube_ns='' verb resource name owner payload
     if [[ "${1:-}" == -n ]]; then kube_ns="$2"; shift 2; fi

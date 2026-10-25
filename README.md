@@ -656,7 +656,23 @@ adds the logs route to an existing kubeton-managed gateway. This does not
 restart the TON fleet or reinstall its storage, logs backend, or collector;
 there is no need to rerun `kubeton start`. Existing credentials and metrics
 routes are preserved. The command never publishes the bare VictoriaLogs
-backend. Use the VMAuth credentials in the printed Kubernetes Secret.
+backend. Before publishing the forward it checks that anonymous dashboard
+requests are rejected and that the decoded VMAuth credentials can load the
+dashboard. It retries while the authentication configuration loads and requests
+one configuration refresh if those credentials remain rejected. A failed
+check keeps access local and exits with an error, rather than reporting success.
+
+Use the decoded username and password from the printed Secret for the browser's
+HTTP Basic Auth prompt. With the default names, retrieve them on the server:
+
+```bash
+kubectl -n vm get secret vmuser-kubeton -o go-template='{{printf "Username: %s\nPassword: %s\n" (.data.username | base64decode) (.data.password | base64decode)}}'
+```
+
+`kubeton logs expose` prints the same retrieval command with the discovered
+namespace and Secret name. Credentials are not printed by `logs expose` itself.
+If the browser cached a previous login, open a private window and enter the
+decoded values there.
 
 VMAuth's port-forward serves HTTP Basic Auth. Public HTTP does not encrypt
 credentials or responses; use an HTTPS reverse proxy when encrypted public

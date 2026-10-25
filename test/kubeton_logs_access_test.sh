@@ -61,8 +61,28 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
   require_bin() { :; }
   resolve_logs_public_host() { printf 203.0.113.10; }
   forward_fails=false
+  auth_fixture_mode=ready
+  verify_logs_dashboard_auth() {
+    local count=0
+    [[ ! -e "$test_dir/auth-check-count" ]] || count="$(cat "$test_dir/auth-check-count")"
+    count=$((count + 1))
+    printf '%s' "$count" >"$test_dir/auth-check-count"
+    printf 'verify\n' >>"$test_dir/expose-events"
+    case "$auth_fixture_mode" in
+      rejected) return 2 ;;
+      unprotected) return 3 ;;
+      unavailable) return 1 ;;
+      recover) [[ -e "$test_dir/reconciled" ]] || return 2 ;;
+      post-failure) (( count < 2 )) || return 2 ;;
+    esac
+  }
+  reconcile_logs_dashboard_auth() {
+    printf 'reconcile\n' >>"$test_dir/expose-events"
+    touch "$test_dir/reconciled"
+  }
   ensure_victoria_metrics_port_forward() {
     [[ "$forward_fails" == false ]] || return 1
+    printf 'forward %s\n' "$5" >>"$test_dir/expose-events"
     printf '%s\n' "$*" >"$test_dir/public-forward"
     printf '%s\t%s\t%s\t1234\t/tmp/synthetic-forward.log\n' "$1" "$2" "$3"
   }
@@ -71,6 +91,9 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
     || fail 'expose did not forward the authenticated service on all interfaces'
   assert_contains 'now exposed externally: http://203.0.113.10:8427/select/vmui/' "$test_dir/exposed"
   assert_contains 'Credentials Secret: auth-ns/vmuser-custom-stack' "$test_dir/exposed"
+  assert_contains 'Read the browser login: kubectl -n auth-ns get secret vmuser-custom-stack' "$test_dir/exposed"
+  [[ "$(cat "$test_dir/expose-events")" == $'forward 127.0.0.1\nverify\nforward 0.0.0.0\nverify' ]] \
+    || fail 'dashboard was published before authenticating the local forward'
   assert_not_contains 'custom-backend' "$test_dir/exposed"
   assert_not_contains 'SSH' "$test_dir/exposed"
 
@@ -92,6 +115,34 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
   fi
   assert_not_contains 'now exposed externally' "$test_dir/forward-failed"
   forward_fails=false
+
+  for auth_fixture_mode in rejected unprotected unavailable post-failure; do
+    : >"$test_dir/expose-events"
+    printf 0 >"$test_dir/auth-check-count"
+    if run_logs expose --public-host logs.example.com >"$test_dir/$auth_fixture_mode" 2>&1; then
+      fail "expose ignored failed authentication: $auth_fixture_mode"
+    fi
+    assert_not_contains 'now exposed externally' "$test_dir/$auth_fixture_mode"
+    if [[ "$auth_fixture_mode" == post-failure ]]; then
+      assert_contains 'public access was withdrawn' "$test_dir/$auth_fixture_mode"
+      [[ "$(tail -n 1 "$test_dir/expose-events")" == 'forward 127.0.0.1' ]] || fail 'failed public login was not withdrawn'
+    else
+      assert_not_contains 'forward 0.0.0.0' "$test_dir/expose-events"
+      assert_contains 'local only' "$test_dir/$auth_fixture_mode"
+    fi
+    if [[ "$auth_fixture_mode" != rejected ]]; then
+      assert_not_contains reconcile "$test_dir/expose-events"
+    fi
+  done
+  auth_fixture_mode=recover
+  : >"$test_dir/expose-events"
+  # The earlier rejection case left a reconciliation marker; start this case fresh.
+  mv "$test_dir/reconciled" "$test_dir/previous-reconciliation"
+  run_logs expose --public-host logs.example.com >"$test_dir/recovered" 2>&1
+  assert_contains 'now exposed externally' "$test_dir/recovered"
+  [[ "$(cat "$test_dir/expose-events")" == $'forward 127.0.0.1\nverify\nreconcile\nverify\nforward 0.0.0.0\nverify' ]] \
+    || fail 'auth recovery did not verify the refreshed configuration before publishing'
+
   banner_mode=backend
   ensure_logs_dashboard_auth() { return 1; }
   if run_logs expose --public-host logs.example.com >"$test_dir/no-auth" 2>&1; then
@@ -99,6 +150,26 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
   fi
   assert_contains 'no public port-forward was started' "$test_dir/no-auth"
   assert_not_contains 'now exposed externally' "$test_dir/no-auth"
+)
+
+(
+  source "$kubeton"
+  run_with_timeout() { shift; "$@"; }
+  fixture_owner=kubeton
+  kubectl() {
+    case "$*" in
+      '-n vm get vmauth kubeton -o jsonpath='*) printf '%s' "$fixture_owner" ;;
+      '-n vm annotate vmauth kubeton ton.ton.org/auth-reconcile-at='*' --overwrite') printf '%s\n' "$*" >>"$test_dir/reconcile-calls" ;;
+      *) fail 'auth recovery changed something other than VMAuth metadata' ;;
+    esac
+  }
+  reconcile_logs_dashboard_auth vm kubeton >"$test_dir/reconcile-output" 2>&1
+  [[ "$(wc -l <"$test_dir/reconcile-calls")" == 1 ]] || fail 'managed VMAuth was not reconciled'
+  fixture_owner=foreign
+  if reconcile_logs_dashboard_auth vm kubeton >>"$test_dir/reconcile-output" 2>&1; then
+    fail 'auth recovery modified a foreign gateway'
+  fi
+  [[ "$(wc -l <"$test_dir/reconcile-calls")" == 1 ]] || fail 'foreign gateway metadata was changed'
 )
 
 (
