@@ -100,6 +100,8 @@ const (
 
 	customParametersEnvName   = "CUSTOM_PARAMETERS"
 	exporterContainerPortName = "exporter-tcp"
+
+	storageClassDefaultAnnotationValue = "true"
 )
 
 var (
@@ -2287,8 +2289,8 @@ func (r *TonNodeReconciler) detectStorageClassName(
 		if sc.Name == "longhorn" {
 			hasLonghorn = true
 		}
-		if sc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" ||
-			sc.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
+		if sc.Annotations["storageclass.kubernetes.io/is-default-class"] == storageClassDefaultAnnotationValue ||
+			sc.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == storageClassDefaultAnnotationValue {
 			defaultClasses = append(defaultClasses, sc.Name)
 		}
 	}

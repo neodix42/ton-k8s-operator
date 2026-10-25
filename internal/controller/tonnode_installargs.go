@@ -91,10 +91,22 @@ func validateInstallationArgs(node *tonv1alpha1.TonNode) string {
 	}
 	args = append(args, node.Spec.Args...)
 
+	if message := validateInstallationEnvironment(environment); message != "" {
+		return message
+	}
+
 	// Upstream applies the environment first, then MYTONCTRL_ARGS, then the
 	// explicit container argv. Repeated value options use the last occurrence.
-	work, workDynamic := installationEnvValue(environment, "TON_WORK_DIR", "/var/ton-work")
-	user, userDynamic := installationEnvValue(environment, "MTC_USER", "root")
+	var topology installationTopology
+	topology.work, topology.workDynamic = installationEnvValue(environment, "TON_WORK_DIR", "/var/ton-work")
+	topology.user, topology.userDynamic = installationEnvValue(environment, "MTC_USER", "root")
+	if message := validateInstallationOptions(args, &topology); message != "" {
+		return message
+	}
+	return topology.validate(keyManagementEnabled(node))
+}
+
+func validateInstallationEnvironment(environment map[string]corev1.EnvVar) string {
 	for _, name := range []string{"ONLY_NODE", "ONLY_MTC"} {
 		if variable, exists := environment[name]; exists {
 			if variable.ValueFrom != nil {
@@ -132,7 +144,10 @@ func validateInstallationArgs(node *tonv1alpha1.TonNode) string {
 	if variable, exists := environment["ARCHIVE_BLOCKS"]; exists && (variable.ValueFrom != nil || variable.Value != "") {
 		return "spec.env ARCHIVE_BLOCKS is unsupported; it requires an extra tonutils-storage executable that the standard official TON image does not provide"
 	}
+	return ""
+}
 
+func validateInstallationOptions(args []string, topology *installationTopology) string {
 	// These diagnostics reach status and operator logs. Argument values may
 	// contain credentials, so report positions and known option names only.
 	for index := 0; index < len(args); index++ {
@@ -144,89 +159,114 @@ func validateInstallationArgs(node *tonv1alpha1.TonNode) string {
 			return fmt.Sprintf("unexpected installation argument at position %d; expected MyTonCtrl installer flags after run", index+1)
 		}
 		if strings.HasPrefix(arg, "--") {
-			name, value, attached := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
-			switch name {
-			case "only-node", "only-mtc":
-				return fmt.Sprintf("--%s is unsupported; this operator requires both local validator and MyTonCtrl services", name)
-			case "env-file":
-				return "--env-file is unsupported; use spec.env so storage paths can be validated"
-			case "author", "repo", "branch", "node-repo", "node-version":
-				return fmt.Sprintf("--%s selects sources; select spec.image or spec.tonImage instead", name)
-			case "help", "print-env":
-				return fmt.Sprintf("--%s is unsupported in a TonNode; it exits without starting the node services", name)
-			case "archive":
-				return "--archive is unsupported; it requires an extra tonutils-storage executable that the standard official TON image does not provide"
-			case "telemetry", "ignore-reqs", "dump", "no-startup-checks":
-				if attached {
-					return fmt.Sprintf("--%s is a flag and does not accept a value", name)
-				}
-				continue
-			case "mode", "network", "config", "user", "backup", "bin-dir", "src-dir", "ton-work-dir":
-				if !attached {
-					var errorMessage string
-					value, errorMessage = installationOptionValue(args, &index, arg)
-					if errorMessage != "" {
-						return errorMessage
-					}
-				}
-			default:
-				return fmt.Sprintf("unsupported MyTonCtrl installation option at position %d", index+1)
-			}
-			if name == "ton-work-dir" {
-				work, workDynamic = value, false
-			}
-			if name == "user" {
-				user, userDynamic = value, false
+			if message := validateInstallationLongOption(args, &index, topology); message != "" {
+				return message
 			}
 			continue
 		}
+		if message := validateInstallationShortOptions(args, &index, topology); message != "" {
+			return message
+		}
+	}
+	return ""
+}
 
-		// argparse supports groups of short flags, including -idW/data.
-		for position := 1; position < len(arg); position++ {
-			name := arg[position]
-			switch name {
-			case 'o', 'l':
-				return fmt.Sprintf("-%c is unsupported; this operator requires both local validator and MyTonCtrl services", name)
-			case 'e':
-				return "-e/--env-file is unsupported; use spec.env so storage paths can be validated"
-			case 'a', 'r', 'b', 'g', 'v':
-				return fmt.Sprintf("-%c selects sources; select spec.image or spec.tonImage instead", name)
-			case 'h':
-				return "-h/--help is unsupported in a TonNode; it exits without starting the node services"
-			case 't', 'i', 'd', 's':
-				continue
-			case 'm', 'n', 'c', 'u', 'p', 'B', 'S', 'W':
-				value := strings.TrimPrefix(arg[position+1:], "=")
-				if position == len(arg)-1 {
-					var errorMessage string
-					value, errorMessage = installationOptionValue(args, &index, "-"+string(name))
-					if errorMessage != "" {
-						return errorMessage
-					}
-				}
-				if name == 'W' {
-					work, workDynamic = value, false
-				}
-				if name == 'u' {
-					user, userDynamic = value, false
-				}
-				position = len(arg)
-			default:
-				return fmt.Sprintf("unsupported MyTonCtrl installation option at argument %d, character %d", index+1, position+1)
+func validateInstallationLongOption(args []string, index *int, topology *installationTopology) string {
+	arg := args[*index]
+	name, value, attached := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
+	switch name {
+	case "only-node", "only-mtc":
+		return fmt.Sprintf("--%s is unsupported; this operator requires both local validator and MyTonCtrl services", name)
+	case "env-file":
+		return "--env-file is unsupported; use spec.env so storage paths can be validated"
+	case "author", "repo", "branch", "node-repo", "node-version":
+		return fmt.Sprintf("--%s selects sources; select spec.image or spec.tonImage instead", name)
+	case "help", "print-env":
+		return fmt.Sprintf("--%s is unsupported in a TonNode; it exits without starting the node services", name)
+	case "archive":
+		return "--archive is unsupported; it requires an extra tonutils-storage executable that the standard official TON image does not provide"
+	case "telemetry", "ignore-reqs", "dump", "no-startup-checks":
+		if attached {
+			return fmt.Sprintf("--%s is a flag and does not accept a value", name)
+		}
+		return ""
+	case "mode", "network", "config", "user", "backup", "bin-dir", "src-dir", "ton-work-dir":
+		if !attached {
+			var errorMessage string
+			value, errorMessage = installationOptionValue(args, index, arg)
+			if errorMessage != "" {
+				return errorMessage
 			}
 		}
+	default:
+		return fmt.Sprintf("unsupported MyTonCtrl installation option at position %d", *index+1)
 	}
-	if workDynamic {
+	topology.setOption(name, value)
+	return ""
+}
+
+func validateInstallationShortOptions(args []string, index *int, topology *installationTopology) string {
+	arg := args[*index]
+	// argparse supports groups of short flags, including -idW/data.
+	for position := 1; position < len(arg); position++ {
+		name := arg[position]
+		switch name {
+		case 'o', 'l':
+			return fmt.Sprintf("-%c is unsupported; this operator requires both local validator and MyTonCtrl services", name)
+		case 'e':
+			return "-e/--env-file is unsupported; use spec.env so storage paths can be validated"
+		case 'a', 'r', 'b', 'g', 'v':
+			return fmt.Sprintf("-%c selects sources; select spec.image or spec.tonImage instead", name)
+		case 'h':
+			return "-h/--help is unsupported in a TonNode; it exits without starting the node services"
+		case 't', 'i', 'd', 's':
+			continue
+		case 'm', 'n', 'c', 'u', 'p', 'B', 'S', 'W':
+			value := strings.TrimPrefix(arg[position+1:], "=")
+			if position == len(arg)-1 {
+				var errorMessage string
+				value, errorMessage = installationOptionValue(args, index, "-"+string(name))
+				if errorMessage != "" {
+					return errorMessage
+				}
+			}
+			topology.setOption(string(name), value)
+			return ""
+		default:
+			return fmt.Sprintf("unsupported MyTonCtrl installation option at argument %d, character %d", *index+1, position+1)
+		}
+	}
+	return ""
+}
+
+type installationTopology struct {
+	work        string
+	user        string
+	workDynamic bool
+	userDynamic bool
+}
+
+func (topology *installationTopology) setOption(name, value string) {
+	switch name {
+	case "ton-work-dir", "W":
+		topology.work, topology.workDynamic = value, false
+	case "user", "u":
+		topology.user, topology.userDynamic = value, false
+	}
+}
+
+func (topology installationTopology) validate(keyManagement bool) string {
+	if topology.workDynamic {
 		return "spec.env TON_WORK_DIR must be literal or overridden by --ton-work-dir=/var/ton-work"
 	}
-	if work != "/var/ton-work" {
+	if topology.work != "/var/ton-work" {
 		return "MyTonCtrl --ton-work-dir/TON_WORK_DIR must remain /var/ton-work for the operator's storage, probes and key management"
 	}
-	if keyManagementEnabled(node) {
-		if userDynamic {
+	if keyManagement {
+		if topology.userDynamic {
 			return "spec.env MTC_USER must be literal when key management is enabled"
 		}
-		if user != "root" && user != "validator" {
+		if topology.user != "root" && topology.user != "validator" {
 			return "MyTonCtrl -u/--user/MTC_USER must be root or validator when key management is enabled so restored client keys remain readable"
 		}
 	}
