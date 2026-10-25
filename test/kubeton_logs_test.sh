@@ -93,10 +93,13 @@ if [[ "${1:-}" == get && "${2:-}" == pods ]]; then
     || unexpected "$@"
   printf 'inventory\n' >>"$LOGS_STATE/events"
   case "$LOGS_CASE" in
-    empty) ;;
+    empty|empty-selected) ;;
     inventory-failure)
       echo 'mock inventory access denied' >&2
       exit 1
+      ;;
+    node-filter|node-logs-failure|blackbox-node-filter)
+      printf 'alpha\tton-0\tworker-a\nbeta\tton-1\tworker-a\nalpha\tton-2\tworker-aa\ngamma\tton-3\t\n'
       ;;
     *) printf 'alpha\tton-0\tworker-a\nbeta\tton-1\t\n' ;;
   esac
@@ -110,7 +113,7 @@ if [[ "${1:-}" == -n && "${3:-}" == logs ]]; then
   [[ "$ns/$pod" == alpha/ton-0 || "$ns/$pod" == beta/ton-1 ]] \
     || unexpected "$@"
   printf 'logs %s/%s\n' "$ns" "$pod" >>"$LOGS_STATE/events"
-  if [[ "$LOGS_CASE" == logs-failure && "$pod" == ton-0 ]]; then
+  if [[ ( "$LOGS_CASE" == logs-failure || "$LOGS_CASE" == node-logs-failure ) && "$pod" == ton-0 ]]; then
     echo 'mock first pod logs denied' >&2
     exit 17
   fi
@@ -186,16 +189,53 @@ assert_not_contains 'No TON pods found.' "$test_dir/inventory-failure/output"
 [[ "$(cat "$test_dir/inventory-failure/events")" == inventory ]] \
   || fail 'inventory failure should not fetch pod logs'
 
-run_case extra-arguments 1 unexpected
-assert_contains 'usage:' "$test_dir/extra-arguments/output"
+run_case node-filter 0 worker-a
+[[ "$(head -n 1 "$test_dir/node-filter/output")" == 'Full logs: VictoriaLogs test endpoint' ]] \
+  || fail 'filtered logs should start with full log server information'
+[[ "$(cat "$test_dir/node-filter/events")" == $'inventory\nlogs alpha/ton-0\nlogs beta/ton-1' ]] \
+  || fail 'node filtering should include all matching pods across namespaces, with an exact node name match'
+assert_log_lines node-filter alpha/ton-0
+assert_log_lines node-filter beta/ton-1
+assert_not_contains 'ton-2' "$test_dir/node-filter/output"
+assert_not_contains 'ton-3' "$test_dir/node-filter/output"
+
+run_case node-no-match 1 worker-z
+assert_contains "No TON pods found on node 'worker-z'." "$test_dir/node-no-match/output"
+[[ "$(cat "$test_dir/node-no-match/events")" == inventory ]] \
+  || fail 'a node without TON pods should not fetch pod logs'
+
+run_case node-logs-failure 1 worker-a
+[[ "$(cat "$test_dir/node-logs-failure/events")" == $'inventory\nlogs alpha/ton-0\nlogs beta/ton-1' ]] \
+  || fail 'failed selected pod logs should not skip other matching pods or fetch pods on another node'
+assert_contains 'mock first pod logs denied' "$test_dir/node-logs-failure/output"
+assert_log_lines node-logs-failure beta/ton-1
+assert_not_contains 'fixture alpha/ton-0' "$test_dir/node-logs-failure/output"
+assert_not_contains 'ton-2' "$test_dir/node-logs-failure/output"
+
+run_case empty-selected 1 worker-a
+assert_contains "No TON pods found on node 'worker-a'." "$test_dir/empty-selected/output"
+[[ "$(cat "$test_dir/empty-selected/events")" == inventory ]] \
+  || fail 'empty cluster with a selected node should not fetch pod logs'
+
+run_case extra-arguments 1 worker-a worker-b
+assert_contains 'kubeton logs [node]' "$test_dir/extra-arguments/output"
 [[ ! -s "$test_dir/extra-arguments/events" ]] || fail 'invalid arguments should not access the cluster'
+
+run_case empty-argument 1 ''
+assert_contains 'kubeton logs [node]' "$test_dir/empty-argument/output"
+[[ ! -s "$test_dir/empty-argument/events" ]] || fail 'an empty node argument should not access the cluster'
+
+run_case invalid-option 1 --unexpected
+assert_contains 'kubeton logs [node]' "$test_dir/invalid-option/output"
+[[ ! -s "$test_dir/invalid-option/events" ]] || fail 'an invalid option should not access the cluster'
 
 run_blackbox_case() {
   local mode="$1" rc=0
+  shift
   mkdir -p "$test_dir/$mode"
   : >"$test_dir/$mode/events"
   PATH="$test_dir/bin:$PATH" LOGS_CASE="$mode" LOGS_STATE="$test_dir/$mode" \
-    bash "$kubeton" logs >"$test_dir/$mode/output" 2>&1 || rc=$?
+    bash "$kubeton" logs "$@" >"$test_dir/$mode/output" 2>&1 || rc=$?
   if (( rc != 0 )); then
     cat "$test_dir/$mode/output" >&2
     fail "$mode should show pod logs even without a usable logging stack"
@@ -241,4 +281,11 @@ assert_contains 'http://logs-backend.logs-ns.svc:9428/select/vmui/' "$test_dir/a
 assert_not_contains 'vmauth-metrics-stack' "$test_dir/auth-select-only/output"
 assert_not_contains 'VMAuth credentials' "$test_dir/auth-select-only/output"
 
-echo 'kubeton logs checks: PASS (12 cases)'
+run_blackbox_case blackbox-node-filter worker-a
+assert_contains 'http://logs-backend.logs-ns.svc:9428/select/vmui/' "$test_dir/blackbox-node-filter/output"
+[[ "$(tail -n 3 "$test_dir/blackbox-node-filter/events")" == $'inventory\nlogs alpha/ton-0\nlogs beta/ton-1' ]] \
+  || fail 'the CLI entry point should fetch logs only for pods on the requested node'
+assert_not_contains 'ton-2' "$test_dir/blackbox-node-filter/output"
+assert_not_contains 'ton-3' "$test_dir/blackbox-node-filter/output"
+
+echo 'kubeton logs checks: PASS (19 cases)'

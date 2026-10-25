@@ -242,7 +242,7 @@ Commands:
   purge                Full best-effort cleanup + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
   verify               Verify operator and TON resources (deploy, pods with node/server, tonnodes, sts, pvc).
   status               Show each TON pod's image tags, build date, wallet, ADNL, sync, and database sizes.
-  logs                 Show the last 20 log lines from each TON pod and the VictoriaLogs server address.
+  logs [node]          Show the last 20 log lines from TON pods, optionally on one node, and the VictoriaLogs server address.
   logs expose          Expose the authenticated VictoriaLogs dashboard with a background public port-forward.
   exec <cmd>           Run a command in each TON pod and print table with node/pod/exit code.
   exec-mtc <cmd>       Run a command in each TON pod inside mytonctrl and print table with node/pod/exit code.
@@ -18036,25 +18036,22 @@ run_logs() {
     run_logs_expose "$@"
     return $?
   fi
-  if [[ $# -ne 0 ]]; then
-    echo "Error: usage: kubeton logs" >&2
+  if [[ $# -gt 1 || "${1:-}" == -* || ( $# -eq 1 && -z "${1:-}" ) ]]; then
+    echo "Error: usage: kubeton logs [node]" >&2
     return 1
   fi
   require_bin kubectl
   print_logs_victoria_logs_info
 
-  local pod_rows ns pod node_name failed=0
+  local requested_node="${1:-}" pod_rows ns pod node_name failed=0 matched=0
   if ! pod_rows="$(list_ton_pods)"; then
     echo "Error: could not list TON pods for logs." >&2
     return 1
   fi
-  if [[ -z "$pod_rows" ]]; then
-    echo "No TON pods found."
-    return 0
-  fi
-
   while IFS=$'\t' read -r ns pod node_name; do
     [[ -n "$ns" && -n "$pod" ]] || continue
+    [[ -z "$requested_node" || "$node_name" == "$requested_node" ]] || continue
+    matched=$((matched + 1))
     printf '\n=== %s/%s (server: %s; last 20 lines) ===\n' "$ns" "$pod" "${node_name:-N/A}"
     if ! run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" logs "$pod" -c ton-node --tail=20; then
       echo "Error: could not read logs from ${ns}/${pod}." >&2
@@ -18062,6 +18059,13 @@ run_logs() {
     fi
     printf '\n'
   done <<<"$pod_rows"
+  if (( matched == 0 )); then
+    if [[ -n "$requested_node" ]]; then
+      echo "No TON pods found on node '${requested_node}'." >&2
+      return 1
+    fi
+    echo "No TON pods found."
+  fi
   return "$failed"
 }
 
