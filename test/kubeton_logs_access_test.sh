@@ -16,7 +16,13 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
   banner_mode=backend
   kubectl() {
     case "$1/$2" in
-      get/services) printf 'private-logs\tcustom-backend\t19428\n' ;;
+      get/services)
+        if [[ "$5" == app.kubernetes.io/name=vmauth ]]; then
+          [[ "$banner_mode" == backend ]] || printf 'auth-ns\tcustom-stack\n'
+        else
+          printf 'private-logs\tcustom-backend\t19428\n'
+        fi
+        ;;
       get/configmaps)
         [[ "$banner_mode" != auth ]] || printf 'auth-ns\tcustom-stack\n'
         ;;
@@ -46,6 +52,11 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
   assert_contains './kubeton logs expose' "$test_dir/auth-banner"
   assert_not_contains 'SSH' "$test_dir/auth-banner"
   assert_not_contains 'http://203.0.113.27' "$test_dir/auth-banner"
+
+  banner_mode=auth-no-state
+  print_logs_victoria_logs_info >"$test_dir/auth-no-state-banner"
+  assert_contains 'VMAuth credentials' "$test_dir/auth-no-state-banner"
+  assert_contains 'service/vmauth-custom-stack 18427:18427' "$test_dir/auth-no-state-banner"
 
   require_bin() { :; }
   resolve_logs_public_host() { printf 203.0.113.10; }
@@ -82,10 +93,11 @@ assert_not_contains() { ! grep -Fq -- "$1" "$2" || fail "unexpected '$1' in $2";
   assert_not_contains 'now exposed externally' "$test_dir/forward-failed"
   forward_fails=false
   banner_mode=backend
+  ensure_logs_dashboard_auth() { return 1; }
   if run_logs expose --public-host logs.example.com >"$test_dir/no-auth" 2>&1; then
     fail 'expose published the unauthenticated backend'
   fi
-  assert_contains 'run kubeton start first' "$test_dir/no-auth"
+  assert_contains 'no public port-forward was started' "$test_dir/no-auth"
   assert_not_contains 'now exposed externally' "$test_dir/no-auth"
 )
 

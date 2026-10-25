@@ -17560,11 +17560,38 @@ run_verify() {
   kubectl -n "$TON_NAMESPACE" get pvc
 }
 
+list_logs_auth_stacks() {
+  local state_rows service_rows
+  state_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get configmaps -A \
+    -l 'app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton' \
+    -o jsonpath='{range .items[*]}{.data.stackNamespace}{"\t"}{.data.stackName}{"\n"}{end}' 2>/dev/null || true)"
+  # The state ConfigMap may be missing or predate automatic metrics setup.
+  # Operator-created Services carry the actual VMAuth instance identity.
+  if ! service_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get services -A \
+    -l 'app.kubernetes.io/name=vmauth' \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.spec.selector.app\.kubernetes\.io/instance}{"\n"}{end}')"; then
+    return 1
+  fi
+  printf '%s\n%s\n' "$service_rows" "$state_rows" | awk -F '\t' 'NF == 2 && $1 != "" && $2 != "" && !seen[$0]++'
+}
+
+logs_dashboard_route_matches() {
+  local backend_url="$1" target_urls="$2" target_url target_paths path_pattern path_regex
+  local -a route_patterns=()
+  while IFS=$'\t' read -r target_url target_paths; do
+    [[ "${target_url%/}" == "$backend_url" ]] || continue
+    read -r -a route_patterns <<<"$target_paths"
+    for path_pattern in "${route_patterns[@]}"; do
+      path_regex="^(${path_pattern})$"
+      [[ '/select/vmui/' =~ $path_regex ]] && return 0
+    done
+  done <<<"$target_urls"
+  return 1
+}
+
 list_logs_dashboard_access() {
   local backend_rows metrics_rows
-  local logs_ns logs_service logs_port auth_ns stack_name target_urls target_url target_paths auth_port
-  local path_pattern path_regex route_matches
-  local -a route_patterns=()
+  local logs_ns logs_service logs_port auth_ns stack_name target_urls auth_port
   local access_ns access_service access_port access_note
 
   if ! backend_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get services -A \
@@ -17578,9 +17605,7 @@ list_logs_dashboard_access() {
 
   # Discover installed stacks rather than assuming the current environment
   # matches the names and ports used when logging was installed.
-  metrics_rows="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get configmaps -A \
-    -l 'app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton' \
-    -o jsonpath='{range .items[*]}{.data.stackNamespace}{"\t"}{.data.stackName}{"\n"}{end}' 2>/dev/null || true)"
+  metrics_rows="$(list_logs_auth_stacks)" || return 1
   while IFS=$'\t' read -r logs_ns logs_service logs_port; do
     [[ -n "$logs_ns" && -n "$logs_service" && "$logs_port" =~ ^[0-9]+$ ]] || continue
     access_ns="$logs_ns"
@@ -17591,18 +17616,7 @@ list_logs_dashboard_access() {
       [[ -n "$auth_ns" && -n "$stack_name" ]] || continue
       target_urls="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$auth_ns" get vmuser "$stack_name" \
         -o jsonpath='{range .spec.targetRefs[*]}{.static.url}{"\t"}{.paths[*]}{"\n"}{end}' 2>/dev/null || true)"
-      while IFS=$'\t' read -r target_url target_paths; do
-        [[ "${target_url%/}" == "http://${logs_service}.${logs_ns}.svc:${logs_port}" ]] || continue
-        read -r -a route_patterns <<<"$target_paths"
-        route_matches=false
-        for path_pattern in "${route_patterns[@]}"; do
-          path_regex="^(${path_pattern})$"
-          if [[ '/select/vmui/' =~ $path_regex ]]; then
-            route_matches=true
-            break
-          fi
-        done
-        [[ "$route_matches" == true ]] || continue
+      if logs_dashboard_route_matches "http://${logs_service}.${logs_ns}.svc:${logs_port}" "$target_urls"; then
         auth_port="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$auth_ns" get service "vmauth-${stack_name}" \
           -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
         [[ "$auth_port" =~ ^[0-9]+$ ]] || continue
@@ -17611,8 +17625,7 @@ list_logs_dashboard_access() {
         access_port="$auth_port"
         access_note="; use your existing VMAuth credentials"
         break
-      done <<<"$target_urls"
-      [[ -z "$access_note" ]] || break
+      fi
     done <<<"$metrics_rows"
 
     if [[ -n "$access_note" ]]; then
@@ -17621,6 +17634,150 @@ list_logs_dashboard_access() {
       printf '%s\t%s\t%s\tbackend\t-\n' "$access_ns" "$access_service" "$access_port"
     fi
   done <<<"$backend_rows"
+}
+
+ensure_logs_dashboard_auth_ingress() {
+  local logs_ns="$1" logs_service="$2" auth_ns="$3" stack_name="$4"
+  local pod_selector
+  # Keep the existing collector rules intact. NetworkPolicy allows are
+  # additive; grant only this gateway access to an already protected backend.
+  if ! pod_selector="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$logs_ns" \
+    get networkpolicy "${logs_service}-ingress" --ignore-not-found -o jsonpath='{.spec.podSelector}')"; then
+    return 1
+  fi
+  [[ -n "$pod_selector" ]] || return 0
+  cat <<EOF | kubectl -n "$logs_ns" apply -f - >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${logs_service}-auth
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-logs-access
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-logs
+spec:
+  podSelector: ${pod_selector}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${auth_ns}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: ${stack_name}
+              app.kubernetes.io/name: vmauth
+      ports:
+        - protocol: TCP
+          port: http
+EOF
+}
+
+ensure_logs_dashboard_auth() {
+  local logs_ns="$1" logs_service="$2" logs_port="$3"
+  local ns="${VICTORIA_METRICS_NAMESPACE:-vm}" stack_name candidate_ns candidate_stack candidates
+  local crds auth_owner user_owner target_refs target_urls route patch_path timeout_seconds auth_port
+  stack_name="$(victoria_metrics_stack_name)"
+  candidates="$(list_logs_auth_stacks)" || return 1
+  timeout_seconds="$(resolve_victoria_metrics_rollout_timeout_seconds)"
+
+  if ! crds="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl get crd \
+    vmauths.operator.victoriametrics.com vmusers.operator.victoriametrics.com --ignore-not-found -o name)"; then
+    return 1
+  fi
+  if [[ "$(printf '%s\n' "$crds" | awk 'NF {n++} END {print n+0}')" != 2 ]]; then
+    ensure_victoria_metrics_operator "${VICTORIA_METRICS_OPERATOR_NAMESPACE:-vm}" "$stack_name" >/dev/null || return 1
+  fi
+  # Reuse a managed stack with its custom identity. Skip unrelated VMAuth
+  # installations, and preserve existing credentials and metrics routes.
+  while IFS=$'\t' read -r candidate_ns candidate_stack; do
+    [[ -n "$candidate_ns" && -n "$candidate_stack" ]] || continue
+    auth_owner="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$candidate_ns" get vmauth "$candidate_stack" \
+      --ignore-not-found -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}')" || return 1
+    user_owner="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$candidate_ns" get vmuser "$candidate_stack" \
+      --ignore-not-found -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}')" || return 1
+    if [[ "$auth_owner" == kubeton || "$user_owner" == kubeton ]]; then
+      ns="$candidate_ns"
+      stack_name="$candidate_stack"
+      break
+    fi
+  done <<<"$candidates"
+  ensure_namespace "$ns" || return 1
+  if ! auth_owner="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get vmauth "$stack_name" \
+    --ignore-not-found -o jsonpath='{.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}')" \
+    || ! user_owner="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get vmuser "$stack_name" \
+    --ignore-not-found -o jsonpath='{.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}')"; then
+    return 1
+  fi
+  for candidate_stack in "$auth_owner" "$user_owner"; do
+    if [[ -n "$candidate_stack" && "$candidate_stack" != "$stack_name"$'\t'kubeton ]]; then
+      echo "Error: refusing to change VictoriaLogs access resources not managed by kubeton in ${ns}." >&2
+      return 1
+    fi
+  done
+  echo "[logs] Configuring authenticated access to existing VictoriaLogs ${logs_ns}/${logs_service} ..." >&2
+  if [[ -z "$auth_owner" ]]; then
+    cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null || return 1
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAuth
+metadata:
+  name: ${stack_name}
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-metrics
+    app.kubernetes.io/component: auth
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-metrics
+spec:
+  userSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: kubeton
+EOF
+  fi
+  route="{\"static\":{\"url\":$(json_quote "http://${logs_service}.${logs_ns}.svc:${logs_port}")},\"paths\":[\"/select/.*\"]}"
+  if [[ -z "$user_owner" ]]; then
+    cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null || return 1
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: ${stack_name}
+  labels:
+    app.kubernetes.io/name: kubeton-victoria-metrics-user
+    app.kubernetes.io/managed-by: kubeton
+    app.kubernetes.io/part-of: kubeton-victoria-metrics
+spec:
+  name: $(yaml_quote "${VICTORIA_METRICS_AUTH_USERNAME:-$stack_name}")
+  username: $(yaml_quote "${VICTORIA_METRICS_AUTH_USERNAME:-$stack_name}")
+  generatePassword: true
+  targetRefs: [${route}]
+EOF
+  else
+    target_urls="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get vmuser "$stack_name" \
+      -o jsonpath='{range .spec.targetRefs[*]}{.static.url}{"\t"}{.paths[*]}{"\n"}{end}')" || return 1
+    if ! logs_dashboard_route_matches "http://${logs_service}.${logs_ns}.svc:${logs_port}" "$target_urls"; then
+      target_refs="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get vmuser "$stack_name" \
+        -o jsonpath='{.spec.targetRefs}')" || return 1
+      patch_path='/spec/targetRefs/-'
+      if [[ -z "$target_refs" || "$target_refs" == null ]]; then
+        patch_path='/spec/targetRefs'
+        route="[${route}]"
+      fi
+      kubectl -n "$ns" patch vmuser "$stack_name" --type=json \
+        -p "[{\"op\":\"add\",\"path\":\"${patch_path}\",\"value\":${route}}]" >/dev/null || return 1
+    fi
+  fi
+  ensure_logs_dashboard_auth_ingress "$logs_ns" "$logs_service" "$ns" "$stack_name" || return 1
+  # Unlike the informational start checks, exposure must fail when the gateway
+  # is not ready. Never fall back to forwarding the unauthenticated backend.
+  kubectl -n "$ns" wait --for=jsonpath='{.status.updateStatus}'=operational "vmuser/${stack_name}" \
+    --timeout="${timeout_seconds}s" >/dev/null || return 1
+  kubectl -n "$ns" wait --for=jsonpath='{.status.updateStatus}'=operational "vmauth/${stack_name}" \
+    --timeout="${timeout_seconds}s" >/dev/null || return 1
+  kubectl -n "$ns" rollout status "deployment/vmauth-${stack_name}" --timeout="${timeout_seconds}s" >/dev/null || return 1
+  resolve_victoria_metrics_credentials "$ns" "$stack_name" '' '' >/dev/null || return 1
+  auth_port="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" get service "vmauth-${stack_name}" \
+    -o jsonpath='{.spec.ports[0].port}')" || return 1
+  [[ "$auth_port" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\t%s\t%s\tauth\t%s\n' "$ns" "vmauth-${stack_name}" "$auth_port" "$stack_name"
 }
 
 print_logs_victoria_logs_info() {
@@ -17704,6 +17861,17 @@ run_logs_expose() {
     echo "Error: cannot discover the authenticated VictoriaLogs dashboard." >&2
     return 1
   fi
+  if [[ -z "$access_rows" ]]; then
+    echo "Error: VictoriaLogs backend was not found in this cluster; install logging with kubeton start." >&2
+    return 1
+  fi
+  if ! grep -q $'\tauth\t' <<<"$access_rows"; then
+    IFS=$'\t' read -r ns service remote_port mode stack_name <<<"$access_rows"
+    if ! access_rows="$(ensure_logs_dashboard_auth "$ns" "$service" "$remote_port")"; then
+      echo "Error: could not configure authenticated VictoriaLogs access; no public port-forward was started." >&2
+      return 1
+    fi
+  fi
   while IFS=$'\t' read -r ns service remote_port mode stack_name; do
     [[ "$mode" == auth ]] || continue
     if ! forward_row="$(ensure_victoria_metrics_port_forward "$ns" "$service" "$port" "$remote_port" 0.0.0.0)"; then
@@ -17721,7 +17889,7 @@ run_logs_expose() {
     echo "[logs] Allow inbound TCP ${local_port} to this server through its firewall/NAT."
     return 0
   done <<<"$access_rows"
-  echo "Error: authenticated VictoriaLogs access is not installed; run kubeton start first." >&2
+  echo "Error: could not resolve an authenticated VictoriaLogs endpoint." >&2
   return 1
 }
 

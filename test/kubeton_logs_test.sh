@@ -33,6 +33,14 @@ unexpected() {
 }
 
 if [[ "${1:-}" == get && "${2:-}" == services ]]; then
+  if [[ "${5:-}" == app.kubernetes.io/name=vmauth ]]; then
+    [[ $# == 7 && "${3:-}" == -A && "${4:-}" == -l \
+      && "${6:-}" == -o && "${7:-}" == jsonpath=* ]] || unexpected "$@"
+    case "$LOGS_CASE" in
+      auth-match|auth-mismatch|auth-health-only|auth-select-only) printf 'metrics-ns\tmetrics-stack\n' ;;
+    esac
+    exit 0
+  fi
   [[ $# == 7 && "${3:-}" == -A && "${4:-}" == -l \
     && "${5:-}" == app.kubernetes.io/name=kubeton-victoria-logs-access,app.kubernetes.io/managed-by=kubeton \
     && "${6:-}" == -o && "${7:-}" == jsonpath=* ]] || unexpected "$@"

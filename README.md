@@ -649,8 +649,13 @@ to VMAuth and prints the external dashboard URL, for example
 `http://203.0.113.10:8427/select/vmui/`. It discovers this server's public IPv4
 address using [ipify](https://www.ipify.org/); use `--public-host` when NAT, proxies, or DNS require a
 different advertised address. Permit inbound TCP to the printed port in the
-server firewall and any upstream NAT. It requires the authenticated access
-stack installed by `kubeton start` and never publishes the bare VictoriaLogs
+server firewall and any upstream NAT. The command discovers the installed
+VMAuth gateway even if its saved metrics state is missing. For older clusters
+with VictoriaLogs already running, it sets up missing authenticated access or
+adds the logs route to an existing kubeton-managed gateway. This does not
+restart the TON fleet or reinstall its storage, logs backend, or collector;
+there is no need to rerun `kubeton start`. Existing credentials and metrics
+routes are preserved. The command never publishes the bare VictoriaLogs
 backend. Use the VMAuth credentials in the printed Kubernetes Secret.
 
 VMAuth's port-forward serves HTTP Basic Auth. Public HTTP does not encrypt
