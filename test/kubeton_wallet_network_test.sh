@@ -571,7 +571,7 @@ import sys
 
 workchain, account = sys.argv[1].split(":")
 addresses = []
-for tag in (0x51, 0x11):
+for tag in (0xD1, 0x91):
     body = bytes([tag, int(workchain) & 0xff]) + bytes.fromhex(account)
     addresses.append(base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode())
 print("\t".join(addresses))
@@ -603,6 +603,52 @@ PY
   assert_contains 'saved for testnet' "$case_dir/mismatch"
 )
 
+test_collect_mainnet_legacy_friendly_flags() (
+  setup_main_wallet_case collect-mainnet-legacy-flags
+  WALLET_NETWORK=mainnet
+  write_wallet_fixture savings mainnet
+  IFS=$'\t' read -r fixture_test_receive fixture_test_bounceable fixture_main_receive fixture_main_bounceable < <(python3 - "$fixture_wallet_address" <<'PY'
+import base64
+import binascii
+import sys
+
+workchain, account = sys.argv[1].split(":")
+addresses = []
+for tag in (0xD1, 0x91, 0x51, 0x11):
+    body = bytes([tag, int(workchain) & 0xff]) + bytes.fromhex(account)
+    addresses.append(base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode())
+print("\t".join(addresses))
+PY
+)
+  printf 'workchain=0\nwallet_id=42\nnon_bounceable=%s\nbounceable=%s\n' \
+    "$fixture_test_receive" "$fixture_test_bounceable" >>"$MAIN_WALLET_DIR/savings.wallet.meta"
+  printf 'synthetic existing private key' >"$MAIN_WALLET_DIR/savings.pk"
+  cp "$MAIN_WALLET_DIR/savings.wallet.meta" "$case_dir/original.meta"
+  cp "$MAIN_WALLET_DIR/savings.pk" "$case_dir/original.pk"
+  cp "$MAIN_WALLET_DIR/savings-query.boc" "$case_dir/original.boc"
+  wallet_balance_nano() { printf 0; }
+  wallet_seqno_decimal() { printf 0; }
+  fixture_show_table="$(main_wallet_show savings)"
+  assert_contains "$fixture_main_receive" <(printf '%s\n' "$fixture_show_table")
+  assert_contains "$fixture_main_bounceable" <(printf '%s\n' "$fixture_show_table")
+  assert_not_contains "$fixture_test_receive" <(printf '%s\n' "$fixture_show_table")
+  cmp "$case_dir/original.meta" "$MAIN_WALLET_DIR/savings.wallet.meta" || fail 'show rewrote saved wallet metadata'
+  cmp "$case_dir/original.pk" "$MAIN_WALLET_DIR/savings.pk" || fail 'show changed an existing private key'
+  cmp "$case_dir/original.boc" "$MAIN_WALLET_DIR/savings-query.boc" || fail 'show changed the deployment message'
+
+  source "$kubeton"
+  run_wallet() {
+    [[ "$*" == 'show savings' ]] || fail "unexpected nested wallet operation: $*"
+    printf '%s\n' "$fixture_show_table"
+  }
+  [[ "$(resolve_main_wallet_receive_address mainnet savings)" == "$fixture_main_receive" ]] \
+    || fail 'collect rejected the mainnet wallet generated with legacy test-only friendly flags'
+  if resolve_main_wallet_receive_address testnet savings >"$case_dir/mismatch" 2>&1; then
+    fail 'address normalization bypassed the saved mainnet wallet guard'
+  fi
+  assert_contains 'saved for mainnet' "$case_dir/mismatch"
+)
+
 test_unchanged_local_commands
 test_networkless_deploy
 test_networkless_send_forms
@@ -617,5 +663,6 @@ test_runtime_config_failures_prevent_transactions
 test_main_wallet_transaction_network_guards
 test_main_wallet_show_network_and_config
 test_collect_receive_address_from_real_show_table
+test_collect_mainnet_legacy_friendly_flags
 
 echo "kubeton wallet network tests passed"

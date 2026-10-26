@@ -265,6 +265,47 @@ ton_address_to_hex() {
   printf '%s:%s' "$wc_dec" "$account_hex"
 }
 
+ton_friendly_address_for_network() {
+  local address="${1:-}" network decoded_hex tag body_hex crc=0 byte_offset bit byte_value
+
+  network="$(normalize_wallet_network_name "${2:-}")" || return 1
+  address="$(trim_whitespace "$address")"
+  [[ "$address" =~ ^[A-Za-z0-9_-]{48}$ ]] || return 1
+  # Validate the original checksum before changing its presentation flags.
+  ton_address_to_hex "$address" >/dev/null || return 1
+  decoded_hex="$(printf '%s' "${address//-/+}" | tr '_' '/' | base64 -d 2>/dev/null | od -An -tx1 -v | tr -d ' \n')" || return 1
+  tag=$((16#${decoded_hex:0:2} & 0x7f))
+  [[ "$network" != testnet ]] || tag=$((tag | 0x80))
+  body_hex="$(printf '%02x' "$tag")${decoded_hex:2:66}"
+  for ((byte_offset=0; byte_offset<68; byte_offset+=2)); do
+    byte_value=$((16#${body_hex:byte_offset:2}))
+    crc=$((crc ^ (byte_value << 8)))
+    for ((bit=0; bit<8; bit++)); do
+      if (( crc & 0x8000 )); then
+        crc=$((((crc << 1) ^ 0x1021) & 0xffff))
+      else
+        crc=$(((crc << 1) & 0xffff))
+      fi
+    done
+  done
+  printf '%b' "$(printf '%s%04x' "$body_hex" "$crc" | sed 's/../\\x&/g')" \
+    | base64 | tr '+/' '-_' | tr -d '\r\n'
+}
+
+wallet_matching_friendly_address() {
+  local candidate="${1:-}" wallet_address="${2:-}" network="${3:-}"
+  local candidate_hex
+
+  [[ "$candidate" =~ ^[A-Za-z0-9_-]{48}$ && -n "$wallet_address" ]] || return 1
+  candidate_hex="$(ton_address_to_hex "$candidate")" || return 1
+  [[ "$candidate_hex" == "$wallet_address" ]] || return 1
+  if [[ -n "$network" && "$network" != unknown ]]; then
+    ton_friendly_address_for_network "$candidate" "$network"
+  else
+    printf '%s' "$candidate"
+  fi
+}
+
 wallet_address_file_text() {
   local file="$1" candidate nontext_bytes
 
@@ -789,15 +830,18 @@ send_boc_payload() {
 print_wallet_deploy_failure_hint() {
   local wallet_name="$1"
   local meta_file="${MAIN_WALLET_DIR}/${wallet_name}.wallet.meta"
-  local non_bounceable bounceable wallet_address
+  local non_bounceable bounceable wallet_address network
 
   non_bounceable=""
   bounceable=""
-  wallet_address=""
+  wallet_address="$(resolve_wallet_address_by_name "$wallet_name" || true)"
   if [[ -f "$meta_file" ]]; then
+    network="$(normalize_wallet_network_name "$(read_meta_value network "$meta_file")" || true)"
+    [[ -n "$network" ]] || network="$(resolve_current_wallet_network || true)"
     non_bounceable="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
     bounceable="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
-    wallet_address="$(trim_whitespace "$(read_meta_value wallet_address "$meta_file")")"
+    non_bounceable="$(wallet_matching_friendly_address "$non_bounceable" "$wallet_address" "$network" || true)"
+    bounceable="$(wallet_matching_friendly_address "$bounceable" "$wallet_address" "$network" || true)"
   fi
 
   echo "Hint: wallet deployment sends an external init message; it does not fund the wallet." >&2
@@ -873,14 +917,15 @@ main_wallet_create() {
   fi
 
   local create_log
-  local wallet_address non_bounceable bounceable meta_file
+  local wallet_address non_bounceable bounceable meta_file network
   create_log="$(mktemp)"
 
   if ! (
     cd "$MAIN_WALLET_DIR"
     export FIFTPATH="${FIFTPATH:-/usr/lib/fift:/usr/share/ton/smartcont/}"
-    "$fift_bin" -s "./new-wallet-v3.fif" "$workchain" "$subwallet_id" "$wallet_name" 2>&1 | tee "$create_log"
+    "$fift_bin" -s "./new-wallet-v3.fif" "$workchain" "$subwallet_id" "$wallet_name" >"$create_log" 2>&1
   ); then
+    cat "$create_log"
     rm -f "$create_log"
     return 1
   fi
@@ -888,14 +933,23 @@ main_wallet_create() {
   wallet_address="$(sed -n 's/^new wallet address = \([^[:space:]]*\).*/\1/p' "$create_log" | tail -n1)"
   non_bounceable="$(sed -n 's/^Non-bounceable address (for init):[[:space:]]*\(.*\)$/\1/p' "$create_log" | tail -n1)"
   bounceable="$(sed -n 's/^Bounceable address (for later access):[[:space:]]*\(.*\)$/\1/p' "$create_log" | tail -n1)"
-  rm -f "$create_log"
-
   wallet_address="$(ton_address_to_hex "$wallet_address" || true)"
-  if [[ -z "$wallet_address" && -s "$MAIN_WALLET_DIR/${wallet_name}.addr" ]]; then
-    wallet_address="$(wallet_address_file_to_hex "$MAIN_WALLET_DIR/${wallet_name}.addr" || true)"
+  if [[ -s "$MAIN_WALLET_DIR/${wallet_name}.addr" ]]; then
+    local file_address
+    file_address="$(wallet_address_file_to_hex "$MAIN_WALLET_DIR/${wallet_name}.addr" || true)"
+    [[ -z "$file_address" ]] || wallet_address="$file_address"
   fi
-  ton_address_to_hex "$non_bounceable" >/dev/null || non_bounceable=""
-  ton_address_to_hex "$bounceable" >/dev/null || bounceable=""
+  network="$(resolve_current_wallet_network || true)"
+  # Upstream new-wallet-v3.fif prints 7/6 .Addr, which always sets the
+  # test-only flag. Match the saved account before using the active network.
+  non_bounceable="$(wallet_matching_friendly_address "$non_bounceable" "$wallet_address" "$network" || true)"
+  bounceable="$(wallet_matching_friendly_address "$bounceable" "$wallet_address" "$network" || true)"
+  awk -v non_bounceable="${non_bounceable:-unknown}" -v bounceable="${bounceable:-unknown}" '
+    /^Non-bounceable address \(for init\):/ { print "Non-bounceable address (for init): " non_bounceable; next }
+    /^Bounceable address \(for later access\):/ { print "Bounceable address (for later access): " bounceable; next }
+    { print }
+  ' "$create_log"
+  rm -f "$create_log"
 
   meta_file="$MAIN_WALLET_DIR/${wallet_name}.wallet.meta"
   {
@@ -905,11 +959,7 @@ main_wallet_create() {
     echo "wallet_address=${wallet_address}"
     echo "non_bounceable=${non_bounceable}"
     echo "bounceable=${bounceable}"
-    if [[ -n "$WALLET_NETWORK" ]]; then
-      local network
-      network="$(resolve_current_wallet_network || true)"
-      [[ -z "$network" ]] || echo "network=${network}"
-    fi
+    [[ -z "$network" ]] || echo "network=${network}"
   } > "$meta_file"
   chmod 600 "$meta_file"
 }
@@ -989,27 +1039,22 @@ main_wallet_show() {
     wallet_address="$(resolve_wallet_address_by_name "$wallet_name" || true)"
     non_bounceable="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
     bounceable="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
-    # The .addr account is authoritative. A valid but stale friendly address
-    # must not become a transfer destination when collect reads this table.
-    if [[ -z "$wallet_address" || "$(ton_address_to_hex "$non_bounceable" || true)" != "$wallet_address" ]]; then
-      non_bounceable=""
-    fi
-    if [[ -z "$wallet_address" || "$(ton_address_to_hex "$bounceable" || true)" != "$wallet_address" ]]; then
-      bounceable=""
-    fi
     network="$(normalize_wallet_network_name "$(read_meta_value network "$meta_file")" 2>/dev/null || true)"
     network="$(trim_whitespace "$network")"
+    if [[ -z "$network" ]]; then
+      network="$(resolve_current_wallet_network || true)"
+      [[ -n "$network" ]] || network=unknown
+    fi
+    # The .addr account is authoritative. Correct only presentation flags on
+    # valid metadata for that account; retain genuine saved-network guards.
+    non_bounceable="$(wallet_matching_friendly_address "$non_bounceable" "$wallet_address" "$network" || true)"
+    bounceable="$(wallet_matching_friendly_address "$bounceable" "$wallet_address" "$network" || true)"
 
     [[ -z "$workchain" ]] && workchain="unknown"
     [[ -z "$wallet_id" ]] && wallet_id="unknown"
     [[ -z "$wallet_address" ]] && wallet_address="unknown"
     [[ -z "$non_bounceable" ]] && non_bounceable="unknown"
     [[ -z "$bounceable" ]] && bounceable="unknown"
-    if [[ -z "$network" ]]; then
-      network="$(resolve_current_wallet_network || true)"
-      [[ -n "$network" ]] || network=unknown
-    fi
-
     chain_state="$(wallet_show_chain_state "$wallet_name" "$wallet_address" "$network" || true)"
     IFS=$'\t' read -r balance seqno <<<"$chain_state"
     [[ -z "$balance" ]] && balance="unknown"
@@ -1358,6 +1403,14 @@ parse_seqno_from_account_output() {
   return 1
 }
 
+liteclient_account_state_is_empty() {
+  local output="${1//$'\r'/}"
+
+  # Current lite-client prints this sentence instead of an account_none TL-B
+  # record when a successfully checked account does not exist on-chain.
+  printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*account state is empty[[:space:]]*$|state:[[:space:]]*\(?[[:space:]]*(account_none|none|nonexist)([^[:alnum:]_]|$)|account_none\$0'
+}
+
 wallet_seqno_decimal() {
   local wallet_address="$1"
   local output seq_dec attempts delay attempt
@@ -1366,27 +1419,30 @@ wallet_seqno_decimal() {
   delay="$(main_wallet_send_retry_delay_seconds)"
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null || true)"
-    seq_dec="$(parse_seqno_from_runmethod_output "$output" || true)"
-    seq_dec="$(trim_whitespace "$seq_dec")"
-    if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
-      printf '%s' "$seq_dec"
-      return 0
+    if output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null)"; then
+      seq_dec="$(parse_seqno_from_runmethod_output "$output" || true)"
+      seq_dec="$(trim_whitespace "$seq_dec")"
+      if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$seq_dec"
+        return 0
+      fi
     fi
 
-    output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
+    if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)"; then
+      # Only a successful account query can establish an undeployed wallet.
+      # A failed runmethod (including an RPC failure) alone does not imply 0.
+      if liteclient_account_state_is_empty "$output" ||
+        printf '%s\n' "$output" | grep -Eiq 'state:[[:space:]]*\(?[[:space:]]*(account_uninit|uninit)([^[:alnum:]_]|$)'; then
+        printf '%s' "0"
+        return 0
+      fi
 
-    # For undeployed/nonexistent wallets seqno is 0 by definition.
-    if printf '%s\n' "$output" | grep -Eiq 'state:[[:space:]]*(account_uninit|uninit|account_none|none|nonexist)|account_none\$0'; then
-      printf '%s' "0"
-      return 0
-    fi
-
-    seq_dec="$(parse_seqno_from_account_output "$output" || true)"
-    seq_dec="$(trim_whitespace "$seq_dec")"
-    if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
-      printf '%s' "$seq_dec"
-      return 0
+      seq_dec="$(parse_seqno_from_account_output "$output" || true)"
+      seq_dec="$(trim_whitespace "$seq_dec")"
+      if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$seq_dec"
+        return 0
+      fi
     fi
 
     if (( attempt < attempts )); then
@@ -1416,24 +1472,25 @@ wallet_balance_nano() {
   delay="$(main_wallet_send_retry_delay_seconds)"
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true)"
-    if printf '%s\n' "$output" | grep -Eiq 'state:[[:space:]]*(account_none|none|nonexist)|account_none\$0'; then
-      printf '%s' "0"
-      return 0
-    fi
-    balance="$(printf '%s\n' "$output" | awk '
-      /balance:/ {in_balance=1}
-      in_balance && match($0, /value:[[:space:]]*[0-9]+/) {
-        v=substr($0, RSTART, RLENGTH)
-        sub(/value:[[:space:]]*/, "", v)
-        print v
-        exit
-      }
-    ')"
-    balance="$(trim_whitespace "$balance")"
-    if [[ "$balance" =~ ^[0-9]+$ ]]; then
-      printf '%s' "$balance"
-      return 0
+    if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)"; then
+      if liteclient_account_state_is_empty "$output"; then
+        printf '%s' "0"
+        return 0
+      fi
+      balance="$(printf '%s\n' "$output" | awk '
+        /balance:/ {in_balance=1}
+        in_balance && match($0, /value:[[:space:]]*[0-9]+/) {
+          v=substr($0, RSTART, RLENGTH)
+          sub(/value:[[:space:]]*/, "", v)
+          print v
+          exit
+        }
+      ')"
+      balance="$(trim_whitespace "$balance")"
+      if [[ "$balance" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$balance"
+        return 0
+      fi
     fi
 
     if (( attempt < attempts )); then

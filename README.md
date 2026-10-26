@@ -836,6 +836,15 @@ seqno are shown only with a readable, consistent active network that matches
 the wallet, otherwise they are unknown. A successful deploy also records the
 wallet network in the encrypted main-wallet metadata.
 
+Friendly addresses shown by create/show and deployment hints use the wallet's
+known network. For workchain 0, mainnet uses `UQ`/`EQ` forms and testnet uses
+`0Q`/`kQ` forms.
+Older wallet metadata may contain Fift's default test-only forms even for a
+mainnet wallet. These are corrected when displayed, preserving the same raw
+account, keys, wallet ID, and bounce behavior. A genuine saved-network mismatch
+still blocks transfers. A successful lite-client response that an account is
+empty reports zero balance and seqno; connection/query failures remain unknown.
+
 By default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
