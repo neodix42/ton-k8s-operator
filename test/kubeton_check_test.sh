@@ -120,6 +120,8 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
   # columns when parsing unlabelled workloads.
   if [[ "$mode" == "loaded" ]]; then
     printf 'node-good-1\x1fRunning\x1f\x1f\x1f17000m,70Gi;\n'
+  elif [[ "$mode" == "add-current-fleet-load" ]]; then
+    printf 'node-good-3\x1fRunning\x1fton-node\x1f\x1f17000m,70Gi;\n'
   fi
   # Other modes have no existing assigned workloads.
   exit 0
@@ -1016,5 +1018,30 @@ TMPDIR="$test_dir" PATH="$fake_bin:$PATH" bash -c 'source "$1"; selector_file="$
   "$kubeton" 'node.longhorn.io/create-default-disk=true,ton.ton.org/kubeton-prereq=ready' >"$longhorn_values_output"
 assert_contains "defaultSettings:" "$longhorn_values_output"
 assert_contains 'systemManagedComponentsNodeSelector: "node.longhorn.io/create-default-disk:true;ton.ton.org/kubeton-prereq:ready"' "$longhorn_values_output"
+
+# Add admits one new host. Existing fleet reservations cannot be discounted as
+# they are for an in-place start/upgrade, and anti-affinity applies even when
+# host ports are disabled.
+for add_mode in host-port-current-fleet add-current-fleet-load; do
+  PATH="$fake_bin:$PATH" KUBETON_TEST_MODE="$add_mode" bash -euo pipefail -c '
+    source "$1"
+    KUBETON_ADD_MODE=true
+    KUBETON_ADD_STS=tonnode
+    KUBETON_ADD_CPU_MILLI=16000
+    KUBETON_ADD_MEMORY_BYTES=68719476736
+    KUBETON_ADD_DATA_BYTES=0
+    KUBETON_ADD_HOST_PORTS=(UDP/30001)
+    declare -A KUBETON_ADD_OCCUPIED_NODES=([node-good-1]=1)
+    run_node_prerequisite_check 1 ""
+    [[ "${KUBETON_NODE_CHECK_RESULT[node-good-1]}" == FAIL ]]
+    [[ "${KUBETON_NODE_CHECK_RESULT[node-good-2]}" == PASS ]]
+    [[ "${KUBETON_NODE_CHECK_RESULT[node-good-3]}" == FAIL ]]
+    if [[ "$KUBETON_TEST_MODE" == host-port-current-fleet ]]; then
+      [[ "${KUBETON_NODE_CHECK_REASON[node-good-3]}" == *"host ports in use"* ]]
+    else
+      [[ "${KUBETON_NODE_CHECK_REASON[node-good-3]}" == *"insufficient CPU"* ]]
+    fi
+  ' _ "$kubeton" >"$test_dir/$add_mode-add.out"
+done
 
 echo "kubeton node prerequisite checks: PASS"

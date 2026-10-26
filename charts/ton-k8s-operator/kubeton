@@ -1938,6 +1938,11 @@ node_check_resolve_host_port_requirements() {
   KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS=()
   KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS=()
   KUBETON_NODE_CHECK_HOST_PORTS_ENABLED=false
+  if is_true "${KUBETON_ADD_MODE:-false}"; then
+    KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS=("${KUBETON_ADD_HOST_PORTS[@]}")
+    (( ${#KUBETON_ADD_HOST_PORTS[@]} == 0 )) || KUBETON_NODE_CHECK_HOST_PORTS_ENABLED=true
+    return 0
+  fi
 
   for values_file in "$TON_VALUES_FILE" "$CHART_DIR/values.yaml"; do
     if tonnode_network_uses_inline_map_in_values_file "$values_file"; then
@@ -2015,6 +2020,10 @@ node_check_collect_host_port_conflicts() {
 
   target_ns="$(resolve_tonnode_namespace_from_values)"
   target_name="$(resolve_tonnode_name_from_values)"
+  if is_true "${KUBETON_ADD_MODE:-false}"; then
+    target_ns="$TON_NAMESPACE"
+    target_name="$KUBETON_ADD_STS"
+  fi
   if ! target_sts_uid="$(kubectl -n "$target_ns" get statefulset "$target_name" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
     echo "Error: cannot read the configured TonNode StatefulSet identity for host-port preflight." >&2
     return 1
@@ -2038,7 +2047,7 @@ node_check_collect_host_port_conflicts() {
     case "$phase" in
       Succeeded|Failed) continue ;;
     esac
-    if [[ -n "$target_sts_uid" && "$ns" == "$target_ns" && "$app_name" == "ton-node" && "$managed_by" == "ton-k8s-operator" && "$instance" == "$target_name" && ",${owners}," == *",controller/StatefulSet/${target_name}/${target_sts_uid},"* ]]; then
+    if ! is_true "${KUBETON_ADD_MODE:-false}" && [[ -n "$target_sts_uid" && "$ns" == "$target_ns" && "$app_name" == "ton-node" && "$managed_by" == "ton-k8s-operator" && "$instance" == "$target_name" && ",${owners}," == *",controller/StatefulSet/${target_name}/${target_sts_uid},"* ]]; then
       continue
     fi
 
@@ -2177,7 +2186,9 @@ collect_node_requested_resources() {
     # Existing TON pods are treated as replaceable fleet members. Their own
     # requests must not make an in-place start/upgrade fail the preflight;
     # all other assigned pod requests remain reserved.
-    [[ "$ton_pod_label" == "ton-node" ]] && continue
+    if [[ "$ton_pod_label" == "ton-node" ]] && ! is_true "${KUBETON_ADD_MODE:-false}"; then
+      continue
+    fi
 
     app_cpu=0
     app_memory=0
@@ -2285,7 +2296,15 @@ run_node_prerequisite_check() {
     echo "Error: invalid required TON node count '${required_nodes}'." >&2
     return 1
   }
-  resolve_node_check_requirements || return 1
+  if is_true "${KUBETON_ADD_MODE:-false}"; then
+    KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI="$KUBETON_ADD_CPU_MILLI"
+    KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES="$KUBETON_ADD_MEMORY_BYTES"
+    KUBETON_NODE_CHECK_TON_DATA_BYTES="$KUBETON_ADD_DATA_BYTES"
+    KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES="$(quantity_to_bytes "$KUBETON_CHECK_DISK_HEADROOM")" || return 1
+    KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=$((KUBETON_ADD_DATA_BYTES + KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES))
+  else
+    resolve_node_check_requirements || return 1
+  fi
   node_check_resolve_host_port_requirements || return 1
   node_check_scope_nodes "$selector" || return 1
   collect_node_requested_resources || return 1
@@ -2306,7 +2325,11 @@ run_node_prerequisite_check() {
     return 1
   fi
 
-  echo "Node prerequisites from ${TON_VALUES_FILE}:"
+  if is_true "${KUBETON_ADD_MODE:-false}"; then
+    echo "Node prerequisites for one additional replica of the live StatefulSet:"
+  else
+    echo "Node prerequisites from ${TON_VALUES_FILE}:"
+  fi
   echo "  per TON pod: cpu >= $(node_check_format_cpu "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI") cores, memory >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES")"
   echo "  local TON PVC capacity: $(node_check_format_bytes "$KUBETON_NODE_CHECK_TON_DATA_BYTES") (tonWork + tonSource + myTonCore + myTonCtrl)"
   echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES") (configured local TON PVC capacity + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom); disk data comes from the kubelet summary API"
@@ -2322,6 +2345,9 @@ run_node_prerequisite_check() {
     node="$(trim_whitespace "$node")"
     [[ -n "$node" ]] || continue
     basic_reason=""
+    if is_true "${KUBETON_ADD_MODE:-false}" && [[ -n "${KUBETON_ADD_OCCUPIED_NODES[$node]:-}" ]]; then
+      basic_reason="already hosts a TON replica"
+    fi
     if [[ "$unschedulable" == "true" ]]; then
       basic_reason="unschedulable"
     fi
@@ -11404,17 +11430,27 @@ resolve_tonnode_wallet_row_from_pod() {
 list_tonnode_wallet_names_from_pod() {
   local ns="$1"
   local pod="$2"
+  local strict="${3:-false}"
   local output
 
   output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+    set -o pipefail
+    strict="$1"
     wallet_dir="/var/ton-work/controller/mytoncore/wallets"
-    [[ -d "$wallet_dir" ]] || exit 0
+    if [[ ! -d "$wallet_dir" || ! -r "$wallet_dir" || ! -x "$wallet_dir" ]]; then
+      [[ "$strict" != true ]] || exit 1
+      exit 0
+    fi
     shopt -s nullglob
-    for f in "$wallet_dir"/*.pk; do
+    files=("$wallet_dir"/*.pk)
+    # Deletion checks also include address-only wallets, even if their key
+    # file is missing. Never read private key contents for this inventory.
+    [[ "$strict" != true ]] || files+=("$wallet_dir"/*.addr)
+    for f in "${files[@]}"; do
       base="${f##*/}"
-      printf "%s\n" "${base%.pk}"
+      printf "%s\n" "${base%.*}"
     done | sort -u
-  ' 2>/dev/null || true)"
+  ' _ "$strict" 2>/dev/null)" || return 1
   output="$(strip_ansi_sequences "$output")"
   printf '%s\n' "$output" | awk 'NF'
 }
@@ -13065,9 +13101,10 @@ get_single_ton_statefulset() {
   local -n out_sts="$2"
   local -n out_replicas="$3"
   local -a rows=()
-  local row row_ns row_sts row_replicas count=0
+  local row row_ns row_sts row_replicas inventory count=0
 
-  mapfile -t rows < <(list_ton_statefulsets)
+  inventory="$(list_ton_statefulsets)" || return 1
+  mapfile -t rows <<<"$inventory"
   if [[ ${#rows[@]} -eq 0 || -z "${rows[0]}" ]]; then
     echo "Error: no TON StatefulSets found." >&2
     return 1
@@ -14001,14 +14038,222 @@ enforce_stopped_node_mappings_after_start() {
   return 0
 }
 
-run_add() {
+ton_add_context_script() {
+  cat <<'PY'
+import json
+import math
+import re
+import sys
+from decimal import Decimal
+
+
+def quantity(value):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)([A-Za-z]*)", str(value or 0))
+    units = {"": 1, "n": Decimal("1e-9"), "u": Decimal("1e-6"), "m": Decimal(".001")}
+    units.update({suffix: 1000 ** power for power, suffix in enumerate("kMGTPE", 1)})
+    units.update({suffix + "i": 1024 ** power for power, suffix in enumerate("KMGTPE", 1)})
+    if not match or match[2] not in units:
+        raise ValueError("unrecognized resource quantity")
+    return Decimal(match[1]) * units[match[2]]
+
+
+def requests(spec):
+    apps = [item.get("resources", {}).get("requests", {}) for item in spec.get("containers", [])]
+    initial = [item.get("resources", {}).get("requests", {}) for item in spec.get("initContainers", [])]
+    return [max(sum(quantity(item.get(key, 0)) for item in apps),
+                max((quantity(item.get(key, 0)) for item in initial), default=0))
+            + quantity(spec.get("overhead", {}).get(key, 0)) for key in ("cpu", "memory")]
+
+
+def main():
+    sts, cr, pods, pvcs, pvs, classes = [json.loads(part) if part else {} for part in sys.stdin.read().split("\0")[:6]]
+    key, value, minimum_cpu, minimum_memory, map_key = sys.argv[1:]
+    name, namespace = sts["metadata"]["name"], sts["metadata"]["namespace"]
+    uid, replicas = sts["metadata"]["uid"], sts["spec"]["replicas"]
+    if type(replicas) is not int or replicas < 1:
+        raise ValueError("add requires a running fleet; use kubeton start for a stopped fleet")
+    if cr and (cr.get("spec", {}).get("replicas", 1) != replicas or
+               cr.get("metadata", {}).get("annotations", {}).get("ton.ton.org/kubeton-paused-replicas")):
+        raise ValueError("TonNode and StatefulSet replica counts are not converged; finish start/stop first")
+    if cr and not any(owner.get("controller") and owner.get("kind") == "TonNode" and owner.get("uid") == cr["metadata"]["uid"]
+                      for owner in sts["metadata"].get("ownerReferences", [])):
+        raise ValueError("StatefulSet is not controlled by the matching TonNode")
+    spec = sts["spec"]["template"]["spec"]
+    selector = dict(spec.get("nodeSelector", {}))
+    for label, wanted in cr.get("spec", {}).get("nodeSelector", {}).items():
+        if selector.get(label) != wanted:
+            raise ValueError("TonNode and StatefulSet node selectors are not converged")
+    owned = {}
+    for pod in pods["items"]:
+        if any(owner.get("controller") and owner.get("kind") == "StatefulSet" and owner.get("uid") == uid
+               for owner in pod.get("metadata", {}).get("ownerReferences", [])):
+            suffix = pod["metadata"]["name"].removeprefix(name + "-")
+            if not suffix.isdigit() or int(suffix) >= replicas or pod["metadata"].get("deletionTimestamp"):
+                raise ValueError("fleet has terminating or unexpected pods; wait for convergence before add")
+            owned[int(suffix)] = pod
+    ready = lambda pod: bool(pod and pod.get("spec", {}).get("nodeName") and any(
+        item.get("type") == "Ready" and item.get("status") == "True" for item in pod.get("status", {}).get("conditions", [])))
+    unfinished = [ordinal for ordinal in range(replicas) if not ready(owned.get(ordinal))]
+    resume = bool(unfinished)
+    if resume:
+        if unfinished != [replicas - 1]:
+            raise ValueError("existing replicas are not Ready; add will not create another replica")
+        tail = owned.get(replicas - 1, {})
+        if tail.get("spec", {}).get("nodeName") or tail.get("status", {}).get("phase", "Pending") != "Pending":
+            raise ValueError("tail replica is already assigned/starting; wait for it instead of adding another")
+    ordinal = replicas - 1 if resume else replicas
+    running = {str(index): pod["spec"]["nodeName"] for index, pod in owned.items() if ready(pod)}
+    affinity = spec.get("affinity", {}).get("nodeAffinity", {})
+    terms = affinity.get("requiredDuringSchedulingIgnoredDuringExecution", {}).get("nodeSelectorTerms", [])
+    network = cr.get("spec", {}).get("network", {})
+    automatic = bool(cr and network.get("hostPortsEnabled", True) and not network.get("publicIP") and len(terms) == 1
+                     and not terms[0].get("matchFields") and len(terms[0].get("matchExpressions", [])) == 1
+                     and terms[0]["matchExpressions"][0].get("key") == "kubernetes.io/hostname"
+                     and terms[0]["matchExpressions"][0].get("operator") == "In")
+    if automatic and not re.fullmatch(r"[0-9a-f]{64}", sts["metadata"].get("annotations", {}).get("ton.ton.org/sticky-placement-spec-hash", "")):
+        raise ValueError("upgrade the operator with kubeton install before add: the running operator lacks safe placement-growth support")
+    managed = {label: wanted for label, wanted in selector.items()
+               if (label == key and wanted == value) or (label == "node.longhorn.io/create-default-disk" and wanted == "true")}
+    cpu, memory = requests(spec)
+    claims = {item["metadata"]["name"]: item for item in pvcs["items"]}
+    volumes = {item["metadata"]["name"]: item for item in pvs["items"]}
+    storage = {item["metadata"]["name"]: item for item in classes["items"]}
+    data, require_csi, constraints = 0, False, []
+    for template in sts["spec"].get("volumeClaimTemplates", []):
+        claim = claims.get(template["metadata"]["name"] + "-" + name + "-" + str(ordinal))
+        claim_spec = (claim or template)["spec"]
+        if claim and (claim_spec.get("storageClassName") != template["spec"].get("storageClassName")
+                      or quantity(claim_spec["resources"]["requests"]["storage"]) < quantity(template["spec"]["resources"]["requests"]["storage"])):
+            raise ValueError("retained target PVC does not match the live claim template; PVCs were preserved")
+        storage_name = claim_spec.get("storageClassName")
+        if storage_name and storage_name not in storage:
+            raise ValueError("StorageClass " + storage_name + " is missing")
+        provisioner = storage.get(storage_name, {}).get("provisioner", "")
+        require_csi |= provisioner == "driver.longhorn.io"
+        bound = bool(claim_spec.get("volumeName"))
+        if not bound and provisioner in ("rancher.io/local-path", "kubernetes.io/no-provisioner", ""):
+            data += math.ceil(quantity(claim_spec["resources"]["requests"]["storage"]))
+        if claim:
+            selected = claim.get("metadata", {}).get("annotations", {}).get("volume.kubernetes.io/selected-node")
+            if selected:
+                constraints.append({"node": selected})
+        if bound:
+            pv = volumes.get(claim_spec["volumeName"])
+            if not pv or pv.get("spec", {}).get("claimRef", {}).get("uid") != claim["metadata"]["uid"]:
+                raise ValueError("cannot verify the retained PVC's bound PV identity")
+            if pv.get("spec", {}).get("nodeAffinity", {}).get("required"):
+                constraints.append({"affinity": pv["spec"]["nodeAffinity"]["required"]})
+    ports = sorted({item.get("protocol", "TCP") + "/" + str(item["hostPort"])
+                    for container in spec.get("containers", []) + spec.get("initContainers", [])
+                    for item in container.get("ports", []) if item.get("hostPort", 0) > 0})
+    print(json.dumps({"namespace": namespace, "name": name, "uid": uid, "cr_uid": cr.get("metadata", {}).get("uid"), "replicas": replicas, "ordinal": ordinal,
+                      "target": replicas if resume else replicas + 1, "resume": resume, "pod_uid": owned.get(ordinal, {}).get("metadata", {}).get("uid"),
+                      "cpu": math.ceil(max(cpu, quantity(minimum_cpu)) * 1000), "memory": math.ceil(max(memory, quantity(minimum_memory))),
+                      "data": data, "ports": ports, "selector": selector, "managed": managed, "running": running,
+                      "automatic": automatic, "affinity": affinity, "constraints": constraints, "longhorn": require_csi,
+                      "scope": ",".join(label + "=" + wanted for label, wanted in sorted(selector.items()) if label not in managed)}))
+
+
+try:
+    main()
+except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+    sys.exit("Error: cannot prepare add: " + str(error))
+PY
+}
+
+ton_add_field() {
+  printf '%s' "$1" | python3 -c 'import json,sys; value=json.load(sys.stdin)[sys.argv[1]]; print("\n".join(value) if isinstance(value,list) else json.dumps(value) if isinstance(value,dict) else str(value).lower() if isinstance(value,bool) else value)' "$2"
+}
+
+ton_add_context() {
+  local ns="$1" sts="$2" sts_json cr_json pods_json pvcs_json pvs_json classes_json
+  sts_json="$(kubectl -n "$ns" get statefulset "$sts" -o json)" || return 1
+  cr_json="$(kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" --ignore-not-found -o json)" || return 1
+  pods_json="$(kubectl -n "$ns" get pods -o json)" || return 1
+  pvcs_json="$(kubectl -n "$ns" get pvc -o json)" || return 1
+  pvs_json="$(kubectl get pv -o json)" || return 1
+  classes_json="$(kubectl get storageclass -o json)" || return 1
+  printf '%s\0' "$sts_json" "$cr_json" "$pods_json" "$pvcs_json" "$pvs_json" "$classes_json" \
+    | python3 -c "$(ton_add_context_script)" "$KUBETON_NODE_PREREQ_LABEL_KEY" "$KUBETON_NODE_PREREQ_LABEL_VALUE" \
+      "$KUBETON_CHECK_MIN_CPU" "$KUBETON_CHECK_MIN_MEMORY" "$STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY"
+}
+
+ton_add_node_fits() {
+  printf '%s\0%s' "$1" "$2" | python3 -c '
+import json,sys
+context,node=map(json.loads,sys.stdin.read().split("\0")); labels=node["metadata"].get("labels",{}); name=node["metadata"]["name"]
+def term_matches(term):
+    def matches(item, values):
+        key,op,wanted=item["key"],item["operator"],item.get("values",[]); present=key in values; actual=values.get(key)
+        if op=="In": return present and actual in wanted
+        if op=="NotIn": return not present or actual not in wanted
+        if op=="Exists": return present
+        if op=="DoesNotExist": return not present
+        if op in ("Gt","Lt"):
+            try: return present and (int(actual)>int(wanted[0]) if op=="Gt" else int(actual)<int(wanted[0]))
+            except (ValueError,IndexError): return False
+        return False
+    return bool(term.get("matchExpressions") or term.get("matchFields")) and all(matches(item,labels) for item in term.get("matchExpressions",[])) and all(matches(item,{"metadata.name":name}) for item in term.get("matchFields",[]))
+def affinity_matches(affinity): return any(term_matches(term) for term in affinity.get("nodeSelectorTerms",[]))
+if any(labels.get(key)!=value and not(key in context["managed"] and key not in labels) for key,value in context["selector"].items()): sys.exit(1)
+required=context["affinity"].get("requiredDuringSchedulingIgnoredDuringExecution")
+if required and not context["automatic"] and not affinity_matches(required): sys.exit(1)
+for restriction in context["constraints"]:
+    if restriction.get("node",name)!=name or ("affinity" in restriction and not affinity_matches(restriction["affinity"])): sys.exit(1)
+print(labels.get("kubernetes.io/hostname",name))
+'
+}
+
+ton_add_admit_node() {
+  local context="$1" preferred="${2:-}" node node_json hostname scope
+  scope="$(ton_add_field "$context" scope)"
+  KUBETON_ADD_CPU_MILLI="$(ton_add_field "$context" cpu)"
+  KUBETON_ADD_MEMORY_BYTES="$(ton_add_field "$context" memory)"
+  KUBETON_ADD_DATA_BYTES="$(ton_add_field "$context" data)"
+  mapfile -t KUBETON_ADD_HOST_PORTS < <(ton_add_field "$context" ports | awk NF)
+  KUBETON_ADD_OCCUPIED_NODES=()
+  while IFS= read -r node; do
+    [[ -z "$node" ]] || KUBETON_ADD_OCCUPIED_NODES["$node"]=1
+  done < <(printf '%s' "$context" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["running"].values()))')
+  run_node_prerequisite_check 1 "$scope" || return 1
+  for node in "${KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]}"; do
+    [[ -z "$preferred" || "$node" == "$preferred" ]] || continue
+    node_json="$(kubectl get node "$node" -o json)" || return 1
+    if hostname="$(ton_add_node_fits "$context" "$node_json")"; then
+      KUBETON_ADD_SELECTED_NODE="$node"
+      KUBETON_ADD_SELECTED_HOSTNAME="$hostname"
+      return 0
+    fi
+  done
+  echo "Error: no free node meets the live selector, affinity, PVC placement, resources, and host-port requirements; no replica was added." >&2
+  return 1
+}
+
+ton_add_resume_operator() {
+  local -n names_ref="$1" replicas_ref="$2"
+  local index failed=0
+  for index in "${!names_ref[@]}"; do
+    if ! kubectl -n "$OP_NAMESPACE" scale deployment "${names_ref[$index]}" --replicas="${replicas_ref[$index]}" >/dev/null; then
+      echo "Error: cannot restore operator ${OP_NAMESPACE}/${names_ref[$index]} to ${replicas_ref[$index]} replica(s)." >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+run_add() (
   require_bin kubectl
+  require_bin python3
   local ns="" sts="" replicas=""
-  local new_ordinal new_replicas
-  local new_pod node_name target_pvc
-  local -a claim_prefixes=("ton-work" "ton-src" "mytoncore" "mytonctrl" "keybundle")
-  local -a prepared_pvcs=()
-  local claim_prefix pvc pv
+  local context refreshed new_ordinal new_replicas new_pod node_name selected_node selected_hostname
+  local label nodes_json current_sts current_cr patch has_cr resume pod_json operator_pods
+  local operator_paused=0
+  local KUBETON_ADD_MODE=true KUBETON_ADD_CPU_MILLI KUBETON_ADD_MEMORY_BYTES KUBETON_ADD_DATA_BYTES
+  local KUBETON_ADD_STS
+  local KUBETON_ADD_SELECTED_NODE KUBETON_ADD_SELECTED_HOSTNAME
+  local -a KUBETON_ADD_HOST_PORTS=() operator_names=() operator_replicas=()
+  local -A KUBETON_ADD_OCCUPIED_NODES=()
+  trap 'if (( operator_paused )); then ton_add_resume_operator operator_names operator_replicas; fi' EXIT
 
   if [[ $# -ne 0 ]]; then
     echo "Error: usage: kubeton add" >&2
@@ -14016,76 +14261,175 @@ run_add() {
   fi
 
   get_single_ton_statefulset ns sts replicas || exit 1
-  if ! [[ "$replicas" =~ ^[0-9]+$ ]]; then
-    echo "Error: invalid replicas value for ${ns}/${sts}: ${replicas}" >&2
-    exit 1
-  fi
-
-  new_replicas=$((replicas + 1))
+  KUBETON_ADD_STS="$sts"
+  TON_NAMESPACE="$ns"
+  context="$(ton_add_context "$ns" "$sts")" || exit 1
+  new_ordinal="$(ton_add_field "$context" ordinal)"
+  new_replicas="$(ton_add_field "$context" target)"
+  resume="$(ton_add_field "$context" resume)"
+  has_cr="$(ton_add_field "$context" cr_uid)"
+  new_pod="${sts}-${new_ordinal}"
   KUBETON_TARGET_TON_REPLICAS="$new_replicas"
+  TON_NAMESPACE="$ns"
+  if is_true "$resume"; then
+    echo "[add] Resuming unfinished replica ${ns}/${new_pod}; keeping replicas=${new_replicas}."
+  fi
+  # Admission is for one extra, unoccupied host, using the live pod resources,
+  # ports and storage. Existing validators are not treated as replaceable.
+  ton_add_admit_node "$context" || exit 1
+  selected_node="$KUBETON_ADD_SELECTED_NODE"
+  selected_hostname="$KUBETON_ADD_SELECTED_HOSTNAME"
+  echo "[add] Selected additional node: ${selected_node}."
 
   if should_bootstrap_baremetal; then
     ensure_auto_bootstrap_stack_if_needed
   fi
   validate_external_key_prereqs
-
-  new_ordinal="$replicas"
-  new_pod="${sts}-${new_ordinal}"
-  if kubectl -n "$ns" get pod "$new_pod" >/dev/null 2>&1; then
-    echo "Error: target pod ${ns}/${new_pod} already exists; cluster is not in expected pre-add state." >&2
+  # Only kubeton's placement labels may be extended. Preserve every existing
+  # node's labels, all explicit selectors, and all retained PVCs.
+  while IFS= read -r label; do
+    [[ -z "$label" ]] || kubectl label node "$selected_node" "$label" --overwrite >/dev/null || exit 1
+  done < <(ton_add_field "$context" managed | python3 -c 'import json,sys; print("\n".join(key+"="+value for key,value in json.load(sys.stdin).items()))')
+  if is_true "$(ton_add_field "$context" longhorn)"; then
+    wait_ton_selected_nodes_longhorn_csi_ready "kubernetes.io/hostname=${selected_hostname}" || exit 1
+  fi
+  refreshed="$(ton_add_context "$ns" "$sts")" || exit 1
+  if [[ "$(ton_add_field "$refreshed" ordinal)" != "$new_ordinal" || "$(ton_add_field "$refreshed" target)" != "$new_replicas" \
+     || "$(ton_add_field "$refreshed" uid)" != "$(ton_add_field "$context" uid)" \
+     || "$(ton_add_field "$refreshed" cr_uid)" != "$has_cr" \
+     || "$(ton_add_field "$refreshed" managed)" != "$(ton_add_field "$context" managed)" ]]; then
+    echo "Error: replica state changed while preparing add; rerun after the fleet converges." >&2
     exit 1
   fi
-
-  for claim_prefix in "${claim_prefixes[@]}"; do
-    target_pvc="${claim_prefix}-${sts}-${new_ordinal}"
-    reset_add_target_pvc_if_exists "$ns" "$target_pvc" || {
-      echo "Error: failed to reset leftover PVC ${ns}/${target_pvc} before add." >&2
-      exit 1
-    }
-  done
-
-  echo "Preparing PVCs for new replica ${ns}/${sts}-${new_ordinal} ..."
-  for claim_prefix in "${claim_prefixes[@]}"; do
-    if create_replica_pvc_from_ordinal0 "$ns" "$sts" "$claim_prefix" "$new_ordinal"; then
-      prepared_pvcs+=("${claim_prefix}-${sts}-${new_ordinal}")
-    else
-      case "$?" in
-        10)
-          ;;
-        *)
-          echo "Error: failed to prepare PVC for claim prefix ${claim_prefix}." >&2
-          exit 1
-          ;;
-      esac
+  context="$refreshed"
+  ton_add_admit_node "$context" "$selected_node" || exit 1
+  if [[ "$KUBETON_ADD_SELECTED_HOSTNAME" != "$selected_hostname" ]]; then
+    echo "Error: selected node's hostname label changed during add; rerun after placement stabilizes." >&2
+    exit 1
+  fi
+  if [[ "$has_cr" != None && -n "$has_cr" ]]; then
+    operator_paused=1
+    pause_operator_reconcile operator_names operator_replicas || exit 1
+    (( ${#operator_names[@]} > 0 )) || { echo "Error: cannot pause the TonNode operator for safe scale-up." >&2; exit 1; }
+    operator_pods="$(kubectl -n "$OP_NAMESPACE" get pods -l "app.kubernetes.io/instance=${RELEASE_NAME}" -o name)" || exit 1
+    if [[ -n "$operator_pods" ]]; then
+      kubectl -n "$OP_NAMESPACE" wait --for=delete pod -l "app.kubernetes.io/instance=${RELEASE_NAME}" --timeout=120s >/dev/null || exit 1
     fi
-  done
-
-  for pvc in "${prepared_pvcs[@]}"; do
-    if pvc_uses_wait_for_first_consumer "$ns" "$pvc"; then
-      echo "PVC ${ns}/${pvc} uses WaitForFirstConsumer; skipping pre-scale Bound wait."
-    else
-      wait_pvc_bound "$ns" "$pvc" 300
+    current_cr="$(kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" -o json)" || exit 1
+    patch="$(printf '%s\0%s' "$context" "$current_cr" | python3 -c '
+import json,sys
+c,cr=map(json.loads,sys.stdin.read().split("\0"))
+if cr["metadata"]["uid"]!=c["cr_uid"] or cr["spec"].get("replicas",1)!=c["replicas"]: sys.exit("Error: TonNode changed during add")
+print(json.dumps([{"op":"test","path":"/metadata/resourceVersion","value":cr["metadata"]["resourceVersion"]},{"op":"add","path":"/spec/replicas","value":c["target"]}]))
+')" || exit 1
+    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --field-manager=helm --type=json -p "$patch" >/dev/null || exit 1
+  fi
+  current_sts="$(kubectl -n "$ns" get statefulset "$sts" -o json)" || exit 1
+  nodes_json="$(kubectl get nodes -o json)" || exit 1
+  patch="$(printf '%s\0%s\0%s' "$context" "$current_sts" "$nodes_json" | python3 -c '
+import json,sys
+c,sts,nodes=map(json.loads,sys.stdin.read().split("\0")); node,hostname,map_key=sys.argv[1:]
+if sts["metadata"]["uid"]!=c["uid"] or sts["spec"]["replicas"]!=c["replicas"]: sys.exit("Error: StatefulSet changed during add")
+patch=[{"op":"test","path":"/metadata/resourceVersion","value":sts["metadata"]["resourceVersion"]},{"op":"add","path":"/spec/updateStrategy","value":{"type":"OnDelete"}},{"op":"add","path":"/spec/replicas","value":c["target"]}]
+if c["automatic"]:
+    hosts={item["metadata"]["name"]:item["metadata"].get("labels",{}).get("kubernetes.io/hostname",item["metadata"]["name"]) for item in nodes["items"]}
+    allowed=sorted({hosts[name] for name in c["running"].values()}|{hostname})
+    affinity={"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":allowed}]}]}}
+    patch.append({"op":"add","path":"/spec/template/spec/affinity/nodeAffinity","value":affinity})
+    mapping={**c["running"],str(c["ordinal"]):node}
+    if sts["metadata"].get("annotations") is None: patch.append({"op":"add","path":"/metadata/annotations","value":{}})
+    patch.append({"op":"add","path":"/metadata/annotations/"+map_key.replace("~","~0").replace("/","~1"),"value":",".join(key+"="+value for key,value in sorted(mapping.items(),key=lambda pair:int(pair[0])))})
+print(json.dumps(patch))
+' "$selected_node" "$selected_hostname" "$STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY")" || exit 1
+  echo "[add] Applying placement and replicas=${new_replicas} for ${ns}/${sts}; retaining existing PVCs."
+  kubectl -n "$ns" patch statefulset "$sts" --type=json -p "$patch" >/dev/null || exit 1
+  if is_true "$resume" && [[ -n "$(ton_add_field "$context" pod_uid)" ]]; then
+    pod_json="$(kubectl -n "$ns" get pod "$new_pod" --ignore-not-found -o json)" || exit 1
+    if [[ -n "$pod_json" ]] && printf '%s\0%s' "$context" "$pod_json" | python3 -c 'import json,sys; c,p=map(json.loads,sys.stdin.read().split("\0")); sys.exit(0 if p["metadata"]["uid"]==c["pod_uid"] and not p.get("spec",{}).get("nodeName") and p.get("status",{}).get("phase")=="Pending" else 1)'; then
+      echo "[add] Recreating only unscheduled Pending pod ${ns}/${new_pod} with the expanded placement."
+      kubectl -n "$ns" delete pod "$new_pod" --wait=false >/dev/null || exit 1
     fi
-    pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
-    if [[ -n "$pv" ]]; then
-      kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$pv" >/dev/null 2>&1 || true
-    fi
-  done
-
-  echo "Scaling ${ns}/${sts} from ${replicas} to ${new_replicas} ..."
-  if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
-    kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --field-manager=helm --type=merge -p "{\"spec\":{\"replicas\":${new_replicas}}}" >/dev/null
-  else
-    set_ton_replicas "$ns" "$sts" "$new_replicas"
+  fi
+  if (( operator_paused )); then
+    ton_add_resume_operator operator_names operator_replicas || exit 1
+    operator_paused=0
   fi
 
   echo "Waiting for ${ns}/${new_pod} to become Ready ..."
-  wait_pod_ready "$ns" "$new_pod" 1200
+  if ! wait_pod_ready "$ns" "$new_pod" 1200; then
+    print_helper_pod_failure_context "$ns" "$new_pod"
+    echo "[add] Pod and PVCs were retained; a retry will not create another replica while this one is unfinished." >&2
+    exit 1
+  fi
 
   node_name="$(kubectl -n "$ns" get pod "$new_pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
   [[ -z "$node_name" ]] && node_name="N/A"
   echo "Added TON replica: ${ns}/${new_pod} on node ${node_name}."
   echo "Next step: execute ./kubeton backup-keys"
+)
+
+confirm_tail_replica_wallets_and_backup() {
+  local ns="$1" pod="$2"
+  local inventory wallet_name wallet_row resolved_name status balance version workchain address raw_address safety
+  local nonempty_count=0 unknown_count=0
+  local -a table_rows=()
+
+  echo "[del] Checking all wallets on ${ns}/${pod} before deleting its storage ..."
+  if inventory="$(list_tonnode_wallet_names_from_pod "$ns" "$pod" true)"; then
+    while IFS= read -r wallet_name; do
+      [[ -n "$wallet_name" ]] || continue
+      if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "Warning: a wallet filename could not be inspected safely; wallet inventory is incomplete." >&2
+        ((unknown_count+=1))
+        continue
+      fi
+      status=unknown balance=unknown address=unknown safety=unknown
+      # Require an actual chain query. wl's inferred empty state is not
+      # sufficient evidence for deleting a wallet's private key.
+      if raw_address="$(read_tonnode_wallet_address_file_from_pod "$ns" "$pod" "$wallet_name")"; then
+        address="$raw_address"
+        if wallet_row="$(read_tonnode_wallet_state_from_pod "$ns" "$pod" "$wallet_name" "$raw_address" 2>/dev/null)"; then
+          IFS=$'\t' read -r resolved_name status balance version workchain address <<<"$wallet_row"
+          if [[ "$resolved_name" == "$wallet_name" && "$balance" =~ ^[0-9]+([.][0-9]*)?$ ]] \
+            && [[ "$(ton_address_to_hex "$address" || true)" == "$raw_address" ]]; then
+            if ! [[ "$balance" =~ ^0+([.]0*)?$ ]]; then
+              safety=non-empty
+            else
+              case "${status,,}" in
+                empty) safety=empty ;;
+                active|uninit|uninitialized|frozen) safety=non-empty ;;
+              esac
+            fi
+          fi
+        fi
+      fi
+      case "$safety" in
+        non-empty) ((nonempty_count+=1)) ;;
+        unknown) status=unknown balance=unknown; ((unknown_count+=1)) ;;
+      esac
+      table_rows+=("${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${address}"$'\t'"${safety}")
+    done <<<"$inventory"
+    if [[ -z "$inventory" ]]; then
+      echo "[del] No wallet key or address files found on ${ns}/${pod}."
+    fi
+  else
+    echo "Warning: cannot list wallets on ${ns}/${pod}; their balances are unknown." >&2
+    ((unknown_count+=1))
+  fi
+  if (( ${#table_rows[@]} > 0 )); then
+    print_aligned_table_5col "wallet-name" "status" "balance (TON)" "wallet-address" "check" "${table_rows[@]}"
+  fi
+  if (( nonempty_count > 0 )); then
+    echo "Warning: ${nonempty_count} wallet(s) have a non-empty on-chain state or a positive balance. Deleting their keys without a usable backup can lose access to funds." >&2
+    confirm_or_exit "Continue deleting ${ns}/${pod} despite its non-empty wallet(s)?" || return 1
+  fi
+  if (( unknown_count > 0 )); then
+    echo "Warning: could not verify ${unknown_count} wallet balance(s) or inventory item(s). Unknown does not mean empty." >&2
+    confirm_or_exit "Continue deleting ${ns}/${pod} despite unknown wallet balances or incomplete inventory?" || return 1
+  fi
+  echo "[del] Create a current off-cluster backup first: ./kubeton backup-fleet <backup-dir>"
+  echo "[del] Alternatively: ./kubeton backup-keys <backup-dir> (recovery requires the original Vault/KMS key)."
+  confirm_or_exit "Do you have a current backup of ${ns}/${pod}'s keys and wallets stored outside this cluster?"
 }
 
 run_del() {
@@ -14096,7 +14440,7 @@ run_del() {
     exit 1
   fi
 
-  local ns sts replicas ordinal pod
+  local ns sts replicas ordinal pod sts_uid pod_uid current_replicas current_sts_uid current_pod_uid
   local -a claim_prefixes=("ton-work" "ton-src" "mytoncore" "mytonctrl" "keybundle")
   local -a pvc_names=()
   local -a pv_names=()
@@ -14117,7 +14461,21 @@ run_del() {
   ordinal=$((replicas - 1))
   pod="${sts}-${ordinal}"
 
+  sts_uid="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.metadata.uid}')" || return 1
+  [[ -n "$sts_uid" ]] || { echo "Error: cannot verify StatefulSet identity before deletion." >&2; return 1; }
+  pod_uid="$(kubectl -n "$ns" get pod "$pod" --ignore-not-found -o jsonpath='{.metadata.uid}')" || return 1
+  confirm_tail_replica_wallets_and_backup "$ns" "$pod" || return 1
   confirm_or_exit "This will remove the tail TON replica ${ns}/${pod}, delete its PVC/PV (including Longhorn volume if present), and scale ${sts} to $((replicas - 1)). Continue?"
+
+  # Wallet queries and human confirmation can take time. Do not apply the
+  # approval to a different tail replica after another add/del or pod restart.
+  current_replicas="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.replicas}')" || return 1
+  current_sts_uid="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.metadata.uid}')" || return 1
+  current_pod_uid="$(kubectl -n "$ns" get pod "$pod" --ignore-not-found -o jsonpath='{.metadata.uid}')" || return 1
+  if [[ "$current_replicas" != "$replicas" || "$current_sts_uid" != "$sts_uid" || "$current_pod_uid" != "$pod_uid" ]]; then
+    echo "Error: fleet or tail pod changed during confirmation; rerun kubeton del to inspect the current wallets." >&2
+    return 1
+  fi
 
   for claim_prefix in "${claim_prefixes[@]}"; do
     pvc="${claim_prefix}-${sts}-${ordinal}"
@@ -15589,23 +15947,28 @@ run_install() {
   if (( release_exists == 1 )); then
     # Preserve current TonNode chart values during operator-only upgrades.
     helm_cmd+=(--reuse-values)
-    # Image-only upgrades patch the live CR without rewriting Helm's saved
-    # values. Carry those image selections forward instead of reverting them.
+    # Image upgrades and add/del patch the live CR without rewriting Helm's
+    # saved values. Preserve those selections during operator-only upgrades.
     local selected_ton_namespace selected_ton_name live_ton_row
-    local live_ton_name live_ton_image live_ton_artifact_image live_ton_release live_ton_release_namespace
+    local live_ton_name live_ton_image live_ton_artifact_image live_ton_release live_ton_release_namespace live_ton_replicas
     selected_ton_namespace="$(resolve_tonnode_namespace_from_values)"
     selected_ton_name="$(resolve_tonnode_name_from_values)"
     if ! live_ton_row="$(kubectl -n "$selected_ton_namespace" get tonnodes.ton.ton.org "$selected_ton_name" \
-      --ignore-not-found -o go-template='{{.metadata.name}}{{"\x1f"}}{{with .spec.image}}{{.}}{{end}}{{"\x1f"}}{{with .spec.tonImage}}{{.}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{with index . "meta.helm.sh/release-name"}}{{.}}{{end}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{with index . "meta.helm.sh/release-namespace"}}{{.}}{{end}}{{end}}')"; then
+      --ignore-not-found -o go-template='{{.metadata.name}}{{"\x1f"}}{{with .spec.image}}{{.}}{{end}}{{"\x1f"}}{{with .spec.tonImage}}{{.}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{with index . "meta.helm.sh/release-name"}}{{.}}{{end}}{{end}}{{"\x1f"}}{{with .metadata.annotations}}{{with index . "meta.helm.sh/release-namespace"}}{{.}}{{end}}{{end}}{{"\x1f"}}{{if .spec.replicas}}{{.spec.replicas}}{{else}}1{{end}}')"; then
       echo "Error: cannot read TonNode ${selected_ton_namespace}/${selected_ton_name}; refusing an operator-only upgrade that could revert its image selections." >&2
       return 1
     fi
     if [[ -n "$live_ton_row" ]]; then
-      IFS=$'\x1f' read -r live_ton_name live_ton_image live_ton_artifact_image live_ton_release live_ton_release_namespace <<<"$live_ton_row"
+      IFS=$'\x1f' read -r live_ton_name live_ton_image live_ton_artifact_image live_ton_release live_ton_release_namespace live_ton_replicas <<<"$live_ton_row"
       if [[ "$live_ton_name" == "$selected_ton_name" \
         && "$live_ton_release" == "$RELEASE_NAME" \
         && "$live_ton_release_namespace" == "$OP_NAMESPACE" ]]; then
+        if ! [[ "$live_ton_replicas" =~ ^[1-9][0-9]*$ ]]; then
+          echo "Error: cannot preserve the live TON replica count during operator upgrade." >&2
+          return 1
+        fi
         helm_cmd+=(--set-string "tonNode.image=${live_ton_image}" --set-string "tonNode.tonImage=${live_ton_artifact_image}")
+        helm_cmd+=(--set "tonNode.replicas=${live_ton_replicas}")
       fi
     fi
     # If no TonNode CRs exist, keep operator-only behavior and avoid accidental TonNode recreation

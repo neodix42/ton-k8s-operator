@@ -318,6 +318,7 @@ test_operator_install_preserves_selected_live_ton_images() (
 tonNode:
   namespace: selected-ns
   name: selected-ton
+  replicas: 3
   image: ghcr.io/example/controller:stale-local
   tonImage: ghcr.io/example/ton:stale-local
 EOF
@@ -352,8 +353,8 @@ EOF
         foreign-namespace)
           printf 'selected-ton\x1f%s\x1f%s\x1fselected-release\x1fother-operator-ns' "$live_controller" "$live_ton"
           ;;
-        defaults) printf 'selected-ton\x1f\x1f\x1fselected-release\x1foperator-ns' ;;
-        *) printf 'selected-ton\x1f%s\x1f%s\x1fselected-release\x1foperator-ns' "$live_controller" "$live_ton" ;;
+        defaults) printf 'selected-ton\x1f\x1f\x1fselected-release\x1foperator-ns\x1f6' ;;
+        *) printf 'selected-ton\x1f%s\x1f%s\x1fselected-release\x1foperator-ns\x1f6' "$live_controller" "$live_ton" ;;
       esac
       return 0
     fi
@@ -379,7 +380,12 @@ EOF
       continue
     fi
     [[ "$rc" == 0 ]] || fail "operator install rejected live image case ${mode}"
-    assert_not_contains tonNode.replicas "$helm_log"
+    if [[ "$mode" == owned || "$mode" == defaults ]]; then
+      assert_contains 'tonNode.replicas=6' "$helm_log"
+      assert_not_contains 'tonNode.replicas=3' "$helm_log"
+    else
+      assert_not_contains tonNode.replicas "$helm_log"
+    fi
     assert_not_contains stale-local "$helm_log"
     if [[ "$mode" == fresh ]]; then
       [[ ! -s "$query_log" ]] || fail 'fresh install queried an existing TonNode for Helm image preservation'

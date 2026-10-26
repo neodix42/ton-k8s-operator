@@ -153,6 +153,56 @@ Restore prerequisites:
 - `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
+`kubeton add` checks one additional, unoccupied worker against the live
+StatefulSet's CPU, memory, storage, host ports, selectors, and retained volume
+placement. Reusing Vault and StorageClasses does not skip that check. It can
+extend kubeton's managed placement labels on an approved worker while retaining
+the labels on existing workers. Explicit selectors and manually disabled storage
+labels remain constraints. Longhorn-backed claims also require the selected
+worker's CSI plugin to become ready before scaling.
+
+If an earlier add left an unassigned Pending tail such as `tonnode-5`, retrying
+`kubeton add` resumes that replica without increasing the count to seven. The
+command refreshes placement and recreates only that unscheduled tail pod. It
+retains every existing PVC, including an already-bound encrypted key bundle.
+For a new ordinal, Kubernetes creates claims from the current StatefulSet
+templates; `add` does not clone old PVC settings or delete retained volumes.
+`WaitForFirstConsumer` claims normally remain Pending until the pod is scheduled,
+and an unscheduled pod has neither a node nor a pod IP.
+
+This fix requires the updated operator image as well as the updated CLI. The
+operator preserves existing validators during placement-only growth using
+`OnDelete`; an intentional non-replica TonNode spec change, such as an image
+upgrade, restores rolling updates. Operator-only installs preserve the live
+TON replica count, including counts previously changed by `add` or `del`.
+To recover an unfinished add from an older release, use the updated release
+bundle with its updated operator image configured, then run:
+
+```bash
+# Upgrade the operator without requalifying disk capacity on existing replicas.
+KUBETON_SKIP_NODE_PREREQ_CHECK=true ./kubeton install
+./kubeton add
+```
+
+`add` still performs fresh admission for the extra worker. If no worker passes,
+it reports the failed prerequisites before changing replica counts or PVCs.
+
+`kubeton del` inventories every wallet on the tail pod, including address-only
+wallets, and displays its on-chain status and balance without reading private
+key contents. A positive balance or an existing non-empty account state requires
+an additional confirmation. Failed queries, an unavailable pod, or an incomplete
+wallet inventory produce a separate unknown-balance warning and confirmation;
+they are never treated as empty wallets.
+
+Before any scale-down or storage deletion, `del` also asks whether you have a
+current backup of that pod's keys and wallets stored outside the cluster, then
+asks for final approval of the deletion. Answering `n`, pressing Enter, or
+closing input cancels. Backup confirmation is your acknowledgement; the command
+does not verify a backup archive. Use `./kubeton backup-fleet <backup-dir>` for
+portable recovery, or `./kubeton backup-keys <backup-dir>` while retaining the
+original Vault/KMS key. If the fleet count or tail pod identity changes
+during the checks, `del` aborts so that a fresh run can inspect the new target.
+
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
 
 ### Moving a fleet to another Kubernetes cluster
@@ -1575,6 +1625,32 @@ If you use `local-path` StorageClass:
 Use this workflow for local development from this repository.  
 Production deployments should use release artifacts/charts, not this dev-repo flow.
 
+There are three different test environments:
+
+- `make test-kubeton` runs CLI regression tests with synthetic files and mocked
+  Kubernetes calls. It does not start containers or modify a Kubernetes cluster.
+- `make test` also runs Go unit tests and `envtest`, which starts local
+  `kube-apiserver` and `etcd` processes. This checks Kubernetes API behavior but
+  does not run a scheduler, kubelet, or application containers.
+- The workflow below runs actual containers in k3d. Its Kubernetes nodes are
+  Docker containers, with TON pods running inside those nodes. The separate
+  `make test-e2e` target currently expects a disposable **Kind** cluster; it is
+  not the k3d workflow.
+
+For example, run the deletion confirmation checks without a cluster:
+
+```bash
+bash test/kubeton_del_test.sh
+```
+
+For actual container testing, build and import the operator image with
+`./devrun.sh`, then deploy it with `kubeton install` and `kubeton start` as below.
+An image build or a passing mocked test does not demonstrate successful pod
+scheduling, storage provisioning, or TON synchronization. k3d also uses the
+local `encrypted-sc` development fallback rather than Longhorn disk encryption;
+test production Longhorn behavior separately. Several k3d nodes still share
+one machine's CPU, memory, disk, and public IP.
+
 Prerequisites:
 - `k3d`
 - `docker`
@@ -1582,7 +1658,7 @@ Prerequisites:
 - `helm`
 - `make`
 
-Create a local k3d cluster (example with 5 agent nodes):
+Create a local k3d cluster (example with 3 agent nodes):
 
 ```bash
 k3d cluster create --agents 3 --api-port 127.0.0.1:6550

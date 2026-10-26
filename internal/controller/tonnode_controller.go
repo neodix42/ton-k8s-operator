@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -29,6 +31,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -43,6 +46,8 @@ import (
 
 	tonv1alpha1 "github.com/neodix/ton-k8s-operator/api/v1alpha1"
 )
+
+const stickyPlacementSpecHashAnnotationKey = "ton.ton.org/sticky-placement-spec-hash"
 
 const (
 	defaultImage                       = "ghcr.io/neodix42/mytonctrl:v1.0.0"
@@ -292,6 +297,16 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
+		placementSpec := tonNode.Spec.DeepCopy()
+		placementSpec.Replicas = nil
+		placementJSON, err := json.Marshal(placementSpec)
+		if err != nil {
+			return err
+		}
+		specHash := fmt.Sprintf("%x", sha256.Sum256(placementJSON))
+		previousSpecHash := annotationValue(sts.Annotations, stickyPlacementSpecHashAnnotationKey)
+		previousHostnames := stickyNodeHostnamesFromAffinity(sts.Spec.Template.Spec.Affinity)
+		previousStrategy := sts.Spec.UpdateStrategy.Type
 		labels := labelsForTonNode(tonNode)
 		replicas := desiredStatefulSetReplicas(tonNode)
 		mapReplicas := int(desiredReplicas(tonNode))
@@ -330,14 +345,36 @@ func (r *TonNodeReconciler) reconcileStatefulSet(
 			stickyOrdinalNodeMapAnnotationKey,
 			formatOrdinalNodeMapAnnotation(effectiveOrdinalNodeMap, mapReplicas),
 		)
+		sts.Annotations = setAnnotationValue(sts.Annotations, stickyPlacementSpecHashAnnotationKey, specHash)
 		sts.Spec.Replicas = ptr.To(replicas)
 		sts.Spec.ServiceName = serviceName
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		if sts.Spec.PodManagementPolicy == "" {
 			sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 		}
+		desiredTemplate := r.desiredPodTemplate(tonNode, labels, publicIP, stickyNodeHostnames)
+		placementOnly := previousSpecHash == specHash
+		if previousSpecHash == "" {
+			// An older operator did not record the spec hash. Ignore only the
+			// generated node affinity and API-defaulted zero fields when checking
+			// that its first placement expansion can keep existing pods running.
+			previousTemplate := sts.Spec.Template.DeepCopy()
+			if previousTemplate.Spec.Affinity == nil {
+				previousTemplate.Spec.Affinity = &corev1.Affinity{}
+			}
+			previousTemplate.Spec.Affinity.NodeAffinity = desiredTemplate.Spec.Affinity.NodeAffinity
+			placementOnly = apiequality.Semantic.DeepDerivative(&desiredTemplate, previousTemplate)
+		}
 		sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType}
-		sts.Spec.Template = r.desiredPodTemplate(tonNode, labels, publicIP, stickyNodeHostnames)
+		// Growing a placement allowlist must not restart existing validators.
+		// Persist OnDelete across reconciles until a non-replica spec edit
+		// requests an intentional rollout. Comparing the CR hash also avoids
+		// treating API-defaulted Pod fields as intentional template changes.
+		if placementOnly && (previousStrategy == appsv1.OnDeleteStatefulSetStrategyType ||
+			(sts.Spec.Template.Spec.Affinity != nil && !reflect.DeepEqual(previousHostnames, stickyNodeHostnames))) {
+			sts.Spec.UpdateStrategy.Type = appsv1.OnDeleteStatefulSetStrategyType
+		}
+		sts.Spec.Template = desiredTemplate
 		sts.Spec.VolumeClaimTemplates = desiredVolumeClaims(tonNode, storageClassName)
 		return controllerutil.SetControllerReference(tonNode, sts, r.Scheme)
 	})
