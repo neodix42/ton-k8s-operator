@@ -828,6 +828,8 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton status
 ./kubeton logs
 ./kubeton logs devnet-16
+./kubeton logs tonnode-2
+./kubeton logs default/tonnode-2
 ./kubeton logs expose
 ./kubeton exec "sync"
 ./kubeton exec-mtc "set stake 1000000"
@@ -837,14 +839,16 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 (for example, `v2026.08-amd64` and `v1.0.3`) from each pod's image references,
 alongside the validator build date, wallet, ADNL, sync, and database sizes.
 
-`kubeton logs [node]` prints a snapshot of the last 20 lines from each TON pod's
+`kubeton logs [server-name|pod-name]` prints a snapshot of the last 20 lines from each TON pod's
 `ton-node` container across namespaces, selected by `TON_POD_LABEL`. Each pod's
 output has a namespace, pod, and node heading. If a pod's logs cannot be read,
 the command still tries the remaining pods and exits with a nonzero status.
-Omit `node` to show all TON pods, or run `./kubeton logs devnet-16` to show only
-the TON pods scheduled on the Kubernetes node named `devnet-16`. Node names
-match exactly. If no TON pods are found on the requested node, the command
-prints a message and exits with a nonzero status.
+Omit the name to show all TON pods. Run `./kubeton logs devnet-16` for the pods
+on that server, or `./kubeton logs tonnode-2` for pods with that name. Server
+and pod names match exactly. If a pod name exists in several namespaces, all
+matching pods are shown; use `./kubeton logs default/tonnode-2` to select one
+namespace. Pods can be selected by name even before a server is assigned. If
+no TON pods match, the command prints a message and exits with a nonzero status.
 
 The initial message points to VictoriaLogs for full historical container logs.
 It discovers installed Services, including custom names and ports, and prefers
