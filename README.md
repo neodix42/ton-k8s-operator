@@ -809,7 +809,7 @@ After topping up mytonctrl wallets inside TON pods with split mode, for example
 `kubeton wallet activate [tonnode-name] [wallet-name]`. The
 activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
 pod and does not send a BOC payload to the network.
-`kubeton wallet collect` reads the same `mytonctrl wl` status and only runs
+`kubeton wallet collect` reads the same live account status and only runs
 `mg` for source wallets that are already `active`; activate funded pod wallets
 before collecting from them.
 
@@ -848,12 +848,26 @@ empty reports zero balance and seqno; connection/query failures remain unknown.
 By default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
-`kubeton wallet activate ...` and `kubeton wallet show balance ...` run against
-`mytonctrl` inside TON pods; `mytonctrl` already has the network configured.
-Balance queries use `MYTONCTRL_EXEC_TIMEOUT` (default `180s`). A failed or
-timed-out query keeps the pod's row in the table with unknown live state and
-balance; its address and workchain are read from the local wallet `.addr` file
-when available. A query failure never implies an empty wallet or zero balance.
+Pod wallet state checks query the named wallet directly with the pod's
+lite-client and active `global.config.json`. They retry up to three times with
+10 seconds per request, trying different configured lite servers before
+repeating one. These read-only checks avoid MyTonCtrl's short RPC timeout and
+do not depend on successful queries for other wallets. Adjust them with
+`WALLET_QUERY_ATTEMPTS` (1–10) and `WALLET_QUERY_TIMEOUT_SECONDS` (1–60); the
+whole pod command is bounded by `MYTONCTRL_EXEC_TIMEOUT` (default `180s`).
+
+A successful response that the account does not exist shows `empty` and
+`0.000000000`. A funded, undeployed account shows `uninit` and its actual
+balance. If every query fails, the row remains visible with unknown live state
+and balance, plus its local address and workchain when available. Unknown
+means the balance could not be checked; it must not be treated as empty or zero.
+Older installations without the direct query prerequisites use `mytonctrl wl`
+as a compatibility fallback. Activation and collection still execute MyTonCtrl
+commands inside the TON pods.
+
+Collection stops before confirmation if any selected pod's live state cannot
+be read. Confirmed inactive wallets are skipped, with funding guidance for
+empty wallets and activation guidance for uninitialized wallets.
 
 Sending to pod wallets reads their named `.addr` files without querying live
 balances. These destinations use non-bounceable addresses for the detected
@@ -960,6 +974,8 @@ MAIN_WALLET_TONCENTER_SEND_ATTEMPTS
 MAIN_WALLET_SEND_RETRY_DELAY_SEC
 MAIN_WALLET_POD_TIMEOUT
 MAIN_WALLET_RUNTIME_TMPFS_SIZE
+WALLET_QUERY_ATTEMPTS
+WALLET_QUERY_TIMEOUT_SECONDS
 
 AUTO_BAREMETAL_BOOTSTRAP
 FORCE_BAREMETAL_BOOTSTRAP

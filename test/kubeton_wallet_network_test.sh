@@ -387,6 +387,139 @@ test_networkless_collect_forms() (
   [[ ! -e "$manifest" ]] || fail "collect unexpectedly created a wallet helper"
 )
 
+test_collect_requires_complete_inventory() (
+  setup_case collect-inventory-errors
+  local mode
+  list_ton_pods() {
+    case "$mode" in
+      failed) return 1 ;;
+      partial-error) printf 'test-ns\ttonnode-0\tworker-0\n'; return 1 ;;
+      empty) return 0 ;;
+      malformed) printf 'test-ns\ttonnode-0\tworker-0\nincomplete-row\n' ;;
+    esac
+  }
+  resolve_tonnode_wallet_row_from_pod() {
+    record wallet-state "$@"
+    printf '%s\tactive\t25\tv3\t0\t%s\n' "$3" "$fixture_second_address"
+  }
+  for mode in failed partial-error empty malformed; do
+    : >"$events"
+    if run_wallet collect treasury >"$case_dir/$mode" 2>&1; then
+      fail "collect accepted $mode pod inventory"
+    fi
+    assert_contains 'Error:' "$case_dir/$mode"
+    assert_no_side_effects
+    if [[ "$mode" != malformed ]]; then
+      assert_not_contains wallet-state "$events"
+    fi
+  done
+)
+
+test_collect_requires_live_state_from_every_selected_pod() (
+  setup_case collect-state-errors
+  local mode target
+  resolve_tonnode_wallet_row_from_pod() {
+    record wallet-state "$@"
+    if [[ "$2" == tonnode-0 && "$mode" != all-unavailable ]]; then
+      printf '%s\tactive\t25\tv3\t0\t%s\n' "$3" "$fixture_destination_address"
+      return 0
+    fi
+    case "$mode" in
+      mixed-unavailable|all-unavailable) return 1 ;;
+      empty-output) return 0 ;;
+      unknown-status) printf '%s\tunknown\tunknown\tv3\t0\t%s\n' "$3" "$fixture_second_address" ;;
+      partial-error) printf '%s\tactive\t25\tv3\t0\t%s\n' "$3" "$fixture_second_address"; return 1 ;;
+    esac
+  }
+  for mode in mixed-unavailable all-unavailable empty-output unknown-status partial-error; do
+    for target in all selected; do
+      : >"$events"
+      local -a args=(treasury)
+      [[ "$target" != selected ]] || args+=(tonnode-1)
+      if run_wallet collect "${args[@]}" >"$case_dir/$mode-$target" 2>&1; then
+        fail "collect accepted $mode live state for $target pods"
+      fi
+      assert_contains "cannot read live state for wallet 'validator_wallet_001'" "$case_dir/$mode-$target"
+      assert_not_contains 'was not found' "$case_dir/$mode-$target"
+      assert_not_contains skipping "$case_dir/$mode-$target"
+      assert_not_contains 'wallet activate' "$case_dir/$mode-$target"
+      assert_no_side_effects
+    done
+  done
+)
+
+test_collect_nonactive_states_are_distinct_from_lookup_failures() (
+  setup_case collect-nonactive-states
+  local fixture_status target
+  resolve_tonnode_wallet_row_from_pod() {
+    printf '%s\t%s\t0\tv3\t0\t%s\n' "$3" "$fixture_status" "$fixture_second_address"
+  }
+  for fixture_status in empty uninit uninitialized frozen; do
+    for target in all selected; do
+      : >"$events"
+      local -a args=(treasury)
+      [[ "$target" != selected ]] || args+=(tonnode-1)
+      if run_wallet collect "${args[@]}" >"$case_dir/$fixture_status-$target" 2>&1; then
+        fail "collected from a $fixture_status wallet"
+      fi
+      assert_contains "is '$fixture_status', not active" "$case_dir/$fixture_status-$target"
+      assert_not_contains 'cannot read live state' "$case_dir/$fixture_status-$target"
+      assert_not_contains 'cannot resolve wallet' "$case_dir/$fixture_status-$target"
+      case "$fixture_status" in
+        empty)
+          assert_contains 'fund this wallet first' "$case_dir/$fixture_status-$target"
+          assert_not_contains 'wallet activate' "$case_dir/$fixture_status-$target"
+          ;;
+        uninit|uninitialized)
+          assert_contains 'after funding it, run:' "$case_dir/$fixture_status-$target"
+          assert_contains 'wallet activate' "$case_dir/$fixture_status-$target"
+          ;;
+        frozen)
+          assert_contains 'recover this frozen wallet' "$case_dir/$fixture_status-$target"
+          assert_not_contains 'wallet activate' "$case_dir/$fixture_status-$target"
+          ;;
+      esac
+      assert_no_side_effects
+    done
+  done
+
+  # A confirmed empty wallet may be skipped while collecting active peers.
+  : >"$events"
+  resolve_tonnode_wallet_row_from_pod() {
+    local status=empty
+    [[ "$2" != tonnode-0 ]] || status=active
+    printf '%s\t%s\t25\tv3\t0\t%s\n' "$3" "$status" "$fixture_second_address"
+  }
+  run_wallet collect treasury >"$case_dir/mixed-confirmed" 2>&1
+  assert_contains "collect <test-ns> <tonnode-0>" "$events"
+  assert_not_contains "collect <test-ns> <tonnode-1>" "$events"
+  assert_contains '[wallet] Collected 1/1 wallet(s)' "$case_dir/mixed-confirmed"
+)
+
+test_collect_rejects_active_wallet_with_invalid_address() (
+  setup_case collect-invalid-active-address
+  local destination target
+  resolve_tonnode_wallet_row_from_pod() {
+    if [[ "$2" == tonnode-0 ]]; then
+      printf '%s\tactive\t25\tv3\t0\t%s\n' "$3" "$fixture_destination_address"
+    else
+      printf '%s\tactive\t25\tv3\t0\t%s\n' "$3" "$destination"
+    fi
+  }
+  for destination in '' '0:invalid-address'; do
+    for target in all selected; do
+      : >"$events"
+      local -a args=(treasury)
+      [[ "$target" != selected ]] || args+=(tonnode-1)
+      if run_wallet collect "${args[@]}" >"$case_dir/invalid-$target" 2>&1; then
+        fail "collected from an active wallet with an invalid address"
+      fi
+      assert_contains "cannot read the address of active wallet 'validator_wallet_001' in test-ns/tonnode-1" "$case_dir/invalid-$target"
+      assert_no_side_effects
+    done
+  done
+)
+
 test_legacy_matching_network() (
   setup_case legacy-matching
   run_wallet deploy testnet savings >"$case_dir/deploy"
@@ -756,6 +889,10 @@ test_send_requires_every_wallet_address
 test_send_rejects_invalid_pod_addresses
 test_invalid_no_bounce_positions
 test_networkless_collect_forms
+test_collect_requires_complete_inventory
+test_collect_requires_live_state_from_every_selected_pod
+test_collect_nonactive_states_are_distinct_from_lookup_failures
+test_collect_rejects_active_wallet_with_invalid_address
 test_legacy_matching_network
 test_network_mismatch_or_failure
 test_global_config_classification

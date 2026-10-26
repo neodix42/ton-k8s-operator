@@ -81,6 +81,9 @@ setup_case() {
   inventory_mode=normal
   STATUS_EXEC_TIMEOUT=2s
   MYTONCTRL_EXEC_TIMEOUT=91s
+  # These fixtures exercise the compatibility wl path; the dedicated Python
+  # state-query tests cover the preferred targeted lite-client reader.
+  read_tonnode_wallet_state_from_pod() { return 78; }
   run_with_timeout() {
     printf 'timeout %s\n' "$1" >>"$mock_events"
     shift
@@ -279,6 +282,79 @@ test_wl_fallback() (
   assert_contains 'timeout 91s' "$mock_events"
 )
 
+test_targeted_state_takes_precedence_over_wl() (
+  setup_case preferred-state
+  read_tonnode_wallet_state_from_pod() {
+    [[ "$1" == unit-ns && "$2" == tonnode-2 && "$3" == validator_wallet_001 ]] \
+      || fail "targeted query received the wrong wallet"
+    [[ "$4" == "$(expected_value tonnode-2 raw)" ]] || fail "query received the wrong public account"
+    printf 'state %s\n' "$2" >>"$mock_events"
+    printf '%s\tactive\t7.500000000\tv1\t0\t%s\n' "$3" "$(expected_value tonnode-2 mainnet)"
+  }
+  local actual
+  actual="$(resolve_tonnode_wallet_row_from_pod unit-ns tonnode-2 validator_wallet_001)"
+  [[ "$actual" == $'validator_wallet_001\tactive\t7.500000000\tv1\t0\t'"$(expected_value tonnode-2 mainnet)" ]] \
+    || fail "targeted account state was replaced by wl data"
+  assert_contains 'state tonnode-2' "$mock_events"
+  assert_not_contains 'wl tonnode-' "$mock_events"
+)
+
+test_targeted_rpc_failure_never_falls_back_to_wl() (
+  setup_case targeted-rpc-failure
+  read_tonnode_wallet_state_from_pod() {
+    # Failed transport may contain valid-looking partial stdout. The caller
+    # must discard it and must not trust wl's inferred account state instead.
+    printf '%s\tempty\t0.000000000\tv1\t0\t%s\n' "$3" "$(expected_value tonnode-2 mainnet)"
+    return 1
+  }
+  if resolve_tonnode_wallet_row_from_pod unit-ns tonnode-2 validator_wallet_001 \
+    >"$case_dir/out" 2>"$case_dir/err"; then
+    fail "targeted RPC failure fell back to successful wl output"
+  fi
+  [[ ! -s "$case_dir/out" ]] || fail "failed targeted query leaked a wallet row"
+  assert_not_contains 'wl tonnode-' "$mock_events"
+)
+
+test_targeted_missing_interpreter_allows_wl_compatibility() (
+  setup_case missing-interpreter
+  read_tonnode_wallet_state_from_pod() { return 127; }
+  local actual
+  actual="$(resolve_tonnode_wallet_row_from_pod unit-ns tonnode-2 validator_wallet_001)"
+  [[ "$actual" == $'validator_wallet_001\tactive\t22.5\tv3\t0\t'"$(expected_value tonnode-2 mainnet)" ]] \
+    || fail "missing targeted-query prerequisite did not allow wl compatibility"
+  assert_contains 'wl tonnode-2' "$mock_events"
+)
+
+test_confirmed_empty_balances_show_all_five_wallets() (
+  setup_case confirmed-empty-balances
+  read_tonnode_wallet_state_from_pod() {
+    printf 'state %s\n' "$2" >>"$mock_events"
+    printf '%s\tempty\t0.000000000\tv1\t%s\t%s\n' "$3" "${4%%:*}" \
+      "$(ton_address_to_non_bounceable "$4")"
+  }
+  run_wallet_balance_show >"$case_dir/out" 2>"$case_dir/err"
+  python3 - "$test_dir/expected.json" "$case_dir/out" <<'PY'
+import json
+import pathlib
+import sys
+expected = json.loads(pathlib.Path(sys.argv[1]).read_text())
+actual = {}
+for line in pathlib.Path(sys.argv[2]).read_text().splitlines():
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    if cells[0] != "unit-ns":
+        continue
+    assert len(cells) == 8, ("malformed balance row", cells)
+    namespace, pod, name, state, balance, version, workchain, address = cells
+    assert [state, balance, version] == ["empty", "0.000000000", "v1"], (pod, cells)
+    assert address == expected[pod]["mainnet"], (pod, address)
+    assert workchain == expected[pod]["workchain"], (pod, workchain)
+    actual[pod] = address
+assert actual.keys() == expected.keys(), ("empty wallet set differs", sorted(actual), sorted(expected))
+PY
+  [[ ! -s "$case_dir/err" ]] || fail "confirmed empty balance lookup emitted a warning"
+  assert_not_contains 'wl tonnode-' "$mock_events"
+)
+
 test_invalid_wl_fallback() (
   setup_case invalid-wl
   rm "$case_dir/pods/tonnode-1/validator_wallet_001.addr"
@@ -355,7 +431,6 @@ test_successful_balances_are_unchanged() (
   run_wallet_balance_show >"$case_dir/out" 2>"$case_dir/err"
   assert_balance_rows "$case_dir/out"
   [[ ! -s "$case_dir/err" ]] || fail "successful balance lookup emitted warning"
-  assert_not_contains 'addr tonnode-' "$mock_events"
   assert_not_contains unexpected "$mock_events"
 )
 
@@ -412,6 +487,10 @@ tests=(
   test_send_previews_all_five_local_identities
   test_legacy_address_file
   test_wl_fallback
+  test_targeted_state_takes_precedence_over_wl
+  test_targeted_rpc_failure_never_falls_back_to_wl
+  test_targeted_missing_interpreter_allows_wl_compatibility
+  test_confirmed_empty_balances_show_all_five_wallets
   test_invalid_wl_fallback
   test_failed_queries_discard_partial_stdout
   test_failed_file_reads_discard_partial_stdout

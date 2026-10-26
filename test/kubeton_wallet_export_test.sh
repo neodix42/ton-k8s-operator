@@ -134,6 +134,9 @@ chmod +x "$test_dir/bin/mytonctrl"
 
 setup_pod_mock() {
   source "$kubeton"
+  # Preserve coverage of wl compatibility and .addr identity precedence;
+  # targeted lite-client account queries have their own synthetic fixtures.
+  read_tonnode_wallet_state_from_pod() { return 78; }
   mock_events="$test_dir/$1.events"
   : >"$mock_events"
   run_with_timeout() { shift; "$@"; }

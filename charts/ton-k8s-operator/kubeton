@@ -82,6 +82,8 @@ KUBETON_START_STATUS_READ_ERROR_LIMIT="${KUBETON_START_STATUS_READ_ERROR_LIMIT:-
 KUBETON_START_VICTORIA_LOGS_ENABLED="${KUBETON_START_VICTORIA_LOGS_ENABLED:-true}"
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 MYTONCTRL_EXEC_TIMEOUT="${MYTONCTRL_EXEC_TIMEOUT:-180s}"
+WALLET_QUERY_ATTEMPTS="${WALLET_QUERY_ATTEMPTS:-3}"
+WALLET_QUERY_TIMEOUT_SECONDS="${WALLET_QUERY_TIMEOUT_SECONDS:-10}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
 HELM_UNINSTALL_CMD_TIMEOUT="${HELM_UNINSTALL_CMD_TIMEOUT:-900s}"
@@ -11005,13 +11007,174 @@ resolve_tonnode_wallet_address_from_pod() {
   printf '%s' "$address"
 }
 
+tonnode_wallet_query_script() {
+  cat <<'PY'
+import base64
+import binascii
+import json
+import pathlib
+import random
+import re
+import shutil
+import subprocess
+import sys
+
+
+def form(text):
+    text = text.lstrip()
+    if not text.startswith("("):
+        token = re.match(r"[^\s()]+", text)
+        if not token:
+            raise ValueError("missing field value")
+        return token.group()
+    depth = 0
+    for index, character in enumerate(text):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return text[:index + 1]
+    raise ValueError("incomplete account state")
+
+
+def field(text, name):
+    match = re.search(r"(?<![A-Za-z0-9_])" + name + r":\s*", text)
+    if not match:
+        raise ValueError("missing account field")
+    return form(text[match.end():])
+
+
+def account_state(output):
+    marker = re.search(r"(?m)^\s*account state is[ \t]*", output)
+    if not marker:
+        raise ValueError("no verified account state")
+    content = output[marker.end():].lstrip()
+    if re.match(r"empty[ \t]*(?:\r?\n|$)", content):
+        return "empty", 0
+    account = form(content)
+    if account == "account_none" or re.fullmatch(r"\(account_none\s*\)", account):
+        return "empty", 0
+    if not re.match(r"\(account\s", account):
+        raise ValueError("invalid account record")
+    storage = field(account, "storage")
+    if not re.match(r"\(account_storage\s", storage):
+        raise ValueError("invalid account storage")
+    state = field(storage, "state").lstrip("(")
+    state = re.match(r"account_(active|uninit|frozen)(?=\s|\)|$)", state)
+    if not state:
+        raise ValueError("unrecognized account state")
+    amount = field(field(field(storage, "balance"), "grams"), "amount")
+    if not re.match(r"\(var_uint\s", amount):
+        raise ValueError("invalid balance record")
+    value = field(amount, "value")
+    if not re.fullmatch(r"[0-9]+", value):
+        raise ValueError("invalid account balance")
+    return state[1], int(value)
+
+
+def friendly(raw, bounceable=False):
+    workchain, account = raw.split(":")
+    workchain = int(workchain)
+    if not -128 <= workchain <= 127:
+        return raw
+    body = bytes([0x11 if bounceable else 0x51, workchain & 255]) + bytes.fromhex(account)
+    return base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode()
+
+
+def main():
+    name, raw, attempts, timeout = sys.argv[1:]
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or not re.fullmatch(r"-?[0-9]+:[0-9a-fA-F]{64}", raw):
+        return 1
+    attempts, timeout = int(attempts), int(timeout)
+    if not 1 <= attempts <= 10 or not 1 <= timeout <= 60:
+        return 1
+    config_path = pathlib.Path("/var/ton-work/controller/global.config.json")
+    try:
+        config = json.loads(config_path.read_text())
+        servers = config["liteservers"]
+        if not isinstance(servers, list) or not servers:
+            return 1
+    except FileNotFoundError:
+        return 78
+    except (OSError, ValueError, KeyError, TypeError):
+        return 1
+    try:
+        database = json.loads(pathlib.Path("/var/ton-work/controller/mytoncore/mytoncore.db").read_text())
+        if not isinstance(database, dict):
+            database = {}
+    except (OSError, ValueError):
+        database = {}
+    client = database.get("liteClient", {})
+    configured_binary = client.get("appPath") if isinstance(client, dict) else None
+    candidates = [configured_binary, "lite-client", "/usr/bin/ton/lite-client/lite-client", "/usr/local/bin/lite-client"]
+    binary = next((found for candidate in candidates if isinstance(candidate, str) and candidate
+                   for found in [shutil.which(candidate)] if found), None)
+    if not binary:
+        return 78
+    indexes = list(range(len(servers)))
+    random.SystemRandom().shuffle(indexes)
+    preferred = database.get("liteServers", [])
+    if not isinstance(preferred, list):
+        preferred = []
+    preferred = {index for index in preferred if type(index) is int and 0 <= index < len(servers)}
+    preferred = [index for index in indexes if index in preferred]
+    # Retain healthy-server preference while escaping a stale cached list.
+    remaining = [index for index in indexes if index not in preferred]
+    indexes = preferred[:2] + remaining + preferred[2:]
+    versions = database.get("walletsVersionList", {})
+    version = versions.get(friendly(raw, True), "unknown") if isinstance(versions, dict) else "unknown"
+    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", version):
+        version = "unknown"
+    for attempt in range(attempts):
+        index = indexes[attempt % len(indexes)]
+        try:
+            result = subprocess.run(
+                [binary, "-C", str(config_path), "-v", "0", "-i", str(index), "-c", "getaccount " + raw],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, errors="replace", timeout=timeout, check=False,
+            )
+            if result.returncode != 0:
+                continue
+            state, nano = account_state(result.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+        balance = str(nano // 1_000_000_000) + "." + str(nano % 1_000_000_000).zfill(9)
+        print("\t".join((name, state, balance, version, raw.split(":")[0], friendly(raw))))
+        return 0
+    return 1
+
+
+try:
+    sys.exit(main())
+except (ValueError, TypeError, OverflowError):
+    sys.exit(1)
+PY
+}
+
+read_tonnode_wallet_state_from_pod() {
+  run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$1" exec "$2" -c ton-node -- \
+    python3 -c "$(tonnode_wallet_query_script)" "$3" "$4" "$WALLET_QUERY_ATTEMPTS" "$WALLET_QUERY_TIMEOUT_SECONDS"
+}
+
 resolve_tonnode_wallet_row_from_pod() {
   local ns="$1"
   local pod="$2"
   local wallet_name="$3"
-  local output row
+  local output row raw_address query_rc=0
 
   [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  if raw_address="$(read_tonnode_wallet_address_file_from_pod "$ns" "$pod" "$wallet_name")"; then
+    output="$(read_tonnode_wallet_state_from_pod "$ns" "$pod" "$wallet_name" "$raw_address" 2>/dev/null)" || query_rc=$?
+    if (( query_rc == 0 )); then
+      [[ -n "$output" ]] || return 1
+      printf '%s' "$output"
+      return 0
+    fi
+    # A real RPC failure must not fall back to wl's inferred empty/zero state.
+    # Exit 78 is reserved for missing prerequisites in older installations.
+    (( query_rc == 78 || query_rc == 127 )) || return 1
+  fi
   output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if command -v mytonctrl >/dev/null 2>&1; then
       mytonctrl --cmd wl
@@ -11538,6 +11701,7 @@ run_wallet_collect() {
   local amount="alld"
   local candidate=""
   local main_wallet_address=""
+  local pod_inventory=""
   local row target_ns target_pod target_node_name wallet_row
   local wallet_name status balance version workchain source_address status_lc
   local rc=0 collected_count=0 collect_rc=0
@@ -11602,7 +11766,10 @@ run_wallet_collect() {
   main_wallet_address="$(resolve_main_wallet_receive_address "$wallet_network" "$main_wallet_name")" || return 1
 
   if [[ -n "$target_pod_name" ]]; then
-    row="$(resolve_tonnode_pod_row_by_name "$target_pod_name" || true)"
+    if ! row="$(resolve_tonnode_pod_row_by_name "$target_pod_name")"; then
+      echo "Error: TON pod '${target_pod_name}' not found or its inventory is unavailable." >&2
+      return 1
+    fi
     row="$(trim_whitespace "$row")"
     if [[ -z "$row" ]]; then
       echo "Error: TON pod '${target_pod_name}' not found." >&2
@@ -11610,51 +11777,71 @@ run_wallet_collect() {
     fi
     pod_rows+=("$row")
   else
-    mapfile -t pod_rows < <(list_ton_pods 2>/dev/null || true)
+    if ! pod_inventory="$(list_ton_pods)"; then
+      echo "Error: cannot list all TON pods; no collection will be started." >&2
+      return 1
+    fi
+    if [[ -z "$(trim_whitespace "$pod_inventory")" ]]; then
+      echo "Error: no TON pods found for collection." >&2
+      return 1
+    fi
+    mapfile -t pod_rows <<<"$pod_inventory"
   fi
 
   for row in "${pod_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
-    [[ -z "$target_ns" || -z "$target_pod" ]] && continue
-    wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$source_wallet_name" || true)"
+    if [[ -z "$target_ns" || -z "$target_pod" ]]; then
+      echo "Error: incomplete TON pod inventory; no collection will be started." >&2
+      return 1
+    fi
+    if ! wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$source_wallet_name")"; then
+      echo "Error: cannot read live state for wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; no collection will be started." >&2
+      return 1
+    fi
     wallet_row="$(trim_whitespace "$wallet_row")"
     if [[ -z "$wallet_row" ]]; then
-      if [[ -n "$target_pod_name" ]]; then
-        echo "Error: wallet '${source_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
-        return 1
-      fi
-      echo "Warning: cannot resolve wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
-      continue
+      echo "Error: cannot read live state for wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; no collection will be started." >&2
+      return 1
     fi
     IFS=$'\t' read -r wallet_name status balance version workchain source_address <<<"$wallet_row"
     status="$(trim_whitespace "$status")"
     status_lc="${status,,}"
     source_address="$(trim_whitespace "$source_address")"
+    if [[ "$wallet_name" != "$source_wallet_name" ]] || [[ "$status_lc" != active && "$status_lc" != empty && "$status_lc" != uninit && "$status_lc" != uninitialized && "$status_lc" != frozen ]]; then
+      echo "Error: cannot read live state for wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; no collection will be started." >&2
+      return 1
+    fi
     if [[ "$status_lc" != "active" ]]; then
       if [[ -n "$target_pod_name" ]]; then
         echo "Error: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active." >&2
-        echo "Hint: after funding it, run: ./kubeton wallet activate ${target_pod} ${source_wallet_name}" >&2
-        return 1
+      else
+        echo "Warning: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status}', not active; skipping." >&2
       fi
-      echo "Warning: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active; skipping." >&2
-      echo "Warning: after funding it, run: ./kubeton wallet activate ${target_pod} ${source_wallet_name}" >&2
+      case "$status_lc" in
+        empty)
+          echo "Hint: fund this wallet first; an empty wallet cannot send funds." >&2
+          ;;
+        uninit|uninitialized)
+          echo "Hint: after funding it, run: ./kubeton wallet activate ${target_pod} ${source_wallet_name}" >&2
+          ;;
+        frozen)
+          echo "Hint: recover this frozen wallet before collecting funds." >&2
+          ;;
+      esac
+      [[ -z "$target_pod_name" ]] || return 1
       continue
     fi
-    if [[ -z "$source_address" ]]; then
-      if [[ -n "$target_pod_name" ]]; then
-        echo "Error: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is active but has no address in mytonctrl wl output." >&2
-        return 1
-      fi
-      echo "Warning: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is active but has no address; skipping." >&2
-      continue
+    if [[ -z "$source_address" ]] || ! ton_address_to_hex "$source_address" >/dev/null 2>&1; then
+      echo "Error: cannot read the address of active wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; no collection will be started." >&2
+      return 1
     fi
     table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${source_address}"$'\t'"${amount}")
   done
 
   if [[ ${#table_rows[@]} -eq 0 ]]; then
-    echo "Error: no active TON wallets resolved for wallet name '${source_wallet_name}'." >&2
-    echo "Hint: check source status with './kubeton wallet show balance' and activate funded wallets with './kubeton wallet activate [tonnode-name] ${source_wallet_name}'." >&2
+    echo "Error: no active TON wallets available for collection for wallet name '${source_wallet_name}'." >&2
+    echo "Hint: check source status with './kubeton wallet show balance'." >&2
     return 1
   fi
 
@@ -19090,10 +19277,10 @@ run_wallet() {
     echo "  - deploy/send reuse the active global config and select the matching TONCenter endpoint."
     echo "  - A legacy network argument must match detection; it cannot override the active network."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
-    echo "  - activate/show balance use mytonctrl inside TON pods; mytonctrl already has its network configured."
+    echo "  - wallet state queries retry the lite servers in each TON pod's active global.config.json."
     echo "  - export prints private key material to stdout; treat the output as a secret."
-    echo "  - collect only runs mytonctrl mg for source wallets reported as active by mytonctrl wl."
-    echo "  - activate/exec-mtc timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
+    echo "  - collect only runs mytonctrl mg for source wallets confirmed active; unreadable state stops collection."
+    echo "  - activate/exec-mtc and wallet state timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
     echo "  - optional -n (last argument) forwards --no-bounce to wallet.fif"
     echo "  - <to-tonnode-name> is pod name like tonnode-0 (or namespace/pod when applicable)"
