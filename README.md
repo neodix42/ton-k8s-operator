@@ -161,6 +161,13 @@ the labels on existing workers. Explicit selectors and manually disabled storage
 labels remain constraints. Longhorn-backed claims also require the selected
 worker's CSI plugin to become ready before scaling.
 
+After applying placement and the replica count and restoring operator
+reconciliation, `kubeton add` returns immediately without waiting for the new
+TON pod to become Ready. It reports that startup has been initiated on the
+selected worker; initialization and blockchain synchronization continue in the
+background. Use `./kubeton status` and `./kubeton logs <node>` to follow progress,
+then run `./kubeton backup-keys` after the new keys have been generated.
+
 If an earlier add left an unassigned Pending tail such as `tonnode-5`, retrying
 `kubeton add` resumes that replica without increasing the count to seven. The
 command refreshes placement and recreates only that unscheduled tail pod. It
@@ -760,7 +767,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.4.4/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.4.5/install.sh" | bash
 ```
 
 The script:
@@ -1403,7 +1410,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.4.4/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.4.5/install.sh" | bash
 cd ./ton-k8s-operator-0.3.0
 
 # review values before upgrade

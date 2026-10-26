@@ -14245,7 +14245,7 @@ run_add() (
   require_bin kubectl
   require_bin python3
   local ns="" sts="" replicas=""
-  local context refreshed new_ordinal new_replicas new_pod node_name selected_node selected_hostname
+  local context refreshed new_ordinal new_replicas new_pod selected_node selected_hostname
   local label nodes_json current_sts current_cr patch has_cr resume pod_json operator_pods
   local operator_paused=0
   local KUBETON_ADD_MODE=true KUBETON_ADD_CPU_MILLI KUBETON_ADD_MEMORY_BYTES KUBETON_ADD_DATA_BYTES
@@ -14355,17 +14355,11 @@ print(json.dumps(patch))
     operator_paused=0
   fi
 
-  echo "Waiting for ${ns}/${new_pod} to become Ready ..."
-  if ! wait_pod_ready "$ns" "$new_pod" 1200; then
-    print_helper_pod_failure_context "$ns" "$new_pod"
-    echo "[add] Pod and PVCs were retained; a retry will not create another replica while this one is unfinished." >&2
-    exit 1
-  fi
-
-  node_name="$(kubectl -n "$ns" get pod "$new_pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
-  [[ -z "$node_name" ]] && node_name="N/A"
-  echo "Added TON replica: ${ns}/${new_pod} on node ${node_name}."
-  echo "Next step: execute ./kubeton backup-keys"
+  echo "Added TON replica: ${ns}/${new_pod} (selected node ${selected_node}); startup initiated."
+  echo "[add] Initialization and TON synchronization will continue in the background."
+  echo "[add] Check progress: ./kubeton status"
+  echo "[add] View logs: ./kubeton logs ${selected_node}"
+  echo "[add] After key generation completes, execute ./kubeton backup-keys"
 )
 
 confirm_tail_replica_wallets_and_backup() {

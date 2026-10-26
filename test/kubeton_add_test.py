@@ -52,19 +52,13 @@ args=sys.argv[1:]
 def record(event):
     with (root/"events").open("a") as target: target.write(event+"\n")
 def save(): path.write_text(json.dumps(state))
-def pod_ready():
+def pod_starting():
     if not any(p["metadata"]["name"]=="tonnode-5" for p in state["pods"]["items"]):
-        state["pods"]["items"].append({"metadata":{"name":"tonnode-5","namespace":"unit-ns","uid":"new-5"},"spec":{"nodeName":"worker-5"},"status":{"phase":"Running"}})
+        state["pods"]["items"].append({"metadata":{"name":"tonnode-5","namespace":"unit-ns","uid":"new-5"},"spec":{},"status":{"phase":"Pending"}})
 if args[0]=="snapshot":
     for key in ("sts","cr","pods","pvcs","pvs","classes"): sys.stdout.write(json.dumps(state[key])+"\0")
 elif args[0]=="replicas": print(state["sts"]["spec"]["replicas"])
 elif args[0]=="event": record(" ".join(args[1:]))
-elif args[0]=="ready":
-    assert state["sts"]["spec"]["replicas"]==6 and state["cr"]["spec"]["replicas"]==6
-    assert state["sts"]["spec"]["updateStrategy"]=={"type":"OnDelete"}
-    assert all(state["pods"]["items"][i]["metadata"]["uid"]==f"original-{i}" for i in range(5))
-    assert state["sts"]["spec"]["template"]["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchExpressions"][0]["values"]==[f"host-{i}" for i in range(6)]
-    record("ready")
 elif args[0]=="kubectl":
     a=args[1:]
     if a[:2]==["label","node"]:
@@ -91,11 +85,11 @@ elif args[0]=="kubectl":
                 if item["op"]=="test": assert target[keys[-1]]==item["value"]
                 else: target[keys[-1]]=item["value"]
             state[key]["metadata"]["resourceVersion"]=str(int(state[key]["metadata"]["resourceVersion"])+1)
-            if key=="sts" and state["sts"]["spec"]["replicas"]==6 and os.environ["ADD_CASE"]!="resume": pod_ready()
+            if key=="sts" and state["sts"]["spec"]["replicas"]==6 and os.environ["ADD_CASE"] not in ("resume","not-created"): pod_starting()
             save()
         elif op=="delete" and kind=="pod":
             assert a[4]=="tonnode-5", "existing validator deleted"
-            record("delete tail"); state["pods"]["items"]=[p for p in state["pods"]["items"] if p["metadata"]["name"]!="tonnode-5"]; pod_ready(); save()
+            record("delete tail"); state["pods"]["items"]=[p for p in state["pods"]["items"] if p["metadata"]["name"]!="tonnode-5"]; pod_starting(); save()
         else: raise AssertionError("Unexpected cluster mutation/call: "+str(a))
     else: raise AssertionError("Unexpected cluster mutation/call: "+str(a))
 else: raise AssertionError(args)
@@ -123,7 +117,7 @@ validate_external_key_prereqs() { :; }
 wait_ton_selected_nodes_longhorn_csi_ready() { [[ "$1" == kubernetes.io/hostname=host-5 ]] || return 94; python3 "$ADD_HELPER" event csi; }
 pause_operator_reconcile() { local -n a="$1" b="$2"; a=(operator); b=(1); python3 "$ADD_HELPER" event pause; }
 ton_add_resume_operator() { python3 "$ADD_HELPER" event resume; [[ "$ADD_CASE" != resume-failure ]]; }
-wait_pod_ready() { [[ "$1 $2" == 'unit-ns tonnode-5' ]] || return 95; python3 "$ADD_HELPER" ready; }
+wait_pod_ready() { python3 "$ADD_HELPER" event readiness-wait; return 95; }
 run_add
 '''
 
@@ -201,14 +195,33 @@ class AddTests(unittest.TestCase):
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", WRAPPER, "_", str(CLI)], env=env, text=True, capture_output=True)
             return result, (root / "events").read_text(), json.loads((root / "state.json").read_text())
 
-    def test_fresh_scale_updates_placement_before_wait(self):
+    def test_fresh_scale_returns_while_pod_is_pending(self):
         result, events, state = self.flow("fresh")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertLess(events.index("admission 2"), events.index("pause"))
-        self.assertLess(events.index("patch sts"), events.index("ready"))
-        self.assertIn("resume", events)
+        self.assertLess(events.index("patch sts"), events.index("resume"))
+        self.assertNotIn("readiness-wait", events)
         self.assertNotIn("delete", events)
         self.assertEqual(state["cr"]["spec"]["replicas"], 6)
+        self.assertEqual(state["sts"]["spec"]["replicas"], 6)
+        self.assertEqual(state["sts"]["spec"]["updateStrategy"], {"type": "OnDelete"})
+        self.assertEqual([pod["metadata"]["uid"] for pod in state["pods"]["items"][:5]], [f"original-{i}" for i in range(5)])
+        self.assertEqual(state["sts"]["spec"]["template"]["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchExpressions"][0]["values"], [f"host-{i}" for i in range(6)])
+        self.assertEqual(state["pods"]["items"][-1]["status"]["phase"], "Pending")
+        self.assertIn("startup initiated", result.stdout)
+        self.assertIn("synchronization will continue in the background", result.stdout)
+        self.assertIn("./kubeton status", result.stdout)
+        self.assertIn("./kubeton logs worker-5", result.stdout)
+        self.assertIn("After key generation completes", result.stdout)
+        self.assertNotIn("Waiting for", result.stdout)
+
+    def test_returns_before_controller_creates_new_pod(self):
+        result, events, state = self.flow("not-created")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("readiness-wait", events)
+        self.assertEqual(len(state["pods"]["items"]), 5)
+        self.assertEqual(state["sts"]["spec"]["replicas"], 6)
+        self.assertIn("unit-ns/tonnode-5 (selected node worker-5); startup initiated", result.stdout)
 
     def test_resumed_tail_only_is_recreated(self):
         result, events, state = self.flow("resume")
@@ -217,6 +230,8 @@ class AddTests(unittest.TestCase):
         self.assertEqual(state["sts"]["spec"]["replicas"], 6)
         self.assertIn("keeping replicas=6", result.stdout)
         self.assertEqual(state["pvcs"]["items"][0]["metadata"]["uid"], "retained-keybundle")
+        self.assertEqual(state["pods"]["items"][-1]["status"]["phase"], "Pending")
+        self.assertNotIn("readiness-wait", events)
 
     def test_capacity_failure_cannot_scale_or_touch_pvcs(self):
         for mode in ("no-capacity", "capacity-loss"):
@@ -232,7 +247,7 @@ class AddTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pause", events)
         self.assertIn("resume", events)
-        self.assertNotIn("ready", events)
+        self.assertNotIn("Added TON replica", result.stdout)
 
     def test_failed_operator_restore_is_not_reported_as_success(self):
         result, events, state = self.flow("resume-failure")
