@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CHART_VERSION="0.4.0"
+CHART_VERSION="0.4.1"
 CHART_REF="${CHART_REF:-oci://ghcr.io/neodix42/charts/ton-k8s-operator}"
 RELEASE_BASE_URL="${RELEASE_BASE_URL:-https://github.com/neodix42/ton-k8s-operator/releases/download/$CHART_VERSION}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD/ton-k8s-operator-$CHART_VERSION}"
