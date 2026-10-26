@@ -83,7 +83,7 @@ KUBETON_START_VICTORIA_LOGS_ENABLED="${KUBETON_START_VICTORIA_LOGS_ENABLED:-true
 STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 MYTONCTRL_EXEC_TIMEOUT="${MYTONCTRL_EXEC_TIMEOUT:-180s}"
 WALLET_QUERY_ATTEMPTS="${WALLET_QUERY_ATTEMPTS:-3}"
-WALLET_QUERY_TIMEOUT_SECONDS="${WALLET_QUERY_TIMEOUT_SECONDS:-10}"
+WALLET_QUERY_TIMEOUT_SECONDS="${WALLET_QUERY_TIMEOUT_SECONDS:-45}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
 HELM_UNINSTALL_CMD_TIMEOUT="${HELM_UNINSTALL_CMD_TIMEOUT:-900s}"
@@ -1107,11 +1107,14 @@ run_with_launch_session() {
 print_prefixed_lines() {
   local prefix="$1"
   local text="${2:-}"
+  local line
   if [[ -z "$text" ]]; then
     printf '%s<no output>\n' "$prefix"
     return
   fi
-  printf '%s\n' "$text" | sed "s/^/${prefix}/"
+  while IFS= read -r line; do
+    printf '%s%s\n' "$prefix" "$line"
+  done <<<"$text"
 }
 
 yaml_quote() {
@@ -11011,13 +11014,17 @@ tonnode_wallet_query_script() {
   cat <<'PY'
 import base64
 import binascii
+import http.client
 import json
 import pathlib
-import random
 import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
 def form(text):
@@ -11082,8 +11089,148 @@ def friendly(raw, bounceable=False):
     return base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode()
 
 
+def account_none_cell(encoded):
+    blob = base64.b64decode(encoded, validate=True)
+    if len(blob) < 8 or blob[:4] != bytes.fromhex("b5ee9c72"):
+        raise ValueError("invalid account BOC")
+    flags, offset_size = blob[4:6]
+    size = flags & 7
+    if flags & 0x38 or not 1 <= size <= 4 or not 1 <= offset_size <= 8:
+        raise ValueError("unsupported account BOC")
+    end = len(blob) - (4 if flags & 0x40 else 0)
+    if flags & 0x40:
+        crc = 0xffffffff
+        for byte in blob[:end]:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
+        if (crc ^ 0xffffffff).to_bytes(4, "little") != blob[end:]:
+            raise ValueError("invalid account BOC checksum")
+    cursor = 6
+
+    def number(width):
+        nonlocal cursor
+        if cursor + width > end:
+            raise ValueError("truncated account BOC")
+        value = int.from_bytes(blob[cursor:cursor + width], "big")
+        cursor += width
+        return value
+
+    count, roots, absent, total = number(size), number(size), number(size), number(offset_size)
+    if not 1 <= count <= 4096 or roots != 1 or absent != 0:
+        raise ValueError("invalid account BOC roots")
+    root = number(size)
+    if flags & 0x80:
+        for _ in range(count):
+            number(offset_size)
+    if cursor + total != end:
+        raise ValueError("invalid account BOC length")
+    cells = []
+    for _ in range(count):
+        descriptor, bits = number(1), number(1)
+        refs = descriptor & 7
+        if descriptor & 0xf8 or refs > 4:
+            raise ValueError("unsupported account BOC cell")
+        length = (bits + 1) // 2
+        if cursor + length > end:
+            raise ValueError("truncated account BOC cell")
+        data = blob[cursor:cursor + length]
+        cursor += length
+        references = [number(size) for _ in range(refs)]
+        cells.append((bits, data, references))
+    if cursor != end or root >= count or any(ref >= count for _, _, refs in cells for ref in refs):
+        raise ValueError("invalid account BOC references")
+    bits, data, refs = cells[root]
+    if bits != 80 or len(data) != 40 or len(refs) != 1:
+        raise ValueError("invalid ShardAccount cell")
+    account_bits, account_data, account_refs = cells[refs[0]]
+    if not account_data:
+        raise ValueError("missing Account constructor")
+    if account_data[0] & 0x80:
+        return False
+    if account_bits != 1 or account_data != b"\x40" or account_refs or any(data):
+        raise ValueError("invalid account_none cell")
+    return True
+
+
+def https_endpoint(config):
+    validator = config.get("validator", {})
+    state = validator.get("zero_state", {}) if isinstance(validator, dict) else {}
+    if not isinstance(state, dict):
+        return None
+    if any(type(state.get(key)) is not int or state[key] != expected
+           for key, expected in (("workchain", -1), ("shard", -9223372036854775808), ("seqno", 0))):
+        return None
+    identities = {
+        ("F6OpKZKqvqeFp6CQmFomXNMfMj2EnaUSOXN+Mh+wVWk=", "XplPz01CXAps5qeSWUtxcyBfdAo5zVb1N979KLSKD24="): "https://toncenter.com",
+        ("gj+B8wb/AmlPk1z1AhVI484rhrUpgSr2oSFIh56VoSg=", "Z+IKwYS54DmmJmesw/nAD5DzWadnOCMzee+kdgSYDOg="): "https://testnet.toncenter.com",
+    }
+    root_hash, file_hash = state.get("root_hash"), state.get("file_hash")
+    if not isinstance(root_hash, str) or not isinstance(file_hash, str):
+        return None
+    return identities.get((root_hash, file_hash))
+
+
+def https_account_state(endpoint, raw):
+    last_request = None
+
+    def request(method, **parameters):
+        nonlocal last_request
+        url = endpoint + "/api/v2/" + method + "?" + urllib.parse.urlencode({"address": raw, **parameters})
+        for attempt in range(3):
+            if last_request is not None:
+                time.sleep(max(0, 1.05 - (time.monotonic() - last_request)))
+            last_request = time.monotonic()
+            try:
+                query = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "kubeton/wallet-state"})
+                with urllib.request.urlopen(query, timeout=10) as response:
+                    body = response.read(1048577)
+                    if len(body) > 1048576:
+                        raise ValueError("oversized HTTPS account response")
+                    result = json.loads(body)
+                if not isinstance(result, dict) or result.get("ok") is not True or not isinstance(result.get("result"), dict):
+                    raise ValueError("HTTPS account API rejected the query")
+                return result["result"]
+            except urllib.error.HTTPError as error:
+                if (error.code == 429 or 500 <= error.code < 600) and attempt < 2:
+                    continue
+                raise
+        raise ValueError("HTTPS account API retry limit reached")
+
+    result = request("getAddressInformation")
+    balance, state = result.get("balance"), result.get("state")
+    if not isinstance(balance, str) or not re.fullmatch(r"[0-9]+", balance) or state not in ("active", "frozen", "uninitialized"):
+        raise ValueError("invalid HTTPS account state or balance")
+    nano = int(balance)
+    if state != "uninitialized":
+        return state, nano
+    transaction = result.get("last_transaction_id", {})
+    possible_empty = (nano == 0 and result.get("code") == "" and result.get("data") == ""
+                      and result.get("frozen_hash") == "" and result.get("extra_currencies") == []
+                      and isinstance(transaction, dict) and transaction.get("lt") == "0"
+                      and transaction.get("hash") == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+    if possible_empty:
+        block = result.get("block_id", {})
+        if not isinstance(block, dict) or block.get("workchain") != -1 or type(block.get("seqno")) is not int or block["seqno"] <= 0:
+            raise ValueError("missing HTTPS account snapshot block")
+        cell = request("getShardAccountCell", seqno=block["seqno"])
+        if cell.get("@type") != "tvm.cell" or not isinstance(cell.get("bytes"), str):
+            raise ValueError("missing HTTPS ShardAccount cell")
+        if account_none_cell(cell["bytes"]):
+            return "empty", 0
+    return "uninit", nano
+
+
+def emit_row(name, raw, version, state, nano):
+    balance = str(nano // 1_000_000_000) + "." + str(nano % 1_000_000_000).zfill(9)
+    print("\t".join((name, state, balance, version, raw.split(":")[0], friendly(raw))))
+
+
 def main():
-    name, raw, attempts, timeout = sys.argv[1:]
+    name, raw, attempts, timeout = sys.argv[1:5]
+    mode = sys.argv[5] if len(sys.argv) > 5 else "--auto"
+    if mode not in ("--auto", "--https-only", "--rpc-only"):
+        return 1
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or not re.fullmatch(r"-?[0-9]+:[0-9a-fA-F]{64}", raw):
         return 1
     attempts, timeout = int(attempts), int(timeout)
@@ -11091,29 +11238,53 @@ def main():
         return 1
     config_path = pathlib.Path("/var/ton-work/controller/global.config.json")
     try:
-        config = json.loads(config_path.read_text())
-        servers = config["liteservers"]
-        if not isinstance(servers, list) or not servers:
+        config = json.load(sys.stdin) if mode == "--https-only" else json.loads(config_path.read_text())
+        if not isinstance(config, dict):
             return 1
     except FileNotFoundError:
         return 78
     except (OSError, ValueError, KeyError, TypeError):
         return 1
     try:
-        database = json.loads(pathlib.Path("/var/ton-work/controller/mytoncore/mytoncore.db").read_text())
+        database = {} if mode == "--https-only" else json.loads(pathlib.Path("/var/ton-work/controller/mytoncore/mytoncore.db").read_text())
         if not isinstance(database, dict):
             database = {}
     except (OSError, ValueError):
         database = {}
+    versions = database.get("walletsVersionList", {})
+    version = (sys.argv[6] if len(sys.argv) > 6 else "unknown") if mode == "--https-only" else (
+        versions.get(friendly(raw, True), "unknown") if isinstance(versions, dict) else "unknown")
+    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", version):
+        version = "unknown"
+    errors = []
+    endpoint = https_endpoint(config)
+    if mode != "--rpc-only" and endpoint:
+        try:
+            if mode == "--https-only":
+                # Separate host queries run sequentially for fleet wallets.
+                # Pace their first requests too, without persisting balances.
+                time.sleep(1.05)
+            state, nano = https_account_state(endpoint, raw)
+            emit_row(name, raw, version, state, nano)
+            return 0
+        except (OSError, ValueError, http.client.HTTPException, urllib.error.URLError) as error:
+            errors.append("HTTPS: " + str(error))
+    if mode == "--https-only":
+        print("; ".join(errors) if errors else "HTTPS queries require a supported mainnet or testnet zero-state identity", file=sys.stderr)
+        return 1
+    servers = config.get("liteservers")
+    if not isinstance(servers, list) or not servers:
+        print("active global.config.json has no lite servers", file=sys.stderr)
+        return 1
     client = database.get("liteClient", {})
     configured_binary = client.get("appPath") if isinstance(client, dict) else None
     candidates = [configured_binary, "lite-client", "/usr/bin/ton/lite-client/lite-client", "/usr/local/bin/lite-client"]
     binary = next((found for candidate in candidates if isinstance(candidate, str) and candidate
                    for found in [shutil.which(candidate)] if found), None)
     if not binary:
+        print("lite-client executable is unavailable" + ("; " + "; ".join(errors) if errors else ""), file=sys.stderr)
         return 78
     indexes = list(range(len(servers)))
-    random.SystemRandom().shuffle(indexes)
     preferred = database.get("liteServers", [])
     if not isinstance(preferred, list):
         preferred = []
@@ -11122,26 +11293,28 @@ def main():
     # Retain healthy-server preference while escaping a stale cached list.
     remaining = [index for index in indexes if index not in preferred]
     indexes = preferred[:2] + remaining + preferred[2:]
-    versions = database.get("walletsVersionList", {})
-    version = versions.get(friendly(raw, True), "unknown") if isinstance(versions, dict) else "unknown"
-    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", version):
-        version = "unknown"
     for attempt in range(attempts):
         index = indexes[attempt % len(indexes)]
         try:
             result = subprocess.run(
-                [binary, "-C", str(config_path), "-v", "0", "-i", str(index), "-c", "getaccount " + raw],
+                [binary, "-C", str(config_path), "-v", "1", "-i", str(index), "-c", "getaccount " + raw],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, errors="replace", timeout=timeout, check=False,
             )
             if result.returncode != 0:
+                detail = re.sub(r"\s+", " ", result.stderr).strip()[:240]
+                errors.append(f"lite server #{index}: exit {result.returncode}" + (": " + detail if detail else ""))
                 continue
             state, nano = account_state(result.stdout)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            errors.append(f"lite server #{index}: timed out after {timeout}s during client startup/account query")
             continue
-        balance = str(nano // 1_000_000_000) + "." + str(nano % 1_000_000_000).zfill(9)
-        print("\t".join((name, state, balance, version, raw.split(":")[0], friendly(raw))))
+        except (OSError, ValueError) as error:
+            errors.append(f"lite server #{index}: {error}")
+            continue
+        emit_row(name, raw, version, state, nano)
         return 0
+    print("Wallet state query failed: " + "; ".join(errors), file=sys.stderr)
     return 1
 
 
@@ -11153,8 +11326,40 @@ PY
 }
 
 read_tonnode_wallet_state_from_pod() {
-  run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$1" exec "$2" -c ton-node -- \
-    python3 -c "$(tonnode_wallet_query_script)" "$3" "$4" "$WALLET_QUERY_ATTEMPTS" "$WALLET_QUERY_TIMEOUT_SECONDS"
+  local ns="$1" pod="$2" wallet_name="$3" raw_address="$4"
+  local script config version="unknown" https_output="" rpc_output="" rpc_rc=0
+  script="$(tonnode_wallet_query_script)"
+  if command -v python3 >/dev/null 2>&1; then
+    if config="$(read_tonnode_global_config "$ns" "$pod" 2>/dev/null)"; then
+      version="$(read_tonnode_wallet_version_from_pod "$ns" "$pod" "$raw_address" 2>/dev/null || true)"
+      [[ -n "$version" ]] || version="unknown"
+      if https_output="$(printf '%s' "$config" | python3 -c "$script" "$wallet_name" "$raw_address" \
+          "$WALLET_QUERY_ATTEMPTS" "$WALLET_QUERY_TIMEOUT_SECONDS" --https-only "$version" 2>&1)"; then
+        printf '%s' "$https_output"
+        return 0
+      fi
+    else
+      https_output="cannot read the pod's active global.config.json for the HTTPS query"
+    fi
+  else
+    https_output="local python3 is unavailable for the HTTPS query"
+  fi
+  rpc_output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- \
+    python3 -c "$script" "$wallet_name" "$raw_address" "$WALLET_QUERY_ATTEMPTS" "$WALLET_QUERY_TIMEOUT_SECONDS" --rpc-only 2>&1)" || rpc_rc=$?
+  if (( rpc_rc == 0 )); then
+    [[ -n "$rpc_output" ]] || return 1
+    printf '%s' "$rpc_output"
+    return 0
+  fi
+  [[ -z "$https_output" ]] || print_prefixed_lines "[wallet ${ns}/${pod}] " "$https_output" >&2
+  if [[ -n "$rpc_output" ]]; then
+    print_prefixed_lines "[wallet ${ns}/${pod}] " "$rpc_output" >&2
+  elif (( rpc_rc == 124 )); then
+    echo "[wallet ${ns}/${pod}] Pod query timed out after ${MYTONCTRL_EXEC_TIMEOUT}." >&2
+  else
+    echo "[wallet ${ns}/${pod}] Pod query failed with exit ${rpc_rc}." >&2
+  fi
+  return "$rpc_rc"
 }
 
 resolve_tonnode_wallet_row_from_pod() {
@@ -11165,7 +11370,7 @@ resolve_tonnode_wallet_row_from_pod() {
 
   [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   if raw_address="$(read_tonnode_wallet_address_file_from_pod "$ns" "$pod" "$wallet_name")"; then
-    output="$(read_tonnode_wallet_state_from_pod "$ns" "$pod" "$wallet_name" "$raw_address" 2>/dev/null)" || query_rc=$?
+    output="$(read_tonnode_wallet_state_from_pod "$ns" "$pod" "$wallet_name" "$raw_address")" || query_rc=$?
     if (( query_rc == 0 )); then
       [[ -n "$output" ]] || return 1
       printf '%s' "$output"
@@ -11232,6 +11437,41 @@ read_tonnode_wallet_address_file_from_pod() {
     LC_ALL=C od -An -tx1 -v "$addr_file" | tr -d " \n"
   ' _ "$wallet_name" 2>/dev/null)" || return 1
   ton_wallet_address_file_hex_to_hex "$output"
+}
+
+read_tonnode_wallet_version_from_pod() {
+  local ns="$1"
+  local pod="$2"
+  local raw_address="$3"
+  local output
+
+  [[ "$raw_address" =~ ^-?[0-9]+:[[:xdigit:]]{64}$ ]] || return 1
+  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- python3 -c '
+import base64
+import binascii
+import json
+import pathlib
+import re
+import sys
+
+try:
+    workchain, account = sys.argv[1].split(":")
+    workchain = int(workchain)
+    if not -128 <= workchain <= 127:
+        sys.exit(1)
+    body = bytes([0x11, workchain & 255]) + bytes.fromhex(account)
+    key = base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode()
+    database = json.loads(pathlib.Path("/var/ton-work/controller/mytoncore/mytoncore.db").read_text())
+    versions = database.get("walletsVersionList", {})
+    version = versions.get(key) if isinstance(versions, dict) else None
+    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", version):
+        sys.exit(1)
+    print(version)
+except (OSError, ValueError, TypeError, AttributeError):
+    sys.exit(1)
+' "$raw_address" 2>/dev/null)" || return 1
+  [[ "$output" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || return 1
+  printf '%s' "$output"
 }
 
 read_tonnode_wallet_private_key_hex_from_pod() {
@@ -11398,6 +11638,7 @@ run_wallet_balance_show() {
   local target_wallet_name="${2:-validator_wallet_001}"
   local row target_ns target_pod target_node_name wallet_row
   local wallet_name status balance version workchain address raw_address pod_inventory
+  local live_state_available
   local -a pod_rows=()
   local -a table_rows=()
 
@@ -11430,8 +11671,10 @@ run_wallet_balance_show() {
     [[ -z "$target_ns" || -z "$target_pod" ]] && continue
     wallet_name="$target_wallet_name"
     status="unknown" balance="unknown" version="unknown" workchain="unknown" address="unknown"
+    live_state_available=0
     if wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$target_wallet_name")" && [[ -n "$wallet_row" ]]; then
       IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
+      live_state_available=1
     else
       echo "Warning: live balance unavailable for wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; showing unknown." >&2
     fi
@@ -11442,6 +11685,11 @@ run_wallet_balance_show() {
       if raw_address="$(read_tonnode_wallet_address_file_from_pod "$target_ns" "$target_pod" "$target_wallet_name")"; then
         workchain="${raw_address%%:*}"
         address="$(ton_address_to_non_bounceable "$raw_address" || printf '%s' "$raw_address")"
+        if (( live_state_available == 0 )); then
+          if ! version="$(read_tonnode_wallet_version_from_pod "$target_ns" "$target_pod" "$raw_address")"; then
+            version="unknown"
+          fi
+        fi
       fi
     fi
     table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${version}"$'\t'"${workchain}"$'\t'"${address}")
@@ -19277,7 +19525,7 @@ run_wallet() {
     echo "  - deploy/send reuse the active global config and select the matching TONCenter endpoint."
     echo "  - A legacy network argument must match detection; it cannot override the active network."
     echo "  - activate runs mytonctrl aw inside TON pods and does not use the kubeton main-wallet BOC sender."
-    echo "  - wallet state queries retry the lite servers in each TON pod's active global.config.json."
+    echo "  - wallet state uses network-matched HTTPS from this machine, with pod lite-server fallback."
     echo "  - export prints private key material to stdout; treat the output as a secret."
     echo "  - collect only runs mytonctrl mg for source wallets confirmed active; unreadable state stops collection."
     echo "  - activate/exec-mtc and wallet state timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."

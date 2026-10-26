@@ -84,6 +84,8 @@ setup_case() {
   # These fixtures exercise the compatibility wl path; the dedicated Python
   # state-query tests cover the preferred targeted lite-client reader.
   read_tonnode_wallet_state_from_pod() { return 78; }
+  # Static version metadata has its own JSON-only reader regression suite.
+  read_tonnode_wallet_version_from_pod() { return 1; }
   run_with_timeout() {
     printf 'timeout %s\n' "$1" >>"$mock_events"
     shift

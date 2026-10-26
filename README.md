@@ -848,19 +848,29 @@ empty reports zero balance and seqno; connection/query failures remain unknown.
 By default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
-Pod wallet state checks query the named wallet directly with the pod's
-lite-client and active `global.config.json`. They retry up to three times with
-10 seconds per request, trying different configured lite servers before
-repeating one. These read-only checks avoid MyTonCtrl's short RPC timeout and
-do not depend on successful queries for other wallets. Adjust them with
+Pod wallet state checks first use HTTPS from the machine running `kubeton`.
+The active `global.config.json` zero-state identity selects TONCenter mainnet
+or testnet, so queries do not depend on each pod's outbound lite-server
+connection. No API key is required; requests are paced for the anonymous rate
+limit and retry rate-limit responses. Public APIs are not queried for an
+unrecognized or private network.
+
+If HTTPS is unavailable, the pod's lite-client queries the exact local wallet
+address using its active configuration. This fallback tries configured servers
+in a stable order, with up to three attempts and 45 seconds per process to allow
+connection setup and the client's multiple RPCs to complete. Adjust these with
 `WALLET_QUERY_ATTEMPTS` (1–10) and `WALLET_QUERY_TIMEOUT_SECONDS` (1–60); the
 whole pod command is bounded by `MYTONCTRL_EXEC_TIMEOUT` (default `180s`).
 
 A successful response that the account does not exist shows `empty` and
-`0.000000000`. A funded, undeployed account shows `uninit` and its actual
-balance. If every query fails, the row remains visible with unknown live state
-and balance, plus its local address and workchain when available. Unknown
-means the balance could not be checked; it must not be treated as empty or zero.
+`0.000000000`. For HTTPS results, `kubeton` checks the returned ShardAccount
+cell for an explicit `account_none` at the same masterchain block; a zero
+balance alone does not establish emptiness. A funded, undeployed account shows
+`uninit` and its actual balance. If both query paths fail, the output includes
+the HTTPS/RPC failure reasons and retains the row with unknown live state and
+balance. Local address, workchain, and known wallet version remain visible.
+Unknown means the balance could not be checked; it must not be treated as empty
+or zero.
 Older installations without the direct query prerequisites use `mytonctrl wl`
 as a compatibility fallback. Activation and collection still execute MyTonCtrl
 commands inside the TON pods.
