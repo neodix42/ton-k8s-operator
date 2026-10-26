@@ -238,7 +238,7 @@ test_networkless_send_forms() (
 
     run_wallet send savings tonnode-0 3.5 "${flags[@]}" >"$case_dir/pod${flag}"
     assert_helper_command send savings "$fixture_destination_address" 3.5 "${flags[@]}"
-    assert_contains 'wallet-address <test-ns> <tonnode-0> <validator_wallet_001>' "$events"
+    assert_contains 'wallet-address <test-ns> <tonnode-0> <validator_wallet_001> <testnet>' "$events"
 
     run_wallet send savings tonnode-0 reserve 3.5 "${flags[@]}" >"$case_dir/named${flag}"
     assert_helper_command send savings "$fixture_destination_address" 3.5 "${flags[@]}"
@@ -247,6 +247,105 @@ test_networkless_send_forms() (
     run_wallet send savings 10. "${flags[@]}" >"$case_dir/split${flag}"
     assert_helper_command send savings 10. "$fixture_destination_address" "$fixture_second_address" "${flags[@]}"
     assert_contains "send '5.000000000' from 'savings' on testnet" "$events"
+    assert_contains '(2 total)' "$events"
+    assert_contains "$fixture_destination_address" "$case_dir/split${flag}"
+    assert_contains "$fixture_second_address" "$case_dir/split${flag}"
+  done
+)
+
+test_send_requires_complete_inventory() (
+  setup_case send-inventory-errors
+  local mode
+  list_ton_pods() {
+    case "$mode" in
+      failed) return 1 ;;
+      partial-error) printf 'test-ns\ttonnode-0\tworker-0\n'; return 1 ;;
+      empty) return 0 ;;
+      malformed) printf 'test-ns\ttonnode-0\tworker-0\nincomplete-row\n' ;;
+    esac
+  }
+  for mode in failed partial-error empty malformed; do
+    : >"$events"
+    if run_wallet send savings 10. >"$case_dir/$mode" 2>&1; then
+      fail "send accepted $mode recipient inventory"
+    fi
+    assert_contains 'Error:' "$case_dir/$mode"
+    assert_not_contains skipping "$case_dir/$mode"
+    assert_no_side_effects
+    if [[ "$mode" == failed || "$mode" == partial-error ]]; then
+      assert_not_contains wallet-address "$events"
+    fi
+  done
+)
+
+test_send_requires_every_wallet_address() (
+  setup_case send-wallet-errors
+  local mode
+  resolve_tonnode_wallet_address_from_pod() {
+    record wallet-address "$@"
+    if [[ "$2" == tonnode-0 ]]; then
+      printf '%s' "$fixture_destination_address"
+      return 0
+    fi
+    case "$mode" in
+      empty) return 0 ;;
+      failed) return 1 ;;
+      partial-error) printf '%s' "$fixture_second_address"; return 1 ;;
+    esac
+  }
+  for mode in empty failed partial-error; do
+    : >"$events"
+    if run_wallet send savings 10. >"$case_dir/$mode" 2>&1; then
+      fail "send accepted $mode address lookup for a recipient"
+    fi
+    assert_contains "cannot resolve wallet 'validator_wallet_001' in test-ns/tonnode-1" "$case_dir/$mode"
+    assert_not_contains skipping "$case_dir/$mode"
+    assert_contains 'wallet-address <test-ns> <tonnode-0>' "$events"
+    assert_contains 'wallet-address <test-ns> <tonnode-1>' "$events"
+    assert_no_side_effects
+  done
+)
+
+test_send_rejects_invalid_pod_addresses() (
+  setup_case send-invalid-addresses
+  local friendly_testnet invalid_checksum mode destination
+  friendly_testnet="$(python3 - "$fixture_second_address" <<'PY'
+import base64
+import binascii
+import sys
+
+workchain, account = sys.argv[1].split(":")
+body = bytes([0xD1, int(workchain) & 0xff]) + bytes.fromhex(account)
+print(base64.urlsafe_b64encode(body + binascii.crc_hqx(body, 0).to_bytes(2, "big")).decode())
+PY
+)"
+  invalid_checksum="${friendly_testnet:0:47}A"
+  [[ "$invalid_checksum" != "$friendly_testnet" ]] || invalid_checksum="${friendly_testnet:0:47}B"
+  resolve_tonnode_wallet_address_from_pod() {
+    record wallet-address "$@"
+    if [[ "$2" == tonnode-0 ]]; then
+      printf '%s' "$fixture_destination_address"
+    else
+      printf '%s' "$destination"
+    fi
+  }
+  for mode in malformed bad-checksum wrong-network; do
+    inference_mode=testnet
+    case "$mode" in
+      malformed) destination='0:invalid-address' ;;
+      bad-checksum) destination="$invalid_checksum" ;;
+      wrong-network) inference_mode=mainnet; destination="$friendly_testnet" ;;
+    esac
+    for target in all selected; do
+      : >"$events"
+      local -a args=(savings 10.)
+      [[ "$target" != selected ]] || args=(savings tonnode-1 10.)
+      if run_wallet send "${args[@]}" >"$case_dir/$mode-$target" 2>&1; then
+        fail "send accepted $mode address for $target recipients"
+      fi
+      assert_contains "wallet 'validator_wallet_001' in test-ns/tonnode-1 has an invalid destination address" "$case_dir/$mode-$target"
+      assert_no_side_effects
+    done
   done
 )
 
@@ -652,6 +751,9 @@ PY
 test_unchanged_local_commands
 test_networkless_deploy
 test_networkless_send_forms
+test_send_requires_complete_inventory
+test_send_requires_every_wallet_address
+test_send_rejects_invalid_pod_addresses
 test_invalid_no_bounce_positions
 test_networkless_collect_forms
 test_legacy_matching_network

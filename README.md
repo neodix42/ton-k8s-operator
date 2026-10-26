@@ -850,6 +850,19 @@ By default wallet BOC sending uses
 attempts.
 `kubeton wallet activate ...` and `kubeton wallet show balance ...` run against
 `mytonctrl` inside TON pods; `mytonctrl` already has the network configured.
+Balance queries use `MYTONCTRL_EXEC_TIMEOUT` (default `180s`). A failed or
+timed-out query keeps the pod's row in the table with unknown live state and
+balance; its address and workchain are read from the local wallet `.addr` file
+when available. A query failure never implies an empty wallet or zero balance.
+
+Sending to pod wallets reads their named `.addr` files without querying live
+balances. These destinations use non-bounceable addresses for the detected
+network, allowing initial funding while nodes are still syncing. If the file
+cannot be read, a successful, validated `mytonctrl wl` lookup is used as a
+compatibility fallback. Fleet sends require every pod's destination to resolve
+before confirmation; a failed lookup stops the command instead of dividing the
+total amount among fewer wallets.
+
 `kubeton wallet export` prints private key material to stdout after confirmation:
 with no arguments it exports all pod wallet `.pk` files, with one argument it
 exports the named main wallet, including its subwallet id, from the encrypted

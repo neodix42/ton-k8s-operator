@@ -3388,6 +3388,41 @@ ton_address_to_hex() {
   printf '%s:%s' "$wc_dec" "$account_hex"
 }
 
+ton_address_to_non_bounceable() {
+  local address network="${2:-mainnet}" workchain body_hex byte_offset byte_value
+  local crc=0 bit escaped="" character
+
+  address="$(ton_address_to_hex "${1:-}")" || return 1
+  workchain="${address%%:*}"
+  # The friendly format stores a signed, single-byte workchain.
+  [[ "$workchain" =~ ^-?(0|[1-9][0-9]{0,2})$ ]] || return 1
+  (( workchain >= -128 && workchain <= 127 )) || return 1
+  case "$network" in
+    mainnet) body_hex="51" ;;
+    testnet) body_hex="d1" ;;
+    *) return 1 ;;
+  esac
+  body_hex+="$(printf '%02x' "$((workchain & 255))")${address#*:}"
+  for ((byte_offset=0; byte_offset<68; byte_offset+=2)); do
+    byte_value=$((16#${body_hex:byte_offset:2}))
+    crc=$((crc ^ (byte_value << 8)))
+    for ((bit=0; bit<8; bit++)); do
+      if (( crc & 0x8000 )); then
+        crc=$((((crc << 1) ^ 0x1021) & 0xffff))
+      else
+        crc=$(((crc << 1) & 0xffff))
+      fi
+    done
+  done
+  body_hex+="$(printf '%04x' "$crc")"
+  # Keep binary bytes out of shell variables; printf decodes them in the pipe.
+  for ((byte_offset=0; byte_offset<72; byte_offset+=2)); do
+    character="${body_hex:byte_offset:2}"
+    escaped+="\\x${character}"
+  done
+  printf '%b' "$escaped" | base64 | tr '+/' '-_' | tr -d '\n'
+}
+
 ton_wallet_address_file_hex_to_hex() {
   local data_hex="${1,,}" wc_dec candidate="" byte_offset byte_value character
   [[ -n "$data_hex" && "$data_hex" =~ ^([0-9a-f]{2})+$ ]] || return 1
@@ -10950,20 +10985,23 @@ resolve_tonnode_wallet_address_from_pod() {
   local ns="$1"
   local pod="$2"
   local wallet_name="$3"
-  local output address
+  local network="${4:-mainnet}"
+  local wallet_row address raw_address status balance version workchain
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
-    if command -v mytonctrl >/dev/null 2>&1; then
-      mytonctrl --cmd wl
-    fi
-  ' 2>/dev/null || true)"
-  output="$(strip_ansi_sequences "$output")"
-  address="$(printf '%s\n' "$output" | awk -v wallet_name="$wallet_name" '$1 == wallet_name {print $NF; exit}')"
-  address="$(trim_whitespace "$address")"
-
-  if [[ -z "$address" ]]; then
-    return 1
+  [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  # Account identity is local data. Do not make funding a validator depend on
+  # a successful live balance query (especially while its node is syncing).
+  if raw_address="$(read_tonnode_wallet_address_file_from_pod "$ns" "$pod" "$wallet_name")"; then
+    ton_address_to_non_bounceable "$raw_address" "$network"
+    return $?
   fi
+
+  # Compatibility for installations whose address is available only via wl.
+  wallet_row="$(resolve_tonnode_wallet_row_from_pod "$ns" "$pod" "$wallet_name")" || return 1
+  IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
+  address="$(trim_whitespace "$address")"
+  ton_address_to_hex "$address" >/dev/null || return 1
+  ton_address_valid_for_network "$address" "$network" || return 1
   printf '%s' "$address"
 }
 
@@ -10973,11 +11011,14 @@ resolve_tonnode_wallet_row_from_pod() {
   local wallet_name="$3"
   local output row
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
+  [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if command -v mytonctrl >/dev/null 2>&1; then
       mytonctrl --cmd wl
+    else
+      exit 127
     fi
-  ' 2>/dev/null || true)"
+  ' 2>/dev/null)" || return 1
   output="$(strip_ansi_sequences "$output")"
   row="$(printf '%s\n' "$output" | awk -v wallet_name="$wallet_name" '
     $1 == wallet_name && NF >= 6 {
@@ -11019,13 +11060,14 @@ read_tonnode_wallet_address_file_from_pod() {
   output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     wallet_name="$1"
     wallet_dir="/var/ton-work/controller/mytoncore/wallets"
+    set -o pipefail
     if ! [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
       exit 2
     fi
     addr_file="${wallet_dir}/${wallet_name}.addr"
     [[ -r "$addr_file" ]] || exit 1
     LC_ALL=C od -An -tx1 -v "$addr_file" | tr -d " \n"
-  ' _ "$wallet_name" 2>/dev/null || true)"
+  ' _ "$wallet_name" 2>/dev/null)" || return 1
   ton_wallet_address_file_hex_to_hex "$output"
 }
 
@@ -11192,12 +11234,16 @@ run_wallet_balance_show() {
   local target_pod_name="${1:-}"
   local target_wallet_name="${2:-validator_wallet_001}"
   local row target_ns target_pod target_node_name wallet_row
-  local wallet_name status balance version workchain address
+  local wallet_name status balance version workchain address raw_address pod_inventory
   local -a pod_rows=()
   local -a table_rows=()
 
   target_wallet_name="$(trim_whitespace "$target_wallet_name")"
   [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
+  if ! [[ "$target_wallet_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Error: invalid wallet name '${target_wallet_name}'." >&2
+    return 1
+  fi
 
   if [[ -n "$target_pod_name" ]]; then
     row="$(resolve_tonnode_pod_row_by_name "$target_pod_name" || true)"
@@ -11208,20 +11254,33 @@ run_wallet_balance_show() {
     fi
     pod_rows+=("$row")
   else
-    mapfile -t pod_rows < <(list_ton_pods 2>/dev/null || true)
+    if ! pod_inventory="$(list_ton_pods)"; then
+      echo "Error: cannot list all TON pods for wallet balances." >&2
+      return 1
+    fi
+    mapfile -t pod_rows <<<"$pod_inventory"
   fi
 
   for row in "${pod_rows[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
     [[ -z "$target_ns" || -z "$target_pod" ]] && continue
-    wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
-    wallet_row="$(trim_whitespace "$wallet_row")"
-    if [[ -z "$wallet_row" ]]; then
-      echo "Warning: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
-      continue
+    wallet_name="$target_wallet_name"
+    status="unknown" balance="unknown" version="unknown" workchain="unknown" address="unknown"
+    if wallet_row="$(resolve_tonnode_wallet_row_from_pod "$target_ns" "$target_pod" "$target_wallet_name")" && [[ -n "$wallet_row" ]]; then
+      IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
+    else
+      echo "Warning: live balance unavailable for wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; showing unknown." >&2
     fi
-    IFS=$'\t' read -r wallet_name status balance version workchain address <<<"$wallet_row"
+    # Retain the row even when wl fails. A local address does not establish
+    # whether the wallet is active or funded, so those fields remain unknown.
+    if ! ton_address_to_hex "$address" >/dev/null 2>&1; then
+      address="unknown"
+      if raw_address="$(read_tonnode_wallet_address_file_from_pod "$target_ns" "$target_pod" "$target_wallet_name")"; then
+        workchain="${raw_address%%:*}"
+        address="$(ton_address_to_non_bounceable "$raw_address" || printf '%s' "$raw_address")"
+      fi
+    fi
     table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${version}"$'\t'"${workchain}"$'\t'"${address}")
   done
 
@@ -19253,19 +19312,34 @@ run_wallet() {
           target_wallet_name="$(trim_whitespace "$MAIN_WALLET_TARGET_WALLET_NAME")"
           [[ -z "$target_wallet_name" ]] && target_wallet_name="validator_wallet_001"
 
+          local send_pod_inventory
+          if ! send_pod_inventory="$(list_ton_pods)"; then
+            echo "Error: cannot list all TON pods; refusing to send to an incomplete recipient set." >&2
+            return 1
+          fi
           while IFS= read -r row; do
             [[ -z "$row" ]] && continue
             IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
-            [[ -z "$target_ns" || -z "$target_pod" ]] && continue
-            destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
+            if [[ -z "$target_ns" || -z "$target_pod" ]]; then
+              echo "Error: incomplete TON pod inventory; refusing to send to an incomplete recipient set." >&2
+              return 1
+            fi
+            if ! destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" "$wallet_network")"; then
+              echo "Error: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; no transfer will be started." >&2
+              return 1
+            fi
             destination_address="$(trim_whitespace "$destination_address")"
             if [[ -z "$destination_address" ]]; then
-              echo "Warning: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; skipping." >&2
-              continue
+              echo "Error: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; no transfer will be started." >&2
+              return 1
+            fi
+            if ! ton_address_to_hex "$destination_address" >/dev/null 2>&1 || ! ton_address_valid_for_network "$destination_address" "$wallet_network"; then
+              echo "Error: wallet '${target_wallet_name}' in ${target_ns}/${target_pod} has an invalid destination address for ${wallet_network}; no transfer will be started." >&2
+              return 1
             fi
             destination_addresses+=("$destination_address")
             table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${target_wallet_name}"$'\t'"${destination_address}")
-          done < <(list_ton_pods 2>/dev/null || true)
+          done <<<"$send_pod_inventory"
 
           if [[ ${#table_rows[@]} -eq 0 ]]; then
             echo "Error: no TON wallets resolved for wallet name '${target_wallet_name}'." >&2
@@ -19362,10 +19436,17 @@ run_wallet() {
               return 1
             fi
             IFS=$'\t' read -r target_ns target_pod target_node_name <<<"$row"
-            destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" || true)"
+            if ! destination_address="$(resolve_tonnode_wallet_address_from_pod "$target_ns" "$target_pod" "$target_wallet_name" "$wallet_network")"; then
+              echo "Error: cannot resolve wallet '${target_wallet_name}' in ${target_ns}/${target_pod}; no transfer will be started." >&2
+              return 1
+            fi
             destination_address="$(trim_whitespace "$destination_address")"
             if [[ -z "$destination_address" ]]; then
               echo "Error: wallet '${target_wallet_name}' was not found in ${target_ns}/${target_pod}." >&2
+              return 1
+            fi
+            if ! ton_address_to_hex "$destination_address" >/dev/null 2>&1 || ! ton_address_valid_for_network "$destination_address" "$wallet_network"; then
+              echo "Error: wallet '${target_wallet_name}' in ${target_ns}/${target_pod} has an invalid destination address for ${wallet_network}; no transfer will be started." >&2
               return 1
             fi
 
