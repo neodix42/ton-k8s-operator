@@ -341,15 +341,17 @@ import pathlib
 import sys
 
 show_rows = [line.split() for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
-row = next(row for row in show_rows if len(row) == 9 and row[2] == "stale_show")
-assert row[6] == sys.argv[3], "show ignored the authoritative .addr account"
-assert row[7:] == ["unknown", "unknown"], "show retained another account's friendly metadata"
+header = next(row for row in show_rows if row and row[0] == "workchain")
+columns = {name: index for index, name in enumerate(header)}
+row = next(row for row in show_rows if len(row) == len(header) and row[columns["wallet-name"]] == "stale_show")
+assert row[columns["wallet-address"]] == sys.argv[3], "show ignored the authoritative .addr account"
+assert [row[columns[name]] for name in ("non-bounceable", "bounceable")] == ["unknown", "unknown"], "show retained another account's friendly metadata"
 export_rows = [line.split() for line in pathlib.Path(sys.argv[2]).read_text().splitlines()]
 row = next(row for row in export_rows if row and row[0] == "stale_show")
 assert row[2:4] == [sys.argv[3], sys.argv[3]], "helper export retained stale address metadata"
 PY
 
-  # Collect consumes this exact nine-column show table, preferring the
+  # Collect consumes the show table by its headers, preferring the
   # non-bounceable column when present. It must fall back to the file account.
   fixture_show_table="$(cat "$test_dir/stale-show.out")"
   source "$kubeton"

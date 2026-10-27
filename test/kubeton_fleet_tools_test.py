@@ -61,7 +61,7 @@ class FleetToolsTest(unittest.TestCase):
                         PATH=str(bindir)+":"+os.environ["PATH"])
         assets = self.root / "assets"
         assets.mkdir()
-        for name in ("kubeton", "fleet.sh", "fleet.py", "fleet-crypto.sh"):
+        for name in ("kubeton", "main-wallet.sh", "fleet.sh", "fleet.py", "fleet-crypto.sh"):
             (assets / name).write_bytes((CHART / name).read_bytes())
         with tarfile.open(self.root / "chart.tgz", "w:gz") as archive:
             for name, value in (("Chart.yaml", b"version: 0.3.4\n"),
@@ -92,17 +92,20 @@ class FleetToolsTest(unittest.TestCase):
         result = subprocess.run(["bash", str(REPO / "install.sh")], capture_output=True, text=True,
                                 cwd=self.root, env=dict(self.env, INSTALL_DIR=str(destination)), timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
-        for name in ("kubeton", "fleet.sh", "fleet.py", "fleet-crypto.sh"):
+        for name in ("kubeton", "main-wallet.sh", "fleet.sh", "fleet.py", "fleet-crypto.sh"):
             self.assertEqual((destination / name).read_bytes(), (CHART / name).read_bytes())
         self.assertTrue(os.access(destination / "kubeton", os.X_OK))
+        self.assertTrue(os.access(destination / "main-wallet.sh", os.X_OK))
         self.assertFalse(list(destination.glob("*.download")))
 
     def test_installer_reports_missing_release_asset(self):
-        result = subprocess.run(["bash", str(REPO / "install.sh")], capture_output=True, text=True,
-                                cwd=self.root, env=dict(self.env, INSTALL_DIR=str(self.root / "installed"),
-                                                       TOOLS_TEST_FAIL="fleet.py"), timeout=10)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("Done. Chart version", result.stdout)
+        for missing in ("fleet.py", "main-wallet.sh"):
+            with self.subTest(missing=missing):
+                result = subprocess.run(["bash", str(REPO / "install.sh")], capture_output=True, text=True,
+                                        cwd=self.root, env=dict(self.env, INSTALL_DIR=str(self.root / ("installed-" + missing)),
+                                                               TOOLS_TEST_FAIL=missing), timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Done. Chart version", result.stdout)
 
     def test_backup_uses_tools_image_and_downloads_private_local_directory(self):
         output = self.root / "export"

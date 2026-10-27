@@ -70,6 +70,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	python3 test/kubeton_add_test.py
 	bash test/kubeton_del_test.sh
 	bash test/kubeton_restore_keys_test.sh
+	python3 test/kubeton_targeted_restore_test.py
 	python3 test/kubeton_fleet_test.py
 	python3 test/kubeton_fleet_tools_test.py
 	bash test/kubeton_status_test.sh
@@ -85,6 +86,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_wallet_metadata_test.sh
 	bash test/kubeton_wallet_query_routing_test.sh
 	bash test/main_wallet_address_flags_test.sh
+	bash test/main_wallet_send_test.sh
 	bash test/kubeton_wallet_chain_queries_test.sh
 	bash test/kubeton_wallet_export_test.sh
 

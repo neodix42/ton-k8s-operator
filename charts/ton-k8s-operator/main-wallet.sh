@@ -19,6 +19,9 @@ MAIN_WALLET_LITESERVER_SEND_ATTEMPTS="${MAIN_WALLET_LITESERVER_SEND_ATTEMPTS:-$M
 MAIN_WALLET_TONCENTER_SEND_ATTEMPTS="${MAIN_WALLET_TONCENTER_SEND_ATTEMPTS:-$MAIN_WALLET_SEND_RETRY_ATTEMPTS}"
 MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
 MAIN_WALLET_MULTI_SEND_PAUSE_SEC="${MAIN_WALLET_MULTI_SEND_PAUSE_SEC:-3}"
+MAIN_WALLET_CONFIRM_ATTEMPTS="${MAIN_WALLET_CONFIRM_ATTEMPTS:-30}"
+MAIN_WALLET_CONFIRM_DELAY_SEC="${MAIN_WALLET_CONFIRM_DELAY_SEC:-2}"
+MAIN_WALLET_CONFIRM_TIMEOUT_SEC="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-60}"
 
 usage() {
   cat <<'EOF'
@@ -98,6 +101,22 @@ main_wallet_multi_send_pause_seconds() {
     return 0
   fi
   printf '%s' "3"
+}
+
+main_wallet_confirm_attempts() {
+  if [[ "${MAIN_WALLET_CONFIRM_ATTEMPTS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$MAIN_WALLET_CONFIRM_ATTEMPTS"
+  else
+    printf '%s' 30
+  fi
+}
+
+main_wallet_confirm_delay_seconds() {
+  if [[ "${MAIN_WALLET_CONFIRM_DELAY_SEC:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$MAIN_WALLET_CONFIRM_DELAY_SEC"
+  else
+    printf '%s' 2
+  fi
 }
 
 require_bin() {
@@ -396,6 +415,7 @@ vault_decrypt_data_key() {
 
   require_bin curl
   require_bin base64
+  require_bin jq
   if [[ "${KEY_PROVIDER:-}" != "vault" ]]; then
     echo "Error: KEY_PROVIDER must be 'vault' for main wallet persistence." >&2
     return 1
@@ -567,14 +587,6 @@ resolve_wallet_fif() {
       return 0
     fi
   done
-  for candidate in \
-    "$MAIN_WALLET_DIR/wallet.fif" \
-    "${SMARTCONT_DIR}/wallet.fif"; do
-    if [[ -f "$candidate" ]]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  done
   return 1
 }
 
@@ -620,6 +632,7 @@ send_boc_toncenter_once() {
 
   boc_b64="$(base64 -w0 "$boc_file" 2>/dev/null || base64 < "$boc_file" | tr -d '\r\n')"
   if http_response="$(curl -sS \
+    --connect-timeout 5 --max-time 15 \
     -w $'\n%{http_code}' \
     "${curl_args[@]}" \
     -H "Content-Type: application/json" \
@@ -641,7 +654,7 @@ send_boc_toncenter_once() {
     echo "Error: TONCenter sendBoc returned HTTP ${http_code}." >&2
     return 1
   fi
-  if ! printf '%s' "$response" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+  if ! printf '%s' "$response" | jq -es 'length == 1 and (.[0] | type == "object" and .ok == true)' >/dev/null 2>&1; then
     echo "Error: TONCenter sendBoc request did not return ok=true." >&2
     return 1
   fi
@@ -735,7 +748,7 @@ warn_liteserver_toncenter_network_mismatch() {
 run_liteclient_query() {
   local query="$1"
   local lite_client_bin
-  local config_row config_path temp_config_path rc=0
+  local config_row config_path temp_config_path rc=0 verbosity=0
 
   lite_client_bin="$(resolve_lite_client_bin || true)"
   lite_client_bin="$(trim_whitespace "$lite_client_bin")"
@@ -757,7 +770,13 @@ run_liteclient_query() {
     return 1
   fi
 
-  if "$lite_client_bin" -C "$config_path" -v 0 -c "$query"; then
+  # sendfile reports the server acknowledgement at INFO level. Its exit code
+  # alone can be zero after an RPC error, so keep this acknowledgement visible.
+  [[ "$query" != sendfile\ * ]] || verbosity=3
+
+  # Bound each batch query as well as the confirmation loop. An unreachable
+  # liteserver must not keep a wallet helper alive indefinitely.
+  if "$lite_client_bin" -C "$config_path" -v "$verbosity" -t 15 -c "$query"; then
     rc=0
   else
     rc=$?
@@ -770,17 +789,25 @@ run_liteclient_query() {
 
 send_boc_liteserver() {
   local boc_file="$1"
-  local attempts delay attempt rc=1
+  local attempts delay attempt rc=1 output
 
   attempts="$(main_wallet_liteserver_send_attempts)"
   delay="$(main_wallet_send_retry_delay_seconds)"
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     echo "Sending BOC via lite-server config ${GLOBAL_CONFIG_URL} (attempt ${attempt}/${attempts}) ..." >&2
-    if run_liteclient_query "sendfile $boc_file"; then
-      return 0
+    if output="$(run_liteclient_query "sendfile $boc_file" 2>&1)"; then
+      rc=0
     else
       rc=$?
+    fi
+    [[ -z "$output" ]] || printf '%s\n' "$output"
+    if (( rc == 0 )) && printf '%s\n' "${output//$'\r'/}" | grep -Eq 'external message status is 1[[:space:]]*$'; then
+      return 0
+    fi
+    if (( rc == 0 )); then
+      rc=1
+      echo "Warning: lite-client exited without a successful external-message acknowledgement; submission is unconfirmed." >&2
     fi
     if (( attempt < attempts )); then
       echo "Warning: lite-client sendfile failed (attempt ${attempt}/${attempts}); retrying..." >&2
@@ -921,7 +948,7 @@ main_wallet_create() {
   create_log="$(mktemp)"
 
   if ! (
-    cd "$MAIN_WALLET_DIR"
+    cd "$MAIN_WALLET_DIR" || exit 1
     export FIFTPATH="${FIFTPATH:-/usr/lib/fift:/usr/share/ton/smartcont/}"
     "$fift_bin" -s "./new-wallet-v3.fif" "$workchain" "$subwallet_id" "$wallet_name" >"$create_log" 2>&1
   ); then
@@ -956,6 +983,7 @@ main_wallet_create() {
     echo "wallet_name=${wallet_name}"
     echo "workchain=${workchain}"
     echo "wallet_id=${subwallet_id}"
+    echo "wallet_version=v3"
     echo "wallet_address=${wallet_address}"
     echo "non_bounceable=${non_bounceable}"
     echo "bounceable=${bounceable}"
@@ -1018,7 +1046,7 @@ main_wallet_show() {
 
   local -a rows=()
   local meta_file addr_file wallet_name
-  local workchain wallet_id wallet_address non_bounceable bounceable network balance seqno chain_state
+  local workchain wallet_id wallet_version wallet_address non_bounceable bounceable network balance seqno chain_state
 
   mkdir -p "$MAIN_WALLET_DIR"
 
@@ -1036,6 +1064,7 @@ main_wallet_show() {
 
     workchain="$(trim_whitespace "$(read_meta_value workchain "$meta_file")")"
     wallet_id="$(trim_whitespace "$(read_meta_value wallet_id "$meta_file")")"
+    wallet_version="$(main_wallet_version_by_name "$wallet_name")"
     wallet_address="$(resolve_wallet_address_by_name "$wallet_name" || true)"
     non_bounceable="$(trim_whitespace "$(read_meta_value non_bounceable "$meta_file")")"
     bounceable="$(trim_whitespace "$(read_meta_value bounceable "$meta_file")")"
@@ -1060,7 +1089,7 @@ main_wallet_show() {
     [[ -z "$balance" ]] && balance="unknown"
     [[ -z "$seqno" ]] && seqno="unknown"
 
-    rows+=("${workchain}"$'\t'"${wallet_id}"$'\t'"${wallet_name}"$'\t'"${network}"$'\t'"${balance}"$'\t'"${seqno}"$'\t'"${wallet_address}"$'\t'"${non_bounceable}"$'\t'"${bounceable}")
+    rows+=("${workchain}"$'\t'"${wallet_id}"$'\t'"${wallet_name}"$'\t'"${network}"$'\t'"${balance}"$'\t'"${seqno}"$'\t'"${wallet_version}"$'\t'"${wallet_address}"$'\t'"${non_bounceable}"$'\t'"${bounceable}")
   done
 
   for addr_file in "$MAIN_WALLET_DIR"/*.addr; do
@@ -1081,9 +1110,10 @@ main_wallet_show() {
     fi
     network="$(resolve_current_wallet_network || true)"
     [[ -n "$network" ]] || network=unknown
+    wallet_version="$(main_wallet_version_by_name "$wallet_name")"
     chain_state="$(wallet_show_chain_state "$wallet_name" "$wallet_address" "$network" || true)"
     IFS=$'\t' read -r balance seqno <<<"$chain_state"
-    rows+=("${workchain}"$'\t'"unknown"$'\t'"${wallet_name}"$'\t'"${network}"$'\t'"${balance:-unknown}"$'\t'"${seqno:-unknown}"$'\t'"${wallet_address:-unknown}"$'\t'"unknown"$'\t'"unknown")
+    rows+=("${workchain}"$'\t'"unknown"$'\t'"${wallet_name}"$'\t'"${network}"$'\t'"${balance:-unknown}"$'\t'"${seqno:-unknown}"$'\t'"${wallet_version}"$'\t'"${wallet_address:-unknown}"$'\t'"unknown"$'\t'"unknown")
   done
   shopt -u nullglob
 
@@ -1097,7 +1127,7 @@ main_wallet_show() {
   fi
 
   {
-    echo -e "workchain\twallet-id\twallet-name\tnetwork\tbalance\tseqno\twallet-address\tnon-bounceable\tbounceable"
+    echo -e "workchain\twallet-id\twallet-name\tnetwork\tbalance\tseqno\twallet-version\twallet-address\tnon-bounceable\tbounceable"
     printf '%s\n' "${rows[@]}" | sort
   } | awk -F'\t' '
     {
@@ -1323,50 +1353,232 @@ resolve_wallet_subwallet_id_by_name() {
   printf '%s' "42"
 }
 
+# Regenerate the initialization message from the existing key, never from a new
+# key or an unchecked saved BOC. Matching the derived account proves that the
+# workchain, wallet id, public key and V3 contract code describe this wallet.
+wallet_build_deploy_boc() (
+  local wallet_name="$1" destination="${2:-${MAIN_WALLET_DIR}/${1}-verified-init.boc}"
+  local wallet_address generated_address workchain wallet_id wallet_fif fift_bin tmp_dir
+  wallet_address="$(resolve_wallet_address_by_name "$wallet_name")" || return 1
+  [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]] || return 1
+  workchain="${wallet_address%%:*}"
+  wallet_id="$(read_meta_value wallet_id "${MAIN_WALLET_DIR}/${wallet_name}.wallet.meta" 2>/dev/null || true)"
+  if ! [[ "$wallet_id" =~ ^[0-9]{1,10}$ ]] || (( 10#$wallet_id > 4294967295 )); then
+    echo "Error: cannot verify V3 initialization for '${wallet_name}': a valid saved wallet-id is required." >&2
+    return 1
+  fi
+  [[ -s "${MAIN_WALLET_DIR}/${wallet_name}.pk" ]] || {
+    echo "Error: existing private-key file is missing for '${wallet_name}'; refusing to generate a replacement key." >&2
+    return 1
+  }
+  wallet_fif="$(resolve_new_wallet_fif)" || return 1
+  fift_bin="$(resolve_fift_bin)" || return 1
+  umask 077
+  # Keep copied key material on the helper's existing memory-backed runtime.
+  tmp_dir="$(mktemp -d "$MAIN_WALLET_DIR/.wallet-init.XXXXXX")" || return 1
+  trap 'rm -rf "$tmp_dir"' EXIT
+  cp "${MAIN_WALLET_DIR}/${wallet_name}.pk" "$tmp_dir/wallet.pk" || return 1
+  if ! (
+    cd "$tmp_dir" || exit 1
+    export FIFTPATH="${FIFTPATH:-/usr/lib/fift:/usr/share/ton/smartcont/}"
+    "$fift_bin" -s "$wallet_fif" "$workchain" "$wallet_id" "$tmp_dir/wallet" >"$tmp_dir/fift.log" 2>&1
+  ); then
+    echo "Error: could not rebuild the V3 initialization message for '${wallet_name}'." >&2
+    return 1
+  fi
+  generated_address="$(wallet_address_file_to_hex "$tmp_dir/wallet.addr")" || return 1
+  if [[ "$generated_address" != "$wallet_address" || ! -s "$tmp_dir/wallet-query.boc" ]] ||
+    ! cmp -s "${MAIN_WALLET_DIR}/${wallet_name}.pk" "$tmp_dir/wallet.pk"; then
+    echo "Error: rebuilt V3 initialization does not match '${wallet_name}'; original wallet files are unchanged." >&2
+    return 1
+  fi
+  cp "$tmp_dir/wallet-query.boc" "$destination" || return 1
+  chmod 600 "$destination" || return 1
+  printf '%s' "$destination"
+)
+
+main_wallet_version_by_name() {
+  local wallet_name="$1" version="" tmp_boc
+  local meta_file="${MAIN_WALLET_DIR}/${1}.wallet.meta"
+  [[ ! -f "$meta_file" ]] || version="$(trim_whitespace "$(read_meta_value wallet_version "$meta_file")")"
+  if [[ "$version" =~ ^[vV][0-9]+([rR][0-9]+)?$ ]]; then
+    printf '%s' "$version"
+    return 0
+  fi
+  # Historical metadata predates wallet_version. Verify the actual account
+  # against the V3 constructor before identifying it; filenames alone prove
+  # neither a version nor a contract revision. Show must not rewrite metadata.
+  if [[ -f "$meta_file" ]] && tmp_boc="$(mktemp)"; then
+    if wallet_build_deploy_boc "$wallet_name" "$tmp_boc" >/dev/null 2>&1; then
+      rm -f "$tmp_boc"
+      printf '%s' v3
+      return 0
+    fi
+    rm -f "$tmp_boc"
+  fi
+  printf '%s' unknown
+}
+
+# The official runtime image includes jq. Keep HTTPS reads tied to the active
+# fleet network; a saved wallet label or an unrelated API must not supply seqno.
+wallet_toncenter_information() {
+  local wallet_address="$1" network endpoint response
+  local -a curl_args=()
+  network="$(resolve_current_wallet_network)" || return 1
+  case "${TONCENTER_URL%/}" in
+    https://toncenter.com) [[ "$network" == mainnet ]] || return 1 ;;
+    https://testnet.toncenter.com) [[ "$network" == testnet ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]] || return 1
+  [[ -z "$TONCENTER_API_KEY" ]] || curl_args+=(-H "X-API-Key: ${TONCENTER_API_KEY}")
+  endpoint="${TONCENTER_URL%/}/api/v2/getWalletInformation"
+  response="$(curl -fsS --connect-timeout 5 --max-time 15 "${curl_args[@]}" \
+    --get --data-urlencode "address=${wallet_address}" "$endpoint")" || return 1
+  printf '%s' "$response" | jq -ers '
+    select(length == 1) | .[0] |
+    select(.ok == true and (.result | type) == "object") | .result |
+    (.account_state | if . == "uninitialized" or . == "uninit" then "uninit"
+      elif . == "active" or . == "frozen" or . == "nonexist" then . else empty end) as $state |
+    (.balance | tostring | select(test("^[0-9]+$"))) as $balance |
+    (if $state == "uninit" or $state == "nonexist" then "0"
+      elif $state == "active" and .wallet == true and (.seqno | type) == "number"
+        and .seqno >= 0 and .seqno <= 4294967295 and .seqno == (.seqno | floor)
+        then (.seqno | tostring) else "unknown" end) as $seqno |
+    [$state, $balance, $seqno] | @tsv'
+}
+
+parse_account_status() {
+  local output="$1" status
+  if liteclient_account_state_is_empty "$output"; then
+    printf '%s' nonexist
+    return 0
+  fi
+  for status in uninit active frozen; do
+    if printf '%s\n' "$output" | grep -Eiq "state:[[:space:]]*\(?[[:space:]]*(account_)?${status}([^[:alnum:]_]|$)"; then
+      printf '%s' "$status"
+      return 0
+    fi
+  done
+  return 1
+}
+
+wallet_account_status() {
+  local wallet_address="$1" output status api_balance api_seqno
+  if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)" &&
+    status="$(parse_account_status "$output")"; then
+    printf '%s' "$status"
+    return 0
+  fi
+  if output="$(wallet_toncenter_information "$wallet_address")"; then
+    IFS=$'\t' read -r status api_balance api_seqno <<<"$output"
+    printf '%s' "$status"
+    return 0
+  fi
+  echo "Error: cannot determine the on-chain state of source wallet ${wallet_address}." >&2
+  return 1
+}
+
+wallet_wait_for_seqno() {
+  local wallet_address="$1" expected="$2" attempt attempts delay seqno deadline timeout_sec
+  attempts="$(main_wallet_confirm_attempts)"
+  delay="$(main_wallet_confirm_delay_seconds)"
+  timeout_sec="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-60}"
+  [[ "$timeout_sec" =~ ^[1-9][0-9]*$ ]] || timeout_sec=60
+  deadline=$((SECONDS + timeout_sec))
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    (( SECONDS < deadline )) || break
+    seqno="$(wallet_seqno_decimal "$wallet_address" 2>/dev/null || true)"
+    if [[ "$seqno" =~ ^[0-9]+$ ]] && (( 10#$seqno == expected )); then
+      printf '%s' "$seqno"
+      return 0
+    fi
+    if [[ "$seqno" =~ ^[0-9]+$ ]] && (( 10#$seqno > expected )); then
+      echo "Error: source wallet seqno advanced beyond ${expected}; another operation may be using this wallet. Stopping." >&2
+      return 1
+    fi
+    if (( attempt < attempts && delay > 0 )); then sleep "$delay"; fi
+  done
+  echo "Error: on-chain confirmation of source wallet seqno=${expected} was not observed. Stopping; check wallet status before retrying." >&2
+  return 1
+}
+
+wallet_prepare_source() {
+  local wallet_name="$1" wallet_address="$2" normalized_mode="$3"
+  local status balance boc_file seqno
+  status="$(wallet_account_status "$wallet_address")" || return 1
+  case "$status" in
+    active)
+      if [[ "$(main_wallet_version_by_name "$wallet_name")" != v3 ]]; then
+        echo "Error: cannot verify V3 contract identity for source wallet '${wallet_name}'; refusing to sign a transfer with an unknown wallet format." >&2
+        return 1
+      fi
+      wallet_seqno_decimal "$wallet_address"
+      ;;
+    uninit)
+      balance="$(wallet_balance_nano "$wallet_address")" || return 1
+      if ! [[ "$balance" =~ ^[0-9]+$ ]] || (( 10#$balance == 0 )); then
+        echo "Error: fund '${wallet_name}' at its non-bounceable address before deploying or sending." >&2
+        return 1
+      fi
+      echo "[wallet] '${wallet_name}' is funded but undeployed; deploying its verified V3 contract before sending." >&2
+      boc_file="$(wallet_build_deploy_boc "$wallet_name")" || return 1
+      if ! deploy_boc_with_mode "$wallet_name" "$boc_file" "$normalized_mode" >&2; then
+        rm -f "$boc_file"
+        echo "Error: wallet deployment submission failed; no transfers were attempted. Check its status before retrying." >&2
+        return 1
+      fi
+      rm -f "$boc_file"
+      seqno="$(wallet_wait_for_seqno "$wallet_address" 1)" || return 1
+      record_wallet_deploy_network "$wallet_name"
+      printf '%s' "$seqno"
+      ;;
+    nonexist)
+      echo "Error: '${wallet_name}' is not funded or deployed; fund its non-bounceable address first." >&2
+      return 1
+      ;;
+    *)
+      echo "Error: source wallet '${wallet_name}' has state '${status}'; no transfers were attempted." >&2
+      return 1
+      ;;
+  esac
+}
+
 liteclient_int_token_to_decimal() {
   local token="$1"
 
   token="$(trim_whitespace "$token")"
-  if [[ "$token" =~ ^0x[0-9A-Fa-f]+$ ]]; then
+  if [[ "$token" =~ ^0x[0-9A-Fa-f]{1,8}$ ]]; then
     printf '%s' "$((16#${token:2}))"
     return 0
   fi
-  if [[ "$token" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$token"
+  if [[ "$token" =~ ^[0-9]{1,10}$ ]] && (( 10#$token <= 4294967295 )); then
+    printf '%s' "$((10#$token))"
     return 0
   fi
   return 1
 }
 
 parse_seqno_from_runmethod_output() {
-  local output="$1"
-  local line token
-  local capture=0
-
+  local output="${1//$'\r'/}" line result="" capture=0
   while IFS= read -r line; do
-    line="${line//$'\r'/}"
-    if [[ "$line" =~ ^[[:space:]]*result:[[:space:]]*\[[[:space:]]*(0x[0-9A-Fa-f]+|[0-9]+) ]]; then
-      liteclient_int_token_to_decimal "${BASH_REMATCH[1]}"
-      return 0
-    fi
-
     if [[ "$line" =~ ^[[:space:]]*result:[[:space:]]*\[ ]]; then
       capture=1
-      line="${line#*[[]}"
+      result="${line#*[[]}"
+    elif (( capture )); then
+      result+=" $line"
     fi
-
-    if (( capture )); then
-      if [[ "$line" =~ (0x[0-9A-Fa-f]+|[0-9]+) ]]; then
-        token="${BASH_REMATCH[1]}"
-        liteclient_int_token_to_decimal "$token"
-        return 0
+    if (( capture )) && [[ "$result" == *"]"* ]]; then
+      # seqno returns exactly one uint32. Error text, other stack entries and
+      # truncated output must not be mistaken for an accepted sequence number.
+      if [[ "$result" =~ ^[[:space:]]*(0x[0-9A-Fa-f]+|[0-9]+)[[:space:]]*\][[:space:]]*$ ]]; then
+        liteclient_int_token_to_decimal "${BASH_REMATCH[1]}"
+        return $?
       fi
-      if [[ "$line" == *"]"* ]]; then
-        capture=0
-      fi
+      return 1
     fi
   done <<<"$output"
-
   return 1
 }
 
@@ -1413,7 +1625,7 @@ liteclient_account_state_is_empty() {
 
 wallet_seqno_decimal() {
   local wallet_address="$1"
-  local output seq_dec attempts delay attempt
+  local output seq_dec attempts delay attempt status api_balance
 
   attempts="$(main_wallet_send_retry_attempts)"
   delay="$(main_wallet_send_retry_delay_seconds)"
@@ -1431,13 +1643,16 @@ wallet_seqno_decimal() {
     if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)"; then
       # Only a successful account query can establish an undeployed wallet.
       # A failed runmethod (including an RPC failure) alone does not imply 0.
-      if liteclient_account_state_is_empty "$output" ||
-        printf '%s\n' "$output" | grep -Eiq 'state:[[:space:]]*\(?[[:space:]]*(account_uninit|uninit)([^[:alnum:]_]|$)'; then
+      status="$(parse_account_status "$output" || true)"
+      if [[ "$status" == nonexist || "$status" == uninit ]]; then
         printf '%s' "0"
         return 0
       fi
 
-      seq_dec="$(parse_seqno_from_account_output "$output" || true)"
+      seq_dec=""
+      if [[ "$status" == active ]]; then
+        seq_dec="$(parse_seqno_from_account_output "$output" || true)"
+      fi
       seq_dec="$(trim_whitespace "$seq_dec")"
       if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
         printf '%s' "$seq_dec"
@@ -1453,6 +1668,14 @@ wallet_seqno_decimal() {
     fi
   done
 
+  if output="$(wallet_toncenter_information "$wallet_address" 2>/dev/null)"; then
+    IFS=$'\t' read -r status api_balance seq_dec <<<"$output"
+    if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$seq_dec"
+      return 0
+    fi
+  fi
+
   echo "Debug: runmethod/getaccount parsing failed for ${wallet_address}" >&2
   {
     echo "--- runmethod output ---"
@@ -1466,7 +1689,7 @@ wallet_seqno_decimal() {
 
 wallet_balance_nano() {
   local wallet_address="$1"
-  local output balance attempts delay attempt
+  local output balance attempts delay attempt status api_seqno
 
   attempts="$(main_wallet_send_retry_attempts)"
   delay="$(main_wallet_send_retry_delay_seconds)"
@@ -1500,6 +1723,14 @@ wallet_balance_nano() {
       fi
     fi
   done
+
+  if output="$(wallet_toncenter_information "$wallet_address" 2>/dev/null)"; then
+    IFS=$'\t' read -r status balance api_seqno <<<"$output"
+    if [[ "$balance" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$balance"
+      return 0
+    fi
+  fi
 
   echo "Error: failed to parse wallet balance for ${wallet_address} after ${attempts} attempts." >&2
   return 1
@@ -1571,7 +1802,7 @@ send_single_transfer() {
   wallet_fif="$(resolve_wallet_fif || true)"
   wallet_fif="$(trim_whitespace "$wallet_fif")"
   if [[ -z "$wallet_fif" ]]; then
-    echo "Error: wallet.fif not found in ${SMARTCONT_DIR}." >&2
+    echo "Error: wallet-v3.fif not found in ${SMARTCONT_DIR}." >&2
     return 1
   fi
 
@@ -1589,9 +1820,12 @@ send_single_transfer() {
   fi
 
   query_file="${MAIN_WALLET_DIR}/${from_wallet}-send-${seqno_dec}.boc"
+  # A failed Fift invocation must never cause an old signed file to be sent.
+  rm -f "$query_file"
   fift_cmd=(
     "$fift_bin" -s "$wallet_fif"
     "$base_path" "$destination_address" "$subwallet_id" "$seqno_dec" "$amount_gram" "${from_wallet}-send-${seqno_dec}"
+    -t 180
   )
   if [[ -n "$no_bounce_flag" ]]; then
     if [[ "$no_bounce_flag" != "-n" ]]; then
@@ -1600,11 +1834,15 @@ send_single_transfer() {
     fi
     fift_cmd+=("$no_bounce_flag")
   fi
-  (
-    cd "$MAIN_WALLET_DIR"
+  if ! (
+    cd "$MAIN_WALLET_DIR" || exit 1
     export FIFTPATH="${FIFTPATH:-/usr/lib/fift:/usr/share/ton/smartcont/}"
     "${fift_cmd[@]}"
-  )
+  ); then
+    rm -f "$query_file"
+    echo "Error: failed to sign the transfer for '${from_wallet}'; no BOC was submitted." >&2
+    return 1
+  fi
   if [[ ! -s "$query_file" ]]; then
     echo "Error: failed to create transfer BOC ${query_file}." >&2
     return 1
@@ -1627,7 +1865,7 @@ main_wallet_send() {
   local multi_send_pause_sec
   local no_bounce_flag=""
   local arg
-  local -a failed_addresses=()
+  local confirmed_seqno expected_seqno idx
 
   if (( $# > 0 )); then
     if [[ "$(trim_whitespace "${!#}")" == "-n" ]]; then
@@ -1657,12 +1895,6 @@ main_wallet_send() {
     return 1
   fi
 
-  current_seqno="$(wallet_seqno_decimal "$source_wallet_address")"
-  current_seqno="$(trim_whitespace "$current_seqno")"
-  if ! [[ "$current_seqno" =~ ^[0-9]+$ ]]; then
-    echo "Error: failed to resolve source wallet seqno for '${from_wallet}'." >&2
-    return 1
-  fi
   source_subwallet_id="$(resolve_wallet_subwallet_id_by_name "$from_wallet" || true)"
   source_subwallet_id="$(trim_whitespace "$source_subwallet_id")"
   if ! [[ "$source_subwallet_id" =~ ^[0-9]+$ ]]; then
@@ -1680,6 +1912,10 @@ main_wallet_send() {
     for destination_address in "$@"; do
       destination_address="$(trim_whitespace "$destination_address")"
       [[ -z "$destination_address" ]] && continue
+      if ! ton_address_to_hex "$destination_address" >/dev/null; then
+        echo "Error: invalid destination wallet address '${destination_address}'." >&2
+        return 1
+      fi
       destination_addresses+=("$destination_address")
     done
     target_count="${#destination_addresses[@]}"
@@ -1711,20 +1947,26 @@ main_wallet_send() {
       echo "Warning: ${remainder_nano} nanoTON remainder is not sent due to equal split rounding." >&2
     fi
 
+    current_seqno="$(wallet_prepare_source "$from_wallet" "$source_wallet_address" "$normalized_mode")" || return 1
+    if ! [[ "$current_seqno" =~ ^[0-9]+$ ]]; then
+      echo "Error: failed to resolve source wallet seqno for '${from_wallet}'." >&2
+      return 1
+    fi
+
     for ((idx = 0; idx < target_count; idx++)); do
       destination_address="${destination_addresses[$idx]}"
       if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"; then
-        failed_addresses+=("$destination_address")
+        echo "Error: submission to '${destination_address}' failed; stopping before any remaining destinations. Check wallet status before retrying." >&2
+        return 1
       fi
-      current_seqno=$((current_seqno + 1))
+      expected_seqno=$((10#$current_seqno + 1))
+      echo "[wallet] Waiting for on-chain acceptance of seqno=${current_seqno} before continuing ..." >&2
+      confirmed_seqno="$(wallet_wait_for_seqno "$source_wallet_address" "$expected_seqno")" || return 1
+      current_seqno="$confirmed_seqno"
       if (( idx + 1 < target_count )) && (( multi_send_pause_sec > 0 )); then
         sleep "$multi_send_pause_sec"
       fi
     done
-    if [[ ${#failed_addresses[@]} -gt 0 ]]; then
-      echo "Error: failed to send to destination(s): ${failed_addresses[*]}" >&2
-      return 1
-    fi
     return 0
   fi
 
@@ -1743,7 +1985,24 @@ main_wallet_send() {
     echo "Error: amount '${amount_gram}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
     return 1
   fi
-  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"
+  total_amount_nano="$(gram_amount_to_nano "$amount_gram" || true)"
+  if ! [[ "$total_amount_nano" =~ ^[0-9]+$ ]] || (( total_amount_nano <= 0 )); then
+    echo "Error: amount '${amount_gram}' must be greater than zero and have at most nine decimal places." >&2
+    return 1
+  fi
+  if ! ton_address_to_hex "$destination_address" >/dev/null; then
+    echo "Error: invalid destination wallet address '${destination_address}'." >&2
+    return 1
+  fi
+  current_seqno="$(wallet_prepare_source "$from_wallet" "$source_wallet_address" "$normalized_mode")" || return 1
+  if ! [[ "$current_seqno" =~ ^[0-9]+$ ]]; then
+    echo "Error: failed to resolve source wallet seqno for '${from_wallet}'." >&2
+    return 1
+  fi
+  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag" || return 1
+  expected_seqno=$((10#$current_seqno + 1))
+  echo "[wallet] Waiting for on-chain acceptance of seqno=${current_seqno} ..." >&2
+  wallet_wait_for_seqno "$source_wallet_address" "$expected_seqno" >/dev/null
 }
 
 run_action() {

@@ -1,0 +1,544 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+test_dir="$(mktemp -d)"
+trap 'rm -rf "$test_dir"' EXIT
+
+fail() { echo "test failure: $*" >&2; exit 1; }
+assert_contains() { grep -Fq -- "$1" "$2" || fail "expected '$1' in $2"; }
+
+# Exercise the real send/deploy/polling functions. Only Fift and the RPC/HTTP
+# process boundaries are synthetic. No real wallet, signing key or network is
+# used, and every unexpected external operation fails closed.
+setup_case() {
+  source "$repo_root/charts/ton-k8s-operator/main-wallet.sh"
+  case_dir="$test_dir/$1"
+  MAIN_WALLET_DIR="$case_dir/wallets"
+  SMARTCONT_DIR="$case_dir/smartcont"
+  mkdir -p "$MAIN_WALLET_DIR" "$SMARTCONT_DIR"
+  events="$case_dir/events"
+  : >"$events"
+  WALLET_NETWORK=mainnet
+  TONCENTER_URL=https://toncenter.com
+  MODE=liteserver
+  MAIN_WALLET_SEND_RETRY_ATTEMPTS=1
+  MAIN_WALLET_LITESERVER_SEND_ATTEMPTS=1
+  MAIN_WALLET_TONCENTER_SEND_ATTEMPTS=1
+  MAIN_WALLET_SEND_RETRY_DELAY_SEC=0
+  MAIN_WALLET_MULTI_SEND_PAUSE_SEC=0
+  MAIN_WALLET_CONFIRM_ATTEMPTS=2
+  MAIN_WALLET_CONFIRM_DELAY_SEC=0
+  MAIN_WALLET_TRANSFER_VALIDITY_SEC=180
+  fixture_source="0:$(printf '%064d' 1)"
+  fixture_first="-1:$(printf '%064d' 2)"
+  fixture_second="-1:$(printf '%064d' 3)"
+  printf '%s\n' "$fixture_source" >"$MAIN_WALLET_DIR/savings.addr"
+  printf 'synthetic signing-key placeholder\n' >"$MAIN_WALLET_DIR/savings.pk"
+  printf 'stale synthetic deployment BOC, must never be reused\n' >"$MAIN_WALLET_DIR/savings-query.boc"
+  printf 'wallet_name=savings\nworkchain=0\nwallet_id=42\nnetwork=mainnet\nwallet_version=v3\nwallet_address=%s\n' \
+    "$fixture_source" >"$MAIN_WALLET_DIR/savings.wallet.meta"
+  printf 'synthetic v3 Fift script\n' >"$SMARTCONT_DIR/wallet-v3.fif"
+  printf 'synthetic v3 StateInit script\n' >"$SMARTCONT_DIR/new-wallet-v3.fif"
+  # An incompatible old script is present to catch accidental fallback.
+  printf 'synthetic legacy script, must never be selected\n' >"$SMARTCONT_DIR/wallet.fif"
+  printf active >"$case_dir/status"
+  printf 7 >"$case_dir/seqno"
+  printf 10000007883 >"$case_dir/balance"
+  printf accept >"$case_dir/behavior"
+  printf accept >"$case_dir/deployment"
+  printf 0 >"$case_dir/fift-rc"
+  printf 0 >"$case_dir/fift-init-rc"
+  printf 0 >"$case_dir/fift-init-mutate-key"
+  printf '%s\n' "$fixture_source" >"$case_dir/fift-init-address"
+  export MAIN_WALLET_TEST_CASE="$case_dir"
+
+  cat >"$case_dir/fake-fift" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case_dir="$MAIN_WALLET_TEST_CASE"
+if [[ $# == 5 && "$1" == -s && "$2" == */new-wallet-v3.fif ]]; then
+  [[ "$3" == 0 && "$4" == 42 && "$5" == "$PWD/wallet" && "$PWD" != "$case_dir/wallets" ]] || { echo 'incorrect init workchain/subwallet identity or isolation' >&2; exit 90; }
+  [[ -f "$5.pk" ]] && cmp "$case_dir/wallets/savings.pk" "$5.pk" || { echo 'init did not reuse the original signing key' >&2; exit 89; }
+  printf 'fift-init\n' >>"$case_dir/events"
+  printf 'synthetic Fift diagnostic containing private fixture text\n'
+  rc="$(cat "$case_dir/fift-init-rc")"
+  (( rc == 0 )) || exit "$rc"
+  cp "$case_dir/fift-init-address" "$5.addr"
+  [[ "$(cat "$case_dir/fift-init-mutate-key")" != 1 ]] || printf 'unexpected replacement key\n' >"$5.pk"
+  printf 'deployment|%s\n' "$(cat "$case_dir/fift-init-address")" >"$5-query.boc"
+  exit 0
+fi
+[[ $# -ge 8 ]] || { echo 'unexpected Fift argument count' >&2; exit 91; }
+[[ "$1" == -s && "$2" == "$case_dir/smartcont/wallet-v3.fif" ]] || { echo 'unexpected wallet signing script' >&2; exit 92; }
+[[ "$3" == "$case_dir/wallets/savings" && "$5" == 42 ]] || { echo 'incorrect source wallet identity' >&2; exit 93; }
+seqno="$6"; destination="$4"; amount="$7"; output="$8"; bounce=""; validity=""
+shift 8
+while (( $# > 0 )); do
+  case "$1" in
+    -n) [[ -z "$bounce" ]] || exit 94; bounce=-n; shift ;;
+    -t) [[ "${2:-}" == 180 && -z "$validity" ]] || exit 94; validity="$2"; shift 2 ;;
+    *) echo 'unexpected transfer signing option' >&2; exit 94 ;;
+  esac
+done
+[[ "$validity" == 180 ]] || { echo 'transfer expiry must cover bounded fallback attempts' >&2; exit 94; }
+printf 'fift %s %s %s %s\n' "$seqno" "$destination" "$amount" "$bounce" >>"$case_dir/events"
+rc="$(cat "$case_dir/fift-rc")"
+(( rc == 0 )) || exit "$rc"
+printf 'transfer|%s|%s|%s\n' "$seqno" "$destination" "$amount" >"$output.boc"
+SH
+  chmod +x "$case_dir/fake-fift"
+  resolve_fift_bin() { printf '%s/fake-fift' "$case_dir"; }
+  curl() { printf 'unexpected HTTP operation\n' >>"$events"; return 95; }
+  sleep() { fail 'test attempted a real confirmation/retry delay'; }
+  run_liteclient_query() {
+    local query="$1" status seqno boc behavior
+    status="$(cat "$case_dir/status")"
+    seqno="$(cat "$case_dir/seqno")"
+    case "$query" in
+      "getaccount $fixture_source")
+        printf 'account %s %s\n' "$status" "$seqno" >>"$events"
+        case "$status" in
+          active|uninit|frozen)
+            printf 'account state is (account\n balance:(currencies grams:(nanograms amount:(var_uint value:%s)))\n state:account_%s' \
+              "$(cat "$case_dir/balance")" "$status"
+            [[ "$status" != active ]] || printf '\n data:x{%08X0000002A}' "$seqno"
+            printf ')\n'
+            ;;
+          nonexist) printf 'account state is empty\n' ;;
+          unknown) printf 'synthetic RPC failure\n' >&2; return 96 ;;
+          *) fail "unrecognized fixture status $status" ;;
+        esac
+        ;;
+      "runmethod $fixture_source seqno")
+        printf 'seqno %s %s\n' "$status" "$seqno" >>"$events"
+        [[ "$status" == active ]] || return 97
+        printf 'result: [ %s ]\n' "$seqno"
+        ;;
+      sendfile\ *)
+        boc="${query#sendfile }"
+        [[ -s "$boc" ]] || fail 'broadcast a missing/empty BOC'
+        if [[ "$(head -c 11 "$boc")" == 'deployment|' ]]; then
+          [[ "$(cat "$boc")" == "deployment|$fixture_source" ]] || fail 'broadcast StateInit for the wrong account'
+          printf 'deploy\n' >>"$events"
+          behavior="$(cat "$case_dir/deployment")"
+          [[ "$behavior" != reject ]] || return 98
+          if [[ "$behavior" == accept ]]; then
+            printf active >"$case_dir/status"
+            printf 1 >"$case_dir/seqno"
+          fi
+        else
+          [[ "$boc" == "$MAIN_WALLET_DIR/savings-send-$seqno.boc" ]] || fail 'broadcast a transfer with an unconfirmed sequence number'
+          [[ "$status" == active ]] || fail 'attempted a transfer before deployment'
+          assert_contains "transfer|$seqno|" "$boc"
+          printf 'broadcast %s\n' "$seqno" >>"$events"
+          if [[ -f "$case_dir/no-ack-at" && "$seqno" == "$(cat "$case_dir/no-ack-at")" ]]; then
+            printf 'zerostate set to fixture\nBLK#1 = public block fixture\n'
+            return 0
+          fi
+          behavior="$(cat "$case_dir/behavior")"
+          [[ "$behavior" != reject ]] || return 99
+          [[ "$behavior" != accept ]] || printf '%s' "$((seqno + 1))" >"$case_dir/seqno"
+          [[ "$behavior" != concurrent ]] || printf '%s' "$((seqno + 2))" >"$case_dir/seqno"
+          if [[ "$behavior" == lost-ack ]]; then
+            printf '%s' "$((seqno + 1))" >"$case_dir/seqno"
+            return 99
+          fi
+        fi
+        printf 'external message status is 1\n'
+        ;;
+      *) fail "unexpected lite-client operation: $query" ;;
+    esac
+  }
+}
+
+send_two() {
+  main_wallet_send savings 8 "$fixture_first" "$fixture_second" -n
+}
+
+assert_failed() {
+  if "$@" >"$case_dir/out" 2>"$case_dir/err"; then
+    fail "unexpected successful send in ${case_dir##*/}"
+  fi
+}
+
+assert_transfer_count() {
+  local expected="$1" actual
+  actual="$(awk '$1 == "fift" {n++} END {print n+0}' "$events")"
+  [[ "$actual" == "$expected" ]] || fail "signed $actual transfer(s); expected $expected"
+}
+
+test_active_wallet_confirms_each_transfer() (
+  setup_case active
+  send_two >"$case_dir/out" 2>"$case_dir/err"
+  assert_transfer_count 2
+  assert_contains "fift 7 $fixture_first 4.000000000 -n" "$events"
+  assert_contains "fift 8 $fixture_second 4.000000000 -n" "$events"
+  [[ "$(cat "$case_dir/seqno")" == 9 ]] || fail 'successful transfers were not confirmed'
+  ! grep -q '^deploy$' "$events" || fail 'redeployed an active wallet'
+  awk '$1 == "broadcast" && $2 == 7 {sent=1}
+    sent && $1 == "seqno" && $3 == 8 {confirmed=1}
+    $1 == "fift" && $2 == 8 && !confirmed {exit 1}' "$events" \
+    || fail 'signed the next transfer before confirming the previous one'
+)
+
+test_funded_uninit_deploys_before_transfer() (
+  setup_case funded-uninit
+  printf uninit >"$case_dir/status"
+  printf 0 >"$case_dir/seqno"
+  cp "$MAIN_WALLET_DIR/savings.pk" "$case_dir/original.pk"
+  cp "$MAIN_WALLET_DIR/savings.addr" "$case_dir/original.addr"
+  cp "$MAIN_WALLET_DIR/savings-query.boc" "$case_dir/original-query.boc"
+  send_two >"$case_dir/out" 2>"$case_dir/err"
+  assert_transfer_count 2
+  assert_contains deploy "$events"
+  assert_contains "fift 1 $fixture_first 4.000000000 -n" "$events"
+  assert_contains "fift 2 $fixture_second 4.000000000 -n" "$events"
+  awk '$1 == "deploy" {deployed=1}
+    $1 == "seqno" && $2 == "active" && $3 == 1 {confirmed=1}
+    $1 == "fift" && (!deployed || !confirmed) {exit 1}' "$events" \
+    || fail 'transfer preceded deployment confirmation'
+  cmp "$case_dir/original.pk" "$MAIN_WALLET_DIR/savings.pk" || fail 'StateInit generation replaced the existing signing key'
+  cmp "$case_dir/original.addr" "$MAIN_WALLET_DIR/savings.addr" || fail 'StateInit generation replaced the existing account address'
+  cmp "$case_dir/original-query.boc" "$MAIN_WALLET_DIR/savings-query.boc" || fail 'StateInit generation overwrote the saved deployment query'
+)
+
+test_rejected_transfer_stops_the_batch() (
+  setup_case rejected
+  printf reject >"$case_dir/behavior"
+  assert_failed send_two
+  assert_transfer_count 1
+  [[ "$(cat "$case_dir/seqno")" == 7 ]] || fail 'a rejected send advanced the fixture state'
+  ! grep -Fq -- "$fixture_second" "$events" || fail 'attempted a later recipient after rejection'
+)
+
+test_unconfirmed_transfer_stops_the_batch() (
+  setup_case unconfirmed
+  printf unconfirmed >"$case_dir/behavior"
+  assert_failed send_two
+  assert_transfer_count 1
+  ! grep -Fq -- "$fixture_second" "$events" || fail 'attempted a later recipient before confirmation'
+)
+
+test_unconfirmed_deployment_never_transfers() (
+  setup_case deployment-unconfirmed
+  printf uninit >"$case_dir/status"
+  printf 0 >"$case_dir/seqno"
+  printf unconfirmed >"$case_dir/deployment"
+  assert_failed send_two
+  assert_transfer_count 0
+  assert_contains deploy "$events"
+)
+
+test_mismatched_deployment_identity_never_transfers() (
+  setup_case mismatched-init
+  printf uninit >"$case_dir/status"
+  printf 0 >"$case_dir/seqno"
+  rm "$MAIN_WALLET_DIR/savings-query.boc"
+  printf '%s\n' "$fixture_first" >"$case_dir/fift-init-address"
+  assert_failed send_two
+  assert_transfer_count 0
+  ! grep -q '^deploy$' "$events" || fail 'broadcast StateInit for another wallet address'
+)
+
+test_unusable_source_state_never_transfers() (
+  local status
+  for status in unknown nonexist frozen; do
+    setup_case "unusable-$status"
+    printf '%s' "$status" >"$case_dir/status"
+    assert_failed send_two
+    assert_transfer_count 0
+    ! grep -q '^deploy$' "$events" || fail "deployed a source in $status state"
+  done
+)
+
+test_unfunded_uninit_never_deploys() (
+  setup_case unfunded
+  printf uninit >"$case_dir/status"
+  printf 0 >"$case_dir/seqno"
+  printf 0 >"$case_dir/balance"
+  assert_failed send_two
+  assert_transfer_count 0
+  ! grep -q '^deploy$' "$events" || fail 'deployed an unfunded wallet'
+)
+
+test_failed_init_generation_never_transfers() (
+  setup_case init-failed
+  printf uninit >"$case_dir/status"
+  printf 0 >"$case_dir/seqno"
+  printf 42 >"$case_dir/fift-init-rc"
+  assert_failed send_two
+  assert_transfer_count 0
+  ! grep -q '^deploy$' "$events" || fail 'broadcast a stale deployment BOC after init generation failed'
+)
+
+test_replacement_init_key_is_rejected() (
+  setup_case init-replaced-key
+  printf uninit >"$case_dir/status"
+  printf 0 >"$case_dir/seqno"
+  printf 1 >"$case_dir/fift-init-mutate-key"
+  cp "$MAIN_WALLET_DIR/savings.pk" "$case_dir/original.pk"
+  assert_failed send_two
+  assert_transfer_count 0
+  ! grep -q '^deploy$' "$events" || fail 'broadcast StateInit after signing key changed'
+  cmp "$case_dir/original.pk" "$MAIN_WALLET_DIR/savings.pk" || fail 'init verification modified the original key'
+)
+
+test_legacy_version_is_derived_from_matching_contract() (
+  setup_case legacy-version
+  sed -i '/^wallet_version=/d' "$MAIN_WALLET_DIR/savings.wallet.meta"
+  cp "$MAIN_WALLET_DIR/savings.wallet.meta" "$case_dir/original.meta"
+  main_wallet_show savings >"$case_dir/show" 2>"$case_dir/err"
+  awk 'NR == 1 {for (i=1; i<=NF; i++) column[$i]=i; next}
+    $(column["wallet-name"]) == "savings" {
+      if (!column["wallet-version"] || $(column["wallet-version"]) != "v3") exit 1
+      found=1
+    } END {if (!found) exit 1}' "$case_dir/show" || fail 'legacy wallet version was not verified'
+  assert_contains fift-init "$events"
+  ! grep -Fq 'private fixture text' "$case_dir/show" "$case_dir/err" || fail 'version lookup printed Fift diagnostic contents'
+  cmp "$case_dir/original.meta" "$MAIN_WALLET_DIR/savings.wallet.meta" || fail 'show rewrote legacy wallet metadata'
+)
+
+test_wrong_legacy_contract_does_not_gain_version() (
+  setup_case legacy-mismatched-version
+  sed -i '/^wallet_version=/d' "$MAIN_WALLET_DIR/savings.wallet.meta"
+  printf '%s\n' "$fixture_first" >"$case_dir/fift-init-address"
+  main_wallet_show savings >"$case_dir/show" 2>"$case_dir/err"
+  awk 'NR == 1 {for (i=1; i<=NF; i++) column[$i]=i; next}
+    $(column["wallet-name"]) == "savings" {
+      if (!column["wallet-version"] || $(column["wallet-version"]) != "unknown") exit 1
+      found=1
+    } END {if (!found) exit 1}' "$case_dir/show" || fail 'mismatched V3 constructor established the wallet version'
+)
+
+test_concurrent_source_sequence_stops_the_batch() (
+  setup_case concurrent
+  printf concurrent >"$case_dir/behavior"
+  assert_failed send_two
+  assert_transfer_count 1
+  ! grep -Fq -- "$fixture_second" "$events" || fail 'continued while another operation changed the source seqno'
+)
+
+test_single_send_requires_confirmation() (
+  setup_case single-unconfirmed
+  printf unconfirmed >"$case_dir/behavior"
+  assert_failed main_wallet_send savings "$fixture_first" 1 -n
+  assert_transfer_count 1
+)
+
+test_lost_acknowledgement_stops_before_later_recipients() (
+  setup_case lost-ack
+  printf lost-ack >"$case_dir/behavior"
+  assert_failed send_two
+  assert_transfer_count 1
+  [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'fixture did not model on-chain acceptance with a lost acknowledgement'
+  ! grep -Fq -- "$fixture_second" "$events" || fail 'continued after an ambiguous accepted send'
+  assert_contains 'Check wallet status before retrying' "$case_dir/err"
+)
+
+test_invalid_arguments_cannot_trigger_deployment() (
+  setup_case invalid-arguments
+  printf uninit >"$case_dir/status"
+  printf 0 >"$case_dir/seqno"
+  assert_failed main_wallet_send savings 8 "$fixture_first" invalid-destination
+  assert_failed main_wallet_send savings "$fixture_first" 1.0000000001
+  assert_failed main_wallet_send savings "$fixture_first" 0
+  assert_transfer_count 0
+  ! grep -q '^fift-init$\|^deploy$\|^account ' "$events" || fail 'invalid arguments reached source deployment preflight'
+)
+
+test_fift_failure_never_broadcasts_stale_boc() (
+  setup_case fift-failed
+  printf 42 >"$case_dir/fift-rc"
+  printf 'stale transfer payload must never be sent\n' >"$MAIN_WALLET_DIR/savings-send-7.boc"
+  assert_failed send_two
+  assert_transfer_count 1
+  ! grep -q '^broadcast ' "$events" || fail 'broadcast after Fift failed'
+)
+
+setup_transport_case() {
+  setup_case "$1"
+  transport_boc="$case_dir/transport.boc"
+  printf 'synthetic unsigned message fixture\n' >"$transport_boc"
+  transport_output=$'zerostate set to fixture\nBLK#1 = public chain block fixture\nBLK#2 = public zero state fixture'
+  transport_rc=0
+  transport_stderr=0
+  transport_api_rc=0
+  transport_http_code=200
+  transport_api_response='{"ok":true,"result":{"@type":"ok"}}'
+  run_liteclient_query() {
+    [[ "$1" == "sendfile $transport_boc" ]] || fail 'unexpected transport RPC'
+    printf 'transport-rpc\n' >>"$events"
+    if [[ "$transport_stderr" == 1 ]]; then
+      printf '%s\n' "$transport_output" >&2
+    else
+      printf '%s\n' "$transport_output"
+    fi
+    return "$transport_rc"
+  }
+  curl() {
+    local endpoint="" method="" payload="" write_code=0 argument
+    while (( $# > 0 )); do
+      argument="$1"
+      shift
+      case "$argument" in
+        -sS) ;;
+        --connect-timeout) [[ "${1:-}" == 5 ]] || fail 'unexpected transport connection timeout'; shift ;;
+        --max-time) [[ "${1:-}" == 15 ]] || fail 'unbounded transport request'; shift ;;
+        -w) [[ "${1:-}" == $'\n%{http_code}' ]] || fail 'unexpected HTTP response framing'; write_code=1; shift ;;
+        -H) [[ "${1:-}" == 'Content-Type: application/json' ]] || fail 'unexpected transport HTTP header'; shift ;;
+        --request) method="${1:-}"; shift ;;
+        --data) payload="${1:-}"; shift ;;
+        https://toncenter.com/api/v2/sendBoc) endpoint="$argument" ;;
+        *) fail "unexpected transport HTTP operation: $argument" ;;
+      esac
+    done
+    [[ "$endpoint" == https://toncenter.com/api/v2/sendBoc && "$method" == POST && "$write_code" == 1 ]] \
+      || fail 'unexpected TONCenter fallback request'
+    [[ "$(printf '%s' "$payload" | jq -er '.boc')" == "$(base64 -w0 "$transport_boc")" ]] \
+      || fail 'fallback changed the signed BOC payload'
+    printf 'transport-https\n' >>"$events"
+    printf '%s\n%s' "$transport_api_response" "$transport_http_code"
+    return "$transport_api_rc"
+  }
+}
+
+test_liteclient_zero_exit_without_ack_uses_api_fallback() (
+  setup_transport_case missing-ack
+  send_boc_payload "$transport_boc" auto >"$case_dir/out" 2>"$case_dir/err"
+  assert_contains transport-rpc "$events"
+  assert_contains transport-https "$events"
+)
+
+test_liteclient_zero_exit_without_ack_fails_in_liteserver_mode() (
+  setup_transport_case missing-ack-liteserver
+  assert_failed send_boc_payload "$transport_boc" liteserver
+  ! grep -q '^transport-https$' "$events" || fail 'liteserver-only mode invoked the API'
+)
+
+test_positive_external_message_ack_is_required() (
+  setup_transport_case acknowledged
+  transport_output+=$'\nexternal message status is 1'
+  send_boc_payload "$transport_boc" auto >"$case_dir/out" 2>"$case_dir/err"
+  ! grep -q '^transport-https$' "$events" || fail 'acknowledged liteserver send unnecessarily fell back'
+)
+
+test_positive_external_message_ack_on_stderr_is_supported() (
+  setup_transport_case acknowledged-stderr
+  transport_output+=$'\nexternal message status is 1'
+  transport_stderr=1
+  send_boc_payload "$transport_boc" auto >"$case_dir/out" 2>"$case_dir/err"
+  ! grep -q '^transport-https$' "$events" || fail 'stderr acknowledgement was lost'
+)
+
+test_unsuccessful_external_message_status_uses_api_fallback() (
+  local status
+  for status in 0 -1 10; do
+    setup_transport_case "negative-status-$status"
+    transport_output+=$'\nexternal message status is '"$status"
+    send_boc_payload "$transport_boc" auto >"$case_dir/out" 2>"$case_dir/err"
+    assert_contains transport-https "$events"
+  done
+)
+
+test_failed_rpc_with_ack_is_not_successful_transport() (
+  setup_transport_case rpc-failure-with-ack
+  transport_output+=$'\nexternal message status is 1'
+  transport_rc=1
+  send_boc_payload "$transport_boc" auto >"$case_dir/out" 2>"$case_dir/err"
+  assert_contains transport-https "$events"
+)
+
+test_missing_rpc_ack_and_rejected_api_is_failure() (
+  setup_transport_case both-rejected
+  transport_api_response='{"ok":false,"error":"synthetic external message rejection"}'
+  transport_http_code=500
+  assert_failed send_boc_payload "$transport_boc" auto
+  assert_contains transport-https "$events"
+)
+
+test_batch_recovers_missing_second_ack_via_api_before_next_recipient() (
+  setup_case missing-second-ack
+  MODE=auto
+  printf 8 >"$case_dir/no-ack-at"
+  fixture_third="-1:$(printf '%064d' 4)"
+  curl() {
+    local -a arguments=("$@")
+    local payload="" i decoded
+    [[ "${arguments[-1]}" == https://toncenter.com/api/v2/sendBoc ]] || fail 'unexpected batch HTTP endpoint'
+    for ((i=0; i<${#arguments[@]}; i++)); do
+      if [[ "${arguments[$i]}" == --data ]]; then payload="${arguments[$((i+1))]}"; fi
+    done
+    [[ -n "$payload" ]] || fail 'missing API fallback BOC'
+    decoded="$(printf '%s' "$payload" | jq -er .boc | base64 -d)"
+    [[ "$decoded" == "transfer|8|$fixture_second|3.000000000" && "$(cat "$case_dir/seqno")" == 8 ]] \
+      || fail 'fallback resent the wrong recipient/sequence or changed its amount'
+    printf 'api-broadcast 8\n' >>"$events"
+    printf 9 >"$case_dir/seqno"
+    printf '{"ok":true,"result":{"@type":"ok"}}\n200'
+  }
+  main_wallet_send savings 9 "$fixture_first" "$fixture_second" "$fixture_third" -n >"$case_dir/out" 2>"$case_dir/err"
+  assert_transfer_count 3
+  assert_contains 'api-broadcast 8' "$events"
+  assert_contains "fift 9 $fixture_third 3.000000000 -n" "$events"
+  [[ "$(cat "$case_dir/seqno")" == 10 ]] || fail 'did not confirm every recipient after API fallback'
+  awk '$1 == "api-broadcast" && $2 == 8 {fallback=1}
+    fallback && $1 == "seqno" && $3 == 9 {confirmed=1}
+    $1 == "fift" && $2 == 9 && !confirmed {exit 1}' "$events" \
+      || fail 'sent the next recipient before API fallback was confirmed'
+)
+
+test_actual_liteclient_invocation_keeps_send_acknowledgement_visible() (
+  setup_case invocation-verbosity
+  # Restore the real subprocess wrapper; intercept only the executable itself.
+  source "$repo_root/charts/ton-k8s-operator/main-wallet.sh"
+  GLOBAL_CONFIG_JSON='{"synthetic_active_network_config":true}'
+  cat >"$case_dir/fake-lite-client" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 8 && "$1" == -C && -r "$2" && "$3" == -v && "$5" == -t && "$6" == 15 && "$7" == -c ]] || exit 91
+[[ "$(cat "$2")" == '{"synthetic_active_network_config":true}' ]] || exit 92
+printf 'lite-client %s %s\n' "$4" "$8" >>"$MAIN_WALLET_TEST_CASE/events"
+case "$8" in
+  sendfile\ *) [[ "$4" == 3 ]] || exit 93; printf 'external message status is 1\n' >&2 ;;
+  runmethod\ *) [[ "$4" == 0 ]] || exit 94; printf 'result: [ 7 ]\n' ;;
+  *) exit 95 ;;
+esac
+SH
+  chmod +x "$case_dir/fake-lite-client"
+  resolve_lite_client_bin() { printf '%s/fake-lite-client' "$case_dir"; }
+  send_boc_liteserver "$MAIN_WALLET_DIR/savings-query.boc" >"$case_dir/out" 2>"$case_dir/err"
+  [[ "$(run_liteclient_query "runmethod $fixture_source seqno")" == 'result: [ 7 ]' ]] \
+    || fail 'read query subprocess failed'
+  assert_contains "lite-client 3 sendfile $MAIN_WALLET_DIR/savings-query.boc" "$events"
+  assert_contains "lite-client 0 runmethod $fixture_source seqno" "$events"
+)
+
+test_active_wallet_confirms_each_transfer
+test_funded_uninit_deploys_before_transfer
+test_rejected_transfer_stops_the_batch
+test_unconfirmed_transfer_stops_the_batch
+test_unconfirmed_deployment_never_transfers
+test_mismatched_deployment_identity_never_transfers
+test_unusable_source_state_never_transfers
+test_unfunded_uninit_never_deploys
+test_failed_init_generation_never_transfers
+test_replacement_init_key_is_rejected
+test_legacy_version_is_derived_from_matching_contract
+test_wrong_legacy_contract_does_not_gain_version
+test_concurrent_source_sequence_stops_the_batch
+test_single_send_requires_confirmation
+test_lost_acknowledgement_stops_before_later_recipients
+test_invalid_arguments_cannot_trigger_deployment
+test_fift_failure_never_broadcasts_stale_boc
+test_liteclient_zero_exit_without_ack_uses_api_fallback
+test_liteclient_zero_exit_without_ack_fails_in_liteserver_mode
+test_positive_external_message_ack_is_required
+test_positive_external_message_ack_on_stderr_is_supported
+test_unsuccessful_external_message_status_uses_api_fallback
+test_failed_rpc_with_ack_is_not_successful_transport
+test_missing_rpc_ack_and_rejected_api_is_failure
+test_batch_recovers_missing_second_ack_via_api_before_next_recipient
+test_actual_liteclient_invocation_keeps_send_acknowledgement_visible
+
+echo 'main wallet send tests passed (30 scenarios).'

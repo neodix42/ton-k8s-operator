@@ -226,6 +226,9 @@ test_networkless_deploy() (
 
 test_networkless_send_forms() (
   setup_case send
+  MAIN_WALLET_CONFIRM_ATTEMPTS=7
+  MAIN_WALLET_CONFIRM_DELAY_SEC=1
+  MAIN_WALLET_CONFIRM_TIMEOUT_SEC=19
   local flag
   for flag in '' -n; do
     local -a flags=()
@@ -235,6 +238,9 @@ test_networkless_send_forms() (
     assert_helper_command send savings "$fixture_destination_address" 3.5 "${flags[@]}"
     assert_helper_env WALLET_NETWORK testnet
     assert_helper_env GLOBAL_CONFIG_JSON "$testnet_config"
+    assert_helper_env MAIN_WALLET_CONFIRM_ATTEMPTS 7
+    assert_helper_env MAIN_WALLET_CONFIRM_DELAY_SEC 1
+    assert_helper_env MAIN_WALLET_CONFIRM_TIMEOUT_SEC 19
 
     run_wallet send savings tonnode-0 3.5 "${flags[@]}" >"$case_dir/pod${flag}"
     assert_helper_command send savings "$fixture_destination_address" 3.5 "${flags[@]}"
@@ -707,6 +713,12 @@ setup_main_wallet_case() {
   resolve_wallet_address_by_name() { record resolve-source "$@"; printf '%s' "$fixture_wallet_address"; }
   resolve_wallet_subwallet_id_by_name() { record subwallet-id "$@"; printf 42; }
   wallet_seqno_decimal() { record seqno "$@"; printf 9; }
+  wallet_prepare_source() {
+    [[ "$1" == savings && "$2" == "$fixture_wallet_address" && "$3" == auto ]] \
+      || fail 'unexpected source wallet preflight'
+    wallet_seqno_decimal "$2"
+  }
+  wallet_wait_for_seqno() { record confirmed-seqno "$@"; printf '%s' "$2"; }
   send_single_transfer() { record send-transfer "$@"; }
   write_wallet_fixture() {
     printf 'wallet_name=%s\nnetwork=%s\nwallet_address=%s\n' "$1" "$2" "$fixture_wallet_address" \

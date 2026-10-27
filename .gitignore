@@ -16,6 +16,7 @@ Dockerfile.cross
 # Local kubeton launch evidence (may contain sensitive operational logs)
 kubeton-launch-logs/
 fleet-backups/
+kubeton-recovery-*/
 
 # Go workspace file
 go.work

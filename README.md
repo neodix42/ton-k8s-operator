@@ -212,6 +212,64 @@ during the checks, `del` aborts so that a fresh run can inspect the new target.
 
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
 
+### Recovering one damaged validator on a replacement server
+
+Use a server name, pod name, or namespace/pod to recover one validator whose
+blockchain database is damaged:
+
+```bash
+# Select a compatible free server automatically.
+./kubeton restore-keys devnet-16
+
+# Select the replacement server explicitly.
+./kubeton restore-keys tonnode-2 --to-node devnet-21
+
+# Use a previously exported backup for this ordinal instead of the live bundle.
+./kubeton restore-keys default/tonnode-2 ./key-backups/20261027T120000Z --to-node devnet-21
+```
+
+The selected validator keeps its pod name and ordinal. Recovery checks the
+replacement's live resource, storage, selector, host-port, and Longhorn CSI
+requirements. By default it triggers a fresh backup on only the selected pod
+and captures its committed encrypted bundle. An explicit backup directory must
+contain that ordinal's bundle and matching `SHA256SUMS`; it restores the keys
+and wallets captured at that backup's date.
+
+Before replacing storage, a temporary helper decrypts and validates the bundle
+using the existing Vault key. It preserves wallet key/address files, validator
+and ADNL keys, the controller database, and node configuration. Only advertised
+IPv4 addresses in `config.json` and the validator service's `--ip` endpoint are
+rebound to the replacement server. Plaintext and unwrapped keys remain in the
+helper's memory-backed volumes. The original encrypted backup remains intact.
+
+Recovery pauses the operator and temporarily removes the StatefulSet controller
+with orphan propagation, so sibling pods keep running. It stops only the
+selected pod, retains its original backing PVs, creates fresh claims from the
+live templates, and stages the verified identity before recreating the
+StatefulSet. The recreated workload uses `OnDelete`, and recovery verifies that
+the sibling pod UIDs were retained and adopted before restoring the operator.
+The replacement initializes and synchronizes in the background; follow it with
+`./kubeton status` and `./kubeton logs tonnode-2`.
+
+This path requires a single live TonNode fleet with automatic sticky placement,
+Vault key management, dynamic local-path or Longhorn storage, and healthy
+siblings. The source Kubernetes server must be reachable for an ordinary pod
+shutdown; this command does not force-delete an unreachable validator or fence
+a failed physical server. An inaccessible or incomplete identity bundle is an
+error, never a reason to generate replacement keys. No snapshot can recover
+wallets created after that snapshot.
+
+The command retains a private `kubeton-recovery-...` checkpoint and the original
+target PVs for review. These occupy storage until you explicitly remove them.
+If a failure occurs after removing the StatefulSet controller, the operator
+remains paused and the checkpoint records the completed phase. Review the
+saved resources and staged identity before resuming reconciliation; running
+`start`, `add`, or `install` at that point can bypass the recovery staging.
+
+The original `./kubeton restore-keys <existing-backup-dir>` syntax still restores
+all available replica bundles and restarts the fleet. Use the node/pod form
+above for isolated replacement onto another server.
+
 ### Moving a fleet to another Kubernetes cluster
 
 `backup-fleet` and `restore-fleet` move TON identities and controller state to
@@ -220,7 +278,7 @@ StatefulSets and PVCs and uses the saved replica counts. It installs the operato
 using the destination `operator-values.yaml`; `replicaCount` in that file
 controls operator pods, not the saved TON replica counts.
 
-The installer downloads `kubeton`, `fleet.sh`, `fleet.py`, and `fleet-crypto.sh`
+The installer downloads `kubeton`, `main-wallet.sh`, `fleet.sh`, `fleet.py`, and `fleet-crypto.sh`
 together from the selected GitHub release. The fleet commands need only Bash,
 `kubectl`, and `tar` on the machine running them. They launch a temporary tools
 pod using `ghcr.io/neodix42/ton-k8s-operator:fleet-tools-0.3.4`, which includes
@@ -860,11 +918,24 @@ port-forward through VMAuth and print its external dashboard URL. Missing
 VictoriaLogs does not block pod log output.
 
 `kubeton wallet create` only generates main-wallet files and the init BOC.
-Before `kubeton wallet deploy <name>` can deploy a new main
-wallet, send funds to the
-non-bounceable init address printed by `wallet create`, wait until the funding
-transaction is visible on-chain, then rerun
-`kubeton wallet deploy <name>`.
+Send funds to the non-bounceable init address printed by `wallet create`.
+Funding gives an undeployed wallet a balance but does not install its contract;
+the account remains uninitialized until deployment. A verified undeployed
+account reports seqno `0`; failed state queries remain `unknown`.
+`kubeton wallet show` also displays `wallet-version`. You can deploy explicitly
+with `kubeton wallet deploy <name>`. A send from a funded, uninitialized wallet
+deploys the saved wallet contract first and waits for an active account before
+building the transfer. It checks that the deployment matches the existing key,
+workchain, wallet ID, and address.
+
+When distributing funds, each outgoing message must be accepted and the source
+wallet's on-chain seqno must advance before the next destination is attempted.
+A rejected or unconfirmed message stops the batch instead of guessing the next
+seqno. If confirmation times out, inspect `kubeton wallet show` and the wallet's
+transactions before retrying. Earlier recipients may already have been paid;
+send only to the remaining recipients rather than repeating the entire batch.
+Seqno advancement confirms that the source wallet consumed the request; check
+recipient balances when you need to confirm delivery.
 After topping up mytonctrl wallets inside TON pods with split mode, for example
 `kubeton wallet send main-wallet 2`, activate those pod wallets with
 `kubeton wallet activate [tonnode-name] [wallet-name]`. The
@@ -909,6 +980,12 @@ empty reports zero balance and seqno; connection/query failures remain unknown.
 By default wallet BOC sending uses
 `MAIN_WALLET_MODE=auto`: two lite-server attempts followed by two TONCenter
 attempts.
+For sendfile, a successful lite-client exit code alone is not an acceptance
+acknowledgement. The command requires `external message status is 1`; an RPC
+failure or missing acknowledgement uses the configured fallback with the same
+signed message. It then checks the on-chain seqno before building another
+transfer. Main-wallet balance and seqno queries can also use the matching
+TONCenter wallet information endpoint when lite-client reads fail.
 Pod wallet state checks first use HTTPS from the machine running `kubeton`.
 The active `global.config.json` zero-state identity selects TONCenter mainnet
 or testnet, so queries do not depend on each pod's outbound lite-server
@@ -1043,6 +1120,9 @@ MAIN_WALLET_SEND_RETRY_ATTEMPTS
 MAIN_WALLET_LITESERVER_SEND_ATTEMPTS
 MAIN_WALLET_TONCENTER_SEND_ATTEMPTS
 MAIN_WALLET_SEND_RETRY_DELAY_SEC
+MAIN_WALLET_CONFIRM_ATTEMPTS
+MAIN_WALLET_CONFIRM_DELAY_SEC
+MAIN_WALLET_CONFIRM_TIMEOUT_SEC
 MAIN_WALLET_POD_TIMEOUT
 MAIN_WALLET_RUNTIME_TMPFS_SIZE
 WALLET_QUERY_ATTEMPTS

@@ -175,6 +175,7 @@ jobs:
           files: |
             install.sh
             charts/ton-k8s-operator/kubeton
+            charts/ton-k8s-operator/main-wallet.sh
             charts/ton-k8s-operator/fleet.sh
             charts/ton-k8s-operator/fleet.py
             charts/ton-k8s-operator/fleet-crypto.sh

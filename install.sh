@@ -57,16 +57,16 @@ if [[ ! -f "$CHART_DIR/operator-values.yaml" || ! -f "$CHART_DIR/tonnode-values.
   exit 1
 fi
 # Release clients can be updated without replacing an already-published OCI
-# chart version. Download the matching CLI and all of its fleet helpers as one set.
-for client_file in kubeton fleet.sh fleet.py fleet-crypto.sh; do
+# chart version. Download the CLI, wallet and fleet helpers as one matching set.
+for client_file in kubeton main-wallet.sh fleet.sh fleet.py fleet-crypto.sh; do
   echo "Downloading ${client_file} from release ${CHART_VERSION} ..."
   download_file "$RELEASE_BASE_URL/$client_file" "$CHART_DIR/${client_file}.download"
   [[ -s "$CHART_DIR/${client_file}.download" ]] || { echo "Error: empty release asset: $client_file" >&2; exit 1; }
 done
-for client_file in kubeton fleet.sh fleet.py fleet-crypto.sh; do
+for client_file in kubeton main-wallet.sh fleet.sh fleet.py fleet-crypto.sh; do
   mv "$CHART_DIR/${client_file}.download" "$CHART_DIR/$client_file"
 done
-chmod +x "$CHART_DIR/kubeton"
+chmod +x "$CHART_DIR/kubeton" "$CHART_DIR/main-wallet.sh"
 
 RESOLVED_VERSION="${ARCHIVE#ton-k8s-operator-}"
 RESOLVED_VERSION="${RESOLVED_VERSION%.tgz}"

@@ -102,6 +102,23 @@ test_show_repairs_legacy_flags_without_writes() (
   assert_contains "$fixture_bounce_test" "$MAIN_WALLET_DIR/testnet.out"
 )
 
+test_show_preserves_saved_wallet_version_offline() (
+  setup_case version-show
+  printf 'wallet_version=v3\n' >>"$MAIN_WALLET_DIR/savings.wallet.meta"
+  cp "$MAIN_WALLET_DIR/savings.wallet.meta" "$MAIN_WALLET_DIR/before.meta"
+  wallet_show_chain_state() { printf 'unknown\tunknown'; }
+  main_wallet_show savings >"$MAIN_WALLET_DIR/show.out"
+  awk 'NR == 1 {for (i=1; i<=NF; i++) column[$i]=i; next}
+    $(column["wallet-name"]) == "savings" {
+      if (!column["wallet-version"] || $(column["wallet-version"]) != "v3") exit 1
+      if ($(column["balance"]) != "unknown" || $(column["seqno"]) != "unknown") exit 1
+      found=1
+    } END {if (!found) exit 1}' "$MAIN_WALLET_DIR/show.out" \
+      || fail 'wallet show lost the known local version when live state was unavailable'
+  cmp "$MAIN_WALLET_DIR/before.meta" "$MAIN_WALLET_DIR/savings.wallet.meta" \
+    || fail 'wallet show changed saved version metadata'
+)
+
 test_other_account_metadata_is_not_repaired() (
   setup_case stale-show
   local other
@@ -111,7 +128,11 @@ test_other_account_metadata_is_not_repaired() (
   main_wallet_show savings >"$MAIN_WALLET_DIR/show.out"
   assert_not_contains "$other" "$MAIN_WALLET_DIR/show.out"
   assert_contains "$fixture_raw" "$MAIN_WALLET_DIR/show.out"
-  awk '$3 == "savings" {if ($8 != "unknown" || $9 != "unknown") exit 1; found=1} END {if (!found) exit 1}' \
+  awk 'NR == 1 {for (i=1; i<=NF; i++) column[$i]=i; next}
+    $(column["wallet-name"]) == "savings" {
+      if ($(column["non-bounceable"]) != "unknown" || $(column["bounceable"]) != "unknown") exit 1
+      found=1
+    } END {if (!found) exit 1}' \
     "$MAIN_WALLET_DIR/show.out" || fail "stale metadata gained usable friendly addresses"
 )
 
@@ -167,6 +188,7 @@ SH
   assert_not_contains "$fixture_non_test" "$MAIN_WALLET_DIR/create.out"
   [[ "$(read_meta_value non_bounceable "$MAIN_WALLET_DIR/savings.wallet.meta")" == "$fixture_non_main" ]] || fail "create saved test-only mainnet metadata"
   [[ "$(read_meta_value wallet_id "$MAIN_WALLET_DIR/savings.wallet.meta")" == 42 ]] || fail "create changed subwallet ID"
+  [[ "$(read_meta_value wallet_version "$MAIN_WALLET_DIR/savings.wallet.meta")" == v3 ]] || fail "create did not save its Fift wallet version"
   cmp "$test_dir/account.addr" "$MAIN_WALLET_DIR/savings.addr" || fail "create changed raw account bytes"
   cmp "$test_dir/account.pk" "$MAIN_WALLET_DIR/savings.pk" || fail "create changed existing private-key bytes"
   WALLET_NETWORK=testnet
@@ -177,6 +199,7 @@ SH
 
 test_encoder_preserves_account_and_bounce
 test_show_repairs_legacy_flags_without_writes
+test_show_preserves_saved_wallet_version_offline
 test_other_account_metadata_is_not_repaired
 test_saved_network_guard_is_preserved
 test_deployment_hints_use_matching_network_forms

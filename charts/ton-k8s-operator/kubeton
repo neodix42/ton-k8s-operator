@@ -180,6 +180,9 @@ MAIN_WALLET_SEND_RETRY_ATTEMPTS="${MAIN_WALLET_SEND_RETRY_ATTEMPTS:-2}"
 MAIN_WALLET_LITESERVER_SEND_ATTEMPTS="${MAIN_WALLET_LITESERVER_SEND_ATTEMPTS:-$MAIN_WALLET_SEND_RETRY_ATTEMPTS}"
 MAIN_WALLET_TONCENTER_SEND_ATTEMPTS="${MAIN_WALLET_TONCENTER_SEND_ATTEMPTS:-$MAIN_WALLET_SEND_RETRY_ATTEMPTS}"
 MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
+MAIN_WALLET_CONFIRM_ATTEMPTS="${MAIN_WALLET_CONFIRM_ATTEMPTS:-30}"
+MAIN_WALLET_CONFIRM_DELAY_SEC="${MAIN_WALLET_CONFIRM_DELAY_SEC:-2}"
+MAIN_WALLET_CONFIRM_TIMEOUT_SEC="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-60}"
 MAIN_WALLET_TARGET_WALLET_NAME="${MAIN_WALLET_TARGET_WALLET_NAME:-validator_wallet_001}"
 MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-900s}"
 MAIN_WALLET_RUNTIME_TMPFS_SIZE="${MAIN_WALLET_RUNTIME_TMPFS_SIZE:-512Mi}"
@@ -234,7 +237,7 @@ Commands:
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
   recreate             Recreate one TON pod data volumes and restore its encrypted key bundle: kubeton recreate <pod-name|namespace/pod-name> <backup-dir>.
   backup-keys          Trigger manual encrypted backup, export key bundles, restore TON replicas.
-  restore-keys         Restore encrypted key bundles from backup dir, then restart TON replicas.
+  restore-keys         Restore all bundles from <backup-dir>, or recover one <server|pod> [backup-dir] [--to-node server] onto a replacement server.
   backup-fleet         Back up fleet specifications, replica bundles, and passphrase-protected recovery keys.
   restore-fleet        Restore a fleet onto fresh destination storage and Vault: see README for options.
   wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|collect|show|export> [args...]
@@ -16826,7 +16829,340 @@ run_backup_keys() {
   echo "Encrypted key bundle backup complete: $output_dir"
 }
 
+ton_restore_plan_script() {
+  # Reuse add's quantity and resource request parsers for replacement admission.
+  ton_add_context_script | python3 -c 'import sys; print(sys.stdin.read().split("def main():",1)[0])'
+  cat <<'PY'
+import hashlib
+
+snapshots = [json.loads(part) if part else {} for part in sys.stdin.read().split("\0")[:7]]
+sts, cr, pods, pvcs, pvs, classes, nodes = snapshots
+reference, key, value, minimum_cpu, minimum_memory, map_key = sys.argv[1:]
+try:
+    if cr.get("spec", {}).get("keyManagement", {}).get("provider", "vault") != "vault":
+        raise ValueError("targeted recovery currently requires Vault key management")
+    if not cr.get("spec", {}).get("keyManagement", {}).get("enabled"):
+        raise ValueError("targeted recovery requires encrypted key management")
+    name, namespace, uid = sts["metadata"]["name"], sts["metadata"]["namespace"], sts["metadata"]["uid"]
+    replicas = sts["spec"]["replicas"]
+    if replicas < 1 or cr["spec"].get("replicas", 1) != replicas:
+        raise ValueError("fleet replica counts are not converged")
+    if not any(o.get("controller") and o.get("kind") == "TonNode" and o.get("uid") == cr["metadata"]["uid"] for o in sts["metadata"].get("ownerReferences", [])):
+        raise ValueError("StatefulSet is not controlled by the matching TonNode")
+    owned = [p for p in pods["items"] if any(o.get("controller") and o.get("uid") == uid and o.get("kind") == "StatefulSet" for o in p.get("metadata", {}).get("ownerReferences", []))]
+    matches = [p for p in owned if reference in (p["metadata"]["name"], namespace + "/" + p["metadata"]["name"], p.get("spec", {}).get("nodeName"))]
+    if len(matches) != 1:
+        raise ValueError("target must identify exactly one existing TON pod or server")
+    pod = matches[0]; ordinal = int(pod["metadata"]["name"].removeprefix(name + "-"))
+    if not 0 <= ordinal < replicas or pod["metadata"].get("deletionTimestamp"):
+        raise ValueError("target is terminating or outside the fleet")
+    source_node = next((n for n in nodes["items"] if n["metadata"]["name"] == pod.get("spec", {}).get("nodeName")), None)
+    if not source_node or source_node["metadata"].get("deletionTimestamp") or not any(c.get("type") == "Ready" and c.get("status") == "True" for c in source_node.get("status", {}).get("conditions", [])):
+        raise ValueError("source server must be Ready and reachable for a verified graceful stop; offline source fencing requires separate recovery")
+    running, siblings = {}, {}
+    for index in range(replicas):
+        found = [p for p in owned if p["metadata"]["name"] == name + "-" + str(index)]
+        if len(found) != 1 or found[0]["metadata"].get("deletionTimestamp"):
+            raise ValueError("fleet has missing or terminating pods; recover them before targeted restore")
+        item = found[0]; node = item.get("spec", {}).get("nodeName")
+        if not node:
+            raise ValueError("fleet contains an unassigned pod")
+        running[str(index)] = node
+        if index != ordinal:
+            if not any(c.get("type") == "Ready" and c.get("status") == "True" for c in item.get("status", {}).get("conditions", [])):
+                raise ValueError("another TON pod is not Ready; recover one pod at a time")
+            siblings[item["metadata"]["name"]] = item["metadata"]["uid"]
+    if len(set(running.values())) != replicas:
+        raise ValueError("targeted recovery requires one TON replica per server")
+    spec = sts["spec"]["template"]["spec"]
+    selector = dict(spec.get("nodeSelector", {})); network = cr["spec"].get("network", {})
+    if selector != cr["spec"].get("nodeSelector", {}):
+        raise ValueError("TonNode and StatefulSet selectors differ")
+    terms = spec.get("affinity", {}).get("nodeAffinity", {}).get("requiredDuringSchedulingIgnoredDuringExecution", {}).get("nodeSelectorTerms", [])
+    automatic = bool(network.get("hostPortsEnabled", True) and not network.get("publicIP") and len(terms) == 1 and not terms[0].get("matchFields") and len(terms[0].get("matchExpressions", [])) == 1 and terms[0]["matchExpressions"][0].get("key") == "kubernetes.io/hostname" and terms[0]["matchExpressions"][0].get("operator") == "In")
+    if not automatic or not re.fullmatch(r"[0-9a-f]{64}", sts["metadata"].get("annotations", {}).get("ton.ton.org/sticky-placement-spec-hash", "")):
+        raise ValueError("targeted relocation requires the current operator with automatic sticky placement and host ports")
+    templates = {t["metadata"]["name"]: t for t in sts["spec"]["volumeClaimTemplates"]}
+    if set(templates) != {"ton-work", "ton-src", "mytoncore", "mytonctrl", "keybundle"}:
+        raise ValueError("unsupported claim layout; all original volumes were preserved")
+    claims = {p["metadata"]["name"]: p for p in pvcs["items"]}; volumes = {p["metadata"]["name"]: p for p in pvs["items"]}; storage = {c["metadata"]["name"]: c for c in classes["items"]}
+    old, data, longhorn = [], 0, False
+    for prefix, template in templates.items():
+        claim_name = prefix + "-" + name + "-" + str(ordinal); claim = claims.get(claim_name)
+        if not claim or claim["metadata"].get("deletionTimestamp"):
+            raise ValueError("target PVC is missing or terminating: " + claim_name)
+        volume = volumes.get(claim["spec"].get("volumeName"))
+        if not volume or volume["spec"].get("claimRef", {}).get("uid") != claim["metadata"]["uid"]:
+            raise ValueError("cannot verify target PVC/PV identity: " + claim_name)
+        if any(o.get("kind") == "Pod" for o in claim["metadata"].get("ownerReferences", [])):
+            raise ValueError("target PVC has a Pod deletion owner; set StatefulSet PVC retention to Retain and retry")
+        sc = template["spec"].get("storageClassName")
+        provisioner = storage.get(sc, {}).get("provisioner")
+        if provisioner not in ("rancher.io/local-path", "driver.longhorn.io"):
+            raise ValueError("targeted recovery supports dynamic local-path or Longhorn claim templates")
+        if template["spec"].get("volumeName") or template["spec"].get("selector"):
+            raise ValueError("prebound claim templates cannot be relocated automatically")
+        if provisioner == "rancher.io/local-path": data += math.ceil(quantity(template["spec"]["resources"]["requests"]["storage"]))
+        longhorn |= provisioner == "driver.longhorn.io"
+        old.append({"name": claim_name, "uid": claim["metadata"]["uid"], "pv": volume["metadata"]["name"], "pv_uid": volume["metadata"]["uid"]})
+    agent = next(c for c in spec["containers"] if c["name"] == "key-backup")
+    env = {e["name"]: e.get("value") for e in agent.get("env", [])}
+    enc, meta = env.get("KEY_BUNDLE_FILE", "keys.bundle.enc"), env.get("KEY_BUNDLE_META_FILE", "keys.bundle.meta")
+    if any(not isinstance(s,str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", s) for s in (enc,meta)):
+        raise ValueError("unsupported encrypted bundle filenames")
+    cpu, memory = requests(spec)
+    managed = {k:v for k,v in selector.items() if (k == key and v == value) or (k == "node.longhorn.io/create-default-disk" and v == "true")}
+    ports = sorted({p.get("protocol", "TCP") + "/" + str(p["hostPort"]) for c in spec.get("containers", []) + spec.get("initContainers", []) for p in c.get("ports", []) if p.get("hostPort", 0) > 0})
+    fingerprint = hashlib.sha256(json.dumps({"sts_spec": sts["spec"], "cr_spec": cr["spec"], "sts_annotations": sts["metadata"].get("annotations", {}), "cr_annotations": cr["metadata"].get("annotations", {})}, sort_keys=True).encode()).hexdigest()
+    print(json.dumps({"namespace": namespace, "name": name, "uid": uid, "cr_uid": cr["metadata"]["uid"], "fingerprint": fingerprint, "replicas": replicas, "ordinal": ordinal, "pod": pod["metadata"]["name"], "pod_uid": pod["metadata"]["uid"], "source": pod["spec"]["nodeName"], "siblings": siblings, "old_claims": old, "cpu": math.ceil(max(cpu, quantity(minimum_cpu))*1000), "memory": math.ceil(max(memory, quantity(minimum_memory))), "data": data, "ports": ports, "selector": selector, "managed": managed, "running": running, "automatic": automatic, "affinity": spec.get("affinity", {}).get("nodeAffinity", {}), "constraints": [], "longhorn": longhorn, "scope": ",".join(k+"="+v for k,v in sorted(selector.items()) if k not in managed), "enc": enc, "meta": meta}))
+except (KeyError, TypeError, ValueError, StopIteration, ArithmeticError) as error:
+    sys.exit("Error: cannot prepare targeted restore: " + str(error))
+PY
+}
+
+ton_restore_plan() {
+  local ns="$1" sts="$2" target="$3" sts_json cr_json pods_json pvcs_json pvs_json classes_json nodes_json
+  sts_json="$(kubectl -n "$ns" get statefulset "$sts" -o json)" || return 1
+  cr_json="$(kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" -o json)" || return 1
+  pods_json="$(kubectl -n "$ns" get pods -o json)" || return 1
+  pvcs_json="$(kubectl -n "$ns" get pvc -o json)" || return 1
+  pvs_json="$(kubectl get pv -o json)" || return 1
+  classes_json="$(kubectl get storageclass -o json)" || return 1
+  nodes_json="$(kubectl get nodes -o json)" || return 1
+  printf '%s\0' "$sts_json" "$cr_json" "$pods_json" "$pvcs_json" "$pvs_json" "$classes_json" "$nodes_json" \
+    | python3 -c "$(ton_restore_plan_script)" "$target" "$KUBETON_NODE_PREREQ_LABEL_KEY" "$KUBETON_NODE_PREREQ_LABEL_VALUE" "$KUBETON_CHECK_MIN_CPU" "$KUBETON_CHECK_MIN_MEMORY" "$STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY"
+}
+
+ton_restore_helper_manifest() {
+  python3 -c '
+import json,sys
+s=json.load(sys.stdin); name,node,image,stage,ordinal=sys.argv[1:]; spec=s["spec"]["template"]["spec"]; agent=next(c for c in spec["containers"] if c["name"]=="key-backup"); main=next(c for c in spec["containers"] if c["name"]=="ton-node")
+volumes=[{"name":"recovery","emptyDir":{"medium":"Memory"}}]; mounts=[{"name":"recovery","mountPath":"/recovery"}]
+if stage=="stage":
+ for claim in s["spec"]["volumeClaimTemplates"]:
+  prefix=claim["metadata"]["name"]; volumes.append({"name":prefix,"persistentVolumeClaim":{"claimName":prefix+"-"+s["metadata"]["name"]+"-"+ordinal}}); mounts.append({"name":prefix,"mountPath":"/bundle" if prefix=="keybundle" else "/volumes/"+prefix})
+else:
+ volumes.append({"name":"bundle","emptyDir":{"medium":"Memory"}}); mounts.append({"name":"bundle","mountPath":"/bundle"})
+container={"name":"restore","image":image,"command":["sh","-c","sleep 86400"],"env":agent.get("env",[]),"envFrom":agent.get("envFrom",[]),"volumeMounts":mounts}
+if stage=="stage": container.update(resources=main.get("resources",{}),ports=main.get("ports",[]))
+p={"restartPolicy":"Never","nodeSelector":spec.get("nodeSelector",{}),"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchFields":[{"key":"metadata.name","operator":"In","values":[node]}]}]}}},"containers":[container],"volumes":volumes}
+for field in ("serviceAccountName", "imagePullSecrets", "securityContext", "tolerations"):
+ if field in spec: p[field]=spec[field]
+print(json.dumps({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":s["metadata"]["namespace"]},"spec":p}))
+' "$@"
+}
+
+ton_restore_archive_validation_script() {
+  cat <<'PY'
+import json
+import sys
+import tarfile
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+with tarfile.open(sys.argv[1] if len(sys.argv) > 1 else "/recovery/check.tar.gz", "r:gz") as archive:
+    members = {}
+    for item in archive:
+        name = item.name.removeprefix("./")
+        require(name not in members, "duplicate archive member")
+        require(not name.startswith("/") and ".." not in name.split("/") and (item.isfile() or item.isdir()), "unsafe archive member")
+        members[name] = item
+    required = ["tondb/config.json", "controller/initialized.json", "controller/mytoncore/mytoncore.db",
+                "controller/services/validator.service", "controller/services/mytoncore.service"]
+    require(all(name in members and members[name].isfile() and members[name].size for name in required), "incomplete controller bootstrap")
+    for prefix, message in [("tondb/keyring/", "missing ADNL keyring"), ("keys/", "missing node keys")]:
+        require(any(name.startswith(prefix) and item.isfile() and item.size for name, item in members.items()), message)
+    wallets = [name for name, item in members.items() if name.startswith("controller/mytoncore/wallets/") and name.endswith(".pk") and item.isfile() and item.size]
+    require(wallets, "missing wallet private keys")
+    require(all(name[:-3] + ".addr" in members and members[name[:-3] + ".addr"].isfile() and members[name[:-3] + ".addr"].size for name in wallets), "missing wallet address files")
+    config = json.load(archive.extractfile(members["tondb/config.json"]))
+    require(config.get("addrs"), "missing advertised addresses")
+PY
+}
+
+run_restore_keys_targeted() (
+  set -euo pipefail
+  umask 077
+  require_bin kubectl; require_bin python3; require_bin sha256sum
+  local target="${1:-}" input_dir="" destination="" option ns="" sts="" replicas="" context checked pod ordinal source hostname address port
+  [[ -n "$target" ]] || { echo 'Error: usage: kubeton restore-keys <server-name|pod-name|namespace/pod> [backup-dir] [--to-node server]' >&2; exit 1; }
+  shift
+  while (( $# )); do
+    case "$1" in
+      --to-node) (( $# >= 2 )) && [[ -n "$2" ]] || { echo 'Error: --to-node requires a server name.' >&2; exit 1; }; destination="$2"; shift 2 ;;
+      -*) echo "Error: unknown restore-keys option: $1" >&2; exit 1 ;;
+      *) [[ -z "$input_dir" && -d "$1" ]] || { echo 'Error: supply at most one existing backup directory.' >&2; exit 1; }; input_dir="$(cd "$1" && pwd)"; shift ;;
+    esac
+  done
+  [[ -f "$CHART_DIR/fleet.py" && -f "$CHART_DIR/fleet-crypto.sh" ]] || { echo 'Error: fleet.py and fleet-crypto.sh must be installed beside kubeton.' >&2; exit 1; }
+  get_single_ton_statefulset ns sts replicas || exit 1
+  local KUBETON_ADD_MODE=true KUBETON_ADD_CPU_MILLI KUBETON_ADD_MEMORY_BYTES KUBETON_ADD_DATA_BYTES KUBETON_ADD_STS="$sts"
+  local KUBETON_ADD_SELECTED_NODE KUBETON_ADD_SELECTED_HOSTNAME
+  local -a KUBETON_ADD_HOST_PORTS=() operator_names=() operator_replicas=()
+  local -A KUBETON_ADD_OCCUPIED_NODES=()
+  TON_NAMESPACE="$ns"
+  context="$(ton_restore_plan "$ns" "$sts" "$target")"
+  pod="$(ton_add_field "$context" pod)"; ordinal="$(ton_add_field "$context" ordinal)"; source="$(ton_add_field "$context" source)"
+  ton_add_admit_node "$context" "$destination"
+  destination="$KUBETON_ADD_SELECTED_NODE"; hostname="$KUBETON_ADD_SELECTED_HOSTNAME"
+  [[ "$destination" != "$source" ]] || { echo 'Error: replacement must use a different unoccupied server.' >&2; exit 1; }
+  local label
+  while IFS= read -r label; do [[ -z "$label" ]] || kubectl label node "$destination" "$label" --overwrite >/dev/null; done < <(ton_add_field "$context" managed | python3 -c 'import json,sys; print("\n".join(k+"="+v for k,v in json.load(sys.stdin).items()))')
+  if is_true "$(ton_add_field "$context" longhorn)"; then wait_ton_selected_nodes_longhorn_csi_ready "kubernetes.io/hostname=${hostname}"; fi
+  address="$(kubectl get node "$destination" -o json | python3 -c 'import json,ipaddress,sys; a=json.load(sys.stdin)["status"]["addresses"]; values=[x["address"] for kind in ("ExternalIP","InternalIP") for x in a if x["type"]==kind]; print(next(x for x in values if isinstance(ipaddress.ip_address(x),ipaddress.IPv4Address)))')"
+  port="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.spec.template.spec.containers[?(@.name=="ton-node")].ports[?(@.name=="validator-udp")].containerPort}')"
+  [[ "$port" =~ ^[0-9]+$ ]] || { echo 'Error: cannot resolve the live validator UDP port.' >&2; exit 1; }
+  if [[ -n "$input_dir" ]]; then echo 'Warning: an external backup restores only the wallets and identity state captured in that snapshot; newer changes are not included.' >&2; fi
+  confirm_or_exit "Recover only ${ns}/${pod} from ${source} onto ${destination} (advertised IPv4 ${address})? The target blockchain database will be replaced and resynchronized; sibling pods keep running."
+  local checkpoint helper="" orphaned=0 operator_paused=0 finished=0 enc meta bundle_dir
+  checkpoint="$(mktemp -d "$PWD/kubeton-recovery-${sts}-${ordinal}-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  chmod 700 "$checkpoint"
+  cleanup_targeted_restore() {
+    local rc=$?
+    trap - EXIT
+    if [[ -n "$helper" ]]; then kubectl -n "$ns" delete pod "$helper" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1 || true; fi
+    if (( operator_paused && ! orphaned )); then ton_add_resume_operator operator_names operator_replicas || rc=1; fi
+    if (( ! finished )); then
+      echo "Error: targeted recovery stopped. Protected recovery checkpoint: ${checkpoint}" >&2
+      if (( orphaned )); then echo "Error: operator reconciliation remains paused. Healthy orphaned pods remain running. Do not run start/add/install or resume the operator until the target bundle and claims in this checkpoint have been reviewed." >&2; fi
+    fi
+    exit "$rc"
+  }
+  trap cleanup_targeted_restore EXIT
+  trap 'exit 130' INT; trap 'exit 143' TERM
+  printf '%s\n' "$context" > "$checkpoint/plan.json"
+  kubectl -n "$ns" get statefulset "$sts" -o json > "$checkpoint/statefulset.json"
+  kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" -o json > "$checkpoint/tonnode.json"
+  printf 'prepared\n' > "$checkpoint/phase"
+  mkdir "$checkpoint/source" "$checkpoint/rebound"
+  enc="$(ton_add_field "$context" enc)"; meta="$(ton_add_field "$context" meta)"
+  if [[ -n "$input_dir" ]]; then
+    bundle_dir="$input_dir/$ns/$sts/$ordinal/bundle"
+    [[ -d "$bundle_dir" && -f "$input_dir/$ns/$sts/$ordinal/SHA256SUMS" ]] || { echo 'Error: targeted external restore requires its bundle directory and SHA256SUMS.' >&2; exit 1; }
+    (cd "$input_dir/$ns/$sts/$ordinal" && sha256sum -c SHA256SUMS >/dev/null)
+    key_bundle_upload_checksums "$bundle_dir" >/dev/null
+    cp "$bundle_dir/$enc" "$bundle_dir/$meta" "$checkpoint/source/"
+  else
+    # A retained bundle may predate wallets created since the last backup.
+    # Refresh only the target, then capture the committed pair twice around
+    # the copy. Failure requires an explicit external snapshot instead.
+    local before after
+    trigger_key_backup_once "$ns" "$pod" || { echo 'Error: cannot create a current target backup; supply an explicit usable backup directory if the source is damaged. No node storage was changed.' >&2; exit 1; }
+    before="$(kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec 'cd /var/ton-key-bundle; test ! -e .backup-publish; sha256sum "$KEY_BUNDLE_FILE" "$KEY_BUNDLE_META_FILE"')" || { echo 'Error: retained encrypted bundle is inaccessible; supply a verified backup directory. No node storage was changed.' >&2; exit 1; }
+    kubectl -n "$ns" cp -c key-backup "$pod:/var/ton-key-bundle/$enc" "$checkpoint/source/$enc"
+    kubectl -n "$ns" cp -c key-backup "$pod:/var/ton-key-bundle/$meta" "$checkpoint/source/$meta"
+    after="$(kubectl -n "$ns" exec "$pod" -c key-backup -- sh -ec 'cd /var/ton-key-bundle; test ! -e .backup-publish; sha256sum "$KEY_BUNDLE_FILE" "$KEY_BUNDLE_META_FILE"')"
+    [[ "$before" == "$after" ]] || { echo 'Error: encrypted bundle changed during capture; retry.' >&2; exit 1; }
+    (cd "$checkpoint/source" && printf '%s\n' "$after" | sha256sum -c - >/dev/null)
+  fi
+  helper="kubeton-recover-check-$RANDOM-$RANDOM"
+  ton_restore_helper_manifest "$helper" "$destination" "$KUBETON_FLEET_TOOLS_IMAGE" verify "$ordinal" < "$checkpoint/statefulset.json" | kubectl create -f - >/dev/null
+  kubectl -n "$ns" wait --for=condition=Ready "pod/$helper" --timeout="$HELPER_POD_READY_TIMEOUT" >/dev/null
+  kubectl -n "$ns" cp "$checkpoint/source/$enc" "$helper:/bundle/$enc" >/dev/null
+  kubectl -n "$ns" cp "$checkpoint/source/$meta" "$helper:/bundle/$meta" >/dev/null
+  kubectl -n "$ns" cp "$CHART_DIR/fleet.py" "$helper:/recovery/fleet.py" >/dev/null
+  local validation
+  validation="$(ton_restore_archive_validation_script)"
+  kubectl -n "$ns" exec "$helper" -- sh -ec '
+    crypto="$1"; validation="$2"; address="$3"; port="$4"
+    metadata="/bundle/$KEY_BUNDLE_META_FILE"
+    test "$(awk -F= '\''$1 == "provider" {print $2}'\'' "$metadata")" = vault
+    test "$(awk -F= '\''$1 == "algorithm" {print $2}'\'' "$metadata")" = aes-256-cbc-pbkdf2
+    data_key="$(sh -ec "$crypto" -- unwrap < "/bundle/$KEY_BUNDLE_META_FILE")"
+    export DATA_KEY_B64="$data_key"
+    trap "rm -f /recovery/check.tar.gz" EXIT
+    openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 -pass env:DATA_KEY_B64 -in "/bundle/$KEY_BUNDLE_FILE" -out /recovery/check.tar.gz
+    python3 -c "$validation"
+    printf "%s\n" "$data_key" | sh -ec "$crypto" -- restore "$address" "$port"
+  ' _ "$(cat "$CHART_DIR/fleet-crypto.sh")" "$validation" "$address" "$port" >/dev/null
+  kubectl -n "$ns" cp "$helper:/bundle/$enc" "$checkpoint/rebound/$enc" >/dev/null
+  kubectl -n "$ns" cp "$helper:/bundle/$meta" "$checkpoint/rebound/$meta" >/dev/null
+  kubectl -n "$ns" delete pod "$helper" --wait=true --timeout=120s >/dev/null; helper=""
+  checked="$(ton_restore_plan "$ns" "$sts" "$target")"
+  [[ "$checked" == "$context" ]] || { echo 'Error: fleet identity or claims changed during validation; rerun recovery.' >&2; exit 1; }
+  ton_add_admit_node "$context" "$destination"
+  [[ "$KUBETON_ADD_SELECTED_HOSTNAME" == "$hostname" ]] || { echo 'Error: destination hostname changed.' >&2; exit 1; }
+  operator_paused=1
+  pause_operator_reconcile operator_names operator_replicas
+  (( ${#operator_names[@]} > 0 )) || { echo 'Error: cannot safely pause the TonNode operator.' >&2; exit 1; }
+  printf '%s\n' "${operator_names[@]}" > "$checkpoint/operator-names"
+  printf '%s\n' "${operator_replicas[@]}" > "$checkpoint/operator-replicas"
+  kubectl -n "$OP_NAMESPACE" wait --for=delete pod -l "app.kubernetes.io/instance=${RELEASE_NAME}" --timeout=120s >/dev/null
+  checked="$(ton_restore_plan "$ns" "$sts" "$target")"
+  [[ "$checked" == "$context" ]] || { echo 'Error: fleet changed while pausing reconciliation.' >&2; exit 1; }
+  local retention_patch
+  retention_patch="$(python3 -c 'import json,sys; s=json.load(sys.stdin); print(json.dumps([{"op":"test","path":"/metadata/uid","value":s["metadata"]["uid"]},{"op":"test","path":"/spec","value":s["spec"]},{"op":"add","path":"/spec/updateStrategy","value":{"type":"OnDelete"}},{"op":"add","path":"/spec/persistentVolumeClaimRetentionPolicy","value":{"whenDeleted":"Retain","whenScaled":"Retain"}}]))' < "$checkpoint/statefulset.json")"
+  kubectl -n "$ns" patch statefulset "$sts" --type=json -p "$retention_patch" >/dev/null
+  # Fetch the retention-safe snapshot which is recreated after staging.
+  kubectl -n "$ns" get statefulset "$sts" -o json > "$checkpoint/statefulset.json"
+  printf 'orphaning\n' > "$checkpoint/phase"
+  orphaned=1
+  kubectl -n "$ns" delete statefulset "$sts" --cascade=orphan --wait=true --timeout=120s >/dev/null
+  # API deletion alone cannot fence a validator on an unreachable machine.
+  # Require a live stop acknowledgement before the replacement can start.
+  kubectl -n "$ns" exec "$pod" -c ton-node -- sh -ec 'systemctl stop validator mytoncore; ! systemctl is-active --quiet validator; ! systemctl is-active --quiet mytoncore' >/dev/null || {
+    echo 'Error: cannot verify that the original validator and MyTonCore stopped. The replacement identity was not started; fence/recover the source before proceeding.' >&2; exit 1;
+  }
+  [[ "$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.metadata.uid}')" == "$(ton_add_field "$context" pod_uid)" ]] || { echo 'Error: source Pod identity changed while stopping services.' >&2; exit 1; }
+  kubectl -n "$ns" delete pod "$pod" --wait=true --timeout=300s >/dev/null
+  printf 'target-stopped\n' > "$checkpoint/phase"
+  local claim claim_uid pv pv_uid current rows
+  rows="$(printf '%s' "$context" | python3 -c 'import json,sys; print("\n".join("\t".join(x[k] for k in ("name","uid","pv","pv_uid")) for x in json.load(sys.stdin)["old_claims"]))')"
+  while IFS=$'\t' read -r claim claim_uid pv pv_uid; do
+    current="$(kubectl -n "$ns" get pvc "$claim" -o jsonpath='{.metadata.uid}')"; [[ "$current" == "$claim_uid" ]] || { echo 'Error: target PVC identity changed.' >&2; exit 1; }
+    current="$(kubectl get pv "$pv" -o jsonpath='{.metadata.uid}')"; [[ "$current" == "$pv_uid" ]] || { echo 'Error: target PV identity changed.' >&2; exit 1; }
+    kubectl get pv "$pv" -o json > "$checkpoint/$claim.pv.json"
+    kubectl -n "$ns" get pvc "$claim" -o json > "$checkpoint/$claim.pvc.json"
+    kubectl patch pv "$pv" --type=merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null
+    kubectl -n "$ns" delete pvc "$claim" --wait=true --timeout=300s >/dev/null
+  done <<< "$rows"
+  printf 'old-volumes-retained\n' > "$checkpoint/phase"
+  python3 -c 'import json,sys; s=json.load(sys.stdin); n=int(sys.argv[1]); print(json.dumps({"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":t["metadata"]["name"]+"-"+s["metadata"]["name"]+"-"+str(n),"namespace":s["metadata"]["namespace"],"labels":t["metadata"].get("labels",{})},"spec":t["spec"]} for t in s["spec"]["volumeClaimTemplates"]]}))' "$ordinal" < "$checkpoint/statefulset.json" | kubectl create -f - >/dev/null
+  helper="kubeton-recover-stage-$RANDOM-$RANDOM"
+  ton_restore_helper_manifest "$helper" "$destination" "$KUBETON_FLEET_TOOLS_IMAGE" stage "$ordinal" < "$checkpoint/statefulset.json" | kubectl create -f - >/dev/null
+  kubectl -n "$ns" wait --for=condition=Ready "pod/$helper" --timeout="$HELPER_POD_READY_TIMEOUT" >/dev/null
+  [[ "$(kubectl -n "$ns" get pod "$helper" -o jsonpath='{.spec.nodeName}')" == "$destination" ]] || { echo 'Error: staging helper landed on the wrong server.' >&2; exit 1; }
+  local checksums staging="/bundle/.restore-upload-$RANDOM-$RANDOM"
+  checksums="$(key_bundle_upload_checksums "$checkpoint/rebound")"
+  kubectl -n "$ns" exec "$helper" -- mkdir -p "$staging"
+  kubectl -n "$ns" cp "$checkpoint/rebound/." "$helper:$staging" >/dev/null
+  commit_uploaded_key_bundle "$ns" "$helper" /bundle "$staging" "$checksums"
+  printf 'identity-staged\n' > "$checkpoint/phase"
+  kubectl -n "$ns" delete pod "$helper" --wait=true --timeout=120s >/dev/null; helper=""
+  kubectl get nodes -o json > "$checkpoint/nodes.json"
+  python3 -c '
+import json,sys
+root=sys.argv[1]; node=sys.argv[2]; map_key=sys.argv[3]; s=json.load(open(root+"/statefulset.json")); c=json.load(open(root+"/plan.json")); nodes=json.load(open(root+"/nodes.json")); hosts={n["metadata"]["name"]:n["metadata"].get("labels",{}).get("kubernetes.io/hostname",n["metadata"]["name"]) for n in nodes["items"]}; mapping=dict(c["running"]); mapping[str(c["ordinal"])]=node
+s["metadata"]={k:v for k,v in s["metadata"].items() if k in ("name","namespace","labels","annotations","ownerReferences")}; s.pop("status",None); s["metadata"].setdefault("annotations",{})[map_key]=",".join(k+"="+v for k,v in sorted(mapping.items(),key=lambda x:int(x[0]))); s["spec"]["updateStrategy"]={"type":"OnDelete"}; s["spec"]["template"]["spec"].setdefault("affinity",{})["nodeAffinity"]={"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":sorted({hosts[n] for n in mapping.values()})}]}]}}; print(json.dumps(s))
+' "$checkpoint" "$destination" "$STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY" > "$checkpoint/replacement-statefulset.json"
+  kubectl create -f "$checkpoint/replacement-statefulset.json" >/dev/null
+  printf 'statefulset-recreated\n' > "$checkpoint/phase"
+  # Adoption is an API operation, independent of the recovered node syncing.
+  local deadline=$(( $(date +%s) + 120 )) adopted=false
+  while (( $(date +%s) < deadline )); do
+    current="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.metadata.uid}')"
+    checked="$(kubectl -n "$ns" get pods -o json)"
+    if printf '%s\0%s' "$context" "$checked" | python3 -c 'import json,sys; c,p=map(json.loads,sys.stdin.read().split("\0")); actual={x["metadata"]["name"]:x for x in p["items"]}; owned=lambda x:any(o.get("controller") and o.get("uid")==sys.argv[1] for o in x["metadata"].get("ownerReferences",[])); target=actual.get(c["pod"]); ok=all(name in actual and actual[name]["metadata"]["uid"]==uid and owned(actual[name]) for name,uid in c["siblings"].items()) and (not target or (target["metadata"]["uid"]!=c["pod_uid"] and owned(target) and target.get("spec",{}).get("nodeName",sys.argv[2])==sys.argv[2])); sys.exit(0 if ok else 1)' "$current" "$destination"; then adopted=true; break; fi
+    sleep 2
+  done
+  is_true "$adopted" || { echo 'Error: could not verify adoption of every unchanged sibling pod; operator remains paused.' >&2; exit 1; }
+  ton_add_resume_operator operator_names operator_replicas
+  operator_paused=0; orphaned=0; finished=1
+  printf 'complete\n' > "$checkpoint/phase"
+  echo "[restore-keys] ${ns}/${pod} recovery started on ${destination}; wallet keys and ADNL identity from the verified backup preserved, advertised IPv4 updated to ${address}."
+  echo '[restore-keys] Blockchain synchronization continues in the background. Check: ./kubeton status'
+  echo "[restore-keys] Original target volumes and protected recovery checkpoint retained: ${checkpoint}"
+)
+
 run_restore_keys() {
+  if [[ $# -ne 1 || ! -d "${1:-}" ]]; then
+    run_restore_keys_targeted "$@"
+    return
+  fi
   require_bin kubectl
   require_bin sha256sum
 
@@ -20372,6 +20708,12 @@ run_wallet() {
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_TONCENTER_SEND_ATTEMPTS")"
     echo "        - name: MAIN_WALLET_SEND_RETRY_DELAY_SEC"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_SEND_RETRY_DELAY_SEC")"
+    echo "        - name: MAIN_WALLET_CONFIRM_ATTEMPTS"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_CONFIRM_ATTEMPTS")"
+    echo "        - name: MAIN_WALLET_CONFIRM_DELAY_SEC"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_CONFIRM_DELAY_SEC")"
+    echo "        - name: MAIN_WALLET_CONFIRM_TIMEOUT_SEC"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_CONFIRM_TIMEOUT_SEC")"
     echo "        - name: MAIN_WALLET_NAME_DEFAULT"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_NAME")"
     echo "        - name: MAIN_WALLET_DIR"
