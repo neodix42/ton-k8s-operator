@@ -87,6 +87,7 @@ WALLET_QUERY_TIMEOUT_SECONDS="${WALLET_QUERY_TIMEOUT_SECONDS:-45}"
 WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS="${WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS:-60}"
 WALLET_ACTIVATION_CONFIRM_ATTEMPTS="${WALLET_ACTIVATION_CONFIRM_ATTEMPTS:-6}"
 WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS="${WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS:-2}"
+WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS="${WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS:-60}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
 HELM_UNINSTALL_CMD_TIMEOUT="${HELM_UNINSTALL_CMD_TIMEOUT:-900s}"
@@ -12002,67 +12003,816 @@ resolve_main_wallet_receive_address() {
   printf '%s' "$address"
 }
 
-collect_tonnode_wallet_in_pod() {
-  local ns="$1"
-  local pod="$2"
-  local wallet_name="$3"
-  local destination_address="$4"
-  local amount="$5"
-  local output
-  local exec_rc=0
+tonnode_wallet_collect_script() {
+  cat <<'PY'
+import base64
+import binascii
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import secrets
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
-    wallet_name="$1"
-    destination_address="$2"
-    amount="$3"
-    mtc_cmd="mg ${wallet_name} ${destination_address} ${amount}"
-    prepare_mytonctrl_fift_env() {
-      # Use the private TON snapshot selected by the running controller. The
-      # image owns compatibility links under /usr/src; console calls must not
-      # rewrite them or read a newer export from /ton-artifacts/current.
-      local fift_dir="/run/ton-active/fift"
-      local smart_dir="/run/ton-active/smartcont"
-      if [[ ! -f "${fift_dir}/Fift.fif" || ! -f "${smart_dir}/wallet.fif" ]]; then
-        echo "Error: the active TON snapshot is missing Fift.fif or wallet.fif; mytonctrl mg cannot build a transfer BOC." >&2
-        return 90
-      fi
-      export FIFTPATH="${fift_dir}:${smart_dir}:${FIFTPATH:-}"
-      return 0
+JOURNAL_ROOT = pathlib.Path('/var/ton-work/controller/.kubeton-collect')
+WALLET_ROOT = pathlib.Path('/var/ton-work/controller/mytoncore/wallets')
+CONFIG_PATH = pathlib.Path('/var/ton-work/controller/global.config.json')
+ACTIVE_ROOT = pathlib.Path('/run/ton-active')
+
+
+def normalize_address(address):
+    if not isinstance(address, str):
+        raise ValueError('invalid TON address')
+    match = re.fullmatch(r'(-?[0-9]+):([0-9A-Fa-f]{64})', address)
+    if match:
+        workchain = int(match[1])
+        if not -(2**31) <= workchain < 2**31:
+            raise ValueError('invalid TON workchain')
+        return str(workchain) + ':' + match[2].lower()
+    if not re.fullmatch(r'[A-Za-z0-9_+/=-]{48}', address):
+        raise ValueError('invalid friendly TON address')
+    data = base64.b64decode(address.replace('-', '+').replace('_', '/'), validate=True)
+    if len(data) != 36 or data[0] & 0x7f not in (0x11, 0x51):
+        raise ValueError('invalid friendly TON address header')
+    if binascii.crc_hqx(data[:34], 0).to_bytes(2, 'big') != data[34:]:
+        raise ValueError('invalid friendly TON address checksum')
+    return str(int.from_bytes(data[1:2], 'big', signed=True)) + ':' + data[2:34].hex()
+
+
+def nano_amount(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:\.[0-9]*)?', value):
+        raise ValueError('invalid TON amount')
+    whole, separator, fraction = value.partition('.')
+    if len(fraction) > 9 or len(whole) > 37:
+        raise ValueError('TON amount must have at most nine decimal places')
+    amount = int(whole) * 1_000_000_000 + int((fraction + '000000000')[:9])
+    if amount >= 2**120:
+        raise ValueError('TON amount is out of range')
+    return amount
+
+
+def comment_body(encoded):
+    # TonUtil stores long text as SnakeData. Validate every ordinary cell and
+    # the complete reference chain before accepting the exact comment.
+    blob = base64.b64decode(encoded, validate=True)
+    if len(blob) < 11 or blob[:4] != bytes.fromhex('b5ee9c72'):
+        raise ValueError('invalid comment BOC')
+    flags, width = blob[4:6]
+    size = flags & 7
+    if flags & 0x38 or not 1 <= size <= 4 or not 1 <= width <= 8:
+        raise ValueError('unsupported comment BOC')
+    end = len(blob) - (4 if flags & 0x40 else 0)
+    if flags & 0x40:
+        crc = 0xffffffff
+        for byte in blob[:end]:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
+        if (crc ^ 0xffffffff).to_bytes(4, 'little') != blob[end:]:
+            raise ValueError('invalid comment BOC checksum')
+    cursor = 6
+
+    def number(length):
+        nonlocal cursor
+        if cursor + length > end:
+            raise ValueError('truncated comment BOC')
+        result = int.from_bytes(blob[cursor:cursor + length], 'big')
+        cursor += length
+        return result
+
+    count, roots, absent, total = number(size), number(size), number(size), number(width)
+    root = number(size)
+    if not 1 <= count <= 32 or roots != 1 or absent != 0 or root >= count:
+        raise ValueError('unsupported comment BOC roots')
+    if flags & 0x80:
+        for _ in range(count):
+            number(width)
+    if cursor + total != end:
+        raise ValueError('invalid comment BOC length')
+    cells = []
+    for _ in range(count):
+        descriptor, bits = number(1), number(1)
+        refs = descriptor & 7
+        if descriptor & 0xf8 or refs > 1 or bits & 1 or cursor + bits // 2 > end:
+            raise ValueError('invalid comment BOC cell')
+        data = blob[cursor:cursor + bits // 2]
+        cursor += bits // 2
+        references = [number(size) for _ in range(refs)]
+        cells.append((data, references))
+    if cursor != end:
+        raise ValueError('invalid comment BOC cell length')
+    body, seen = b'', set()
+    index = root
+    while True:
+        if index >= count or index in seen:
+            raise ValueError('invalid comment BOC references')
+        seen.add(index)
+        data, refs = cells[index]
+        body += data
+        if not refs:
+            break
+        index = refs[0]
+    if len(seen) != count:
+        raise ValueError('unused comment BOC cells')
+    if body[:4] != b'\x00\x00\x00\x00':
+        raise ValueError('message is not a text comment')
+    return body[4:].decode('utf-8')
+
+
+def message_comment(message):
+    data = message.get('msg_data')
+    if not isinstance(data, dict):
+        raise ValueError('missing transfer comment payload')
+    kind = data.get('@type')
+    if kind == 'msg.dataText':
+        decoded = base64.b64decode(data.get('text', ''), validate=True).decode('utf-8')
+    elif kind == 'msg.dataRaw':
+        decoded = comment_body(data.get('body', ''))
+    else:
+        raise ValueError('unsupported transfer comment payload')
+    # The API's message field is decoded text for dataText and base64 cell
+    # contents for dataRaw. The structured payload above is authoritative.
+    if kind == 'msg.dataText' and message.get('message', decoded) != decoded:
+        raise ValueError('inconsistent transfer comment')
+    return decoded
+
+
+def transaction_succeeded(encoded, expected_account=None, expected_lt=None, allow_uninit=True):
+    """Fail closed unless a V2 transaction BOC proves an ordinary wallet credit."""
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        if not (12 <= len(raw) <= 1048576) or raw[:4] != bytes.fromhex('b5ee9c72'):
+            return False
+        flags, offset_size = raw[4:6]
+        size = flags & 7
+        if flags & 0x38 or not 1 <= size <= 4 or not 1 <= offset_size <= 8:
+            return False
+        has_index, has_crc = bool(flags & 0x80), bool(flags & 0x40)
+        pos = 6
+
+        def number(width):
+            nonlocal pos
+            if pos + width > len(raw):
+                raise ValueError('truncated BOC header')
+            value = int.from_bytes(raw[pos:pos + width], 'big')
+            pos += width
+            return value
+
+        count, roots, absent = number(size), number(size), number(size)
+        total = number(offset_size)
+        if not 1 <= count <= 10000 or roots != 1 or absent:
+            return False
+        root = number(size)
+        if root >= count:
+            return False
+        if has_index:
+            previous = 0
+            for unused in range(count):
+                end = number(offset_size)
+                if not previous <= end <= total:
+                    return False
+                previous = end
+        data_end = pos + total
+        if data_end + (4 if has_crc else 0) != len(raw):
+            return False
+        if has_crc:
+            crc = 0xffffffff
+            for byte in raw[:-4]:
+                crc ^= byte
+                for unused in range(8):
+                    crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
+            if ((crc ^ 0xffffffff).to_bytes(4, 'little') != raw[-4:]):
+                return False
+        cells = []
+        for cell_index in range(count):
+            if pos + 2 > data_end:
+                return False
+            descriptor, bits_descriptor = raw[pos:pos + 2]
+            pos += 2
+            references = descriptor & 7
+            if references > 4 or descriptor & 0xf8:
+                return False
+            byte_count = (bits_descriptor + 1) // 2
+            if pos + byte_count + references * size > data_end:
+                return False
+            payload = raw[pos:pos + byte_count]
+            pos += byte_count
+            bits = byte_count * 8
+            if bits_descriptor & 1:
+                if not payload or not payload[-1]:
+                    return False
+                trailing = (payload[-1] & -payload[-1]).bit_length() - 1
+                if trailing >= 7:
+                    return False
+                bits -= trailing + 1
+            refs = [number(size) for unused in range(references)]
+            if any(index <= cell_index or index >= count for index in refs):
+                return False
+            cells.append((int.from_bytes(payload, 'big'), bits, byte_count * 8, refs))
+        if pos != data_end:
+            return False
+
+        class Slice:
+            def __init__(self, index):
+                self.value, self.length, self.width, self.refs = cells[index]
+                self.pos = self.refpos = 0
+
+            def uint(self, width):
+                if width < 0 or self.pos + width > self.length:
+                    raise ValueError('truncated TL-B field')
+                value = (self.value >> (self.width - self.pos - width)) & ((1 << width) - 1)
+                self.pos += width
+                return value
+
+            def ref(self):
+                if self.refpos >= len(self.refs):
+                    raise ValueError('missing TL-B reference')
+                result = Slice(self.refs[self.refpos])
+                self.refpos += 1
+                return result
+
+            def varuint(self, bound):
+                width = self.uint((bound - 1).bit_length())
+                if width >= bound:
+                    raise ValueError('invalid VarUInteger')
+                return self.uint(width * 8)
+
+            def done(self):
+                if self.pos != self.length or self.refpos != len(self.refs):
+                    raise ValueError('unconsumed TL-B data')
+
+        def currency(s):
+            grams = s.varuint(16)
+            if s.uint(1):
+                s.ref()  # ExtraCurrencyCollection dictionary
+            return grams
+
+        def status_change(s):
+            if s.uint(1):
+                s.uint(1)
+
+        tx = Slice(root)
+        if tx.uint(4) != 7:
+            return False
+        account, lt = tx.uint(256), tx.uint(64)
+        if expected_account is not None:
+            if account != int(expected_account.split(':', 1)[1], 16):
+                return False
+        if expected_lt is not None and lt != int(expected_lt):
+            return False
+        tx.uint(256)  # previous transaction hash
+        tx.uint(64)   # previous transaction LT
+        tx.uint(32)   # creation time
+        out_count = tx.uint(15)
+        tx.uint(2)    # original account status
+        end_status = tx.uint(2)
+        messages = tx.ref()
+        currency(tx)
+        state_update = tx.ref()
+        description = tx.ref()
+        tx.done()
+        if state_update.uint(8) != 0x72:
+            return False
+        state_update.uint(512)
+        state_update.done()
+        # A collection must credit the destination without creating a return
+        # message. A non-bounceable deposit into an undeployed wallet is also
+        # valid even though the missing code prevents execution of a getter.
+        if out_count != 0 or end_status not in (0, 2) or messages.uint(1) != 1:
+            return False
+        incoming = messages.ref()
+        if messages.uint(1) != 0:
+            return False
+        messages.done()
+        if incoming.uint(1) != 0:  # int_msg_info$0
+            return False
+        incoming.uint(1)  # IHR disabled
+        requested_bounce = incoming.uint(1)
+        if incoming.uint(1):  # bounced messages cannot be collection receipts
+            return False
+        if description.uint(4) != 0:  # trans_ord$0000
+            return False
+        description.uint(1)  # credit_first
+        if description.uint(1):
+            description.varuint(16)
+            if description.uint(1):
+                description.varuint(16)
+            status_change(description)
+        if description.uint(1) != 1:
+            return False
+        if description.uint(1):
+            description.varuint(16)
+        if currency(description) <= 0:
+            return False
+        if description.uint(1) == 0:  # skipped computation
+            reason = description.uint(2)
+            if not allow_uninit or end_status != 0 or requested_bounce or reason != 0:
+                return False
+            if description.uint(1) != 0:  # no action phase
+                return False
+            description.uint(1)  # aborted is expected when no code could run
+            if description.uint(1) != 0:  # no bounce phase
+                return False
+            if description.uint(1) != 0:  # destination not destroyed
+                return False
+            description.done()
+            return True
+        if end_status != 2:
+            return False
+        if description.uint(1) != 1:
+            return False
+        description.uint(1)  # msg_state_used
+        description.uint(1)  # account_activated
+        description.varuint(16)
+        vm = description.ref()
+        vm.varuint(7)
+        vm.varuint(7)
+        if vm.uint(1):
+            vm.varuint(3)
+        vm.uint(8)
+        if vm.uint(32) not in (0, 1):
+            return False
+        if vm.uint(1):
+            vm.uint(32)
+        vm.uint(32)
+        vm.uint(512)
+        vm.done()
+        if description.uint(1):
+            action = description.ref()
+            if (action.uint(1), action.uint(1), action.uint(1)) != (1, 1, 0):
+                return False
+            status_change(action)
+            if action.uint(1):
+                action.varuint(16)
+            if action.uint(1):
+                action.varuint(16)
+            if action.uint(32) != 0:
+                return False
+            if action.uint(1):
+                action.uint(32)
+            action.uint(16)
+            action.uint(16)
+            if action.uint(16) != 0 or action.uint(16) != 0:
+                return False
+            action.uint(256)
+            action.varuint(7)
+            action.varuint(7)
+            action.done()
+        if description.uint(1) != 0:  # aborted
+            return False
+        if description.uint(1) != 0:  # bounce phase
+            return False
+        if description.uint(1) != 0:  # destroyed main wallet
+            return False
+        description.done()
+        return True
+    except (ValueError, TypeError, IndexError, KeyError, OverflowError):
+        return False
+
+
+def parse_receipt(response, source, destination, amount_nano, balance_nano, marker):
+    source, destination = normalize_address(source), normalize_address(destination)
+    if not isinstance(response, dict) or response.get('ok') is not True or not isinstance(response.get('result'), list):
+        raise ValueError('transaction API rejected the query')
+    matches = []
+    for transaction in response['result']:
+        if not isinstance(transaction, dict):
+            raise ValueError('invalid transaction history entry')
+        message = transaction.get('in_msg')
+        if not isinstance(message, dict):
+            continue
+        try:
+            if message_comment(message) != marker:
+                continue
+            actual_source = normalize_address(message.get('source'))
+            actual_destination = normalize_address(message.get('destination'))
+        except (ValueError, TypeError, UnicodeError, binascii.Error):
+            continue
+        if (actual_source, actual_destination) != (source, destination):
+            continue
+        description = transaction.get('description', {})
+        if not isinstance(description, dict):
+            raise ValueError('invalid matching transaction description')
+        explicit_abort = transaction.get('aborted') is True or description.get('aborted') is True
+        # An explicit bounce from the receiver back to the sending wallet is
+        # a rejection, not successful receipt of a collection payment.
+        outgoing = transaction.get('out_msgs', [])
+        if not isinstance(outgoing, list):
+            raise ValueError('invalid matching transaction outgoing messages')
+        bounced = False
+        for sent in outgoing:
+            if not isinstance(sent, dict):
+                raise ValueError('invalid matching transaction outgoing message')
+            try:
+                returns_to_source = normalize_address(sent.get('destination')) == source
+            except (ValueError, TypeError, binascii.Error):
+                returns_to_source = False
+            # The destination is the plain main wallet: an inbound collection
+            # cannot authorize it to send funds back. Treat any such return as
+            # a rejection even when v2 omits the explicit bounced flag.
+            if returns_to_source:
+                bounced = True
+        if bounced:
+            continue
+        value = message.get('value')
+        identity = transaction.get('transaction_id')
+        if not isinstance(value, str) or not re.fullmatch(r'[0-9]+', value) or not isinstance(identity, dict):
+            raise ValueError('invalid matching transaction receipt')
+        value = int(value)
+        if not 0 < value <= balance_nano or (amount_nano is not None and value != amount_nano):
+            continue
+        lt, tx_hash = identity.get('lt'), identity.get('hash')
+        if not isinstance(lt, str) or not re.fullmatch(r'[1-9][0-9]*', lt) or not isinstance(tx_hash, str):
+            raise ValueError('invalid matching transaction identity')
+        if not re.fullmatch(r'[A-Za-z0-9+/]{43}=', tx_hash) or len(base64.b64decode(tx_hash, validate=True)) != 32:
+            raise ValueError('invalid matching transaction hash')
+        if not transaction_succeeded(transaction.get('data'), destination, lt):
+            continue
+        # A non-bounceable deposit into a wallet without code retains the
+        # credit despite NO_STATE/aborted. Every active-wallet execution must
+        # instead be non-aborted; contradictory API metadata is rejected.
+        if explicit_abort and transaction_succeeded(transaction.get('data'), destination, lt, allow_uninit=False):
+            continue
+        matches.append((lt, tx_hash, value))
+    if len(matches) > 1:
+        raise ValueError('multiple matching collection receipts; manual review required')
+    return matches[0] if matches else None
+
+
+def endpoint_for_network(config, network):
+    state = config.get('validator', {}).get('zero_state', {})
+    if not isinstance(state, dict) or any(type(state.get(key)) is not int or state[key] != value for key, value in (
+            ('workchain', -1), ('shard', -9223372036854775808), ('seqno', 0))):
+        raise ValueError('invalid active global.config.json zero-state identity')
+    identities = {
+        ('F6OpKZKqvqeFp6CQmFomXNMfMj2EnaUSOXN+Mh+wVWk=', 'XplPz01CXAps5qeSWUtxcyBfdAo5zVb1N979KLSKD24='): 'mainnet',
+        ('gj+B8wb/AmlPk1z1AhVI484rhrUpgSr2oSFIh56VoSg=', 'Z+IKwYS54DmmJmesw/nAD5DzWadnOCMzee+kdgSYDOg='): 'testnet',
     }
-    if ! command -v mytonctrl >/dev/null 2>&1; then
-      echo "Error: mytonctrl command not found." >&2
-      exit 127
-    fi
-    if ! prepare_mytonctrl_fift_env; then
-      exit 90
-    fi
-    set +e
-    mytonctrl --cmd "$mtc_cmd"
-    mtc_rc=$?
-    if (( mtc_rc == 2 )); then
-      printf "%s\n" "$mtc_cmd" | mytonctrl
-    else
-      exit "$mtc_rc"
-    fi
-  ' _ "$wallet_name" "$destination_address" "$amount" 2>&1)" || exec_rc=$?
+    if identities.get((state.get('root_hash'), state.get('file_hash'))) != network:
+        raise ValueError('collection network differs from the pod active global.config.json')
+    return 'https://toncenter.com' if network == 'mainnet' else 'https://testnet.toncenter.com'
+
+
+def save_journal(path, state):
+    descriptor, temporary = tempfile.mkstemp(prefix='.collect-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            json.dump(state, stream, separators=(',', ':'), sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def same_plan(left, right):
+    keys = ('wallet', 'source', 'destination', 'network', 'amount_nano')
+    return isinstance(left, dict) and all(left.get(key) == right.get(key) for key in keys)
+
+
+def load_pending(path, plan):
+    if path.is_symlink():
+        raise ValueError('collection journal must not be a symbolic link')
+    if not path.exists():
+        return None
+    state = json.loads(path.read_text())
+    if not isinstance(state, dict) or type(state.get('version')) is not int or state['version'] != 1 or state.get('status') not in ('pending', 'complete'):
+        raise ValueError('invalid collection journal; refusing to submit another transfer')
+    if not isinstance(state.get('marker'), str) or not re.fullmatch(r'kubeton-collect:[0-9a-f]{32}', state['marker']):
+        raise ValueError('invalid collection journal identifier')
+    if type(state.get('balance_nano')) is not int or not 0 < state['balance_nano'] < 2**120:
+        raise ValueError('invalid collection journal balance')
+    saved_plan = state.get('plan')
+    if not isinstance(saved_plan, dict) or not isinstance(saved_plan.get('wallet'), str) or not re.fullmatch(r'[A-Za-z0-9._-]+', saved_plan['wallet']):
+        raise ValueError('invalid collection journal plan')
+    if saved_plan.get('network') not in ('mainnet', 'testnet') or any(normalize_address(saved_plan.get(key)) != saved_plan.get(key) for key in ('source', 'destination')):
+        raise ValueError('invalid collection journal identity')
+    if saved_plan['source'] != plan['source'] or saved_plan['network'] != plan['network']:
+        raise ValueError('collection journal belongs to a different source account or network')
+    saved_amount = saved_plan.get('amount_nano')
+    if saved_amount is not None and (type(saved_amount) is not int or not 0 < saved_amount <= state['balance_nano']):
+        raise ValueError('invalid collection journal amount')
+    if state['status'] == 'complete':
+        receipt = state.get('receipt')
+        if not isinstance(receipt, dict) or not isinstance(receipt.get('lt'), str) or not re.fullmatch(r'[1-9][0-9]*', receipt['lt']):
+            raise ValueError('invalid completed collection receipt identity')
+        tx_hash, value = receipt.get('hash'), receipt.get('value')
+        if not isinstance(tx_hash, str) or not re.fullmatch(r'[A-Za-z0-9+/]{43}=', tx_hash) or len(base64.b64decode(tx_hash, validate=True)) != 32:
+            raise ValueError('invalid completed collection receipt hash')
+        if not isinstance(value, str) or not re.fullmatch(r'[0-9]+', value) or not 0 < int(value) <= state['balance_nano'] or (saved_amount is not None and int(value) != saved_amount):
+            raise ValueError('invalid completed collection receipt amount')
+        return None
+    if not same_plan(saved_plan, plan):
+        raise ValueError('another collection is pending for this source; resolve its recorded destination and amount first')
+    return state
+
+
+def duration_seconds(value):
+    match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)([smh]?)', value)
+    if not match:
+        raise ValueError('invalid collection timeout')
+    seconds = float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600}[match[2]]
+    if not 0 < seconds <= 3600:
+        raise ValueError('invalid collection timeout')
+    return seconds
+
+
+def run_mytonctrl(command, environment, timeout):
+    # MyTonCtrl spawns lite-client and Fift. Kill the complete process group
+    # on timeout, and capture to a file so inherited stdout pipes cannot keep
+    # this driver waiting after the console process exits.
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
+                                   env=environment, start_new_session=True)
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            returncode = 124
+        output.seek(0)
+        return returncode, output.read().decode('utf-8', 'replace')
+
+
+class Collector:
+    def __init__(self, endpoint, plan, balance, journal_path, command_timeout, confirm_timeout, expectation=None):
+        self.endpoint, self.plan, self.balance = endpoint, plan, balance
+        self.journal_path = journal_path
+        self.command_timeout, self.confirm_timeout = command_timeout, confirm_timeout
+        self.expectation = expectation
+        self.last_request = None
+
+    def request_history(self, deadline):
+        query = urllib.parse.urlencode({'address': self.plan['destination'], 'limit': 100, 'archival': 'true'})
+        request = urllib.request.Request(self.endpoint + '/api/v2/getTransactions?' + query,
+                                        headers={'Accept': 'application/json', 'User-Agent': 'kubeton/wallet-collect'})
+        last_failure = None
+
+        def timed_out():
+            detail = ': ' + str(last_failure) if last_failure is not None else ''
+            return TimeoutError('collection confirmation deadline reached' + detail)
+
+        for attempt in range(3):
+            if self.last_request is not None:
+                delay = max(0, 1.05 - (time.monotonic() - self.last_request))
+                if time.monotonic() + delay >= deadline:
+                    raise timed_out()
+                time.sleep(delay)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise timed_out()
+            self.last_request = time.monotonic()
+            try:
+                with urllib.request.urlopen(request, timeout=min(10, remaining)) as response:
+                    data = response.read(4_194_305)
+                if len(data) > 4_194_304:
+                    raise ValueError('oversized collection history response')
+                return json.loads(data)
+            except urllib.error.HTTPError as error:
+                last_failure = error
+                if attempt == 2 or (error.code != 429 and not 500 <= error.code < 600):
+                    raise
+                delay = error.headers.get('Retry-After', '1') if error.headers else '1'
+                delay = int(delay) if re.fullmatch(r'[0-9]{1,3}', delay) else 1
+                if time.monotonic() + delay >= deadline:
+                    raise timed_out() from error
+                time.sleep(delay)
+            except (urllib.error.URLError, TimeoutError) as error:
+                last_failure = error
+                if attempt == 2:
+                    raise
+        raise ValueError('collection history query failed')
+
+    def verify(self, state):
+        deadline = time.monotonic() + self.confirm_timeout
+        error = 'the identified transfer has not appeared in destination history'
+        while time.monotonic() < deadline:
+            try:
+                receipt = parse_receipt(self.request_history(deadline), self.plan['source'], self.plan['destination'],
+                                        self.plan['amount_nano'], state['balance_nano'], state['marker'])
+                if receipt:
+                    return receipt
+                error = 'the identified transfer has not appeared in destination history'
+            except (OSError, ValueError, TypeError, TimeoutError) as failure:
+                error = str(failure)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(2, remaining))
+        raise ValueError('collection is unconfirmed: ' + error)
+
+    def collect(self):
+        state = load_pending(self.journal_path, self.plan)
+        if self.expectation is not None:
+            expectation = re.fullmatch(r'(resume|fresh):(none|kubeton-collect:[0-9a-f]{32})', self.expectation)
+            if not expectation or (expectation[1] == 'resume' and expectation[2] == 'none'):
+                raise ValueError('invalid collection preflight expectation')
+            current = json.loads(self.journal_path.read_text()) if self.journal_path.exists() else None
+            observed = current['marker'] if current is not None else 'none'
+            if observed != expectation[2]:
+                raise ValueError('collection journal changed after preflight; no additional transfer was submitted')
+            if expectation[1] == 'resume':
+                if current is None or not same_plan(current.get('plan'), self.plan):
+                    raise ValueError('the collection being resumed no longer matches this request')
+                if current['status'] == 'complete':
+                    print('[wallet] The previously pending collection is already confirmed; no additional transfer was signed.')
+                    receipt = current['receipt']
+                    print('[wallet] Collection confirmed on chain: {} TON received; transaction {}.'.format(
+                        '{}.{:09d}'.format(int(receipt['value']) // 1_000_000_000, int(receipt['value']) % 1_000_000_000), receipt['lt']))
+                    return 0
+            elif state is not None:
+                raise ValueError('another collection became pending after preflight; no additional transfer was submitted')
+        if state is not None:
+            print('[wallet] Checking the previous collection; no additional transfer will be signed.', flush=True)
+        if state is None:
+            if self.balance <= 0 or (self.plan['amount_nano'] is not None and not 0 < self.plan['amount_nano'] <= self.balance):
+                raise ValueError('source balance is insufficient for the requested collection')
+            state = {'version': 1, 'status': 'pending', 'plan': self.plan, 'balance_nano': self.balance,
+                     'marker': 'kubeton-collect:' + secrets.token_hex(16), 'created_at': int(time.time()), 'diagnostics': ''}
+            save_journal(self.journal_path, state)
+            command = 'mg {} {} {} -C {}'.format(self.plan['wallet'], self.plan['destination_input'],
+                                                 self.plan['amount_input'], state['marker'])
+            environment = os.environ.copy()
+            environment['FIFTPATH'] = str(ACTIVE_ROOT / 'fift') + ':' + str(ACTIVE_ROOT / 'smartcont') + ':' + environment.get('FIFTPATH', '')
+            try:
+                state['command_rc'], state['diagnostics'] = run_mytonctrl(['mytonctrl', '--cmd', command], environment,
+                                                                         self.command_timeout)
+            except subprocess.TimeoutExpired as failure:
+                output = failure.stdout or ''
+                state['command_rc'] = 124
+                state['diagnostics'] = output.decode('utf-8', 'replace') if isinstance(output, bytes) else output
+            except OSError as failure:
+                state['command_rc'], state['diagnostics'] = 127, str(failure)
+            save_journal(self.journal_path, state)
+        try:
+            receipt = self.verify(state)
+        except (OSError, ValueError, TypeError) as failure:
+            print('Error: ' + str(failure) + '. The pending collection was retained; retry the same command to verify it without sending again.', file=sys.stderr)
+            print('Collection journal: ' + str(self.journal_path), file=sys.stderr)
+            diagnostics = state.get('diagnostics')
+            if isinstance(diagnostics, str) and diagnostics:
+                print('mytonctrl output:\n' + diagnostics, file=sys.stderr)
+            return 1
+        state['status'] = 'complete'
+        state['receipt'] = {'lt': receipt[0], 'hash': receipt[1], 'value': str(receipt[2])}
+        save_journal(self.journal_path, state)
+        print('[wallet] Collection confirmed on chain: {} TON received; transaction {}.'.format(
+            '{}.{:09d}'.format(receipt[2] // 1_000_000_000, receipt[2] % 1_000_000_000), receipt[0]))
+        return 0
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    expectation = None
+    if len(args) >= 2 and args[0] == '--expect':
+        expectation, args = args[1], args[2:]
+    inspect = bool(args and args[0] == '--inspect')
+    if inspect:
+        if JOURNAL_ROOT.is_symlink():
+            raise ValueError('collection journal directory must not be a symbolic link')
+        args = args[1:]
+    if len(args) != 8:
+        raise ValueError('invalid collection driver arguments')
+    wallet, expected_source, destination_input, amount_input, network, balance, command_timeout, confirm_timeout = args
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', wallet) or wallet in ('.', '..'):
+        raise ValueError('invalid source wallet name')
+    source, destination = normalize_address(expected_source), normalize_address(destination_input)
+    if source == destination:
+        raise ValueError('source and destination collection accounts must differ')
+    address_file = (WALLET_ROOT / (wallet + '.addr')).read_bytes()
+    if len(address_file) in (32, 36):
+        actual = str(int.from_bytes(address_file[32:], 'big', signed=True) if len(address_file) == 36 else 0) + ':' + address_file[:32].hex()
+    else:
+        actual = normalize_address(address_file.decode('ascii').strip())
+    if actual != source:
+        raise ValueError('source wallet address changed; no collection was submitted')
+    endpoint = endpoint_for_network(json.loads(CONFIG_PATH.read_text()), network)
+    if not re.fullmatch(r'-?[0-9]+:[0-9A-Fa-f]{64}', destination_input):
+        friendly_data = base64.b64decode(destination_input.replace('-', '+').replace('_', '/'), validate=True)
+        if bool(friendly_data[0] & 0x80) != (network == 'testnet'):
+            raise ValueError('destination friendly address belongs to another network')
+    amount_nano = None if amount_input == 'alld' else nano_amount(amount_input)
+    source_key = hashlib.sha256((network + ':' + source).encode()).hexdigest()
+    journal_path = JOURNAL_ROOT / (source_key + '.json')
+    plan = {'wallet': wallet, 'source': source, 'destination': destination, 'network': network,
+            'amount_nano': amount_nano, 'amount_input': amount_input, 'destination_input': destination_input}
+    if inspect:
+        pending = load_pending(journal_path, plan)
+        if pending is None:
+            if journal_path.exists():
+                completed = json.loads(journal_path.read_text())
+                if completed.get('status') == 'complete' and same_plan(completed.get('plan'), plan):
+                    receipt = completed.get('receipt')
+                    if not isinstance(receipt, dict) or not all(key in receipt for key in ('lt', 'hash', 'value')):
+                        raise ValueError('invalid completed collection receipt')
+                    print(json.dumps({'pending': False, 'plan': completed['plan'], 'marker': completed['marker'], 'observed_marker': completed['marker'],
+                                      'receipt': receipt}, separators=(',', ':')))
+                    return 2
+            observed = json.loads(journal_path.read_text())['marker'] if journal_path.exists() else None
+            print(json.dumps({'pending': False, 'observed_marker': observed}, separators=(',', ':')))
+            return 3
+        print(json.dumps({'pending': True, 'plan': pending['plan'], 'marker': pending['marker'],
+                          'observed_marker': pending['marker']}, separators=(',', ':')))
+        return 0
+    balance_nano = nano_amount(balance)
+    command_timeout, confirm_timeout = duration_seconds(command_timeout), duration_seconds(confirm_timeout)
+    if not shutil.which('mytonctrl'):
+        raise ValueError('mytonctrl command not found')
+    if not (ACTIVE_ROOT / 'fift/Fift.fif').is_file() or not (ACTIVE_ROOT / 'smartcont/wallet.fif').is_file():
+        print('Error: the active TON snapshot is missing Fift.fif or wallet.fif; collection cannot build a transfer BOC.', file=sys.stderr)
+        return 90
+    if JOURNAL_ROOT.is_symlink():
+        raise ValueError('collection journal directory must not be a symbolic link')
+    JOURNAL_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(JOURNAL_ROOT, 0o700)
+    lock_descriptor = os.open(JOURNAL_ROOT / (source_key + '.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_descriptor, 'a') as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError('another collection is already running for this source wallet') from error
+        return Collector(endpoint, plan, balance_nano, journal_path, command_timeout, confirm_timeout, expectation).collect()
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        sys.exit('Error: ' + str(error))
+PY
+}
+
+read_tonnode_collect_operation_from_pod() {
+  local ns="$1" pod="$2" wallet_name="$3" source="$4" destination="$5" amount="$6" network="$7" balance="$8"
+  local script
+  script="$(tonnode_wallet_collect_script)"
+  # The inspector reads existing public journal state; it never submits mg.
+  run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- \
+    python3 -c "$script" --inspect "$wallet_name" "$source" "$destination" "$amount" "$network" "$balance" 1 1
+}
+
+collect_tonnode_wallet_in_pod() {
+  local ns="$1" pod="$2" wallet_name="$3" destination_address="$4" amount="$5"
+  local source_address="${6:-}" balance="${7:-}" network="${8:-${KUBETON_WALLET_NETWORK:-}}"
+  local output script budgets command_timeout outer_timeout row name status version workchain observed_source
+  local exec_rc=0 expectation="${9:-}"
+  local -a expectation_args=()
+  [[ -z "$expectation" ]] || expectation_args=(--expect "$expectation")
+  if [[ -z "$source_address" || -z "$balance" ]]; then
+    row="$(resolve_tonnode_wallet_row_from_pod "$ns" "$pod" "$wallet_name")" || return 1
+    IFS=$'\t' read -r name status balance version workchain observed_source <<<"$row"
+    [[ "$name" == "$wallet_name" ]] || return 1
+    source_address="${source_address:-$observed_source}"
+  fi
+  source_address="$(ton_address_to_hex "$source_address")" || return 1
+  budgets="$(python3 -c '
+import math, re, sys
+match=re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([smhd]?)", sys.argv[1])
+if not match: raise SystemExit("Error: invalid MYTONCTRL_EXEC_TIMEOUT for collection")
+command=float(match[1])*{"":1,"s":1,"m":60,"h":3600,"d":86400}[match[2]]
+try: confirmation=float(sys.argv[2])
+except ValueError: raise SystemExit("Error: invalid WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS")
+if not all(math.isfinite(value) and value>0 for value in (command,confirmation)):
+    raise SystemExit("Error: collection timeouts must be positive and finite")
+print(str(command)+"\t"+str(math.ceil(command+confirmation+30)))
+' "$MYTONCTRL_EXEC_TIMEOUT" "$WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS")" || return 1
+  IFS=$'\t' read -r command_timeout outer_timeout <<<"$budgets"
+  script="$(tonnode_wallet_collect_script)"
+  output="$(run_with_timeout "${outer_timeout}s" kubectl -n "$ns" exec "$pod" -c ton-node -- \
+    python3 -c "$script" "${expectation_args[@]}" "$wallet_name" "$source_address" "$destination_address" "$amount" "$network" "$balance" \
+    "$command_timeout" "$WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS" 2>&1)" || exec_rc=$?
   output="$(strip_ansi_sequences "$output")"
   if (( exec_rc != 0 )); then
-    echo "Error: mytonctrl mg failed in ${ns}/${pod} with exit code ${exec_rc}." >&2
+    echo "Error: collection from '${wallet_name}' in ${ns}/${pod} could not be verified (exit ${exec_rc})." >&2
+    [[ -z "$output" ]] || print_prefixed_lines "  ${pod}> " "$output" >&2
     if (( exec_rc == 124 )); then
-      echo "Error: command timed out after MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}." >&2
+      echo "Error: collection helper timed out; the outgoing request may already have executed. Rerun the same collection to check its saved receipt before any new transfer." >&2
     fi
-    echo "mytonctrl output from ${ns}/${pod}:" >&2
-    print_prefixed_lines "  ${pod}> " "$output" >&2
-    if (( exec_rc == 90 )) || printf '%s\n' "$output" | grep -Eq 'Fift\.fif|wallet\.fif'; then
-      echo "Hint: the ton-node image mytonctrl uses is missing or misconfiguring Fift include files; fix the image or ensure Fift.fif and wallet.fif are available in the container." >&2
-      return 90
+    if (( exec_rc == 90 )); then
+      echo "Hint: ensure Fift.fif and wallet.fif are present in the active TON snapshot." >&2
     fi
     return "$exec_rc"
   fi
-  if [[ -n "$output" ]]; then
-    echo "mytonctrl output from ${ns}/${pod}:"
-    print_prefixed_lines "  ${pod}> " "$output"
-  fi
+  [[ -z "$output" ]] || print_prefixed_lines "  ${pod}> " "$output"
 }
 
 run_wallet_collect() {
@@ -12077,7 +12827,10 @@ run_wallet_collect() {
   local pod_inventory=""
   local row target_ns target_pod target_node_name wallet_row
   local wallet_name status balance version workchain source_address status_lc
-  local rc=0 collected_count=0 collect_rc=0
+  local rc=0 collected_count=0 collect_rc=0 operation_state operation_output operation_key observed_marker expected_operation
+  local recovering=false
+  local -A operation_states=() operation_markers=()
+  local -a candidate_rows=()
   local -a pod_rows=()
   local -a table_rows=()
 
@@ -12185,31 +12938,62 @@ run_wallet_collect() {
       echo "Error: cannot read live state for wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; no collection will be started." >&2
       return 1
     fi
-    if [[ "$status_lc" != "active" ]]; then
+    if [[ -z "$source_address" ]] || ! ton_address_to_hex "$source_address" >/dev/null 2>&1; then
+      echo "Error: cannot read the address of wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; no collection will be started." >&2
+      return 1
+    fi
+    operation_key="${target_ns}/${target_pod}/${wallet_name}"
+    if operation_output="$(read_tonnode_collect_operation_from_pod "$target_ns" "$target_pod" "$wallet_name" "$source_address" "$main_wallet_address" "$amount" "$wallet_network" "$balance" 2>&1)"; then
+      operation_state=0
+      recovering=true
+    else
+      operation_state=$?
+    fi
+    case "$operation_state" in
+      0|2|3) operation_states["$operation_key"]="$operation_state" ;;
+      *)
+        echo "Error: cannot safely inspect the saved collection for ${target_ns}/${target_pod}; no collection will be started." >&2
+        [[ -z "$operation_output" ]] || print_prefixed_lines "  ${target_pod}> " "$operation_output" >&2
+        return 1
+        ;;
+    esac
+    observed_marker="$(printf '%s' "$operation_output" | python3 -c '
+import json,re,sys
+value=json.load(sys.stdin)
+if not isinstance(value,dict) or "observed_marker" not in value: raise SystemExit(1)
+marker=value["observed_marker"]
+if marker is None or marker=="none": print("none")
+elif isinstance(marker,str) and re.fullmatch(r"kubeton-collect:[0-9a-f]{32}",marker): print(marker)
+else: raise SystemExit(1)
+')" || {
+      echo "Error: invalid collection operation identity returned by ${target_ns}/${target_pod}; no collection will be started." >&2
+      return 1
+    }
+    operation_markers["$operation_key"]="$observed_marker"
+    candidate_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${source_address}"$'\t'"${amount}")
+  done
+
+  for row in "${candidate_rows[@]}"; do
+    IFS=$'\t' read -r target_ns target_pod wallet_name status balance source_address amount <<<"$row"
+    operation_key="${target_ns}/${target_pod}/${wallet_name}"
+    operation_state="${operation_states[$operation_key]}"
+    status_lc="${status,,}"
+    if [[ "$status_lc" != active && "$operation_state" != 0 ]] &&
+      [[ "$recovering" != true || "$operation_state" != 2 ]]; then
       if [[ -n "$target_pod_name" ]]; then
-        echo "Error: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active." >&2
+        echo "Error: wallet '${wallet_name}' in ${target_ns}/${target_pod} is '${status:-unknown}', not active." >&2
       else
-        echo "Warning: wallet '${source_wallet_name}' in ${target_ns}/${target_pod} is '${status}', not active; skipping." >&2
+        echo "Warning: wallet '${wallet_name}' in ${target_ns}/${target_pod} is '${status}', not active; skipping." >&2
       fi
       case "$status_lc" in
-        empty)
-          echo "Hint: fund this wallet first; an empty wallet cannot send funds." >&2
-          ;;
-        uninit|uninitialized)
-          echo "Hint: after funding it, run: ./kubeton wallet activate ${target_pod} ${source_wallet_name}" >&2
-          ;;
-        frozen)
-          echo "Hint: recover this frozen wallet before collecting funds." >&2
-          ;;
+        empty) echo "Hint: an empty wallet has no funds to collect." >&2 ;;
+        uninit|uninitialized) echo "Hint: after funding it, run: ./kubeton wallet activate ${target_pod} ${wallet_name}" >&2 ;;
+        frozen) echo "Hint: recover this frozen wallet before collecting funds." >&2 ;;
       esac
       [[ -z "$target_pod_name" ]] || return 1
       continue
     fi
-    if [[ -z "$source_address" ]] || ! ton_address_to_hex "$source_address" >/dev/null 2>&1; then
-      echo "Error: cannot read the address of active wallet '${source_wallet_name}' in ${target_ns}/${target_pod}; no collection will be started." >&2
-      return 1
-    fi
-    table_rows+=("${target_ns}"$'\t'"${target_pod}"$'\t'"${wallet_name}"$'\t'"${status}"$'\t'"${balance}"$'\t'"${source_address}"$'\t'"${amount}")
+    table_rows+=("$row")
   done
 
   if [[ ${#table_rows[@]} -eq 0 ]]; then
@@ -12218,14 +13002,25 @@ run_wallet_collect() {
     return 1
   fi
 
+  if [[ "$recovering" == true ]]; then
+    echo "[wallet] Resuming unfinished collection; matching payments already confirmed will be skipped." >&2
+  fi
   print_aligned_table_7col "namespace" "tonnode pod" "from-wallet" "status" "balance" "wallet-address" "amount" "${table_rows[@]}"
   confirm_or_exit "Collect '${amount}' from '${source_wallet_name}' on ${#table_rows[@]} TON wallet(s) to main wallet '${main_wallet_name}' (${main_wallet_address}) on ${wallet_network}?"
 
   for row in "${table_rows[@]}"; do
     IFS=$'\t' read -r target_ns target_pod source_wallet_name status balance source_address amount <<<"$row"
+    operation_key="${target_ns}/${target_pod}/${source_wallet_name}"
+    if [[ "$recovering" == true && "${operation_states[$operation_key]}" == 2 ]]; then
+      echo "[wallet] Collection from ${target_ns}/${target_pod} was already confirmed; skipping another transfer." >&2
+      ((collected_count+=1))
+      continue
+    fi
+    expected_operation="fresh:${operation_markers[$operation_key]}"
+    [[ "${operation_states[$operation_key]}" != 0 ]] || expected_operation="resume:${operation_markers[$operation_key]}"
     collect_rc=0
     echo "[wallet] Collecting ${amount} from ${source_wallet_name} in ${target_ns}/${target_pod} to ${main_wallet_address} using mytonctrl mg" >&2
-    if collect_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$source_wallet_name" "$main_wallet_address" "$amount"; then
+    if collect_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$source_wallet_name" "$main_wallet_address" "$amount" "$source_address" "$balance" "$wallet_network" "$expected_operation"; then
       ((collected_count+=1))
     else
       collect_rc=$?
@@ -12238,10 +13033,10 @@ run_wallet_collect() {
   done
 
   if (( rc != 0 )); then
-    echo "Error: collected ${collected_count}/${#table_rows[@]} wallet(s); at least one mytonctrl mg command failed." >&2
+    echo "Error: collected ${collected_count}/${#table_rows[@]} wallet(s); at least one collection could not be verified." >&2
     return 1
   fi
-  echo "[wallet] Collected ${collected_count}/${#table_rows[@]} wallet(s) with mytonctrl mg."
+  echo "[wallet] Collected ${collected_count}/${#table_rows[@]} wallet(s), verified at the destination."
 }
 
 resolve_tonnode_pod_row_by_name() {

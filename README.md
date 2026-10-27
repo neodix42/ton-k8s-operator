@@ -986,9 +986,39 @@ shared 60-second deadline across metadata, HTTPS and lite-client reads. Set
 `WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS`, or
 `WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS` to adjust these limits. MyTonCtrl's
 activation command retains its separate `MYTONCTRL_EXEC_TIMEOUT` limit.
-`kubeton wallet collect` reads the same live account status and only runs
-`mg` for source wallets that are already `active`; activate funded pod wallets
-before collecting from them.
+`kubeton wallet collect` starts new `mg` operations only for active source
+wallets. The default `alld` drains the source balance and destroys its on-chain
+contract. Its local keys and address remain available; a future top-up requires
+activation again before collection. A deleted wallet has no seqno getter, so
+MyTonCtrl's old `WaitTransaction` check can time out after a successful drain.
+
+Collection now verifies the incoming transaction at the destination main
+wallet. Each operation records a unique public comment before submitting `mg`;
+the receipt must match that comment, source, destination and amount. Numeric
+amounts must match exactly; `alld` must deliver a positive amount within the
+recorded source balance after fees. A source becoming empty, a changed balance,
+or a console success message alone cannot confirm collection. Verified
+payments produce a concise received-amount message even if MyTonCtrl's seqno
+wait failed; unresolved payments retain the original diagnostics and return a
+failure. Delivery fallbacks remain enabled.
+
+Public operation journals live in
+`/var/ton-work/controller/.kubeton-collect/` on each source's work PVC, with
+restricted permissions and a lock preventing concurrent collection from the
+same account. Rerunning an unresolved collection checks its existing receipt
+without signing another transfer, including when `alld` already deleted the
+source. In fleet recovery, matching completed operations are skipped while
+pending operations are checked. A completed collection followed by a fresh
+invocation is a new payment instruction. Preserve the journals with their work
+PVCs; a key-only restore does not preserve collection recovery history.
+Older releases did not record these operation identifiers, so inspect their
+transactions before constructing another payment.
+
+Confirmation queries the latest 100 destination transactions over the matching
+network's HTTPS API, with paced requests and transient-error retries. The
+`WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS` default is `60`; the MyTonCtrl command
+has its separate `MYTONCTRL_EXEC_TIMEOUT` limit. Old requests displaced from
+that history window remain unresolved for manual inspection.
 
 `kubeton wallet deploy`, `kubeton wallet send`, and `kubeton wallet collect`
 detect the network from `/var/ton-work/controller/global.config.json` in every
@@ -1070,9 +1100,11 @@ Older installations without the direct query prerequisites use `mytonctrl wl`
 as a compatibility fallback. Activation and collection still execute MyTonCtrl
 commands inside the TON pods.
 
-Collection stops before confirmation if any selected pod's live state cannot
-be read. Confirmed inactive wallets are skipped, with funding guidance for
-empty wallets and activation guidance for uninitialized wallets.
+Collection stops before confirmation if any selected pod's live state or saved
+operation cannot be read safely. Confirmed inactive wallets without a saved
+request are skipped, with funding guidance for empty wallets and activation
+guidance for uninitialized wallets. A saved pending request can still be checked
+after its source contract has disappeared.
 
 Sending to pod wallets reads their named `.addr` files without querying live
 balances. These destinations use non-bounceable addresses for the detected
@@ -1190,6 +1222,7 @@ WALLET_QUERY_TIMEOUT_SECONDS
 WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS
 WALLET_ACTIVATION_CONFIRM_ATTEMPTS
 WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS
+WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS
 
 AUTO_BAREMETAL_BOOTSTRAP
 FORCE_BAREMETAL_BOOTSTRAP

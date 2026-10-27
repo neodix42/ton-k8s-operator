@@ -106,6 +106,7 @@ setup_case() {
     printf '%s\tactive\t25\tv3\t0\t%s\n' "$3" "$fixture_second_address"
   }
   collect_tonnode_wallet_in_pod() { record mutation-collect "$@"; }
+  read_tonnode_collect_operation_from_pod() { printf '{"observed_marker":null}\n'; return 3; }
   resolve_wallet_fleet_config() {
     record detect-network
     case "$inference_mode" in
@@ -384,6 +385,7 @@ test_networkless_collect_forms() (
   assert_contains 'main-address <testnet> <treasury>' "$events"
   assert_contains "collect <test-ns> <tonnode-0> <validator_wallet_001> <$fixture_destination_address> <alld>" "$events"
   assert_contains "collect <test-ns> <tonnode-1> <validator_wallet_001> <$fixture_destination_address> <alld>" "$events"
+  assert_contains "collect <test-ns> <tonnode-0> <validator_wallet_001> <$fixture_destination_address> <alld> <$fixture_second_address> <25> <testnet>" "$events"
 
   : >"$events"
   run_wallet collect treasury 7.5 >"$case_dir/all-amount"
@@ -479,7 +481,7 @@ test_collect_nonactive_states_are_distinct_from_lookup_failures() (
       assert_not_contains 'cannot resolve wallet' "$case_dir/$fixture_status-$target"
       case "$fixture_status" in
         empty)
-          assert_contains 'fund this wallet first' "$case_dir/$fixture_status-$target"
+          assert_contains 'an empty wallet has no funds to collect' "$case_dir/$fixture_status-$target"
           assert_not_contains 'wallet activate' "$case_dir/$fixture_status-$target"
           ;;
         uninit|uninitialized)
@@ -526,7 +528,7 @@ test_collect_rejects_active_wallet_with_invalid_address() (
       if run_wallet collect "${args[@]}" >"$case_dir/invalid-$target" 2>&1; then
         fail "collected from an active wallet with an invalid address"
       fi
-      assert_contains "cannot read the address of active wallet 'validator_wallet_001' in test-ns/tonnode-1" "$case_dir/invalid-$target"
+      assert_contains "cannot read the address of wallet 'validator_wallet_001' in test-ns/tonnode-1" "$case_dir/invalid-$target"
       assert_no_side_effects
     done
   done
