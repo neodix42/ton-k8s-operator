@@ -15,8 +15,9 @@ setup_case() {
   source "$repo_root/charts/ton-k8s-operator/main-wallet.sh"
   case_dir="$test_dir/$1"
   MAIN_WALLET_DIR="$case_dir/wallets"
+  MAIN_WALLET_BUNDLE_DIR="$case_dir/bundle"
   SMARTCONT_DIR="$case_dir/smartcont"
-  mkdir -p "$MAIN_WALLET_DIR" "$SMARTCONT_DIR"
+  mkdir -p "$MAIN_WALLET_DIR" "$MAIN_WALLET_BUNDLE_DIR" "$SMARTCONT_DIR"
   events="$case_dir/events"
   : >"$events"
   WALLET_NETWORK=mainnet
@@ -29,6 +30,9 @@ setup_case() {
   MAIN_WALLET_MULTI_SEND_PAUSE_SEC=0
   MAIN_WALLET_CONFIRM_ATTEMPTS=2
   MAIN_WALLET_CONFIRM_DELAY_SEC=0
+  MAIN_WALLET_HTTP_MIN_INTERVAL_MS=0
+  MAIN_WALLET_REBROADCAST_DELAY_SEC=0
+  MAIN_WALLET_REBROADCAST_ATTEMPTS=1
   MAIN_WALLET_TRANSFER_VALIDITY_SEC=180
   fixture_source="0:$(printf '%064d' 1)"
   fixture_first="-1:$(printf '%064d' 2)"
@@ -128,7 +132,7 @@ SH
             printf 1 >"$case_dir/seqno"
           fi
         else
-          [[ "$boc" == "$MAIN_WALLET_DIR/savings-send-$seqno.boc" ]] || fail 'broadcast a transfer with an unconfirmed sequence number'
+          [[ "$(cat "$boc")" == transfer\|"$seqno"\|* ]] || fail 'broadcast a transfer with an unconfirmed sequence number'
           [[ "$status" == active ]] || fail 'attempted a transfer before deployment'
           assert_contains "transfer|$seqno|" "$boc"
           printf 'broadcast %s\n' "$seqno" >>"$events"
@@ -137,11 +141,29 @@ SH
             return 0
           fi
           behavior="$(cat "$case_dir/behavior")"
+          [[ ! -f "$case_dir/behavior-$seqno" ]] || behavior="$(cat "$case_dir/behavior-$seqno")"
+          if [[ "$behavior" == accept-rebroadcast ]]; then
+            if [[ -f "$case_dir/signed-$seqno.boc" ]]; then
+              cmp "$case_dir/signed-$seqno.boc" "$boc" || fail 'rebroadcast changed the signed message bytes'
+              printf '%s' "$((seqno + 1))" >"$case_dir/seqno"
+              touch "$case_dir/paid-$seqno"
+            else
+              cp "$boc" "$case_dir/signed-$seqno.boc"
+            fi
+          fi
           [[ "$behavior" != reject ]] || return 99
-          [[ "$behavior" != accept ]] || printf '%s' "$((seqno + 1))" >"$case_dir/seqno"
+          if [[ "$behavior" == accept ]]; then
+            printf '%s' "$((seqno + 1))" >"$case_dir/seqno"
+            touch "$case_dir/paid-$seqno"
+          fi
           [[ "$behavior" != concurrent ]] || printf '%s' "$((seqno + 2))" >"$case_dir/seqno"
+          if [[ "$behavior" == consumed-no-payment ]]; then
+            printf '%s' "$((seqno + 1))" >"$case_dir/seqno"
+            touch "$case_dir/consumed-$seqno"
+          fi
           if [[ "$behavior" == lost-ack ]]; then
             printf '%s' "$((seqno + 1))" >"$case_dir/seqno"
+            touch "$case_dir/paid-$seqno"
             return 99
           fi
         fi
@@ -149,6 +171,38 @@ SH
         ;;
       *) fail "unexpected lite-client operation: $query" ;;
     esac
+  }
+  # The transfer orchestration tests use textual synthetic BOCs. Independent
+  # receipt tests exercise real message hashing and transaction JSON. Here a
+  # digest identifies the exact fixture message across retries and restarts.
+  wallet_message_body_hash() {
+    local hash key
+    hash="$(python3 - "$1" <<'PY'
+import base64, hashlib, pathlib, sys
+print(base64.b64encode(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).digest()).decode())
+PY
+    )"
+    key="$(printf '%s' "$hash" | tr '/+' '_-' | tr -d '=')"
+    cp "$1" "$case_dir/receipt-$key.boc"
+    printf '%s' "$hash"
+  }
+  wallet_transaction_receipt() {
+    local source="$1" hash="$2" destination="$3" amount_nano="$4" key kind seqno actual_destination actual_amount
+    [[ "$source" == "$fixture_source" ]] || fail 'receipt queried the wrong source account'
+    key="$(printf '%s' "$hash" | tr '/+' '_-' | tr -d '=')"
+    [[ -f "$case_dir/receipt-$key.boc" ]] || fail 'receipt queried an unsigned fixture message'
+    IFS='|' read -r kind seqno actual_destination actual_amount <"$case_dir/receipt-$key.boc"
+    [[ "$kind" == transfer && "$destination" == "$actual_destination" && "$amount_nano" == "$(gram_amount_to_nano "$actual_amount")" ]] \
+      || fail 'receipt query changed the signed payment identity'
+    printf 'receipt %s\n' "$seqno" >>"$events"
+    [[ ! -f "$case_dir/receipt-unavailable" ]] || return 1
+    [[ ! -f "$case_dir/consumed-$seqno" ]] || return 11
+    if [[ -f "$case_dir/paid-$seqno" ]]; then
+      printf 'receipt-confirmed %s\n' "$seqno" >>"$events"
+      printf '%s\t%s' "$((1000 + seqno))" "$hash"
+      return 0
+    fi
+    return 10
   }
 }
 
@@ -177,7 +231,7 @@ test_active_wallet_confirms_each_transfer() (
   [[ "$(cat "$case_dir/seqno")" == 9 ]] || fail 'successful transfers were not confirmed'
   ! grep -q '^deploy$' "$events" || fail 'redeployed an active wallet'
   awk '$1 == "broadcast" && $2 == 7 {sent=1}
-    sent && $1 == "seqno" && $3 == 8 {confirmed=1}
+    sent && $1 == "receipt-confirmed" && $2 == 7 {confirmed=1}
     $1 == "fift" && $2 == 8 && !confirmed {exit 1}' "$events" \
     || fail 'signed the next transfer before confirming the previous one'
 )
@@ -329,11 +383,14 @@ test_single_send_requires_confirmation() (
 test_lost_acknowledgement_stops_before_later_recipients() (
   setup_case lost-ack
   printf lost-ack >"$case_dir/behavior"
+  # The chain advanced, but no matching payment receipt can be obtained. A
+  # bare seqno change must not establish that this destination was paid.
+  touch "$case_dir/receipt-unavailable"
   assert_failed send_two
   assert_transfer_count 1
   [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'fixture did not model on-chain acceptance with a lost acknowledgement'
   ! grep -Fq -- "$fixture_second" "$events" || fail 'continued after an ambiguous accepted send'
-  assert_contains 'Check wallet status before retrying' "$case_dir/err"
+  assert_contains 'persistent outgoing batch was retained' "$case_dir/err"
 )
 
 test_invalid_arguments_cannot_trigger_deployment() (
@@ -383,8 +440,8 @@ setup_transport_case() {
       shift
       case "$argument" in
         -sS) ;;
-        --connect-timeout) [[ "${1:-}" == 5 ]] || fail 'unexpected transport connection timeout'; shift ;;
-        --max-time) [[ "${1:-}" == 15 ]] || fail 'unbounded transport request'; shift ;;
+        --connect-timeout) [[ "${1:-}" =~ ^[1-5]$ ]] || fail 'unexpected transport connection timeout'; shift ;;
+        --max-time) [[ "${1:-}" =~ ^[1-9][0-9]?$ ]] && (( $1 <= 15 )) || fail 'unbounded transport request'; shift ;;
         -w) [[ "${1:-}" == $'\n%{http_code}' ]] || fail 'unexpected HTTP response framing'; write_code=1; shift ;;
         -H) [[ "${1:-}" == 'Content-Type: application/json' ]] || fail 'unexpected transport HTTP header'; shift ;;
         --request) method="${1:-}"; shift ;;
@@ -475,6 +532,7 @@ test_batch_recovers_missing_second_ack_via_api_before_next_recipient() (
       || fail 'fallback resent the wrong recipient/sequence or changed its amount'
     printf 'api-broadcast 8\n' >>"$events"
     printf 9 >"$case_dir/seqno"
+    touch "$case_dir/paid-8"
     printf '{"ok":true,"result":{"@type":"ok"}}\n200'
   }
   main_wallet_send savings 9 "$fixture_first" "$fixture_second" "$fixture_third" -n >"$case_dir/out" 2>"$case_dir/err"
@@ -483,7 +541,7 @@ test_batch_recovers_missing_second_ack_via_api_before_next_recipient() (
   assert_contains "fift 9 $fixture_third 3.000000000 -n" "$events"
   [[ "$(cat "$case_dir/seqno")" == 10 ]] || fail 'did not confirm every recipient after API fallback'
   awk '$1 == "api-broadcast" && $2 == 8 {fallback=1}
-    fallback && $1 == "seqno" && $3 == 9 {confirmed=1}
+    fallback && $1 == "receipt-confirmed" && $2 == 8 {confirmed=1}
     $1 == "fift" && $2 == 9 && !confirmed {exit 1}' "$events" \
       || fail 'sent the next recipient before API fallback was confirmed'
 )
@@ -514,6 +572,227 @@ SH
   assert_contains "lite-client 0 runmethod $fixture_source seqno" "$events"
 )
 
+test_acknowledged_but_not_included_transfer_rebroadcasts_identical_boc() (
+  setup_case acknowledged-not-included
+  MODE=auto
+  MAIN_WALLET_CONFIRM_ATTEMPTS=5
+  MAIN_WALLET_CONFIRM_DELAY_SEC=0
+  MAIN_WALLET_REBROADCAST_DELAY_SEC=0
+  MAIN_WALLET_REBROADCAST_ATTEMPTS=2
+  printf accept-rebroadcast >"$case_dir/behavior"
+  curl() {
+    local -a arguments=("$@")
+    local payload="" i decoded
+    [[ "${arguments[-1]}" != https://toncenter.com/api/v2/getWalletInformation ]] || return 95
+    [[ "${arguments[-1]}" == https://toncenter.com/api/v2/sendBoc ]] || fail 'unexpected confirmation HTTP endpoint'
+    for ((i=0; i<${#arguments[@]}; i++)); do
+      if [[ "${arguments[$i]}" == --data ]]; then payload="${arguments[$((i+1))]}"; fi
+    done
+    [[ -n "$payload" && -f "$case_dir/signed-7.boc" ]] || fail 'rebroadcast missing the original signed payload'
+    decoded="$(printf '%s' "$payload" | jq -er .boc | base64 -d)"
+    [[ "$decoded" == "$(cat "$case_dir/signed-7.boc")" ]] || fail 'API rebroadcast changed the signed message'
+    [[ "$(cat "$case_dir/seqno")" == 7 ]] || fail 'rebroadcast after an already confirmed payment'
+    printf 'api-broadcast 7\n' >>"$events"
+    printf 8 >"$case_dir/seqno"
+    touch "$case_dir/paid-7"
+    printf '{"ok":true,"result":{"@type":"ok"}}\n200'
+  }
+  main_wallet_send savings "$fixture_first" 1 -n >"$case_dir/out" 2>"$case_dir/err"
+  assert_transfer_count 1
+  [[ "$(awk '($1 == "broadcast" || $1 == "api-broadcast") && $2 == 7 {n++} END {print n+0}' "$events")" == 2 ]] \
+    || fail 'an acknowledged but unconfirmed message was not rebroadcast exactly once'
+  [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'rebroadcasted transfer was not included'
+  assert_contains 'receipt 7' "$events"
+)
+
+test_matching_receipt_resolves_lost_ack_without_resigning() (
+  setup_case lost-ack-receipt
+  printf lost-ack >"$case_dir/behavior"
+  main_wallet_send savings "$fixture_first" 1 -n >"$case_dir/out" 2>"$case_dir/err"
+  assert_transfer_count 1
+  [[ "$(awk '$1 == "broadcast" && $2 == 7 {n++} END {print n+0}' "$events")" == 1 ]] \
+    || fail 'rebroadcast a payment already identified by its exact receipt'
+  [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'fixture did not accept the original ambiguous submission'
+  assert_contains 'receipt 7' "$events"
+)
+
+test_partial_batch_retry_resumes_pending_payload_without_repaying_first() (
+  setup_case partial-resume
+  printf unconfirmed >"$case_dir/behavior-8"
+  assert_failed send_two
+  assert_transfer_count 2
+  local journal="$MAIN_WALLET_BUNDLE_DIR/.outbox/savings/state.json" pending
+  [[ "$(jq -r .next "$journal")" == 1 ]] || fail 'first confirmed recipient was not journaled'
+  pending="$(jq -er .pending.path "$journal")"
+  cp "$pending" "$case_dir/original-pending.boc"
+  wallet_outbox_release
+  MODE=auto
+  curl() {
+    local -a arguments=("$@")
+    local payload="" i decoded
+    [[ "${arguments[-1]}" != https://toncenter.com/api/v2/getWalletInformation ]] || return 95
+    [[ "${arguments[-1]}" == https://toncenter.com/api/v2/sendBoc ]] || fail 'unexpected resume HTTP endpoint'
+    for ((i=0; i<${#arguments[@]}; i++)); do
+      if [[ "${arguments[$i]}" == --data ]]; then payload="${arguments[$((i+1))]}"; fi
+    done
+    decoded="$(printf '%s' "$payload" | jq -er .boc | base64 -d)"
+    [[ "$decoded" == "$(cat "$case_dir/original-pending.boc")" && "$decoded" == "transfer|8|$fixture_second|4.000000000" ]] \
+      || fail 'resumed batch changed the pending authorization'
+    [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'resumed an already paid destination'
+    printf 'api-broadcast 8\n' >>"$events"
+    printf 9 >"$case_dir/seqno"
+    touch "$case_dir/paid-8"
+    printf '{"ok":true,"result":{"@type":"ok"}}\n200'
+  }
+  send_two >"$case_dir/resume.out" 2>"$case_dir/resume.err"
+  assert_transfer_count 2
+  [[ "$(awk '$1 == "broadcast" && $2 == 7 {n++} END {print n+0}' "$events")" == 1 ]] \
+    || fail 'resumed batch repaid its first confirmed recipient'
+  [[ "$(jq -r '.complete and (.confirmed|length == 2)' "$journal")" == true ]] \
+    || fail 'resumed batch did not durably confirm both recipients'
+)
+
+test_changed_unfinished_batch_is_rejected_without_new_payment() (
+  setup_case changed-resume
+  printf unconfirmed >"$case_dir/behavior"
+  assert_failed send_two
+  local before
+  before="$(awk '$1 == "broadcast" {n++} END {print n+0}' "$events")"
+  assert_failed main_wallet_send savings "$fixture_second" 5 -n
+  assert_transfer_count 1
+  [[ "$(awk '$1 == "broadcast" {n++} END {print n+0}' "$events")" == "$before" ]] \
+    || fail 'changed batch submitted another payment'
+)
+
+test_corrupted_pending_payload_cannot_be_resent_or_resigned() (
+  setup_case corrupt-resume
+  printf unconfirmed >"$case_dir/behavior"
+  assert_failed send_two
+  local journal="$MAIN_WALLET_BUNDLE_DIR/.outbox/savings/state.json" before pending
+  before="$(awk '$1 == "broadcast" {n++} END {print n+0}' "$events")"
+  pending="$(jq -er .pending.path "$journal")"
+  printf 'corruption\n' >>"$pending"
+  wallet_outbox_release
+  assert_failed send_two
+  assert_transfer_count 1
+  [[ "$(awk '$1 == "broadcast" {n++} END {print n+0}' "$events")" == "$before" ]] \
+    || fail 'resent corrupted pending authorization'
+)
+
+test_late_matching_receipt_resumes_without_duplicate_payment() (
+  setup_case late-receipt-resume
+  printf lost-ack >"$case_dir/behavior"
+  touch "$case_dir/receipt-unavailable"
+  assert_failed send_two
+  assert_transfer_count 1
+  [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'fixture did not model the initially ambiguous payment'
+  wallet_outbox_release
+  rm "$case_dir/receipt-unavailable"
+  send_two >"$case_dir/resume.out" 2>"$case_dir/resume.err"
+  assert_transfer_count 2
+  [[ "$(awk '$1 == "broadcast" && $2 == 7 {n++} END {print n+0}' "$events")" == 1 ]] \
+    || fail 'late receipt recovery repaid its already confirmed destination'
+  [[ "$(cat "$case_dir/seqno")" == 9 ]] || fail 'late receipt recovery did not finish the remaining recipient'
+)
+
+test_consumed_request_without_outgoing_payment_is_not_counted_as_paid() (
+  setup_case consumed-without-payment
+  printf consumed-no-payment >"$case_dir/behavior"
+  assert_failed send_two
+  assert_transfer_count 1
+  [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'fixture did not model a consumed external request'
+  local journal="$MAIN_WALLET_BUNDLE_DIR/.outbox/savings/state.json"
+  [[ "$(jq -r .next "$journal")" == 0 ]] || fail 'seqno advance without outgoing payment was marked paid'
+  assert_contains 'consumed without emitting the approved payment' "$case_dir/err"
+  assert_failed send_two
+  assert_transfer_count 1
+  [[ "$(awk '$1 == "broadcast" && $2 == 7 {n++} END {print n+0}' "$events")" == 1 ]] \
+    || fail 'repeated an already consumed request'
+  ! grep -Fq -- "$fixture_second" "$events" || fail 'attempted the next recipient after failed outgoing payment'
+)
+
+test_next_recipient_uses_receipt_floor_despite_cached_https_seqno() (
+  setup_case cached-counter-after-receipt
+  curl() {
+    local -a arguments=("$@")
+    [[ "${arguments[-1]}" == https://toncenter.com/api/v2/getWalletInformation ]] || fail 'unexpected cached-counter HTTP endpoint'
+    printf 'http-seqno 7 chain-seqno %s\n' "$(cat "$case_dir/seqno")" >>"$events"
+    printf '{"ok":true,"result":{"wallet":true,"account_state":"active","balance":"10000007883","seqno":7}}'
+  }
+  send_two >"$case_dir/out" 2>"$case_dir/err"
+  assert_transfer_count 2
+  assert_contains "fift 7 $fixture_first 4.000000000 -n" "$events"
+  assert_contains "fift 8 $fixture_second 4.000000000 -n" "$events"
+  assert_contains 'http-seqno 7 chain-seqno 8' "$events"
+  [[ "$(cat "$case_dir/seqno")" == 9 ]] || fail 'cached account counter caused reuse of a consumed sequence number'
+)
+
+test_invalid_send_mode_cannot_sign_stage_or_broadcast() (
+  local mode
+  for mode in invalid dry-run; do
+    setup_case "invalid-mode-$mode"
+    MODE="$mode"
+    assert_failed send_two
+    assert_transfer_count 0
+    [[ ! -e "$MAIN_WALLET_BUNDLE_DIR/.outbox/savings/state.json" ]] || fail 'invalid mode created a persistent payment plan'
+    ! grep -q '^broadcast \|^api-broadcast \|^fift-init$' "$events" || fail 'invalid mode submitted a message'
+  done
+)
+
+test_pending_corruption_during_confirmation_never_rebroadcasts() (
+  local timing original
+  for timing in before-receipt during-receipt; do
+    setup_case "confirmation-corruption-$timing"
+    printf unconfirmed >"$case_dir/behavior"
+    if [[ "$timing" == before-receipt ]]; then
+      original="$(declare -f wallet_outbox_receipts)"
+      eval "${original/wallet_outbox_receipts ()/fixture_outbox_receipts ()}"
+      wallet_outbox_receipts() {
+        local pending
+        pending="$(jq -er .pending.path "$WALLET_OUTBOX_DIR/state.json")" || return 1
+        printf 'corruption after initial broadcast\n' >>"$pending"
+        fixture_outbox_receipts
+      }
+    else
+      original="$(declare -f wallet_transaction_receipt)"
+      eval "${original/wallet_transaction_receipt ()/fixture_payment_receipt ()}"
+      wallet_transaction_receipt() {
+        local pending result rc=0
+        result="$(fixture_payment_receipt "$@")" || rc=$?
+        pending="$(jq -er .pending.path "$WALLET_OUTBOX_DIR/state.json")" || return 1
+        printf 'corruption during receipt query\n' >>"$pending"
+        [[ -z "$result" ]] || printf '%s' "$result"
+        return "$rc"
+      }
+    fi
+    assert_failed send_two
+    assert_transfer_count 1
+    [[ "$(awk '$1 == "broadcast" && $2 == 7 {n++} END {print n+0}' "$events")" == 1 ]] \
+      || fail 'rebroadcast a pending BOC after its checksum changed during confirmation'
+    ! grep -Fq -- "$fixture_second" "$events" || fail 'corrupted pending authorization reached a later recipient'
+  done
+)
+
+test_mismatched_api_network_never_signs_or_broadcasts() (
+  local endpoint
+  for endpoint in https://testnet.toncenter.com https://other.invalid https://toncenter.com.invalid; do
+    setup_case "wrong-api-${endpoint##*/}"
+    TONCENTER_URL="$endpoint"
+    MODE=auto
+    assert_failed send_two
+    assert_transfer_count 0
+    [[ ! -e "$MAIN_WALLET_BUNDLE_DIR/.outbox/savings/state.json" ]] || fail 'mismatched network created an outgoing plan'
+    ! grep -q '^broadcast \|^api-broadcast \|^fift-init$' "$events" || fail 'mismatched API network submitted a message'
+  done
+)
+
+test_direct_api_transport_rejects_wrong_network() (
+  setup_transport_case wrong-api-direct
+  TONCENTER_URL=https://testnet.toncenter.com
+  assert_failed send_boc_toncenter_once "$transport_boc"
+  ! grep -q '^transport-https$' "$events" || fail 'direct API transport broadcast to another network'
+)
+
 test_active_wallet_confirms_each_transfer
 test_funded_uninit_deploys_before_transfer
 test_rejected_transfer_stops_the_batch
@@ -540,5 +819,18 @@ test_failed_rpc_with_ack_is_not_successful_transport
 test_missing_rpc_ack_and_rejected_api_is_failure
 test_batch_recovers_missing_second_ack_via_api_before_next_recipient
 test_actual_liteclient_invocation_keeps_send_acknowledgement_visible
+test_acknowledged_but_not_included_transfer_rebroadcasts_identical_boc
+test_matching_receipt_resolves_lost_ack_without_resigning
+test_partial_batch_retry_resumes_pending_payload_without_repaying_first
+test_changed_unfinished_batch_is_rejected_without_new_payment
+test_corrupted_pending_payload_cannot_be_resent_or_resigned
+test_late_matching_receipt_resumes_without_duplicate_payment
+test_consumed_request_without_outgoing_payment_is_not_counted_as_paid
+test_next_recipient_uses_receipt_floor_despite_cached_https_seqno
+test_invalid_send_mode_cannot_sign_stage_or_broadcast
+test_pending_corruption_during_confirmation_never_rebroadcasts
 
-echo 'main wallet send tests passed (30 scenarios).'
+test_mismatched_api_network_never_signs_or_broadcasts
+test_direct_api_transport_rejects_wrong_network
+
+echo 'main wallet send tests passed (46 scenarios).'

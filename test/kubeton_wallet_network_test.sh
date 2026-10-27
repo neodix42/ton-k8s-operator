@@ -229,6 +229,9 @@ test_networkless_send_forms() (
   MAIN_WALLET_CONFIRM_ATTEMPTS=7
   MAIN_WALLET_CONFIRM_DELAY_SEC=1
   MAIN_WALLET_CONFIRM_TIMEOUT_SEC=19
+  MAIN_WALLET_HTTP_MIN_INTERVAL_MS=1234
+  MAIN_WALLET_REBROADCAST_DELAY_SEC=4
+  MAIN_WALLET_REBROADCAST_ATTEMPTS=2
   local flag
   for flag in '' -n; do
     local -a flags=()
@@ -241,6 +244,9 @@ test_networkless_send_forms() (
     assert_helper_env MAIN_WALLET_CONFIRM_ATTEMPTS 7
     assert_helper_env MAIN_WALLET_CONFIRM_DELAY_SEC 1
     assert_helper_env MAIN_WALLET_CONFIRM_TIMEOUT_SEC 19
+    assert_helper_env MAIN_WALLET_HTTP_MIN_INTERVAL_MS 1234
+    assert_helper_env MAIN_WALLET_REBROADCAST_DELAY_SEC 4
+    assert_helper_env MAIN_WALLET_REBROADCAST_ATTEMPTS 2
 
     run_wallet send savings tonnode-0 3.5 "${flags[@]}" >"$case_dir/pod${flag}"
     assert_helper_command send savings "$fixture_destination_address" 3.5 "${flags[@]}"
@@ -697,6 +703,9 @@ setup_main_wallet_case() {
   export TMPDIR="$case_dir"
   source "$repo_root/charts/ton-k8s-operator/main-wallet.sh"
   MAIN_WALLET_DIR="$case_dir/wallets"
+  MAIN_WALLET_BUNDLE_DIR="$case_dir/bundle"
+  MAIN_WALLET_HTTP_MIN_INTERVAL_MS=0
+  mkdir -p "$MAIN_WALLET_BUNDLE_DIR"
   WALLET_NETWORK=testnet
   GLOBAL_CONFIG_JSON="$testnet_config"
   GLOBAL_CONFIG_URL=/active/node/global.config.json
@@ -719,7 +728,16 @@ setup_main_wallet_case() {
     wallet_seqno_decimal "$2"
   }
   wallet_wait_for_seqno() { record confirmed-seqno "$@"; printf '%s' "$2"; }
-  send_single_transfer() { record send-transfer "$@"; }
+  send_single_transfer() {
+    record send-transfer "$@"
+    printf 'synthetic transfer, never broadcast\n' >"$MAIN_WALLET_DIR/fixture-transfer.boc"
+    wallet_outbox_stage "$WALLET_OUTBOX_INDEX" "$4" 1999999999 "$(printf '%064d' 4)" \
+      "$MAIN_WALLET_DIR/fixture-transfer.boc" "$2" "$(gram_amount_to_nano "$3")"
+  }
+  wallet_confirm_transfer() {
+    record confirmed-payment "$@"
+    printf 'fixture-transaction\t%s' "$4"
+  }
   write_wallet_fixture() {
     printf 'wallet_name=%s\nnetwork=%s\nwallet_address=%s\n' "$1" "$2" "$fixture_wallet_address" \
       >"$MAIN_WALLET_DIR/$1.wallet.meta"

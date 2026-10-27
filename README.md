@@ -401,8 +401,8 @@ inspection. If those stop requests fail, it leaves the operator paused and
 reports the need to check replica counts before resuming reconciliation. Remove
 the partial destination fleets before retrying.
 
-Bulk blockchain databases and `kubeton wallet`'s separate main-wallet bundle
-are excluded. TON must synchronize blockchain data on its fresh volumes.
+Bulk blockchain databases, `kubeton wallet`'s separate main-wallet bundle,
+and its outgoing-payment journal are excluded. TON must synchronize blockchain data on its fresh volumes.
 The restored TonNodes are created directly rather than owned by a Helm chart.
 Before using `kubeton start` for later changes, align destination
 `tonnode-values.yaml` (or `TON_VALUES_FILE`) with the restored names, namespace,
@@ -928,14 +928,40 @@ deploys the saved wallet contract first and waits for an active account before
 building the transfer. It checks that the deployment matches the existing key,
 workchain, wallet ID, and address.
 
-When distributing funds, each outgoing message must be accepted and the source
-wallet's on-chain seqno must advance before the next destination is attempted.
-A rejected or unconfirmed message stops the batch instead of guessing the next
-seqno. If confirmation times out, inspect `kubeton wallet show` and the wallet's
-transactions before retrying. Earlier recipients may already have been paid;
-send only to the remaining recipients rather than repeating the entire batch.
-Seqno advancement confirms that the source wallet consumed the request; check
-recipient balances when you need to confirm delivery.
+When distributing funds, each payment is verified against the source wallet's
+transaction history: the signed message body, destination and nanoTON amount
+must match an actual outgoing payment before the next recipient is attempted.
+A source seqno change or a lite-server acknowledgement alone is insufficient.
+Check recipient balances when you need to confirm final delivery.
+Receipt verification uses the matching TONCenter history endpoint in every
+transport mode; `liteserver` restricts broadcasting, while confirmation still
+requires HTTPS access to that endpoint.
+
+Before broadcasting, `wallet send` saves the exact signed message and the batch
+plan under `.outbox/<wallet-name>/` on the main-wallet bundle PVC. This journal
+contains public transaction data, has restricted file permissions, and contains
+no private keys. An exclusive source-wallet lock prevents concurrent kubeton
+send batches. Keep this directory with the PVC's encrypted wallet bundle.
+Recovery progress follows this PVC: `backup-fleet` excludes the main-wallet and
+its journal, and exporting a signing key does not preserve pending-payment
+history. A main-wallet PVC migration must retain the entire PVC while its
+helpers are stopped, preserve access to its Vault key, and start only one copy.
+
+If a new send is interrupted or confirmation times out, rerun **the same command**
+with the same recipients, amount and bounce option. It resumes the unfinished
+batch, checks receipts again, skips confirmed payments, and rebroadcasts the same
+signed bytes. A different unfinished plan is rejected. An expired message can
+be renewed only after a pinned post-expiry chain query reports its original
+seqno unchanged; the replacement retains that seqno, recipient and amount.
+Unavailable or inconsistent receipts stop the batch with its progress retained.
+Transaction-history lookup checks the latest 100 source transactions; an old
+batch displaced by heavy unrelated activity may require manual inspection.
+
+A completed batch is a completed payment instruction: running it again creates
+a new payment. Sends made by older releases without this journal cannot be
+resumed automatically; check their source transactions and recipient balances
+before constructing another payment.
+
 After topping up mytonctrl wallets inside TON pods with split mode, for example
 `kubeton wallet send main-wallet 2`, activate those pod wallets with
 `kubeton wallet activate [tonnode-name] [wallet-name]`. The
@@ -983,9 +1009,21 @@ attempts.
 For sendfile, a successful lite-client exit code alone is not an acceptance
 acknowledgement. The command requires `external message status is 1`; an RPC
 failure or missing acknowledgement uses the configured fallback with the same
-signed message. It then checks the on-chain seqno before building another
-transfer. Main-wallet balance and seqno queries can also use the matching
-TONCenter wallet information endpoint when lite-client reads fail.
+signed message. An acknowledgement still requires transaction verification.
+In `auto` mode, a missing receipt after 10 seconds also triggers rebroadcast of
+the **same** signed message through TONCenter, even if a lite-server acknowledged
+it. Each payment has a 180-second confirmation budget; HTTP and lite-client
+requests, retries and delays respect the remaining budget.
+
+Main-wallet account queries prefer the matching network's HTTPS endpoint,
+pace anonymous requests, and retry transient rate-limit/server failures.
+Successful payment receipts establish a minimum next seqno so an older cached
+wallet-information response cannot reuse an already consumed counter. Failed
+queries remain unknown. The helper's default completion deadline grows with
+the recipient count; an explicit `MAIN_WALLET_POD_TIMEOUT` takes precedence.
+`MAIN_WALLET_CONFIRM_TIMEOUT_SEC`, `MAIN_WALLET_REBROADCAST_DELAY_SEC`,
+`MAIN_WALLET_REBROADCAST_ATTEMPTS` and `MAIN_WALLET_HTTP_MIN_INTERVAL_MS` control
+the confirmation and retry limits.
 Pod wallet state checks first use HTTPS from the machine running `kubeton`.
 The active `global.config.json` zero-state identity selects TONCenter mainnet
 or testnet, so queries do not depend on each pod's outbound lite-server
@@ -1123,6 +1161,9 @@ MAIN_WALLET_SEND_RETRY_DELAY_SEC
 MAIN_WALLET_CONFIRM_ATTEMPTS
 MAIN_WALLET_CONFIRM_DELAY_SEC
 MAIN_WALLET_CONFIRM_TIMEOUT_SEC
+MAIN_WALLET_HTTP_MIN_INTERVAL_MS
+MAIN_WALLET_REBROADCAST_DELAY_SEC
+MAIN_WALLET_REBROADCAST_ATTEMPTS
 MAIN_WALLET_POD_TIMEOUT
 MAIN_WALLET_RUNTIME_TMPFS_SIZE
 WALLET_QUERY_ATTEMPTS
@@ -1716,10 +1757,16 @@ If you use `local-path` StorageClass:
 Use this workflow for local development from this repository.  
 Production deployments should use release artifacts/charts, not this dev-repo flow.
 
-There are three different test environments:
+The test environments cover different behavior:
 
 - `make test-kubeton` runs CLI regression tests with synthetic files and mocked
   Kubernetes calls. It does not start containers or modify a Kubernetes cluster.
+- `make test-main-wallet-runtime` uses the published TON Docker image with real
+  Fift signing and synthetic keys on temporary container filesystems. Network
+  access is disabled and only RPC/HTTP responses are mocked. It checks ACK
+  without inclusion, identical-message rebroadcast, exact payment receipts and
+  sequential sends. Docker is required; `TON_RUNTIME_TEST_IMAGE` overrides the
+  default image. It neither starts Kubernetes nor sends a real transaction.
 - `make test` also runs Go unit tests and `envtest`, which starts local
   `kube-apiserver` and `etcd` processes. This checks Kubernetes API behavior but
   does not run a scheduler, kubelet, or application containers.

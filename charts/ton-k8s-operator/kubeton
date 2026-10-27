@@ -182,9 +182,14 @@ MAIN_WALLET_TONCENTER_SEND_ATTEMPTS="${MAIN_WALLET_TONCENTER_SEND_ATTEMPTS:-$MAI
 MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
 MAIN_WALLET_CONFIRM_ATTEMPTS="${MAIN_WALLET_CONFIRM_ATTEMPTS:-30}"
 MAIN_WALLET_CONFIRM_DELAY_SEC="${MAIN_WALLET_CONFIRM_DELAY_SEC:-2}"
-MAIN_WALLET_CONFIRM_TIMEOUT_SEC="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-60}"
+MAIN_WALLET_CONFIRM_TIMEOUT_SEC="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-180}"
+MAIN_WALLET_HTTP_MIN_INTERVAL_MS="${MAIN_WALLET_HTTP_MIN_INTERVAL_MS:-1100}"
+MAIN_WALLET_REBROADCAST_DELAY_SEC="${MAIN_WALLET_REBROADCAST_DELAY_SEC:-10}"
+MAIN_WALLET_REBROADCAST_ATTEMPTS="${MAIN_WALLET_REBROADCAST_ATTEMPTS:-3}"
 MAIN_WALLET_TARGET_WALLET_NAME="${MAIN_WALLET_TARGET_WALLET_NAME:-validator_wallet_001}"
-MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-900s}"
+# An unset timeout permits a larger budget for multi-recipient sends. Preserve
+# explicit user values, including an explicit 900s, without silently extending.
+MAIN_WALLET_POD_TIMEOUT="${MAIN_WALLET_POD_TIMEOUT:-}"
 MAIN_WALLET_RUNTIME_TMPFS_SIZE="${MAIN_WALLET_RUNTIME_TMPFS_SIZE:-512Mi}"
 
 declare -a KUBETON_NODE_CHECK_COMPATIBLE_NODES=()
@@ -19811,11 +19816,23 @@ ensure_start_victoria_metrics() {
 }
 
 main_wallet_timeout_seconds() {
-  local raw
-  raw="$(trim_whitespace "${MAIN_WALLET_POD_TIMEOUT:-900s}")"
+  local action="${1:-}" recipients="${2:-1}" raw confirm_timeout budget
+  raw="$(trim_whitespace "${MAIN_WALLET_POD_TIMEOUT:-}")"
   if [[ "$raw" =~ ^([0-9]+)s?$ ]]; then
     printf '%s' "${BASH_REMATCH[1]}"
     return 0
+  fi
+  if [[ -z "$raw" && "$action" == send ]]; then
+    [[ "$recipients" =~ ^[1-9][0-9]{0,5}$ ]] || recipients=1
+    confirm_timeout="$(trim_whitespace "${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-180}")"
+    [[ "$confirm_timeout" =~ ^[1-9][0-9]{0,5}$ ]] || confirm_timeout=180
+    # Reserve confirmation/transport for each payment and optional initial
+    # deployment, plus helper startup, durable writes and encrypted backup.
+    budget=$(( (recipients + 1) * (confirm_timeout + 60) + 120 ))
+    if (( budget > 900 )); then
+      printf '%s' "$budget"
+      return 0
+    fi
   fi
   printf '%s' "900"
 }
@@ -20649,7 +20666,7 @@ run_wallet() {
     global_config_url="/var/ton-work/controller/global.config.json"
   fi
   toncenter_url="$(resolve_main_wallet_toncenter_url "$wallet_network")"
-  timeout_seconds="$(main_wallet_timeout_seconds)"
+  timeout_seconds="$(main_wallet_timeout_seconds "$action" "${#destination_addresses[@]}")"
 
   pod_name="kubeton-main-wallet-$RANDOM-$RANDOM"
 
@@ -20714,6 +20731,12 @@ run_wallet() {
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_CONFIRM_DELAY_SEC")"
     echo "        - name: MAIN_WALLET_CONFIRM_TIMEOUT_SEC"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_CONFIRM_TIMEOUT_SEC")"
+    echo "        - name: MAIN_WALLET_HTTP_MIN_INTERVAL_MS"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_HTTP_MIN_INTERVAL_MS")"
+    echo "        - name: MAIN_WALLET_REBROADCAST_DELAY_SEC"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_REBROADCAST_DELAY_SEC")"
+    echo "        - name: MAIN_WALLET_REBROADCAST_ATTEMPTS"
+    printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_REBROADCAST_ATTEMPTS")"
     echo "        - name: MAIN_WALLET_NAME_DEFAULT"
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_NAME")"
     echo "        - name: MAIN_WALLET_DIR"

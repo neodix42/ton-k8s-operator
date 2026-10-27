@@ -12,6 +12,10 @@ setup_case() {
   case_dir="$test_dir/$1"
   mkdir -p "$case_dir"
   source "$helper"
+  MAIN_WALLET_DIR="$case_dir/runtime"
+  MAIN_WALLET_BUNDLE_DIR="$case_dir/bundle"
+  MAIN_WALLET_HTTP_MIN_INTERVAL_MS=0
+  mkdir -p "$MAIN_WALLET_DIR" "$MAIN_WALLET_BUNDLE_DIR"
   WALLET_NETWORK=mainnet
   MAIN_WALLET_SEND_RETRY_ATTEMPTS=1
   MAIN_WALLET_SEND_RETRY_DELAY_SEC=0
@@ -194,9 +198,11 @@ setup_http_case() {
   account_rc=1
   method_rc=1
   api_rc=0
+  api_http_code=200
+  api_retry_after=0
   api_response='{"ok":true,"result":{"wallet":false,"account_state":"uninitialized","balance":"10000007883"}}'
   curl() {
-    local got_address=0 got_get=0 endpoint="" argument
+    local got_address=0 got_get=0 endpoint="" argument headers=""
     while (( $# > 0 )); do
       argument="$1"
       shift
@@ -207,6 +213,7 @@ setup_http_case() {
           shift
           ;;
         --get) got_get=1 ;;
+        --dump-header) headers="${1:-}"; [[ -n "$headers" ]] || fail 'missing response header path'; shift ;;
         --data-urlencode)
           [[ "${1:-}" == "address=$fixture_address" ]] || fail 'wrong account in API query'
           got_address=1
@@ -224,6 +231,9 @@ setup_http_case() {
     done
     [[ "$got_get" == 1 && "$got_address" == 1 && -n "$endpoint" ]] || fail 'unexpected API request shape'
     printf 'https %s\n' "$endpoint" >>"$case_dir/queries"
+    if [[ -n "$headers" ]]; then
+      printf 'HTTP/1.1 %s Synthetic\r\nRetry-After: %s\r\n\r\n' "$api_http_code" "$api_retry_after" >"$headers"
+    fi
     printf '%s\n' "$api_response"
     return "$api_rc"
   }
@@ -262,6 +272,8 @@ test_invalid_https_account_payload_is_not_zero() (
   setup_http_case https-invalid
   for api_response in \
     '{"ok":false,"result":{"account_state":"uninitialized","balance":"10000007883"}}' \
+    '{"ok":false,"nested":{"ok":true},"result":{"account_state":"uninitialized","balance":"10000007883"}}' \
+    $'{"ok":false}\n{"ok":true,"result":{"account_state":"uninitialized","balance":"10000007883"}}' \
     '{"ok":true,"result":{"account_state":"uninitialized"}}' \
     '{"ok":true,"result":{"account_state":"unexpected","balance":"0"}}' \
     '{"ok":true,"result":{"account_state":"uninitialized","balance":"unknown"}}' \
@@ -340,6 +352,121 @@ test_frozen_account_data_cannot_supply_seqno() (
   assert_query_failure wallet_seqno_decimal
 )
 
+test_confirmation_uses_fresh_https_before_stale_udp() (
+  setup_http_case confirmation-https-first
+  MAIN_WALLET_CONFIRM_ATTEMPTS=2
+  MAIN_WALLET_CONFIRM_DELAY_SEC=0
+  MAIN_WALLET_CONFIRM_TIMEOUT_SEC=2
+  method_output='result: [ 18 ]'
+  method_rc=0
+  account_rc=0
+  account_output=$'state:account_active\n data:x{000000120000002A}'
+  api_response='{"ok":true,"result":{"wallet":true,"account_state":"active","balance":"10000000000","seqno":19}}'
+  [[ "$(wallet_wait_for_seqno "$fixture_address" 19 2>"$case_dir/stderr")" == 19 ]] \
+    || fail 'fresh HTTPS confirmation was blocked by a stale UDP seqno'
+  grep -Fq 'https https://toncenter.com/api/v2/getWalletInformation' "$case_dir/queries" \
+    || fail 'confirmation did not query HTTPS account information'
+  ! grep -q '^runmethod\|^getaccount' "$case_dir/queries" \
+    || fail 'successful HTTPS confirmation unnecessarily queried the UDP boundary'
+)
+
+test_confirmation_recovers_after_https_rate_limit() (
+  setup_http_case confirmation-rate-limit
+  MAIN_WALLET_CONFIRM_ATTEMPTS=3
+  MAIN_WALLET_CONFIRM_DELAY_SEC=0
+  MAIN_WALLET_CONFIRM_TIMEOUT_SEC=4
+  local fixture_http
+  fixture_http="$(declare -f curl)"
+  eval "${fixture_http/curl ()/fixture_http_request ()}"
+  curl() {
+    local previous
+    previous="$(awk '$1 == "https" {n++} END {print n+0}' "$case_dir/queries")"
+    if [[ "$previous" == 0 ]]; then
+      api_rc=22
+      api_http_code=429
+      api_response='{"ok":false,"error":"Ratelimit exceeded","code":429}'
+    else
+      api_rc=0
+      api_http_code=200
+      api_response='{"ok":true,"result":{"wallet":true,"account_state":"active","balance":"10000000000","seqno":19}}'
+    fi
+    fixture_http_request "$@"
+  }
+  [[ "$(wallet_wait_for_seqno "$fixture_address" 19 2>"$case_dir/stderr")" == 19 ]] \
+    || fail 'transient HTTPS rate limit prevented later confirmed account state'
+  [[ "$(awk '$1 == "https" {n++} END {print n+0}' "$case_dir/queries")" -ge 2 ]] \
+    || fail 'rate-limited account query was not retried'
+  ! grep -q '^runmethod\|^getaccount' "$case_dir/queries" \
+    || fail 'transient rate limit bypassed the bounded HTTPS retry'
+)
+
+test_confirmation_deadline_bounds_real_query_processes() (
+  setup_case confirmation-budget
+  python3 - "$helper" "$case_dir" <<'PY'
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+helper = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+binary = root / "bin"
+binary.mkdir()
+fixture = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+kind = pathlib.Path(sys.argv[0]).name
+args = sys.argv[1:]
+flag = "--max-time" if kind == "curl" else "-t"
+limit = float(args[args.index(flag) + 1]) if flag in args else 999
+with open(os.environ["BUDGET_EVENTS"], "a") as target:
+    target.write(json.dumps({"kind": kind, "limit": limit}) + "\n")
+# Model a network process that consumes its entire requested timeout. Long
+# calls cap at three seconds so a regression is quick and deterministic.
+time.sleep(min(limit, 3))
+sys.exit(28 if kind == "curl" else 1)
+'''
+for name in ("curl", "lite-client"):
+    path = binary / name
+    path.write_text(fixture)
+    path.chmod(0o755)
+events = root / "process-events.jsonl"
+body = r'''
+source "$1"
+WALLET_NETWORK=mainnet
+TONCENTER_URL=https://toncenter.com
+GLOBAL_CONFIG_JSON='{"synthetic_active_network_config":true}'
+MAIN_WALLET_SEND_RETRY_ATTEMPTS=2
+MAIN_WALLET_SEND_RETRY_DELAY_SEC=0
+MAIN_WALLET_CONFIRM_ATTEMPTS=30
+MAIN_WALLET_CONFIRM_DELAY_SEC=0
+MAIN_WALLET_CONFIRM_TIMEOUT_SEC=1
+resolve_lite_client_bin() { printf '%s/lite-client' "$BUDGET_BIN"; }
+wallet_wait_for_seqno "0:$(printf '%064d' 1)" 19
+'''
+env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+           BUDGET_BIN=str(binary), BUDGET_EVENTS=str(events))
+started = time.monotonic()
+process = subprocess.Popen(["bash", "-euo", "pipefail", "-c", body, "_", str(helper)],
+                           env=env, text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, start_new_session=True)
+try:
+    stdout, stderr = process.communicate(timeout=2.5)
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGKILL)
+    process.communicate()
+    raise AssertionError("a query process exceeded the one-second confirmation budget")
+elapsed = time.monotonic() - started
+assert process.returncode != 0 and not stdout.strip(), (process.returncode, stdout, stderr)
+assert elapsed < 2.5, elapsed
+records = [json.loads(line) for line in events.read_text().splitlines()]
+assert records, "confirmation did not exercise a real query subprocess"
+assert all(0 < row["limit"] <= 1 for row in records), records
+PY
+)
+
 test_empty_account
 test_empty_account_crlf
 test_legacy_empty_account
@@ -365,5 +492,8 @@ test_frozen_https_is_not_undeployed
 test_https_uses_active_network_only
 test_seqno_stack_requires_exact_uint32
 test_frozen_account_data_cannot_supply_seqno
+test_confirmation_uses_fresh_https_before_stale_udp
+test_confirmation_recovers_after_https_rate_limit
+test_confirmation_deadline_bounds_real_query_processes
 
-echo 'kubeton wallet chain query tests passed (25 cases).'
+echo 'kubeton wallet chain query tests passed (28 cases).'

@@ -21,7 +21,10 @@ MAIN_WALLET_SEND_RETRY_DELAY_SEC="${MAIN_WALLET_SEND_RETRY_DELAY_SEC:-3}"
 MAIN_WALLET_MULTI_SEND_PAUSE_SEC="${MAIN_WALLET_MULTI_SEND_PAUSE_SEC:-3}"
 MAIN_WALLET_CONFIRM_ATTEMPTS="${MAIN_WALLET_CONFIRM_ATTEMPTS:-30}"
 MAIN_WALLET_CONFIRM_DELAY_SEC="${MAIN_WALLET_CONFIRM_DELAY_SEC:-2}"
-MAIN_WALLET_CONFIRM_TIMEOUT_SEC="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-60}"
+MAIN_WALLET_CONFIRM_TIMEOUT_SEC="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-180}"
+MAIN_WALLET_HTTP_MIN_INTERVAL_MS="${MAIN_WALLET_HTTP_MIN_INTERVAL_MS:-1100}"
+MAIN_WALLET_REBROADCAST_DELAY_SEC="${MAIN_WALLET_REBROADCAST_DELAY_SEC:-10}"
+MAIN_WALLET_REBROADCAST_ATTEMPTS="${MAIN_WALLET_REBROADCAST_ATTEMPTS:-3}"
 
 usage() {
   cat <<'EOF'
@@ -618,7 +621,7 @@ toncenter_endpoint() {
 
 send_boc_toncenter_once() {
   local boc_file="$1"
-  local boc_b64 http_response http_code response curl_args=()
+  local boc_b64 http_response http_code response timeout connect curl_args=()
 
   require_bin curl
   require_bin base64
@@ -626,13 +629,20 @@ send_boc_toncenter_once() {
     echo "Error: TONCENTER_URL is empty." >&2
     return 1
   fi
+  wallet_toncenter_base >/dev/null || {
+    echo 'Error: refusing to broadcast through a TONCenter endpoint that does not match the active wallet network.' >&2
+    return 1
+  }
   if [[ -n "$TONCENTER_API_KEY" ]]; then
     curl_args+=(-H "X-API-Key: ${TONCENTER_API_KEY}")
   fi
 
   boc_b64="$(base64 -w0 "$boc_file" 2>/dev/null || base64 < "$boc_file" | tr -d '\r\n')"
+  wallet_http_pace || return 1
+  timeout="$(wallet_request_timeout 15)" || return 1
+  connect="$timeout"; (( connect <= 5 )) || connect=5
   if http_response="$(curl -sS \
-    --connect-timeout 5 --max-time 15 \
+    --connect-timeout "$connect" --max-time "$timeout" \
     -w $'\n%{http_code}' \
     "${curl_args[@]}" \
     -H "Content-Type: application/json" \
@@ -677,7 +687,7 @@ send_boc_toncenter() {
     if (( attempt < attempts )); then
       echo "Warning: TONCenter sendBoc failed (attempt ${attempt}/${attempts}); retrying..." >&2
       if (( delay > 0 )); then
-        sleep "$delay"
+        wallet_bounded_sleep "$delay" || break
       fi
     fi
   done
@@ -707,7 +717,9 @@ resolve_local_global_config_path() {
     require_bin curl
     require_bin mktemp
     temp_config_file="$(mktemp)"
-    if ! curl -fsSL "$global_config_source" -o "$temp_config_file"; then
+    local timeout
+    timeout="$(wallet_request_timeout 15)" || { rm -f "$temp_config_file"; return 1; }
+    if ! curl -fsSL --connect-timeout "$timeout" --max-time "$timeout" "$global_config_source" -o "$temp_config_file"; then
       rm -f "$temp_config_file"
       echo "Error: failed to download global config from ${global_config_source}" >&2
       return 1
@@ -748,7 +760,7 @@ warn_liteserver_toncenter_network_mismatch() {
 run_liteclient_query() {
   local query="$1"
   local lite_client_bin
-  local config_row config_path temp_config_path rc=0 verbosity=0
+  local config_row config_path temp_config_path rc=0 verbosity=0 timeout
 
   lite_client_bin="$(resolve_lite_client_bin || true)"
   lite_client_bin="$(trim_whitespace "$lite_client_bin")"
@@ -776,7 +788,11 @@ run_liteclient_query() {
 
   # Bound each batch query as well as the confirmation loop. An unreachable
   # liteserver must not keep a wallet helper alive indefinitely.
-  if "$lite_client_bin" -C "$config_path" -v "$verbosity" -t 15 -c "$query"; then
+  if ! timeout="$(wallet_request_timeout 15)"; then
+    [[ -z "$temp_config_path" ]] || rm -f "$temp_config_path"
+    return 1
+  fi
+  if "$lite_client_bin" -C "$config_path" -v "$verbosity" -t "$timeout" -c "$query"; then
     rc=0
   else
     rc=$?
@@ -812,7 +828,7 @@ send_boc_liteserver() {
     if (( attempt < attempts )); then
       echo "Warning: lite-client sendfile failed (attempt ${attempt}/${attempts}); retrying..." >&2
       if (( delay > 0 )); then
-        sleep "$delay"
+        wallet_bounded_sleep "$delay" || break
       fi
     fi
   done
@@ -1421,21 +1437,100 @@ main_wallet_version_by_name() {
 
 # The official runtime image includes jq. Keep HTTPS reads tied to the active
 # fleet network; a saved wallet label or an unrelated API must not supply seqno.
-wallet_toncenter_information() {
-  local wallet_address="$1" network endpoint response
-  local -a curl_args=()
+wallet_request_timeout() {
+  local maximum="${1:-15}" remaining
+  if [[ -n "${WALLET_QUERY_DEADLINE:-}" ]]; then
+    remaining=$((WALLET_QUERY_DEADLINE - $(date +%s)))
+    (( remaining > 0 )) || return 1
+    (( maximum <= remaining )) || maximum="$remaining"
+  fi
+  printf '%s' "$maximum"
+}
+
+wallet_bounded_sleep() {
+  local seconds="$1" remaining
+  if [[ -n "${WALLET_QUERY_DEADLINE:-}" ]]; then
+    remaining=$((WALLET_QUERY_DEADLINE - $(date +%s)))
+    (( remaining > 0 )) || return 1
+    (( seconds <= remaining )) || seconds="$remaining"
+  fi
+  (( seconds == 0 )) || sleep "$seconds"
+}
+
+wallet_toncenter_base() {
+  local network
   network="$(resolve_current_wallet_network)" || return 1
   case "${TONCENTER_URL%/}" in
     https://toncenter.com) [[ "$network" == mainnet ]] || return 1 ;;
     https://testnet.toncenter.com) [[ "$network" == testnet ]] || return 1 ;;
     *) return 1 ;;
   esac
+  printf '%s/api/v2' "${TONCENTER_URL%/}"
+}
+
+# Keep anonymous requests below TONCenter's one-request-per-second limit,
+# including across command substitutions. This file contains only a timestamp.
+wallet_http_pace() {
+  local interval="${MAIN_WALLET_HTTP_MIN_INTERVAL_MS:-1100}" now previous=0 wait_ms remaining
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=1100
+  (( interval > 0 )) && [[ -d "$MAIN_WALLET_DIR" ]] || return 0
+  now="$(date +%s%3N)" || return 1
+  if [[ -f "$MAIN_WALLET_DIR/.http-last-call" ]]; then
+    read -r previous <"$MAIN_WALLET_DIR/.http-last-call" || previous=0
+    [[ "$previous" =~ ^[0-9]+$ ]] || previous=0
+  fi
+  wait_ms=$((previous + interval - now))
+  if (( wait_ms > 0 )); then
+    if [[ -n "${WALLET_QUERY_DEADLINE:-}" ]]; then
+      remaining=$((WALLET_QUERY_DEADLINE * 1000 - now))
+      (( wait_ms < remaining )) || return 1
+    fi
+    sleep "$(printf '%d.%03d' "$((wait_ms / 1000))" "$((wait_ms % 1000))")" || return 1
+  fi
+  date +%s%3N >"$MAIN_WALLET_DIR/.http-last-call"
+}
+
+wallet_toncenter_get() (
+  local method="$1" base parameter response headers timeout connect attempt code curl_rc retry_after=1
+  shift
+  local WALLET_QUERY_DEADLINE="${WALLET_QUERY_DEADLINE:-$(($(date +%s) + 15))}"
+  local -a curl_args=()
+  base="$(wallet_toncenter_base)" || return 1
+  [[ "$method" =~ ^[A-Za-z]+$ ]] || return 1
+  [[ -z "$TONCENTER_API_KEY" ]] || curl_args+=(-H "X-API-Key: ${TONCENTER_API_KEY}")
+  for parameter in "$@"; do curl_args+=(--data-urlencode "$parameter"); done
+  headers="$(mktemp)" || return 1
+  trap 'rm -f "$headers"' EXIT
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    wallet_http_pace || return 1
+    timeout="$(wallet_request_timeout 15)" || return 1
+    connect="$timeout"; (( connect <= 5 )) || connect=5
+    : >"$headers"
+    if response="$(curl -fsS --connect-timeout "$connect" --max-time "$timeout" \
+      --dump-header "$headers" --get "${curl_args[@]}" "$base/$method")"; then
+      printf '%s' "$response"
+      return 0
+    else
+      curl_rc=$?
+    fi
+    code="$(awk '/^HTTP\// {code=$2} END {print code}' "$headers")"
+    case "$code" in
+      '') case "$curl_rc" in 6|7|28|52|56) ;; *) return 1 ;; esac ;;
+      429|5??) ;;
+      *) return 1 ;;
+    esac
+    retry_after="$(awk 'tolower($1)=="retry-after:" {gsub("\r", "", $2); print $2}' "$headers" | tail -n1)"
+    [[ "$retry_after" =~ ^[0-9]{1,3}$ ]] || retry_after=1
+    (( attempt == 3 )) || wallet_bounded_sleep "$retry_after" || return 1
+  done
+  return 1
+)
+
+wallet_toncenter_information() {
+  local wallet_address="$1" response
   command -v jq >/dev/null 2>&1 || return 1
   [[ "$wallet_address" =~ ^-?[0-9]+:[0-9A-Fa-f]{64}$ ]] || return 1
-  [[ -z "$TONCENTER_API_KEY" ]] || curl_args+=(-H "X-API-Key: ${TONCENTER_API_KEY}")
-  endpoint="${TONCENTER_URL%/}/api/v2/getWalletInformation"
-  response="$(curl -fsS --connect-timeout 5 --max-time 15 "${curl_args[@]}" \
-    --get --data-urlencode "address=${wallet_address}" "$endpoint")" || return 1
+  response="$(wallet_toncenter_get getWalletInformation "address=${wallet_address}")" || return 1
   printf '%s' "$response" | jq -ers '
     select(length == 1) | .[0] |
     select(.ok == true and (.result | type) == "object") | .result |
@@ -1447,6 +1542,132 @@ wallet_toncenter_information() {
         and .seqno >= 0 and .seqno <= 4294967295 and .seqno == (.seqno | floor)
         then (.seqno | tostring) else "unknown" end) as $seqno |
     [$state, $balance, $seqno] | @tsv'
+}
+
+# Hash the signed external-message body cell, rather than the BOC file bytes.
+# TONCenter exposes this exact hash as in_msg.body_hash, independent of whether
+# the message body or its StateInit was stored inline or in a reference.
+wallet_message_body_hash() (
+  local boc_file="$1" fift_bin script_file body_hash
+  [[ -s "$boc_file" ]] || return 1
+  fift_bin="$(resolve_fift_bin)" || return 1
+  script_file="$(mktemp "$MAIN_WALLET_DIR/.wallet-body-hash.XXXXXX.fif")" || return 1
+  trap 'rm -f "$script_file"' EXIT
+  cat >"$script_file" <<'FIF'
+"TonUtil.fif" include
+{ 1 u@+ swap { ref@+ drop } if } : skip-maybe-ref
+{ 1 u@+ swap { 5 u@+ nip } if
+  1 u@+ swap { 2 u@+ nip } if
+  skip-maybe-ref skip-maybe-ref skip-maybe-ref
+} : skip-inline-stateinit
+$1 file>B B>boc <s
+7 u@+ swap 68 <> abort"unsupported external message header"
+8 u@+ nip 256 u@+ nip
+Gram@+ swap 0<> abort"nonzero import fee"
+1 u@+ swap {
+  1 u@+ swap { ref@+ drop } { skip-inline-stateinit } cond
+} if
+1 u@+ swap { ref@ } { s>c } cond
+hashu 256 u>B B>base64 type cr
+FIF
+  body_hash="$(FIFTPATH="${FIFTPATH:-/usr/lib/fift:/usr/share/ton/smartcont/}" \
+    "$fift_bin" -s "$script_file" "$boc_file" 2>/dev/null)" || return 1
+  [[ "$body_hash" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+  printf '%s' "$body_hash"
+)
+
+# Return 0 with LT<TAB>transaction-hash only for this exact signed request and
+# its expected outgoing payment. 10 means it is not present in the returned
+# history yet; 11 means it was consumed without that outgoing payment. Neither
+# API failure nor a missing/cached receipt establishes that a transfer failed.
+wallet_transaction_receipt() {
+  local source_address="$1" body_hash="$2" destination_address="$3" amount_nano="$4"
+  local network response matches transaction_count index transaction source actual_destination
+  local lt transaction_hash outgoing output_source output_destination output_value output_lines
+  source_address="$(ton_address_to_hex "$source_address")" || return 1
+  destination_address="$(ton_address_to_hex "$destination_address")" || return 1
+  [[ "$body_hash" =~ ^[A-Za-z0-9+/]{43}=$ && "$amount_nano" =~ ^[0-9]+$ ]] || return 1
+  network="$(resolve_current_wallet_network)" || return 1
+  case "${TONCENTER_URL%/}" in
+    https://toncenter.com) [[ "$network" == mainnet ]] || return 1 ;;
+    https://testnet.toncenter.com) [[ "$network" == testnet ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  response="$(wallet_toncenter_get getTransactions "address=${source_address}" 'limit=100')" || return 1
+  matches="$(printf '%s' "$response" | jq -ecs --arg body_hash "$body_hash" '
+    select(length == 1) | .[0] |
+    select(.ok == true and (.result | type) == "array") |
+    [.result[] | select(.in_msg.body_hash == $body_hash and .in_msg.source == "")]
+  ')" || return 1
+  transaction_count="$(printf '%s' "$matches" | jq -r length)" || return 1
+  (( transaction_count > 0 )) || return 10
+  for ((index = 0; index < transaction_count; index++)); do
+    transaction="$(printf '%s' "$matches" | jq -ec --argjson index "$index" '.[$index] |
+      select((.in_msg.destination | type) == "string" and (.out_msgs | type) == "array"
+        and (.transaction_id.lt | type) == "string" and (.transaction_id.lt | test("^[0-9]+$"))
+        and (.transaction_id.hash | type) == "string" and (.transaction_id.hash | test("^[A-Za-z0-9+/]{43}=$"))
+        and all(.out_msgs[]; (.source | type) == "string" and (.destination | type) == "string"
+          and (.value | type) == "string" and (.value | test("^[0-9]+$"))))')" || return 1
+    actual_destination="$(printf '%s' "$transaction" | jq -r '.in_msg.destination')" || return 1
+    actual_destination="$(ton_address_to_hex "$actual_destination")" || return 1
+    [[ "$actual_destination" == "$source_address" ]] || return 1
+    if printf '%s' "$transaction" | jq -e '.aborted == true or .description.aborted == true' >/dev/null; then
+      return 11
+    fi
+    output_lines="$(printf '%s' "$transaction" | jq -er '
+      [.out_msgs[] | [.source, .destination, .value] | @tsv] | join("\n")')" || return 1
+    while IFS=$'\t' read -r output_source output_destination output_value; do
+      [[ -n "$output_source" ]] || continue
+      [[ "$output_value" =~ ^[0-9]+$ ]] || return 1
+      source="$(ton_address_to_hex "$output_source")" || return 1
+      outgoing="$(ton_address_to_hex "$output_destination")" || return 1
+      [[ "$source" == "$source_address" && "$outgoing" == "$destination_address" && "$output_value" == "$amount_nano" ]] || continue
+      lt="$(printf '%s' "$transaction" | jq -r '.transaction_id.lt')" || return 1
+      transaction_hash="$(printf '%s' "$transaction" | jq -r '.transaction_id.hash')" || return 1
+      printf '%s\t%s' "$lt" "$transaction_hash"
+      return 0
+    done <<<"$output_lines"
+  done
+  return 11
+}
+
+# Before replacing an expired signed request, pin both the clock observation
+# and the unchanged wallet counter to the same masterchain snapshot. The
+# replacement must retain the original seqno, destination and amount.
+wallet_expired_message_unconsumed() {
+  local source_address="$1" old_seqno="$2" expiry="$3"
+  local info block block_seqno root_hash file_hash header block_time wallet
+  source_address="$(ton_address_to_hex "$source_address")" || return 1
+  [[ "$old_seqno" =~ ^[0-9]{1,10}$ && "$expiry" =~ ^[0-9]{1,10}$ ]] || return 1
+  (( 10#$old_seqno <= 4294967295 && 10#$expiry <= 4294967295 )) || return 1
+  old_seqno="$((10#$old_seqno))"
+  expiry="$((10#$expiry))"
+  info="$(wallet_toncenter_get getMasterchainInfo)" || return 1
+  block="$(printf '%s' "$info" | jq -ers '
+    select(length == 1) | .[0] | select(.ok == true) | .result.last |
+    select(.workchain == -1 and (.shard | tostring) == "-9223372036854775808"
+      and (.seqno | type) == "number" and .seqno > 0 and .seqno <= 4294967295
+      and .seqno == (.seqno | floor)
+      and (.root_hash | type) == "string" and (.root_hash | test("^[A-Za-z0-9+/]{43}=$"))
+      and (.file_hash | type) == "string" and (.file_hash | test("^[A-Za-z0-9+/]{43}=$"))) |
+    [.seqno, .root_hash, .file_hash] | @tsv')" || return 1
+  IFS=$'\t' read -r block_seqno root_hash file_hash <<<"$block"
+  header="$(wallet_toncenter_get getBlockHeader 'workchain=-1' 'shard=-9223372036854775808' \
+    "seqno=${block_seqno}" "root_hash=${root_hash}" "file_hash=${file_hash}")" || return 1
+  block_time="$(printf '%s' "$header" | jq -ers --argjson seqno "$block_seqno" --arg root_hash "$root_hash" --arg file_hash "$file_hash" '
+    select(length == 1) | .[0] | select(.ok == true) | .result |
+    select(.id.workchain == -1 and (.id.shard | tostring) == "-9223372036854775808"
+      and .id.seqno == $seqno and .id.root_hash == $root_hash and .id.file_hash == $file_hash
+      and (.gen_utime | type) == "number" and .gen_utime >= 0 and .gen_utime <= 4294967295
+      and .gen_utime == (.gen_utime | floor)) | .gen_utime')" || return 1
+  (( block_time > expiry + 10 )) || return 1
+  wallet="$(wallet_toncenter_get getWalletInformation "address=${source_address}" "seqno=${block_seqno}")" || return 1
+  printf '%s' "$wallet" | jq -es --argjson old_seqno "$old_seqno" '
+    length == 1 and (.[0] | .ok == true and .result.wallet == true
+      and .result.account_state == "active" and (.result.seqno | type) == "number"
+      and .result.seqno == $old_seqno)' >/dev/null || return 1
+  jq -nc --argjson masterchain_seqno "$block_seqno" --argjson gen_utime "$block_time" --argjson wallet_seqno "$old_seqno" \
+    '{masterchain_seqno:$masterchain_seqno,gen_utime:$gen_utime,wallet_seqno:$wallet_seqno}'
 }
 
 parse_account_status() {
@@ -1466,13 +1687,14 @@ parse_account_status() {
 
 wallet_account_status() {
   local wallet_address="$1" output status api_balance api_seqno
-  if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)" &&
-    status="$(parse_account_status "$output")"; then
+  local WALLET_QUERY_DEADLINE="${WALLET_QUERY_DEADLINE:-$(($(date +%s) + 30))}"
+  if output="$(wallet_toncenter_information "$wallet_address")"; then
+    IFS=$'\t' read -r status api_balance api_seqno <<<"$output"
     printf '%s' "$status"
     return 0
   fi
-  if output="$(wallet_toncenter_information "$wallet_address")"; then
-    IFS=$'\t' read -r status api_balance api_seqno <<<"$output"
+  if wallet_request_timeout 15 >/dev/null && output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)" &&
+    status="$(parse_account_status "$output")"; then
     printf '%s' "$status"
     return 0
   fi
@@ -1481,14 +1703,14 @@ wallet_account_status() {
 }
 
 wallet_wait_for_seqno() {
-  local wallet_address="$1" expected="$2" attempt attempts delay seqno deadline timeout_sec
+  local wallet_address="$1" expected="$2" attempt attempts delay seqno timeout_sec
   attempts="$(main_wallet_confirm_attempts)"
   delay="$(main_wallet_confirm_delay_seconds)"
-  timeout_sec="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-60}"
-  [[ "$timeout_sec" =~ ^[1-9][0-9]*$ ]] || timeout_sec=60
-  deadline=$((SECONDS + timeout_sec))
+  timeout_sec="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-180}"
+  [[ "$timeout_sec" =~ ^[1-9][0-9]*$ ]] || timeout_sec=180
+  local WALLET_QUERY_DEADLINE="$(($(date +%s) + timeout_sec))"
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    (( SECONDS < deadline )) || break
+    wallet_request_timeout 15 >/dev/null || break
     seqno="$(wallet_seqno_decimal "$wallet_address" 2>/dev/null || true)"
     if [[ "$seqno" =~ ^[0-9]+$ ]] && (( 10#$seqno == expected )); then
       printf '%s' "$seqno"
@@ -1498,9 +1720,9 @@ wallet_wait_for_seqno() {
       echo "Error: source wallet seqno advanced beyond ${expected}; another operation may be using this wallet. Stopping." >&2
       return 1
     fi
-    if (( attempt < attempts && delay > 0 )); then sleep "$delay"; fi
+    if (( attempt < attempts )); then wallet_bounded_sleep "$delay" || break; fi
   done
-  echo "Error: on-chain confirmation of source wallet seqno=${expected} was not observed. Stopping; check wallet status before retrying." >&2
+  echo "Error: on-chain confirmation of source wallet seqno=${expected} was not observed within ${timeout_sec}s. Check wallet status before retrying." >&2
   return 1
 }
 
@@ -1624,66 +1846,33 @@ liteclient_account_state_is_empty() {
 }
 
 wallet_seqno_decimal() {
-  local wallet_address="$1"
-  local output seq_dec attempts delay attempt status api_balance
-
-  attempts="$(main_wallet_send_retry_attempts)"
-  delay="$(main_wallet_send_retry_delay_seconds)"
-
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null)"; then
-      seq_dec="$(parse_seqno_from_runmethod_output "$output" || true)"
-      seq_dec="$(trim_whitespace "$seq_dec")"
-      if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$seq_dec"
-        return 0
-      fi
-    fi
-
-    if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)"; then
-      # Only a successful account query can establish an undeployed wallet.
-      # A failed runmethod (including an RPC failure) alone does not imply 0.
-      status="$(parse_account_status "$output" || true)"
-      if [[ "$status" == nonexist || "$status" == uninit ]]; then
-        printf '%s' "0"
-        return 0
-      fi
-
-      seq_dec=""
-      if [[ "$status" == active ]]; then
-        seq_dec="$(parse_seqno_from_account_output "$output" || true)"
-      fi
-      seq_dec="$(trim_whitespace "$seq_dec")"
-      if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$seq_dec"
-        return 0
-      fi
-    fi
-
-    if (( attempt < attempts )); then
-      echo "Warning: failed to parse wallet seqno for ${wallet_address} (attempt ${attempt}/${attempts}); retrying..." >&2
-      if (( delay > 0 )); then
-        sleep "$delay"
-      fi
-    fi
-  done
-
+  local wallet_address="$1" output seq_dec attempts delay attempt status api_balance
+  local WALLET_QUERY_DEADLINE="${WALLET_QUERY_DEADLINE:-$(($(date +%s) + 30))}"
+  # HTTPS first: a responsive but lagging lite-server must not hide a newer
+  # source counter, and one poll must fit inside the caller's deadline.
   if output="$(wallet_toncenter_information "$wallet_address" 2>/dev/null)"; then
     IFS=$'\t' read -r status api_balance seq_dec <<<"$output"
-    if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then
-      printf '%s' "$seq_dec"
-      return 0
-    fi
+    if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then printf '%s' "$seq_dec"; return 0; fi
   fi
-
-  echo "Debug: runmethod/getaccount parsing failed for ${wallet_address}" >&2
-  {
-    echo "--- runmethod output ---"
-    run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null || true
-    echo "--- getaccount output ---"
-    run_liteclient_query "getaccount $wallet_address" 2>/dev/null || true
-  } >&2
-  echo "Error: failed to parse wallet seqno from account state for ${wallet_address} after ${attempts} attempts." >&2
+  attempts="$(main_wallet_send_retry_attempts)"
+  delay="$(main_wallet_send_retry_delay_seconds)"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    wallet_request_timeout 15 >/dev/null || break
+    if output="$(run_liteclient_query "runmethod $wallet_address seqno" 2>/dev/null)"; then
+      seq_dec="$(parse_seqno_from_runmethod_output "$output" || true)"
+      if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then printf '%s' "$seq_dec"; return 0; fi
+    fi
+    wallet_request_timeout 15 >/dev/null || break
+    if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)"; then
+      status="$(parse_account_status "$output" || true)"
+      if [[ "$status" == nonexist || "$status" == uninit ]]; then printf '%s' 0; return 0; fi
+      seq_dec=""
+      [[ "$status" != active ]] || seq_dec="$(parse_seqno_from_account_output "$output" || true)"
+      if [[ "$seq_dec" =~ ^[0-9]+$ ]]; then printf '%s' "$seq_dec"; return 0; fi
+    fi
+    if (( attempt < attempts )); then wallet_bounded_sleep "$delay" || break; fi
+  done
+  echo "Error: cannot resolve wallet seqno from bounded HTTPS/lite-server reads for ${wallet_address}." >&2
   return 1
 }
 
@@ -1691,10 +1880,16 @@ wallet_balance_nano() {
   local wallet_address="$1"
   local output balance attempts delay attempt status api_seqno
 
+  local WALLET_QUERY_DEADLINE="${WALLET_QUERY_DEADLINE:-$(($(date +%s) + 30))}"
+  if output="$(wallet_toncenter_information "$wallet_address" 2>/dev/null)"; then
+    IFS=$'\t' read -r status balance api_seqno <<<"$output"
+    if [[ "$balance" =~ ^[0-9]+$ ]]; then printf '%s' "$balance"; return 0; fi
+  fi
   attempts="$(main_wallet_send_retry_attempts)"
   delay="$(main_wallet_send_retry_delay_seconds)"
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
+    wallet_request_timeout 15 >/dev/null || break
     if output="$(run_liteclient_query "getaccount $wallet_address" 2>/dev/null)"; then
       if liteclient_account_state_is_empty "$output"; then
         printf '%s' "0"
@@ -1719,18 +1914,10 @@ wallet_balance_nano() {
     if (( attempt < attempts )); then
       echo "Warning: failed to parse wallet balance for ${wallet_address} (attempt ${attempt}/${attempts}); retrying..." >&2
       if (( delay > 0 )); then
-        sleep "$delay"
+        wallet_bounded_sleep "$delay" || break
       fi
     fi
   done
-
-  if output="$(wallet_toncenter_information "$wallet_address" 2>/dev/null)"; then
-    IFS=$'\t' read -r status balance api_seqno <<<"$output"
-    if [[ "$balance" =~ ^[0-9]+$ ]]; then
-      printf '%s' "$balance"
-      return 0
-    fi
-  fi
 
   echo "Error: failed to parse wallet balance for ${wallet_address} after ${attempts} attempts." >&2
   return 1
@@ -1797,7 +1984,7 @@ send_single_transfer() {
   local no_bounce_flag="${7:-}"
   local wallet_fif fift_bin base_path query_file
   local -a fift_cmd=()
-  local rc=0
+  local rc=0 expiry body_hash destination_raw amount_nano pending
 
   wallet_fif="$(resolve_wallet_fif || true)"
   wallet_fif="$(trim_whitespace "$wallet_fif")"
@@ -1847,14 +2034,442 @@ send_single_transfer() {
     echo "Error: failed to create transfer BOC ${query_file}." >&2
     return 1
   fi
+  # Fift samples its clock while signing. Recording an upper bound after it
+  # returns prevents a slow invocation from making the journal expire early.
+  expiry=$(($(date +%s) + 180))
 
+  # Commit the exact signed bytes before any transport can see them. The
+  # encrypted key bundle and this public outgoing journal have separate lives.
+  body_hash="$(wallet_message_body_hash "$query_file")" || {
+    rm -f "$query_file"
+    echo 'Error: cannot identify the signed transfer body; nothing was broadcast.' >&2
+    return 1
+  }
+  destination_raw="$(ton_address_to_hex "$destination_address")" || return 1
+  amount_nano="$(gram_amount_to_nano "$amount_gram")" || return 1
+  wallet_outbox_stage "$WALLET_OUTBOX_INDEX" "$seqno_dec" "$expiry" "$body_hash" "$query_file" "$destination_raw" "$amount_nano" || return 1
+  pending="$(wallet_outbox_pending)" || return 1
+  IFS=$'\t' read -r _ _ _ WALLET_PENDING_BOC _ _ _ <<<"$pending"
+  [[ -s "$WALLET_PENDING_BOC" ]] || return 1
   echo "Sending from '${from_wallet}' to '${destination_address}' amount='${amount_gram}' seqno=${seqno_dec} ..."
-  send_boc_payload "$query_file" "$normalized_mode" || rc=$?
+  local WALLET_QUERY_DEADLINE="$(($(date +%s) + 60))"
+  send_boc_payload "$WALLET_PENDING_BOC" "$normalized_mode" || rc=$?
   rm -f "$query_file"
   return "$rc"
 }
 
-main_wallet_send() {
+wallet_outbox_atomic_json() {
+  local destination="$1" payload="$2" temporary parent
+  parent="${destination%/*}"
+  temporary="$(mktemp "$parent/.journal.XXXXXX")" || return 1
+  if ! { printf '%s\n' "$payload" > "$temporary" && chmod 600 "$temporary" && sync "$temporary" \
+    && mv -f "$temporary" "$destination" && sync "$parent"; }; then
+    echo 'Error: could not durably commit the outgoing wallet journal; no further messages may be sent.' >&2
+    return 1
+  fi
+}
+
+wallet_outbox_read_state() {
+  local state batch
+  [[ -n "${WALLET_OUTBOX_DIR:-}" && -f "$WALLET_OUTBOX_DIR/state.json" && ! -L "$WALLET_OUTBOX_DIR/state.json" ]] || return 1
+  state="$(cat "$WALLET_OUTBOX_DIR/state.json")" || return 1
+  printf '%s' "$state" | jq -e '
+    .version == 1 and (.batch_id | type == "string" and test("^batch-[A-Za-z0-9]+$")) and
+    (.plan | type == "object") and (.plan.destinations | type == "array" and length > 0) and
+    (.next | type == "number" and . >= 0 and . == floor) and .next <= (.plan.destinations | length) and
+    (.confirmed | type == "array") and (.confirmed | length) == .next and
+    ([.confirmed[].index] == [range(0;.next)]) and
+    all(.confirmed[]; (.transaction_id|type=="string" and length>0)) and
+    ((.expired // []) | type == "array") and
+    (.complete == true or .complete == false) and
+    (if .complete then .next == (.plan.destinations | length) and .pending == null else true end) and
+    (if .pending == null then true else
+      (.pending | type == "object") and .pending.index == .next and
+      .pending.destination == .plan.destinations[.next] and .pending.amount_nano == .plan.amount_nano
+      end)' >/dev/null || {
+    echo 'Error: outgoing wallet journal is malformed; refusing to sign or submit another payment.' >&2
+    return 1
+  }
+  batch="$(printf '%s' "$state" | jq -er '.batch_id')" || return 1
+  [[ -d "$WALLET_OUTBOX_DIR/$batch" && ! -L "$WALLET_OUTBOX_DIR/$batch" ]] || {
+    echo 'Error: outgoing batch directory is missing or unsafe.' >&2; return 1;
+  }
+  printf '%s' "$state"
+}
+
+wallet_outbox_validate_entry() {
+  local state="$1" record="$2" directory file expected_digest actual_digest
+  directory="$WALLET_OUTBOX_DIR/$(printf '%s' "$state" | jq -er '.batch_id')/entry-$(printf '%s' "$state" | jq -er '.next')" || return 1
+  file="$directory/payload.boc"
+  [[ -f "$file" && ! -L "$file" && ! -L "$directory" ]] || {
+    echo 'Error: pending signed wallet payload is missing or unsafe; no replacement payment was signed.' >&2; return 1;
+  }
+  printf '%s\n%s\n' "$state" "$record" | jq -es --arg file "$file" '
+    length == 2 and .[1].index == .[0].next and .[1].destination == .[0].plan.destinations[.[0].next] and
+    .[1].amount_nano == .[0].plan.amount_nano and .[1].path == $file and
+    (.[1].seqno | type == "string" and test("^[0-9]{1,10}$")) and
+    (.[1].seqno | tonumber) <= 4294967295 and
+    (.[1].expiry | type == "string" and test("^[0-9]{1,12}$")) and
+    (.[1].body_hash | type == "string" and test("^[A-Za-z0-9_+/=-]{43,88}$")) and
+    (.[1].sha256 | type == "string" and test("^[a-f0-9]{64}$"))' >/dev/null || {
+    echo 'Error: pending outgoing record does not match its approved batch; refusing to continue.' >&2; return 1;
+  }
+  expected_digest="$(printf '%s' "$record" | jq -er '.sha256')" || return 1
+  actual_digest="$(sha256sum "$file")" || return 1
+  [[ "${actual_digest%% *}" == "$expected_digest" ]] || {
+    echo 'Error: pending signed wallet payload checksum changed; refusing to submit it.' >&2; return 1;
+  }
+}
+
+wallet_outbox_recover_entry() {
+  local state record directory updated retired archive batch archive_name
+  state="$(wallet_outbox_read_state)" || return 1
+  if [[ "$(printf '%s' "$state" | jq -r '.pending != null')" == true ]]; then
+    record="$(printf '%s' "$state" | jq -c '.pending')" || return 1
+    wallet_outbox_validate_entry "$state" "$record" || return 1
+    return 0
+  fi
+  directory="$WALLET_OUTBOX_DIR/$(printf '%s' "$state" | jq -er '.batch_id')/entry-$(printf '%s' "$state" | jq -er '.next')" || return 1
+  [[ -e "$directory" || -L "$directory" ]] || return 0
+  [[ -f "$directory/record.json" && ! -L "$directory/record.json" && ! -L "$directory" ]] || {
+    echo 'Error: an incomplete outgoing journal publication needs inspection; refusing another payment.' >&2; return 1;
+  }
+  record="$(cat "$directory/record.json")" || return 1
+  wallet_outbox_validate_entry "$state" "$record" || return 1
+  retired="$(printf '%s' "$state" | jq -c --argjson record "$record" \
+    '[(.expired//[])[]|select(.index==$record.index and .sha256==$record.sha256 and .body_hash==$record.body_hash)]|last//null')" || return 1
+  if [[ "$retired" != null ]]; then
+    # Expiration is committed in state before the old payload is moved. A
+    # process death between those operations must never resurrect that entry.
+    archive="$(printf '%s' "$retired" | jq -er '.archive_directory')" || return 1
+    batch="$(printf '%s' "$state" | jq -er '.batch_id')" || return 1
+    archive_name="${archive##*/}"
+    [[ "$archive" == "$WALLET_OUTBOX_DIR/$batch/$archive_name" && "$archive_name" =~ ^expired-[0-9]+-[A-Za-z0-9]+$ \
+      && -d "$archive" && ! -L "$archive" && ! -e "$archive/entry" && ! -L "$archive/entry" ]] || {
+      echo 'Error: expired outgoing archive is missing or unsafe; refusing to replace its payload.' >&2; return 1;
+    }
+    mv "$directory" "$archive/entry" && sync "$archive" "$WALLET_OUTBOX_DIR/$batch" || return 1
+    return 0
+  fi
+  updated="$(printf '%s' "$state" | jq --argjson record "$record" '.pending=$record')" || return 1
+  wallet_outbox_atomic_json "$WALLET_OUTBOX_DIR/state.json" "$updated" || return 1
+}
+
+wallet_outbox_release() {
+  if [[ -n "${WALLET_OUTBOX_LOCK_FD:-}" ]]; then
+    exec {WALLET_OUTBOX_LOCK_FD}>&- || return 1
+  fi
+  WALLET_OUTBOX_LOCK_FD="" WALLET_OUTBOX_LOCK_PATH=""
+}
+
+wallet_outbox_begin() {
+  local wallet="$1" source="$2" network="$3" wallet_id="$4" amount="$5"
+  shift 5
+  local root lock_key lock_path source_raw amount_nano destination destinations='[]' plan state other_state other batch_id batch_dir updated
+  local bounce="${no_bounce_flag:-}"
+  umask 077
+  for dependency in jq flock sha256sum sync mktemp; do require_bin "$dependency" || return 1; done
+  [[ "$wallet" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$wallet" != . && "$wallet" != .. \
+    && "$wallet_id" =~ ^[0-9]{1,10}$ && "$network" =~ ^(mainnet|testnet)$ && ( -z "$bounce" || "$bounce" == -n ) ]] || {
+    echo 'Error: invalid outgoing wallet batch identity.' >&2; return 1;
+  }
+  (( 10#$wallet_id <= 4294967295 )) || return 1
+  source_raw="$(ton_address_to_hex "$source")" || return 1
+  amount_nano="$(gram_amount_to_nano "$amount")" || return 1
+  [[ "$amount_nano" =~ ^[0-9]+$ ]] && (( amount_nano > 0 && $# > 0 )) || return 1
+  for destination in "$@"; do
+    destination="$(ton_address_to_hex "$destination")" || return 1
+    destinations="$(printf '%s' "$destinations" | jq --arg destination "$destination" '.+[$destination]')" || return 1
+  done
+  root="$MAIN_WALLET_BUNDLE_DIR/.outbox"
+  [[ ! -L "$MAIN_WALLET_BUNDLE_DIR" && ! -L "$root" && ! -L "$root/$wallet" && ! -L "$root/.locks" ]] || return 1
+  mkdir -p "$root/.locks" "$root/$wallet" || return 1
+  chmod 700 "$root" "$root/.locks" "$root/$wallet" || return 1
+  root="$(cd "$root" && pwd -P)" || return 1
+  lock_key="$(printf '%s\n%s' "$network" "$source_raw" | sha256sum)" || return 1
+  lock_path="$root/.locks/${lock_key%% *}.lock"
+  [[ ! -L "$lock_path" && ! -L "$root/.locks" ]] || return 1
+  if [[ "${WALLET_OUTBOX_LOCK_PATH:-}" != "$lock_path" || -z "${WALLET_OUTBOX_LOCK_FD:-}" ]]; then
+    wallet_outbox_release || return 1
+    exec {WALLET_OUTBOX_LOCK_FD}> "$lock_path" || return 1
+    if ! flock -n "$WALLET_OUTBOX_LOCK_FD"; then
+      exec {WALLET_OUTBOX_LOCK_FD}>&-
+      WALLET_OUTBOX_LOCK_FD=""
+      echo 'Error: another process holds the source wallet outgoing lock; no payment was signed.' >&2
+      return 1
+    fi
+    WALLET_OUTBOX_LOCK_PATH="$lock_path"
+  fi
+  # Wallet aliases must not hide an unresolved operation for the same source.
+  for other in "$root"/*/state.json; do
+    [[ -f "$other" && "$other" != "$root/$wallet/state.json" ]] || continue
+    other_state="$(cat "$other")" || return 1
+    if ! printf '%s' "$other_state" | jq -e --arg source "$source_raw" --arg network "$network" \
+      'type=="object" and .version==1 and (.complete==true or .complete==false) and
+        (.plan.source|type=="string") and (.plan.network|type=="string") and
+        (.complete==true or .plan.source!=$source or .plan.network!=$network)' >/dev/null; then
+      echo 'Error: another wallet alias has an unresolved or invalid outgoing journal; inspect it before sending.' >&2
+      return 1
+    fi
+  done
+  WALLET_OUTBOX_DIR="$root/$wallet"
+  plan="$(jq -nc --arg wallet "$wallet" --arg source "$source_raw" --arg network "$network" --arg wallet_id "$((10#$wallet_id))" \
+    --arg amount "$amount_nano" --arg bounce "$bounce" --argjson destinations "$destinations" \
+    '{wallet:$wallet,source:$source,network:$network,wallet_id:$wallet_id,amount_nano:$amount,bounce:$bounce,destinations:$destinations}')" || return 1
+  WALLET_OUTBOX_RESUMED=false
+  if [[ -e "$WALLET_OUTBOX_DIR/state.json" || -L "$WALLET_OUTBOX_DIR/state.json" ]]; then
+    state="$(wallet_outbox_read_state)" || return 1
+    if [[ "$(printf '%s' "$state" | jq -r '.complete')" != true ]]; then
+      if ! printf '%s' "$state" | jq -e --argjson plan "$plan" '.plan==$plan' >/dev/null; then
+        echo "Error: an unfinished outgoing batch exists for '${wallet}'; rerun its original recipients, amount and bounce option to resume. No new payment was signed." >&2
+        return 1
+      fi
+      WALLET_OUTBOX_RESUMED=true
+      wallet_outbox_recover_entry || return 1
+      state="$(wallet_outbox_read_state)" || return 1
+      WALLET_OUTBOX_INDEX="$(printf '%s' "$state" | jq -er '.next')" || return 1
+      return 0
+    fi
+    batch_id="$(printf '%s' "$state" | jq -er '.batch_id')" || return 1
+    wallet_outbox_atomic_json "$WALLET_OUTBOX_DIR/$batch_id/final-state.json" "$state" || return 1
+  elif [[ -n "$(find "$WALLET_OUTBOX_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo 'Error: outgoing files exist without their state journal; inspect them before sending.' >&2
+    return 1
+  fi
+  batch_dir="$(mktemp -d "$WALLET_OUTBOX_DIR/batch-XXXXXXXXXXXX")" || return 1
+  chmod 700 "$batch_dir" || return 1
+  batch_id="${batch_dir##*/}"
+  updated="$(jq -nc --arg batch "$batch_id" --argjson plan "$plan" \
+    '{version:1,batch_id:$batch,plan:$plan,next:0,confirmed:[],expired:[],pending:null,complete:false}')" || return 1
+  wallet_outbox_atomic_json "$WALLET_OUTBOX_DIR/state.json" "$updated" || return 1
+  WALLET_OUTBOX_INDEX=0
+}
+
+wallet_outbox_pending() {
+  wallet_outbox_recover_entry || return 1
+  local state
+  state="$(wallet_outbox_read_state)" || return 1
+  printf '%s' "$state" | jq -r 'if .pending==null then empty else .pending|[.seqno,.expiry,.body_hash,.path,.destination,.amount_nano,(.index|tostring)]|@tsv end'
+}
+
+wallet_outbox_retry_seqno() {
+  local state counters
+  wallet_outbox_recover_entry || return 1
+  state="$(wallet_outbox_read_state)" || return 1
+  counters="$(printf '%s' "$state" | jq -c '[.next as $index|(.expired//[])[]|select(.index==$index)|.seqno]|unique')" || return 1
+  [[ "$(printf '%s' "$counters" | jq 'length')" -le 1 ]] || {
+    echo 'Error: retired payloads for one recipient have inconsistent sequence numbers.' >&2; return 1;
+  }
+  printf '%s' "$counters" | jq -r 'if length==0 then empty else .[0] end'
+}
+
+wallet_outbox_receipts() {
+  local state
+  wallet_outbox_recover_entry || return 1
+  state="$(wallet_outbox_read_state)" || return 1
+  printf '%s' "$state" | jq -r '.next as $index|([(.expired//[])[]|select(.index==$index)]+[.pending|select(.!=null)])|unique_by(.body_hash)[]|[.body_hash,.destination,.amount_nano]|@tsv'
+}
+
+wallet_outbox_expire() {
+  local index="$1" proof="$2" state archive updated
+  [[ "$index" =~ ^[0-9]+$ ]] || return 1
+  wallet_outbox_recover_entry || return 1
+  state="$(wallet_outbox_read_state)" || return 1
+  # The caller obtains this proof from a pinned, current masterchain block.
+  # Recheck its numeric binding here so stale proof cannot retire a new BOC.
+  printf '%s' "$state" | jq -e --argjson index "$index" --argjson proof "$proof" '
+    .complete==false and .next==$index and .pending.index==$index and
+    ($proof|type=="object") and
+    ($proof.masterchain_seqno|type=="number" and .>=0 and .==floor) and
+    ($proof.gen_utime|type=="number" and .>=0 and .==floor) and
+    ($proof.wallet_seqno|type=="number" and .>=0 and .==floor) and
+    $proof.wallet_seqno==(.pending.seqno|tonumber) and
+    $proof.gen_utime>((.pending.expiry|tonumber)+10)' >/dev/null || {
+    echo 'Error: expiration proof does not establish that this exact old sequence number remained unconsumed after expiry.' >&2; return 1;
+  }
+  archive="$(mktemp -d "$WALLET_OUTBOX_DIR/$(printf '%s' "$state" | jq -er '.batch_id')/expired-${index}-XXXXXXXXXXXX")" || return 1
+  chmod 700 "$archive" || return 1
+  updated="$(printf '%s' "$state" | jq --argjson proof "$proof" --arg archive "$archive" \
+    '.expired=((.expired//[])+[(.pending+{expiration_proof:$proof,archive_directory:$archive})])|.pending=null')" || return 1
+  wallet_outbox_atomic_json "$WALLET_OUTBOX_DIR/state.json" "$updated" || return 1
+  wallet_outbox_recover_entry
+}
+
+wallet_outbox_stage() {
+  local index="$1" seqno="$2" expiry="$3" body_hash="$4" input="$5" destination="$6" amount="$7"
+  local state record pending directory temporary digest updated retry_seqno copied_digest
+  wallet_outbox_recover_entry || return 1
+  state="$(wallet_outbox_read_state)" || return 1
+  [[ "$index" =~ ^[0-9]+$ && "$seqno" =~ ^[0-9]{1,10}$ && "$expiry" =~ ^[0-9]{1,12}$ && "$body_hash" =~ ^[A-Za-z0-9_+/=-]{43,88}$ \
+    && -s "$input" && ! -L "$input" ]] || return 1
+  destination="$(ton_address_to_hex "$destination")" || return 1
+  (( 10#$seqno <= 4294967295 )) || return 1
+  retry_seqno="$(wallet_outbox_retry_seqno)" || return 1
+  [[ -z "$retry_seqno" || "$seqno" == "$retry_seqno" ]] || {
+    echo 'Error: re-signing an expired recipient must retain its original unresolved sequence number.' >&2; return 1;
+  }
+  [[ "$(printf '%s' "$state" | jq -r '.complete')" == false && "$(printf '%s' "$state" | jq -r '.next')" == "$index" ]] || return 1
+  [[ "$(printf '%s' "$state" | jq -r --argjson index "$index" '.plan.destinations[$index]')" == "$destination" \
+    && "$(printf '%s' "$state" | jq -r '.plan.amount_nano')" == "$amount" ]] || {
+    echo 'Error: signed payload destination or amount differs from the approved outgoing plan.' >&2; return 1;
+  }
+  digest="$(sha256sum "$input")" || return 1; digest="${digest%% *}"
+  pending="$(printf '%s' "$state" | jq -c '.pending')" || return 1
+  if [[ "$pending" != null ]]; then
+    printf '%s' "$pending" | jq -e --arg seqno "$seqno" --arg expiry "$expiry" --arg hash "$body_hash" --arg digest "$digest" \
+      '.seqno==$seqno and .expiry==$expiry and .body_hash==$hash and .sha256==$digest' >/dev/null || {
+      echo 'Error: an unresolved signed payload already exists; refusing to replace or re-sign it.' >&2; return 1;
+    }
+    return 0
+  fi
+  directory="$WALLET_OUTBOX_DIR/$(printf '%s' "$state" | jq -er '.batch_id')/entry-$index" || return 1
+  temporary="$(mktemp -d "${directory%/*}/.entry-${index}.XXXXXX")" || return 1
+  chmod 700 "$temporary" || return 1
+  record="$(jq -nc --argjson index "$index" --arg seqno "$seqno" --arg expiry "$expiry" --arg hash "$body_hash" --arg digest "$digest" \
+    --arg path "$directory/payload.boc" --arg destination "$destination" --arg amount "$amount" \
+    '{index:$index,seqno:$seqno,expiry:$expiry,body_hash:$hash,sha256:$digest,path:$path,destination:$destination,amount_nano:$amount}')" || return 1
+  # Publish payload+record as one directory, then point the state at it. A
+  # crash between these renames is recovered by wallet_outbox_recover_entry.
+  if ! { cp "$input" "$temporary/payload.boc" && copied_digest="$(sha256sum "$temporary/payload.boc")" \
+    && [[ "${copied_digest%% *}" == "$digest" ]] && printf '%s\n' "$record" > "$temporary/record.json" \
+    && chmod 600 "$temporary/payload.boc" "$temporary/record.json" \
+    && sync "$temporary/payload.boc" "$temporary/record.json" "$temporary" \
+    && mv "$temporary" "$directory" && sync "${directory%/*}"; }; then
+    echo 'Error: signed wallet payload could not be durably staged; nothing further may be broadcast.' >&2
+    return 1
+  fi
+  updated="$(printf '%s' "$state" | jq --argjson record "$record" '.pending=$record')" || return 1
+  wallet_outbox_atomic_json "$WALLET_OUTBOX_DIR/state.json" "$updated"
+}
+
+wallet_outbox_confirm() {
+  local index="$1" transaction="$2" matched_hash="${3:-}" state updated record
+  [[ "$index" =~ ^[0-9]+$ && -n "$transaction" && "$transaction" != *$'\n'* ]] || return 1
+  wallet_outbox_recover_entry || return 1
+  state="$(wallet_outbox_read_state)" || return 1
+  if printf '%s' "$state" | jq -e --argjson index "$index" --arg transaction "$transaction" \
+    --arg hash "$matched_hash" '.confirmed[$index].index==$index and .confirmed[$index].transaction_id==$transaction and ($hash=="" or .confirmed[$index].body_hash==$hash)' >/dev/null; then return 0; fi
+  printf '%s' "$state" | jq -e --argjson index "$index" '.complete==false and .next==$index' >/dev/null || return 1
+  record="$(printf '%s' "$state" | jq -ec --argjson index "$index" --arg hash "$matched_hash" \
+    '([(.expired//[])[]|select(.index==$index)]+[.pending|select(.!=null)])|map(select($hash=="" or .body_hash==$hash))|last|select(.!=null)')" || return 1
+  updated="$(printf '%s' "$state" | jq --arg transaction "$transaction" --argjson record "$record" \
+    '.confirmed += [($record + {transaction_id:$transaction})] | .pending=null | .next+=1')" || return 1
+  wallet_outbox_atomic_json "$WALLET_OUTBOX_DIR/state.json" "$updated" || return 1
+  WALLET_OUTBOX_INDEX="$(printf '%s' "$updated" | jq -er '.next')" || return 1
+}
+
+wallet_outbox_complete() {
+  local state updated
+  state="$(wallet_outbox_read_state)" || return 1
+  printf '%s' "$state" | jq -e '.pending==null and .next==(.plan.destinations|length)' >/dev/null || return 1
+  updated="$(printf '%s' "$state" | jq '.complete=true')" || return 1
+  wallet_outbox_atomic_json "$WALLET_OUTBOX_DIR/state.json" "$updated"
+}
+
+wallet_outbox_fail() {
+  echo "Error: ${1:-payment outcome is unresolved}. The persistent outgoing batch was retained; rerun the same command to inspect/resume it without paying confirmed recipients twice." >&2
+  return 1
+}
+
+# A counter alone cannot identify a payment: another request can consume it,
+# and a wallet can consume a request without emitting the intended message.
+wallet_confirm_known_receipts() {
+  local source="$1" rows hash destination amount receipt rc any_error=0
+  rows="$(wallet_outbox_receipts)" || return 13
+  [[ -n "$rows" ]] || return 10
+  while IFS=$'\t' read -r hash destination amount; do
+    if receipt="$(wallet_transaction_receipt "$source" "$hash" "$destination" "$amount")"; then
+      printf '%s\t%s' "${receipt//$'\t'/:}" "$hash"
+      return 0
+    else
+      rc=$?
+    fi
+    (( rc != 11 )) || {
+      echo 'Error: this exact request was consumed without emitting the approved payment; inspect the source transaction before taking further action.' >&2
+      return 11
+    }
+    (( rc == 10 )) || any_error=1
+  done <<<"$rows"
+  (( any_error == 0 )) || return 1
+  return 10
+}
+
+wallet_rebroadcast_transfer() {
+  local boc="$1" mode="$2" expiry="$3" pending pending_path
+  local WALLET_QUERY_DEADLINE="${WALLET_QUERY_DEADLINE:-$expiry}"
+  (( WALLET_QUERY_DEADLINE <= expiry )) || WALLET_QUERY_DEADLINE="$expiry"
+  wallet_request_timeout 15 >/dev/null || return 1
+  pending="$(wallet_outbox_pending)" || return 13
+  IFS=$'\t' read -r _ _ _ pending_path _ _ _ <<<"$pending"
+  [[ "$pending_path" == "$boc" ]] || return 13
+  case "$mode" in
+    liteserver) send_boc_liteserver "$boc" ;;
+    auto|fallback|both|toncenter) send_boc_toncenter "$boc" ;;
+    *) echo "Error: unsupported wallet transport mode '${mode}'; no rebroadcast attempted." >&2; return 1 ;;
+  esac
+}
+
+wallet_confirm_transfer() {
+  local source="$1" expected="$2" boc="$3" body_hash="$4" destination="$5" amount="$6" expiry="$7"
+  local initially_submitted="${8:-false}" mode="${9:-${MODE:-auto}}"
+  local attempts delay timeout_sec rebroadcast_delay rebroadcast_limit attempt receipt rc seqno=unknown
+  local last_broadcast now broadcasts=0 proof information status balance
+  attempts="$(main_wallet_confirm_attempts)"
+  delay="$(main_wallet_confirm_delay_seconds)"
+  timeout_sec="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-180}"
+  [[ "$timeout_sec" =~ ^[1-9][0-9]*$ ]] || timeout_sec=180
+  rebroadcast_delay="${MAIN_WALLET_REBROADCAST_DELAY_SEC:-10}"
+  [[ "$rebroadcast_delay" =~ ^[0-9]+$ ]] || rebroadcast_delay=10
+  rebroadcast_limit="${MAIN_WALLET_REBROADCAST_ATTEMPTS:-3}"
+  [[ "$rebroadcast_limit" =~ ^[0-9]+$ ]] || rebroadcast_limit=3
+  local WALLET_QUERY_DEADLINE="$(($(date +%s) + timeout_sec))"
+  last_broadcast="$(date +%s)"
+  [[ "$initially_submitted" == true ]] || last_broadcast=$((last_broadcast - rebroadcast_delay))
+  [[ -s "$boc" && "$expected" =~ ^[0-9]+$ && "$expiry" =~ ^[0-9]+$ && -n "$body_hash" && -n "$destination" && "$amount" =~ ^[0-9]+$ ]] || return 1
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    wallet_request_timeout 15 >/dev/null || break
+    if receipt="$(wallet_confirm_known_receipts "$source")"; then
+      printf '%s' "$receipt"
+      return 0
+    else
+      rc=$?
+    fi
+    (( rc != 11 && rc != 13 )) || return "$rc"
+    now="$(date +%s)"
+    if (( now >= expiry )); then
+      # Clock expiry or an empty cached history is insufficient. Keep the
+      # original seqno reserved even after a pinned post-expiry observation.
+      if proof="$(wallet_expired_message_unconsumed "$source" "$((expected - 1))" "$expiry")"; then
+        printf '%s' "$proof"
+        return 12
+      fi
+      break
+    fi
+    if information="$(wallet_toncenter_information "$source" 2>/dev/null)"; then
+      IFS=$'\t' read -r status balance seqno <<<"$information"
+    fi
+    now="$(date +%s)"
+    if (( now < expiry && broadcasts < rebroadcast_limit && now - last_broadcast >= rebroadcast_delay )) &&
+      { [[ ! "$seqno" =~ ^[0-9]+$ ]] || (( 10#$seqno < expected )); }; then
+      echo "[wallet] Payment receipt is pending (last source seqno=${seqno}); rebroadcasting the same signed message (${broadcasts}/${rebroadcast_limit} retries used)." >&2
+      # Cross-broadcast after an ACK in auto mode as well. ACK 1 only admits
+      # the message at one server; it does not establish network inclusion.
+      if wallet_rebroadcast_transfer "$boc" "$mode" "$expiry" >&2; then
+        :
+      else
+        rc=$?
+        (( rc != 13 )) || return 13
+      fi
+      broadcasts=$((broadcasts + 1))
+      last_broadcast="$(date +%s)"
+    fi
+    if (( attempt < attempts )); then wallet_bounded_sleep "$delay" || break; fi
+  done
+  echo "Error: no exact outgoing-payment receipt was verified within the confirmation budget (last source seqno=${seqno}, expected=${expected}). A transport acknowledgement alone cannot mark it paid." >&2
+  return 1
+}
+
+main_wallet_send() (
   local from_wallet="${1:-}"
   shift || true
   local normalized_mode source_wallet_address current_seqno source_subwallet_id
@@ -1865,7 +2480,7 @@ main_wallet_send() {
   local multi_send_pause_sec
   local no_bounce_flag=""
   local arg
-  local confirmed_seqno expected_seqno idx
+  local expected_seqno idx
 
   if (( $# > 0 )); then
     if [[ "$(trim_whitespace "${!#}")" == "-n" ]]; then
@@ -1888,6 +2503,14 @@ main_wallet_send() {
 
   require_wallet_network_match "$from_wallet" || return $?
   normalized_mode="$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')"
+  case "$normalized_mode" in
+    auto|fallback|both|liteserver|toncenter) ;;
+    *) echo "Error: unsupported MODE=${MODE}. Use auto, liteserver, or toncenter." >&2; return 1 ;;
+  esac
+  wallet_toncenter_base >/dev/null || {
+    echo 'Error: verified payment receipts require a TONCenter endpoint matching the active wallet network; no payment was signed.' >&2
+    return 1
+  }
   source_wallet_address="$(resolve_wallet_address_by_name "$from_wallet" || true)"
   source_wallet_address="$(trim_whitespace "$source_wallet_address")"
   if [[ -z "$source_wallet_address" ]]; then
@@ -1947,63 +2570,122 @@ main_wallet_send() {
       echo "Warning: ${remainder_nano} nanoTON remainder is not sent due to equal split rounding." >&2
     fi
 
-    current_seqno="$(wallet_prepare_source "$from_wallet" "$source_wallet_address" "$normalized_mode")" || return 1
-    if ! [[ "$current_seqno" =~ ^[0-9]+$ ]]; then
-      echo "Error: failed to resolve source wallet seqno for '${from_wallet}'." >&2
+  else
+
+    if (( $# != 2 )); then
+      echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]" >&2
+      echo "       usage: main-wallet.sh send [from-wallet-name] [amount] [to-address...] [-n]" >&2
       return 1
     fi
+    destination_address="$(trim_whitespace "${1:-}")"
+    amount_gram="$(trim_whitespace "${2:-}")"
+    if [[ -z "$destination_address" || -z "$amount_gram" ]]; then
+      echo "Error: destination address and amount are required." >&2
+      return 1
+    fi
+    if ! [[ "$amount_gram" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
+      echo "Error: amount '${amount_gram}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
+      return 1
+    fi
+    total_amount_nano="$(gram_amount_to_nano "$amount_gram" || true)"
+    if ! [[ "$total_amount_nano" =~ ^[0-9]+$ ]] || (( total_amount_nano <= 0 )); then
+      echo "Error: amount '${amount_gram}' must be greater than zero and have at most nine decimal places." >&2
+      return 1
+    fi
+    if ! ton_address_to_hex "$destination_address" >/dev/null; then
+      echo "Error: invalid destination wallet address '${destination_address}'." >&2
+      return 1
+    fi
+    destination_addresses=("$destination_address")
+    target_count=1
+  fi
 
-    for ((idx = 0; idx < target_count; idx++)); do
-      destination_address="${destination_addresses[$idx]}"
-      if ! send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"; then
-        echo "Error: submission to '${destination_address}' failed; stopping before any remaining destinations. Check wallet status before retrying." >&2
-        return 1
+  source_wallet_address="$(ton_address_to_hex "$source_wallet_address")" || return 1
+  local network pending pending_seq expiry body_hash boc dest_raw nano item initially_submitted
+  local receipt receipt_rc transaction_id matched_hash proof retries old_seq minimum_seqno state
+  network="$(resolve_current_wallet_network)" || return 1
+  wallet_outbox_begin "$from_wallet" "$source_wallet_address" "$network" "$source_subwallet_id" "$amount_gram" "${destination_addresses[@]}" || return 1
+  if [[ "$WALLET_OUTBOX_RESUMED" == true ]]; then
+    echo "[wallet] Resuming saved batch: ${WALLET_OUTBOX_INDEX}/${target_count} payments already confirmed; those recipients will be skipped." >&2
+  fi
+  for ((idx = WALLET_OUTBOX_INDEX; idx < target_count; idx++)); do
+    WALLET_OUTBOX_INDEX="$idx"
+    destination_address="${destination_addresses[$idx]}"
+    retries=0
+    while :; do
+      pending="$(wallet_outbox_pending)" || return 1
+      initially_submitted=false
+      if [[ -z "$pending" ]]; then
+        # A crash may have followed retirement of an expired attempt. Its
+        # original seqno remains reserved for this same recipient and amount.
+        old_seq="$(wallet_outbox_retry_seqno)" || return 1
+        if [[ -n "$old_seq" ]]; then
+          if receipt="$(wallet_confirm_known_receipts "$source_wallet_address")"; then
+            IFS=$'\t' read -r transaction_id matched_hash <<<"$receipt"
+            wallet_outbox_confirm "$idx" "$transaction_id" "$matched_hash" || return 1
+            break
+          else
+            receipt_rc=$?
+            (( receipt_rc != 13 )) || return 13
+            (( receipt_rc != 11 )) || { wallet_outbox_fail 'the expired request was consumed without the expected outgoing payment'; return 1; }
+          fi
+        fi
+        state="$(wallet_outbox_read_state)" || return 1
+        minimum_seqno="$(printf '%s' "$state" | jq -r 'if .confirmed|length>0 then (.confirmed[-1].seqno|tonumber)+1 else 0 end')" || return 1
+        if (( minimum_seqno > 0 )); then
+          [[ "$(main_wallet_version_by_name "$from_wallet")" == v3 ]] || return 1
+          current_seqno="$(wallet_seqno_decimal "$source_wallet_address" 2>/dev/null || true)"
+          # An exact earlier receipt proves its seqno was consumed even while
+          # the wallet-information endpoint still serves its five-second cache.
+          if [[ ! "$current_seqno" =~ ^[0-9]+$ ]] || (( 10#$current_seqno < minimum_seqno )); then
+            current_seqno="$minimum_seqno"
+          fi
+        else
+          current_seqno="$(wallet_prepare_source "$from_wallet" "$source_wallet_address" "$normalized_mode")" || return 1
+        fi
+        [[ "$current_seqno" =~ ^[0-9]+$ ]] || return 1
+        if [[ -n "$old_seq" && "$current_seqno" != "$old_seq" ]]; then
+          wallet_outbox_fail 'the reserved seqno changed but its exact payment receipt is not available yet'
+          return 1
+        fi
+        if send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag" >&2; then
+          initially_submitted=true
+        fi
+        pending="$(wallet_outbox_pending)" || return 1
+        if [[ -z "$pending" ]]; then
+          wallet_outbox_fail 'signing or staging failed before any payment could be submitted'
+          return 1
+        fi
       fi
-      expected_seqno=$((10#$current_seqno + 1))
-      echo "[wallet] Waiting for on-chain acceptance of seqno=${current_seqno} before continuing ..." >&2
-      confirmed_seqno="$(wallet_wait_for_seqno "$source_wallet_address" "$expected_seqno")" || return 1
-      current_seqno="$confirmed_seqno"
-      if (( idx + 1 < target_count )) && (( multi_send_pause_sec > 0 )); then
-        sleep "$multi_send_pause_sec"
+      IFS=$'\t' read -r pending_seq expiry body_hash boc dest_raw nano item <<<"$pending"
+      expected_seqno=$((10#$pending_seq + 1))
+      echo "[wallet] Confirming payment $((idx + 1))/${target_count} to '${destination_address}' (source seqno=${pending_seq}) ..." >&2
+      if receipt="$(wallet_confirm_transfer "$source_wallet_address" "$expected_seqno" "$boc" "$body_hash" "$dest_raw" "$nano" "$expiry" "$initially_submitted" "$normalized_mode")"; then
+        IFS=$'\t' read -r transaction_id matched_hash <<<"$receipt"
+        wallet_outbox_confirm "$idx" "$transaction_id" "$matched_hash" || return 1
+        echo "[wallet] Confirmed outgoing payment $((idx + 1))/${target_count}; transaction ${transaction_id}." >&2
+        break
+      else
+        receipt_rc=$?
       fi
+      if (( receipt_rc == 12 && retries < 1 )); then
+        proof="$receipt"
+        wallet_outbox_expire "$idx" "$proof" || return 1
+        retries=$((retries + 1))
+        echo '[wallet] The expired request left the source counter unchanged; renewing this same payment with its original seqno.' >&2
+        continue
+      fi
+      wallet_outbox_fail "payment $((idx + 1))/${target_count} could not be verified; no later recipients were attempted"
+      return 1
     done
-    return 0
-  fi
-
-  if (( $# != 2 )); then
-    echo "Error: usage: main-wallet.sh send [from-wallet-name] [to-address] [amount] [-n]" >&2
-    echo "       usage: main-wallet.sh send [from-wallet-name] [amount] [to-address...] [-n]" >&2
+    if (( idx + 1 < target_count && multi_send_pause_sec > 0 )); then sleep "$multi_send_pause_sec"; fi
+  done
+  if ! wallet_outbox_complete; then
+    echo "Error: all ${target_count} outgoing payments were verified, but the final journal update failed. Inspect the saved journal before any retry; do not submit another payment batch." >&2
     return 1
   fi
-  destination_address="$(trim_whitespace "${1:-}")"
-  amount_gram="$(trim_whitespace "${2:-}")"
-  if [[ -z "$destination_address" || -z "$amount_gram" ]]; then
-    echo "Error: destination address and amount are required." >&2
-    return 1
-  fi
-  if ! [[ "$amount_gram" =~ ^[0-9]+([.][0-9]+)?[.]?$ ]]; then
-    echo "Error: amount '${amount_gram}' must be numeric TON amount (for example: 1, 1., 1.5)." >&2
-    return 1
-  fi
-  total_amount_nano="$(gram_amount_to_nano "$amount_gram" || true)"
-  if ! [[ "$total_amount_nano" =~ ^[0-9]+$ ]] || (( total_amount_nano <= 0 )); then
-    echo "Error: amount '${amount_gram}' must be greater than zero and have at most nine decimal places." >&2
-    return 1
-  fi
-  if ! ton_address_to_hex "$destination_address" >/dev/null; then
-    echo "Error: invalid destination wallet address '${destination_address}'." >&2
-    return 1
-  fi
-  current_seqno="$(wallet_prepare_source "$from_wallet" "$source_wallet_address" "$normalized_mode")" || return 1
-  if ! [[ "$current_seqno" =~ ^[0-9]+$ ]]; then
-    echo "Error: failed to resolve source wallet seqno for '${from_wallet}'." >&2
-    return 1
-  fi
-  send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag" || return 1
-  expected_seqno=$((10#$current_seqno + 1))
-  echo "[wallet] Waiting for on-chain acceptance of seqno=${current_seqno} ..." >&2
-  wallet_wait_for_seqno "$source_wallet_address" "$expected_seqno" >/dev/null
-}
+  echo "[wallet] All ${target_count} outgoing payments confirmed. Check recipient balances for final delivery." >&2
+)
 
 run_action() {
   local action="${1:-}"
@@ -2047,7 +2729,10 @@ run_with_persistence() {
   else
     action_rc=$?
   fi
-  if [[ "$action" == "show" || "$action" == "export" ]]; then
+  # Sending changes the durable public outbox, not the encrypted signing keys.
+  # Rewriting the key bundle after confirmed payments adds both corruption
+  # risk on interruption and a misleading post-payment failure to retry.
+  if [[ "$action" == "show" || "$action" == "export" || "$action" == "send" ]]; then
     return "$action_rc"
   fi
   if backup_bundle; then

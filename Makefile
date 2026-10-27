@@ -87,8 +87,15 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_wallet_query_routing_test.sh
 	bash test/main_wallet_address_flags_test.sh
 	bash test/main_wallet_send_test.sh
+	bash test/main_wallet_outbox_test.sh
+	bash test/main_wallet_receipt_test.sh
+	bash test/kubeton_main_wallet_timeout_test.sh
 	bash test/kubeton_wallet_chain_queries_test.sh
 	bash test/kubeton_wallet_export_test.sh
+
+.PHONY: test-main-wallet-runtime
+test-main-wallet-runtime: ## Run optional real-Fift wallet integration in an isolated TON Docker image.
+	bash test/main_wallet_runtime_test.sh
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
