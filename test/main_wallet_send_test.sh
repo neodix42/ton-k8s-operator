@@ -34,6 +34,7 @@ setup_case() {
   MAIN_WALLET_REBROADCAST_DELAY_SEC=0
   MAIN_WALLET_REBROADCAST_ATTEMPTS=1
   MAIN_WALLET_TRANSFER_VALIDITY_SEC=180
+  MAIN_WALLET_VERBOSE=false
   fixture_source="0:$(printf '%064d' 1)"
   fixture_first="-1:$(printf '%064d' 2)"
   fixture_second="-1:$(printf '%064d' 3)"
@@ -87,8 +88,14 @@ while (( $# > 0 )); do
 done
 [[ "$validity" == 180 ]] || { echo 'transfer expiry must cover bounded fallback attempts' >&2; exit 94; }
 printf 'fift %s %s %s %s\n' "$seqno" "$destination" "$amount" "$bounce" >>"$case_dir/events"
+if [[ -e "$case_dir/noisy-signing" ]]; then
+  printf 'signing message: x{SYNTHETIC_SIGNING_DUMP}\nB5EE9C72_SYNTHETIC_BOC_DUMP\n'
+fi
 rc="$(cat "$case_dir/fift-rc")"
-(( rc == 0 )) || exit "$rc"
+if (( rc != 0 )); then
+  printf 'Fift synthetic signing error: rejected transfer fixture\n' >&2
+  exit "$rc"
+fi
 printf 'transfer|%s|%s|%s\n' "$seqno" "$destination" "$amount" >"$output.boc"
 SH
   chmod +x "$case_dir/fake-fift"
@@ -122,6 +129,24 @@ SH
       sendfile\ *)
         boc="${query#sendfile }"
         [[ -s "$boc" ]] || fail 'broadcast a missing/empty BOC'
+        if [[ -f "$case_dir/noisy-rpc-failures" ]]; then
+          local invocation=0
+          printf '%s' "${WALLET_SEND_DIAGNOSTICS_FILE:-}" >"$case_dir/observed-diag-path"
+          [[ ! -e "$case_dir/noisy-rpc-count" ]] || invocation="$(cat "$case_dir/noisy-rpc-count")"
+          invocation=$((invocation + 1))
+          printf '%s' "$invocation" >"$case_dir/noisy-rpc-count"
+          printf 'rpc-attempt %s\n' "$invocation" >>"$events"
+          printf '[ 3][ext-client] SYNTHETIC_RAW_RPC_DEBUG\n'
+          if (( invocation == 1 )); then
+            printf '[error] liteserver error: [Error : -503 : synthetic RPC timeout]\n' >&2
+          else
+            printf '[error] PosixError : synthetic Connection refused : 111\n' >&2
+          fi
+          return 99
+        fi
+        if [[ -f "$case_dir/noisy-rpc-ack" ]]; then
+          printf '[ 3][ext-client] SYNTHETIC_RAW_RPC_DEBUG\n'
+        fi
         if [[ "$(head -c 11 "$boc")" == 'deployment|' ]]; then
           [[ "$(cat "$boc")" == "deployment|$fixture_source" ]] || fail 'broadcast StateInit for the wrong account'
           printf 'deploy\n' >>"$events"
@@ -214,7 +239,21 @@ assert_failed() {
   if "$@" >"$case_dir/out" 2>"$case_dir/err"; then
     fail "unexpected successful send in ${case_dir##*/}"
   fi
+  assert_no_send_diagnostics
 }
+
+assert_no_send_diagnostics() (
+  shopt -s globstar dotglob nullglob
+  local -a leftovers=(
+    "$MAIN_WALLET_DIR"/**/.send-diagnostics.*
+    "$MAIN_WALLET_BUNDLE_DIR"/**/.send-diagnostics.*
+  )
+  (( ${#leftovers[@]} == 0 )) || fail 'temporary send diagnostics remained after the operation finished'
+  if [[ -s "$case_dir/observed-diag-path" ]]; then
+    [[ "$(cat "$case_dir/observed-diag-path")" == "$MAIN_WALLET_DIR"/.send-diagnostics.* ]] \
+      || fail 'send diagnostics were stored outside the temporary wallet runtime'
+  fi
+)
 
 assert_transfer_count() {
   local expected="$1" actual
@@ -793,6 +832,121 @@ test_direct_api_transport_rejects_wrong_network() (
   ! grep -q '^transport-https$' "$events" || fail 'direct API transport broadcast to another network'
 )
 
+setup_noisy_send_case() {
+  setup_case "$1"
+  MODE=auto
+  MAIN_WALLET_LITESERVER_SEND_ATTEMPTS=2
+  MAIN_WALLET_REBROADCAST_ATTEMPTS=0
+  touch "$case_dir/noisy-signing" "$case_dir/noisy-rpc-failures"
+  printf accept >"$case_dir/noisy-api-behavior"
+  curl() {
+    local -a arguments=("$@")
+    local payload="" decoded i
+    # Read queries deliberately use the fixture's lite-client boundary.
+    [[ "${arguments[-1]}" == https://toncenter.com/api/v2/sendBoc ]] || return 95
+    for ((i=0; i<${#arguments[@]}; i++)); do
+      if [[ "${arguments[$i]}" == --data ]]; then payload="${arguments[$((i+1))]}"; fi
+    done
+    decoded="$(printf '%s' "$payload" | jq -er .boc | base64 -d)"
+    [[ "$decoded" == "transfer|7|$fixture_first|1" ]] \
+      || fail 'noisy transport fallback changed the original signed payment'
+    printf 'api-attempt\n' >>"$events"
+    if [[ "$(cat "$case_dir/noisy-api-behavior")" == reject ]]; then
+      printf '{"ok":false,"error":"synthetic API provider rejection"}\n500'
+      return 0
+    fi
+    printf 8 >"$case_dir/seqno"
+    touch "$case_dir/paid-7"
+    printf '{"ok":true,"result":{"@type":"ok"},"diagnostic":"SYNTHETIC_RAW_API_JSON"}\n200'
+  }
+}
+
+assert_quiet_confirmed_send() {
+  local output
+  assert_no_send_diagnostics
+  for output in "$case_dir/out" "$case_dir/err"; do
+    ! grep -Eq 'Error:|Warning:|\[error\]|SYNTHETIC_RAW_|SYNTHETIC_SIGNING_DUMP|B5EE9C72_SYNTHETIC_BOC_DUMP|external message status is' "$output" \
+      || fail "confirmed send printed raw diagnostics or recovered errors in $output"
+  done
+  cat "$case_dir/out" "$case_dir/err" >"$case_dir/combined"
+  assert_contains 'All 1 outgoing payments confirmed.' "$case_dir/combined"
+  assert_transfer_count 1
+  [[ "$(cat "$case_dir/seqno")" == 8 ]] || fail 'quiet output changed the confirmed chain state'
+}
+
+test_recovered_provider_failures_are_quiet_after_payment_confirmation() (
+  setup_noisy_send_case quiet-provider-fallback
+  main_wallet_send savings "$fixture_first" 1 >"$case_dir/out" 2>"$case_dir/err"
+  assert_quiet_confirmed_send
+  [[ "$(awk '$1 == "rpc-attempt" {n++} END {print n+0}' "$events")" == 2 ]] \
+    || fail 'quiet fallback changed the two lite-server attempts'
+  [[ "$(awk '$1 == "api-attempt" {n++} END {print n+0}' "$events")" == 1 ]] \
+    || fail 'quiet fallback changed the successful API attempt'
+)
+
+test_successful_lite_server_send_hides_signing_and_ack_dumps() (
+  setup_case quiet-ack-success
+  touch "$case_dir/noisy-signing" "$case_dir/noisy-rpc-ack"
+  MAIN_WALLET_REBROADCAST_ATTEMPTS=0
+  main_wallet_send savings "$fixture_first" 1 >"$case_dir/out" 2>"$case_dir/err"
+  assert_quiet_confirmed_send
+  [[ "$(awk '$1 == "broadcast" {n++} END {print n+0}' "$events")" == 1 ]] \
+    || fail 'quiet success changed the single lite-server submission'
+)
+
+test_unresolved_provider_failures_keep_the_original_causes() (
+  setup_noisy_send_case noisy-final-provider-failure
+  printf reject >"$case_dir/noisy-api-behavior"
+  assert_failed main_wallet_send savings "$fixture_first" 1
+  cat "$case_dir/out" "$case_dir/err" >"$case_dir/combined"
+  assert_contains 'synthetic RPC timeout' "$case_dir/combined"
+  assert_contains 'synthetic Connection refused' "$case_dir/combined"
+  assert_contains 'synthetic API provider rejection' "$case_dir/combined"
+  assert_contains 'no exact outgoing-payment receipt' "$case_dir/combined"
+  assert_transfer_count 1
+  [[ "$(cat "$case_dir/seqno")" == 7 ]] || fail 'failed providers advanced the source sequence'
+)
+
+test_ack_without_receipt_still_fails_with_diagnostics() (
+  setup_case noisy-ack-unconfirmed
+  touch "$case_dir/noisy-signing" "$case_dir/noisy-rpc-ack"
+  printf unconfirmed >"$case_dir/behavior"
+  MAIN_WALLET_REBROADCAST_ATTEMPTS=0
+  assert_failed main_wallet_send savings "$fixture_first" 1
+  cat "$case_dir/out" "$case_dir/err" >"$case_dir/combined"
+  assert_contains 'SYNTHETIC_RAW_RPC_DEBUG' "$case_dir/combined"
+  assert_contains 'external message status is 1' "$case_dir/combined"
+  assert_contains 'no exact outgoing-payment receipt' "$case_dir/combined"
+  ! grep -Fq 'All 1 outgoing payments confirmed.' "$case_dir/combined" || fail 'ACK-only send was reported as paid'
+  assert_transfer_count 1
+)
+
+test_signing_failure_preserves_its_diagnostic_cause() (
+  setup_case noisy-signing-failure
+  touch "$case_dir/noisy-signing"
+  printf 42 >"$case_dir/fift-rc"
+  assert_failed main_wallet_send savings "$fixture_first" 1
+  cat "$case_dir/out" "$case_dir/err" >"$case_dir/combined"
+  assert_contains 'Fift synthetic signing error: rejected transfer fixture' "$case_dir/combined"
+  assert_contains 'no BOC was submitted' "$case_dir/combined"
+  ! grep -q '^broadcast \|^api-attempt$' "$events" || fail 'signing failure broadcast a transfer'
+)
+
+test_verbose_send_preserves_signing_and_provider_details() (
+  setup_noisy_send_case verbose-provider-fallback
+  MAIN_WALLET_VERBOSE=true
+  main_wallet_send savings "$fixture_first" 1 >"$case_dir/out" 2>"$case_dir/err"
+  cat "$case_dir/out" "$case_dir/err" >"$case_dir/combined"
+  assert_contains 'SYNTHETIC_SIGNING_DUMP' "$case_dir/combined"
+  assert_contains 'B5EE9C72_SYNTHETIC_BOC_DUMP' "$case_dir/combined"
+  assert_contains 'SYNTHETIC_RAW_RPC_DEBUG' "$case_dir/combined"
+  assert_contains 'synthetic RPC timeout' "$case_dir/combined"
+  assert_contains 'synthetic Connection refused' "$case_dir/combined"
+  assert_contains 'SYNTHETIC_RAW_API_JSON' "$case_dir/combined"
+  assert_contains 'All 1 outgoing payments confirmed.' "$case_dir/combined"
+  assert_transfer_count 1
+)
+
 test_active_wallet_confirms_each_transfer
 test_funded_uninit_deploys_before_transfer
 test_rejected_transfer_stops_the_batch
@@ -832,5 +986,11 @@ test_pending_corruption_during_confirmation_never_rebroadcasts
 
 test_mismatched_api_network_never_signs_or_broadcasts
 test_direct_api_transport_rejects_wrong_network
+test_recovered_provider_failures_are_quiet_after_payment_confirmation
+test_successful_lite_server_send_hides_signing_and_ack_dumps
+test_unresolved_provider_failures_keep_the_original_causes
+test_ack_without_receipt_still_fails_with_diagnostics
+test_signing_failure_preserves_its_diagnostic_cause
+test_verbose_send_preserves_signing_and_provider_details
 
-echo 'main wallet send tests passed (46 scenarios).'
+echo 'main wallet send tests passed (52 scenarios).'

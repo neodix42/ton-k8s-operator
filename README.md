@@ -933,6 +933,11 @@ transaction history: the signed message body, destination and nanoTON amount
 must match an actual outgoing payment before the next recipient is attempted.
 A source seqno change or a lite-server acknowledgement alone is insufficient.
 Check recipient balances when you need to confirm final delivery.
+Send output shows progress, concise retry or fallback notices, and confirmed
+payments by default. A recovered lite-server failure does not print the raw
+error trace when the payment is confirmed. For Fift, lite-client, and TONCenter
+diagnostics, run `MAIN_WALLET_VERBOSE=true ./kubeton wallet send ...`.
+Unconfirmed failures still print detailed diagnostics automatically.
 Receipt verification uses the matching TONCenter history endpoint in every
 transport mode; `liteserver` restricts broadcasting, while confirmation still
 requires HTTPS access to that endpoint.
@@ -1201,6 +1206,7 @@ MAIN_WALLET_BUNDLE_SIZE
 MAIN_WALLET_BUNDLE_STORAGE_CLASS
 MAIN_WALLET_BUNDLE_ACCESS_MODE
 MAIN_WALLET_MODE
+MAIN_WALLET_VERBOSE
 MAIN_WALLET_GLOBAL_CONFIG_URL
 MAIN_WALLET_TONCENTER_URL
 MAIN_WALLET_TONCENTER_API_KEY

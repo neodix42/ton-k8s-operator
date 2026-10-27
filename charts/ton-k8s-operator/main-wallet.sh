@@ -25,6 +25,7 @@ MAIN_WALLET_CONFIRM_TIMEOUT_SEC="${MAIN_WALLET_CONFIRM_TIMEOUT_SEC:-180}"
 MAIN_WALLET_HTTP_MIN_INTERVAL_MS="${MAIN_WALLET_HTTP_MIN_INTERVAL_MS:-1100}"
 MAIN_WALLET_REBROADCAST_DELAY_SEC="${MAIN_WALLET_REBROADCAST_DELAY_SEC:-10}"
 MAIN_WALLET_REBROADCAST_ATTEMPTS="${MAIN_WALLET_REBROADCAST_ATTEMPTS:-3}"
+MAIN_WALLET_VERBOSE="${MAIN_WALLET_VERBOSE:-false}"
 
 usage() {
   cat <<'EOF'
@@ -54,6 +55,48 @@ EOF
 
 trim_whitespace() {
   printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+wallet_send_verbose_enabled() {
+  case "${MAIN_WALLET_VERBOSE,,}" in
+    true|1|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wallet_send_progress() {
+  if [[ -n "${WALLET_SEND_PROGRESS_FD:-}" ]]; then
+    printf '%s\n' "$*" >&"$WALLET_SEND_PROGRESS_FD"
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
+
+# Calls carrying receipt/seqno data must preserve stdout. Calls whose entire
+# output is diagnostic run directly, preserving their mutable shell state.
+wallet_send_diagnostics_run() {
+  local capture="$1"
+  shift
+  if wallet_send_verbose_enabled || [[ -z "${WALLET_SEND_DIAGNOSTICS_FILE:-}" ]]; then
+    if [[ "$capture" == all ]]; then "$@" >&2; else "$@"; fi
+  elif [[ "$capture" == all ]]; then
+    "$@" >>"$WALLET_SEND_DIAGNOSTICS_FILE" 2>&1
+  else
+    "$@" 2>>"$WALLET_SEND_DIAGNOSTICS_FILE"
+  fi
+}
+
+wallet_send_diagnostics_finish() {
+  local rc="$1"
+  # Command substitutions must not remove their parent's diagnostic buffer.
+  [[ "$BASHPID" == "${WALLET_SEND_DIAGNOSTICS_OWNER:-}" ]] || return 0
+  if [[ -n "${WALLET_SEND_DIAGNOSTICS_FILE:-}" ]]; then
+    if (( rc != 0 )) && [[ -s "$WALLET_SEND_DIAGNOSTICS_FILE" ]]; then
+      wallet_send_progress '[wallet] Send diagnostics for the unconfirmed or failed operation:'
+      cat "$WALLET_SEND_DIAGNOSTICS_FILE" >&2
+    fi
+    rm -f "$WALLET_SEND_DIAGNOSTICS_FILE"
+  fi
 }
 
 main_wallet_send_retry_attempts() {
@@ -848,6 +891,9 @@ send_boc_payload() {
       warn_liteserver_toncenter_network_mismatch
       send_boc_liteserver "$boc_file" && return 0
       liteserver_rc=$?
+      if [[ -n "${WALLET_SEND_PROGRESS_FD:-}" ]]; then
+        wallet_send_progress '[wallet] Lite-server submission unavailable; using TONCenter fallback.'
+      fi
       echo "Warning: lite-server BOC send failed; trying TONCenter fallback." >&2
       send_boc_toncenter "$boc_file" && return 0
       toncenter_rc=$?
@@ -1744,7 +1790,7 @@ wallet_prepare_source() {
         echo "Error: fund '${wallet_name}' at its non-bounceable address before deploying or sending." >&2
         return 1
       fi
-      echo "[wallet] '${wallet_name}' is funded but undeployed; deploying its verified V3 contract before sending." >&2
+      wallet_send_progress "[wallet] '${wallet_name}' is funded but undeployed; deploying its verified V3 contract before sending."
       boc_file="$(wallet_build_deploy_boc "$wallet_name")" || return 1
       if ! deploy_boc_with_mode "$wallet_name" "$boc_file" "$normalized_mode" >&2; then
         rm -f "$boc_file"
@@ -2451,7 +2497,7 @@ wallet_confirm_transfer() {
     now="$(date +%s)"
     if (( now < expiry && broadcasts < rebroadcast_limit && now - last_broadcast >= rebroadcast_delay )) &&
       { [[ ! "$seqno" =~ ^[0-9]+$ ]] || (( 10#$seqno < expected )); }; then
-      echo "[wallet] Payment receipt is pending (last source seqno=${seqno}); rebroadcasting the same signed message (${broadcasts}/${rebroadcast_limit} retries used)." >&2
+      wallet_send_progress "[wallet] Payment receipt is pending (last source seqno=${seqno}); rebroadcasting the same signed message (${broadcasts}/${rebroadcast_limit} retries used)."
       # Cross-broadcast after an ACK in auto mode as well. ACK 1 only admits
       # the message at one server; it does not establish network inclusion.
       if wallet_rebroadcast_transfer "$boc" "$mode" "$expiry" >&2; then
@@ -2605,6 +2651,13 @@ main_wallet_send() (
   local receipt receipt_rc transaction_id matched_hash proof retries old_seq minimum_seqno state
   network="$(resolve_current_wallet_network)" || return 1
   wallet_outbox_begin "$from_wallet" "$source_wallet_address" "$network" "$source_subwallet_id" "$amount_gram" "${destination_addresses[@]}" || return 1
+  local WALLET_SEND_DIAGNOSTICS_FILE="" WALLET_SEND_DIAGNOSTICS_OWNER="$BASHPID" WALLET_SEND_PROGRESS_FD
+  exec {WALLET_SEND_PROGRESS_FD}>&2
+  if ! wallet_send_verbose_enabled; then
+    WALLET_SEND_DIAGNOSTICS_FILE="$(mktemp "$MAIN_WALLET_DIR/.send-diagnostics.XXXXXX")" || return 1
+    chmod 600 "$WALLET_SEND_DIAGNOSTICS_FILE" || { rm -f "$WALLET_SEND_DIAGNOSTICS_FILE"; return 1; }
+    trap 'wallet_send_diagnostics_finish "$?"' EXIT
+  fi
   if [[ "$WALLET_OUTBOX_RESUMED" == true ]]; then
     echo "[wallet] Resuming saved batch: ${WALLET_OUTBOX_INDEX}/${target_count} payments already confirmed; those recipients will be skipped." >&2
   fi
@@ -2620,9 +2673,10 @@ main_wallet_send() (
         # original seqno remains reserved for this same recipient and amount.
         old_seq="$(wallet_outbox_retry_seqno)" || return 1
         if [[ -n "$old_seq" ]]; then
-          if receipt="$(wallet_confirm_known_receipts "$source_wallet_address")"; then
+          if receipt="$(wallet_send_diagnostics_run stderr wallet_confirm_known_receipts "$source_wallet_address")"; then
             IFS=$'\t' read -r transaction_id matched_hash <<<"$receipt"
             wallet_outbox_confirm "$idx" "$transaction_id" "$matched_hash" || return 1
+            [[ -z "$WALLET_SEND_DIAGNOSTICS_FILE" ]] || : >"$WALLET_SEND_DIAGNOSTICS_FILE"
             break
           else
             receipt_rc=$?
@@ -2641,14 +2695,15 @@ main_wallet_send() (
             current_seqno="$minimum_seqno"
           fi
         else
-          current_seqno="$(wallet_prepare_source "$from_wallet" "$source_wallet_address" "$normalized_mode")" || return 1
+          current_seqno="$(wallet_send_diagnostics_run stderr wallet_prepare_source "$from_wallet" "$source_wallet_address" "$normalized_mode")" || return 1
         fi
         [[ "$current_seqno" =~ ^[0-9]+$ ]] || return 1
         if [[ -n "$old_seq" && "$current_seqno" != "$old_seq" ]]; then
           wallet_outbox_fail 'the reserved seqno changed but its exact payment receipt is not available yet'
           return 1
         fi
-        if send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag" >&2; then
+        wallet_send_progress "[wallet] Sending payment $((idx + 1))/${target_count}: ${amount_gram} TON from '${from_wallet}' to '${destination_address}'."
+        if wallet_send_diagnostics_run all send_single_transfer "$from_wallet" "$destination_address" "$amount_gram" "$current_seqno" "$source_subwallet_id" "$normalized_mode" "$no_bounce_flag"; then
           initially_submitted=true
         fi
         pending="$(wallet_outbox_pending)" || return 1
@@ -2660,9 +2715,12 @@ main_wallet_send() (
       IFS=$'\t' read -r pending_seq expiry body_hash boc dest_raw nano item <<<"$pending"
       expected_seqno=$((10#$pending_seq + 1))
       echo "[wallet] Confirming payment $((idx + 1))/${target_count} to '${destination_address}' (source seqno=${pending_seq}) ..." >&2
-      if receipt="$(wallet_confirm_transfer "$source_wallet_address" "$expected_seqno" "$boc" "$body_hash" "$dest_raw" "$nano" "$expiry" "$initially_submitted" "$normalized_mode")"; then
+      if receipt="$(wallet_send_diagnostics_run stderr wallet_confirm_transfer "$source_wallet_address" "$expected_seqno" "$boc" "$body_hash" "$dest_raw" "$nano" "$expiry" "$initially_submitted" "$normalized_mode")"; then
         IFS=$'\t' read -r transaction_id matched_hash <<<"$receipt"
         wallet_outbox_confirm "$idx" "$transaction_id" "$matched_hash" || return 1
+        # Discard recovered transport/signing chatter only once this exact
+        # outgoing payment and its durable journal update are both confirmed.
+        [[ -z "$WALLET_SEND_DIAGNOSTICS_FILE" ]] || : >"$WALLET_SEND_DIAGNOSTICS_FILE"
         echo "[wallet] Confirmed outgoing payment $((idx + 1))/${target_count}; transaction ${transaction_id}." >&2
         break
       else

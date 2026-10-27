@@ -248,6 +248,7 @@ test_networkless_send_forms() (
     assert_helper_env MAIN_WALLET_HTTP_MIN_INTERVAL_MS 1234
     assert_helper_env MAIN_WALLET_REBROADCAST_DELAY_SEC 4
     assert_helper_env MAIN_WALLET_REBROADCAST_ATTEMPTS 2
+    assert_helper_env MAIN_WALLET_VERBOSE false
 
     run_wallet send savings tonnode-0 3.5 "${flags[@]}" >"$case_dir/pod${flag}"
     assert_helper_command send savings "$fixture_destination_address" 3.5 "${flags[@]}"
@@ -264,6 +265,10 @@ test_networkless_send_forms() (
     assert_contains "$fixture_destination_address" "$case_dir/split${flag}"
     assert_contains "$fixture_second_address" "$case_dir/split${flag}"
   done
+
+  MAIN_WALLET_VERBOSE=true
+  run_wallet send savings "$fixture_destination_address" 3.5 >"$case_dir/verbose"
+  assert_helper_env MAIN_WALLET_VERBOSE true
 )
 
 test_send_requires_complete_inventory() (
