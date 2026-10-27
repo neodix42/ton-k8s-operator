@@ -82,6 +82,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_observability_test.sh
 	bash test/kubeton_wallet_network_test.sh
 	bash test/kubeton_wallet_lookup_test.sh
+	bash test/kubeton_wallet_activate_test.sh
 	python3 test/kubeton_wallet_state_query_test.py
 	bash test/kubeton_wallet_metadata_test.sh
 	bash test/kubeton_wallet_query_routing_test.sh

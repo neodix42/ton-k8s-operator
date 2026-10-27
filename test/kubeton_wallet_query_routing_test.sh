@@ -121,9 +121,96 @@ test_missing_prerequisite_exit_code_is_preserved() (
   [[ ! -s "$routing_dir/out" ]] || fail "prerequisite failure leaked a wallet row"
 )
 
+test_without_confirmation_deadline_preserves_existing_timeout() (
+  source "$repo_root/charts/ton-k8s-operator/kubeton"
+  unset KUBETON_WALLET_QUERY_DEADLINE
+  [[ "$(wallet_query_command_timeout 180s)" == 180s ]] || fail 'ordinary query timeout was changed'
+)
+
+test_confirmation_deadline_caps_long_commands_and_respects_shorter_limit() (
+  source "$repo_root/charts/ton-k8s-operator/kubeton"
+  date() { [[ "$*" == +%s ]] || return 97; printf 100; }
+  KUBETON_WALLET_QUERY_DEADLINE=105
+  [[ "$(wallet_query_command_timeout 180s)" == 5s ]] || fail 'confirmation command exceeded its remaining budget'
+  [[ "$(wallet_query_command_timeout 2s)" == 2s ]] || fail 'confirmation increased a shorter configured timeout'
+  [[ "$(wallet_query_command_timeout 0)" == 5s ]] || fail 'unlimited command escaped confirmation budget'
+)
+
+test_expired_confirmation_budget_prevents_new_commands() (
+  source "$repo_root/charts/ton-k8s-operator/kubeton"
+  date() { [[ "$*" == +%s ]] || return 97; printf 100; }
+  KUBETON_WALLET_QUERY_DEADLINE=100
+  if wallet_query_command_timeout 180s; then fail 'expired confirmation budget started another command'; fi
+)
+
+test_slow_https_process_cannot_overrun_confirmation_deadline() {
+  # Run a genuine timeout process around a deliberately slow executable. The
+  # outer timeout also catches regressions that omit the inner timeout, while
+  # every process boundary remains local and synthetic.
+  python3 - "$repo_root" "$test_dir" <<'PY'
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+repository, temporary = map(pathlib.Path, sys.argv[1:])
+fixture = temporary / "deadline-process"
+binary = fixture / "bin"
+binary.mkdir(parents=True)
+(binary / "python3").write_text('#!/bin/sh\nprintf "https-start\\n" >> "$FIXTURE_EVENTS"\nexec sleep 5\n')
+(binary / "kubectl").write_text('''#!/bin/sh
+if [ "$FIXTURE_SLOW_STAGE" = address ]; then
+  printf "address-start\\n" >> "$FIXTURE_EVENTS"
+  exec sleep 5
+fi
+printf "unexpected-rpc\\n" >> "$FIXTURE_EVENTS"
+exit 98
+''')
+for path in binary.iterdir():
+    path.chmod(0o755)
+events = fixture / "events"
+events.write_text("")
+script = r'''
+set -uo pipefail
+source "$1/charts/ton-k8s-operator/kubeton"
+export PATH="$2/bin:$PATH"
+read_tonnode_global_config() { printf '{"fixture":true}'; }
+read_tonnode_wallet_version_from_pod() { printf v1; }
+KUBETON_WALLET_QUERY_DEADLINE="$(($(date +%s) + 1))"
+result=0
+if [[ "$FIXTURE_SLOW_STAGE" == address ]]; then
+  resolve_tonnode_wallet_row_from_pod unit-ns tonnode-0 validator_wallet_001 || result=$?
+  [[ "$result" != 0 ]]
+else
+  read_tonnode_wallet_state_from_pod unit-ns tonnode-0 validator_wallet_001 "-1:$(printf '%064d' 1)" || result=$?
+  [[ "$result" == 124 ]]
+fi
+'''
+for stage in ("https", "address"):
+    events.write_text("")
+    environment = dict(os.environ, FIXTURE_EVENTS=str(events), FIXTURE_SLOW_STAGE=stage)
+    started = time.monotonic()
+    try:
+        result = subprocess.run(["bash", "-c", script, "_", str(repository), str(fixture)],
+                                env=environment, capture_output=True, text=True, timeout=2.5)
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(f"confirmation deadline failed to stop a slow {stage} process") from error
+    elapsed = time.monotonic() - started
+    assert result.returncode == 0, (stage, result.stdout, result.stderr, result.returncode)
+    assert elapsed < 2.2, f"confirmation took {elapsed:.2f}s despite its 1s budget"
+    assert events.read_text() == f"{stage}-start\n", events.read_text()
+    assert not result.stdout, f"failed query leaked a wallet row: {result.stdout}"
+PY
+}
+
 test_host_https_success_bypasses_pod_network
 test_pod_fallback_hides_recovered_https_failure
 test_both_failures_retain_causes_and_reject_partial_stdout
 test_unreadable_config_uses_pod_fallback
 test_missing_prerequisite_exit_code_is_preserved
-echo 'kubeton wallet host/pod query routing tests passed (5 cases)'
+test_without_confirmation_deadline_preserves_existing_timeout
+test_confirmation_deadline_caps_long_commands_and_respects_shorter_limit
+test_expired_confirmation_budget_prevents_new_commands
+test_slow_https_process_cannot_overrun_confirmation_deadline
+echo 'kubeton wallet host/pod query routing tests passed (9 cases)'

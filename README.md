@@ -966,7 +966,26 @@ After topping up mytonctrl wallets inside TON pods with split mode, for example
 `kubeton wallet send main-wallet 2`, activate those pod wallets with
 `kubeton wallet activate [tonnode-name] [wallet-name]`. The
 activate command executes `aw <wallet-name>` through `mytonctrl` inside the TON
-pod and does not send a BOC payload to the network.
+pod, which submits the wallet's deployment BOC using MyTonCtrl's configured
+transports. MyTonCtrl may submit redundant copies: once the first copy
+activates the account, later copies can be rejected with a seqno mismatch
+(`exitcode=33`). This can occur during a successful activation.
+
+`kubeton` checks the selected wallet's live chain state after `aw`. A matching
+wallet name and raw account must report `active` before it prints a concise
+`is active (confirmed on chain)` message and counts that wallet as activated.
+Intermediate transport diagnostics stay quiet after verified success. If the
+wallet remains uninitialized, cannot be queried, or has a different identity,
+the command returns a failure and prints the MyTonCtrl output and verification
+failure. A console `ActivateWallet - OK` alone cannot establish success.
+Wallets already active at the initial check are skipped.
+
+Confirmation makes up to six checks with two seconds between checks and a
+shared 60-second deadline across metadata, HTTPS and lite-client reads. Set
+`WALLET_ACTIVATION_CONFIRM_ATTEMPTS`,
+`WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS`, or
+`WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS` to adjust these limits. MyTonCtrl's
+activation command retains its separate `MYTONCTRL_EXEC_TIMEOUT` limit.
 `kubeton wallet collect` reads the same live account status and only runs
 `mg` for source wallets that are already `active`; activate funded pod wallets
 before collecting from them.
@@ -1168,6 +1187,9 @@ MAIN_WALLET_POD_TIMEOUT
 MAIN_WALLET_RUNTIME_TMPFS_SIZE
 WALLET_QUERY_ATTEMPTS
 WALLET_QUERY_TIMEOUT_SECONDS
+WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS
+WALLET_ACTIVATION_CONFIRM_ATTEMPTS
+WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS
 
 AUTO_BAREMETAL_BOOTSTRAP
 FORCE_BAREMETAL_BOOTSTRAP

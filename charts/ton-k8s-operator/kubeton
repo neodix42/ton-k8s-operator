@@ -84,6 +84,9 @@ STATUS_EXEC_TIMEOUT="${STATUS_EXEC_TIMEOUT:-20s}"
 MYTONCTRL_EXEC_TIMEOUT="${MYTONCTRL_EXEC_TIMEOUT:-180s}"
 WALLET_QUERY_ATTEMPTS="${WALLET_QUERY_ATTEMPTS:-3}"
 WALLET_QUERY_TIMEOUT_SECONDS="${WALLET_QUERY_TIMEOUT_SECONDS:-45}"
+WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS="${WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS:-60}"
+WALLET_ACTIVATION_CONFIRM_ATTEMPTS="${WALLET_ACTIVATION_CONFIRM_ATTEMPTS:-6}"
+WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS="${WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS:-2}"
 SKIP_STOP_KEY_BACKUP="${SKIP_STOP_KEY_BACKUP:-true}"
 HELPER_POD_READY_TIMEOUT="${HELPER_POD_READY_TIMEOUT:-300s}"
 HELM_UNINSTALL_CMD_TIMEOUT="${HELM_UNINSTALL_CMD_TIMEOUT:-900s}"
@@ -3243,7 +3246,9 @@ except (ValueError, KeyError, TypeError):
 }
 
 read_tonnode_global_config() {
-  run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$1" exec "$2" -c ton-node -- \
+  local query_timeout
+  query_timeout="$(wallet_query_command_timeout "$STATUS_EXEC_TIMEOUT")" || return 124
+  run_with_timeout "$query_timeout" kubectl -n "$1" exec "$2" -c ton-node -- \
     cat /var/ton-work/controller/global.config.json
 }
 
@@ -11359,15 +11364,37 @@ except (ValueError, TypeError, OverflowError):
 PY
 }
 
+# An activation postcheck shares one deadline across metadata, HTTPS and RPC.
+# Other wallet queries keep their existing timeout values.
+wallet_query_command_timeout() {
+  local configured="$1" remaining configured_seconds
+  if [[ -z "${KUBETON_WALLET_QUERY_DEADLINE:-}" ]]; then
+    printf '%s' "$configured"
+    return 0
+  fi
+  remaining=$((KUBETON_WALLET_QUERY_DEADLINE - $(date +%s)))
+  (( remaining > 0 )) || return 1
+  if [[ "$configured" =~ ^([0-9]+)s?$ ]]; then
+    configured_seconds="${BASH_REMATCH[1]}"
+    (( configured_seconds == 0 || configured_seconds >= remaining )) || remaining="$configured_seconds"
+  fi
+  printf '%ss' "$remaining"
+}
+
 read_tonnode_wallet_state_from_pod() {
   local ns="$1" pod="$2" wallet_name="$3" raw_address="$4"
-  local script config version="unknown" https_output="" rpc_output="" rpc_rc=0
+  local script config version="unknown" https_output="" rpc_output="" rpc_rc=0 query_timeout
+  local -a https_command=(python3)
   script="$(tonnode_wallet_query_script)"
   if command -v python3 >/dev/null 2>&1; then
     if config="$(read_tonnode_global_config "$ns" "$pod" 2>/dev/null)"; then
       version="$(read_tonnode_wallet_version_from_pod "$ns" "$pod" "$raw_address" 2>/dev/null || true)"
       [[ -n "$version" ]] || version="unknown"
-      if https_output="$(printf '%s' "$config" | python3 -c "$script" "$wallet_name" "$raw_address" \
+      if [[ -n "${KUBETON_WALLET_QUERY_DEADLINE:-}" ]]; then
+        query_timeout="$(wallet_query_command_timeout "$MYTONCTRL_EXEC_TIMEOUT")" || return 124
+        https_command=(run_with_timeout "$query_timeout" python3)
+      fi
+      if https_output="$(printf '%s' "$config" | "${https_command[@]}" -c "$script" "$wallet_name" "$raw_address" \
           "$WALLET_QUERY_ATTEMPTS" "$WALLET_QUERY_TIMEOUT_SECONDS" --https-only "$version" 2>&1)"; then
         printf '%s' "$https_output"
         return 0
@@ -11378,7 +11405,8 @@ read_tonnode_wallet_state_from_pod() {
   else
     https_output="local python3 is unavailable for the HTTPS query"
   fi
-  rpc_output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- \
+  query_timeout="$(wallet_query_command_timeout "$MYTONCTRL_EXEC_TIMEOUT")" || return 124
+  rpc_output="$(run_with_timeout "$query_timeout" kubectl -n "$ns" exec "$pod" -c ton-node -- \
     python3 -c "$script" "$wallet_name" "$raw_address" "$WALLET_QUERY_ATTEMPTS" "$WALLET_QUERY_TIMEOUT_SECONDS" --rpc-only 2>&1)" || rpc_rc=$?
   if (( rpc_rc == 0 )); then
     [[ -n "$rpc_output" ]] || return 1
@@ -11400,7 +11428,7 @@ resolve_tonnode_wallet_row_from_pod() {
   local ns="$1"
   local pod="$2"
   local wallet_name="$3"
-  local output row raw_address query_rc=0
+  local output row raw_address query_rc=0 query_timeout
 
   [[ "$wallet_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   if raw_address="$(read_tonnode_wallet_address_file_from_pod "$ns" "$pod" "$wallet_name")"; then
@@ -11414,7 +11442,8 @@ resolve_tonnode_wallet_row_from_pod() {
     # Exit 78 is reserved for missing prerequisites in older installations.
     (( query_rc == 78 || query_rc == 127 )) || return 1
   fi
-  output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
+  query_timeout="$(wallet_query_command_timeout "$MYTONCTRL_EXEC_TIMEOUT")" || return 124
+  output="$(run_with_timeout "$query_timeout" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     if command -v mytonctrl >/dev/null 2>&1; then
       mytonctrl --cmd wl
     else
@@ -11467,9 +11496,10 @@ read_tonnode_wallet_address_file_from_pod() {
   local ns="$1"
   local pod="$2"
   local wallet_name="$3"
-  local output
+  local output query_timeout
 
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
+  query_timeout="$(wallet_query_command_timeout "$STATUS_EXEC_TIMEOUT")" || return 124
+  output="$(run_with_timeout "$query_timeout" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -lc '
     wallet_name="$1"
     wallet_dir="/var/ton-work/controller/mytoncore/wallets"
     set -o pipefail
@@ -11487,10 +11517,11 @@ read_tonnode_wallet_version_from_pod() {
   local ns="$1"
   local pod="$2"
   local raw_address="$3"
-  local output
+  local output query_timeout
 
   [[ "$raw_address" =~ ^-?[0-9]+:[[:xdigit:]]{64}$ ]] || return 1
-  output="$(run_with_timeout "$STATUS_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- python3 -c '
+  query_timeout="$(wallet_query_command_timeout "$STATUS_EXEC_TIMEOUT")" || return 124
+  output="$(run_with_timeout "$query_timeout" kubectl -n "$ns" exec "$pod" -c ton-node -- python3 -c '
 import base64
 import binascii
 import json
@@ -11746,13 +11777,56 @@ run_wallet_balance_show() {
   print_aligned_table_8col "namespace" "tonnode pod" "wallet-name" "status" "balance" "ver" "wch" "wallet-address" "${table_rows[@]}"
 }
 
-activate_tonnode_wallet_in_pod() {
-  local ns="$1"
-  local pod="$2"
-  local wallet_name="$3"
-  local output
-  local exec_rc=0
+wait_for_tonnode_wallet_active() (
+  local ns="$1" pod="$2" wallet_name="$3" expected_address="$4"
+  local attempts="$WALLET_ACTIVATION_CONFIRM_ATTEMPTS" delay="$WALLET_ACTIVATION_CONFIRM_DELAY_SECONDS"
+  local timeout_seconds="$WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS" attempt row returned_name status balance version workchain address actual_raw remaining
+  local last_error="no live state response" last_query_error="" error_file
+  [[ "$attempts" =~ ^[1-9][0-9]?$ ]] || attempts=6
+  [[ "$delay" =~ ^[0-9]{1,3}$ ]] || delay=2
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]{0,3}$ ]] || timeout_seconds=60
+  expected_address="$(ton_address_to_hex "$expected_address")" || return 1
+  local KUBETON_WALLET_QUERY_DEADLINE="$(($(date +%s) + timeout_seconds))"
+  error_file="$(mktemp)" || return 1
+  trap 'rm -f "$error_file"' EXIT
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    remaining=$((KUBETON_WALLET_QUERY_DEADLINE - $(date +%s)))
+    (( remaining > 0 )) || break
+    if row="$(resolve_tonnode_wallet_row_from_pod "$ns" "$pod" "$wallet_name" 2>"$error_file")"; then
+      IFS=$'\t' read -r returned_name status balance version workchain address <<<"$row"
+      actual_raw="$(ton_address_to_hex "$address" 2>/dev/null || true)"
+      if [[ "$returned_name" != "$wallet_name" || "$actual_raw" != "$expected_address" ]]; then
+        echo "Error: activation state query returned a different wallet identity for ${ns}/${pod}; refusing to count it as activated." >&2
+        return 1
+      fi
+      if [[ "${status,,}" == active ]]; then return 0; fi
+      last_error="last verified wallet state: ${status:-unknown}"
+      last_query_error=""
+    else
+      last_error="live wallet state could not be read"
+      last_query_error="$(<"$error_file")"
+    fi
+    remaining=$((KUBETON_WALLET_QUERY_DEADLINE - $(date +%s)))
+    if (( attempt < attempts && delay > 0 && remaining > 0 )); then
+      (( delay <= remaining )) || delay="$remaining"
+      sleep "$delay"
+    fi
+  done
+  echo "Error: activation was not confirmed for '${wallet_name}' in ${ns}/${pod} (${last_error})." >&2
+  [[ -z "$last_query_error" ]] || print_prefixed_lines "  ${pod}> " "$last_query_error" >&2
+  return 1
+)
 
+activate_tonnode_wallet_in_pod() {
+  local ns="$1" pod="$2" wallet_name="$3" expected_address="${4:-}"
+  local output verification_output exec_rc=0
+  if [[ -z "$expected_address" ]]; then
+    expected_address="$(read_tonnode_wallet_address_file_from_pod "$ns" "$pod" "$wallet_name")" || {
+      echo "Error: cannot establish the wallet identity for '${wallet_name}' in ${ns}/${pod}; no activation submitted." >&2
+      return 1
+    }
+  fi
+  expected_address="$(ton_address_to_hex "$expected_address")" || return 1
   output="$(run_with_timeout "$MYTONCTRL_EXEC_TIMEOUT" kubectl -n "$ns" exec "$pod" -c ton-node -- bash -c '
     wallet_name="$1"
     mtc_cmd="aw ${wallet_name}"
@@ -11770,19 +11844,26 @@ activate_tonnode_wallet_in_pod() {
     fi
   ' _ "$wallet_name" 2>&1)" || exec_rc=$?
   output="$(strip_ansi_sequences "$output")"
+  # MyTonCtrl broadcasts redundant copies before waiting for seqno. A later
+  # copy can be rejected after activation has already succeeded. Classify the
+  # outcome from the named account's live state, never from console text/rc.
+  if verification_output="$(wait_for_tonnode_wallet_active "$ns" "$pod" "$wallet_name" "$expected_address" 2>&1)"; then
+    echo "[wallet] Wallet '${wallet_name}' in ${ns}/${pod} is active (confirmed on chain)."
+    return 0
+  fi
   if (( exec_rc != 0 )); then
     echo "Error: mytonctrl aw failed in ${ns}/${pod} with exit code ${exec_rc}." >&2
     if (( exec_rc == 124 )); then
       echo "Error: command timed out after MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}." >&2
     fi
+  fi
+  [[ -z "$verification_output" ]] || printf '%s\n' "$verification_output" >&2
+  if [[ -n "$output" ]]; then
     echo "mytonctrl output from ${ns}/${pod}:" >&2
     print_prefixed_lines "  ${pod}> " "$output" >&2
-    return "$exec_rc"
   fi
-  if [[ -n "$output" ]]; then
-    echo "mytonctrl output from ${ns}/${pod}:"
-    print_prefixed_lines "  ${pod}> " "$output"
-  fi
+  (( exec_rc != 0 )) || exec_rc=1
+  return "$exec_rc"
 }
 
 run_wallet_activate() {
@@ -11860,7 +11941,7 @@ run_wallet_activate() {
       continue
     fi
     echo "[wallet] Activating ${wallet_name} in ${target_ns}/${target_pod} using: aw ${wallet_name}" >&2
-    if activate_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$wallet_name"; then
+    if activate_tonnode_wallet_in_pod "$target_ns" "$target_pod" "$wallet_name" "$address"; then
       ((activated_count+=1))
     else
       rc=1
@@ -11868,7 +11949,7 @@ run_wallet_activate() {
   done
 
   if (( rc != 0 )); then
-    echo "Error: activated ${activated_count}/${pending_count} wallet(s), skipped ${skipped_count} already active wallet(s); at least one mytonctrl aw command failed." >&2
+    echo "Error: activated ${activated_count}/${pending_count} wallet(s), skipped ${skipped_count} already active wallet(s); at least one activation could not be verified." >&2
     return 1
   fi
   echo "[wallet] Activated ${activated_count}/${pending_count} wallet(s) with mytonctrl aw; skipped ${skipped_count} already active wallet(s)."
@@ -20191,6 +20272,7 @@ run_wallet() {
     echo "    Activate mytonctrl wallet(s) inside TON pod(s) using: aw <wallet-name>."
     echo "    If [to-tonnode-name] is omitted, activates the wallet in all TON pods."
     echo "    If [wallet-name] is omitted, validator_wallet_001 is used."
+    echo "    Confirms the wallet is active on chain before reporting success."
     echo
     echo "  show [name]"
     echo "    Show one wallet by name, or all wallets if omitted."
@@ -20239,6 +20321,7 @@ run_wallet() {
     echo "  - export prints private key material to stdout; treat the output as a secret."
     echo "  - collect only runs mytonctrl mg for source wallets confirmed active; unreadable state stops collection."
     echo "  - activate/exec-mtc and wallet state timeout defaults to MYTONCTRL_EXEC_TIMEOUT=${MYTONCTRL_EXEC_TIMEOUT}."
+    echo "  - activation confirmation has a separate WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS=${WALLET_ACTIVATION_CONFIRM_TIMEOUT_SECONDS} deadline."
     echo "  - amount must be numeric TON amount (examples: 1, 1., 1.5)"
     echo "  - optional -n (last argument) forwards --no-bounce to wallet.fif"
     echo "  - <to-tonnode-name> is pod name like tonnode-0 (or namespace/pod when applicable)"
