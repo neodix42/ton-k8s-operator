@@ -671,8 +671,8 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 	if len(tpl.Spec.Containers) != 2 {
 		t.Fatalf("expected two containers (ton + sidecar), got %d", len(tpl.Spec.Containers))
 	}
-	if len(tpl.Spec.InitContainers) != 4 {
-		t.Fatalf("expected four init containers (layout, exporter, binaries, key-restore), got %d", len(tpl.Spec.InitContainers))
+	if len(tpl.Spec.InitContainers) != 5 {
+		t.Fatalf("expected five init containers (layout, exporter, binaries, key-restore, recovery bootstrap), got %d", len(tpl.Spec.InitContainers))
 	}
 	if tpl.Spec.InitContainers[0].Name != persistentLayoutInitName {
 		t.Fatalf("expected first init container %q, got %q", persistentLayoutInitName, tpl.Spec.InitContainers[0].Name)
@@ -684,7 +684,10 @@ func TestDesiredPodTemplateKeyManagement(t *testing.T) {
 		t.Fatalf("persistent layout init missing mytoncore mount")
 	}
 	if tpl.Spec.InitContainers[3].Name != "key-restore" {
-		t.Fatalf("expected last init container key-restore, got %q", tpl.Spec.InitContainers[3].Name)
+		t.Fatalf("expected identity restore before recovery bootstrap, got %q", tpl.Spec.InitContainers[3].Name)
+	}
+	if tpl.Spec.InitContainers[4].Name != restoreBootstrapName {
+		t.Fatalf("expected last init container recovery bootstrap, got %q", tpl.Spec.InitContainers[4].Name)
 	}
 	if tpl.Spec.Containers[1].Name != "key-backup" {
 		t.Fatalf("expected sidecar key-backup, got %q", tpl.Spec.Containers[1].Name)
@@ -761,6 +764,7 @@ func TestDesiredPodTemplateTerminationMessagePolicies(t *testing.T) {
 		persistentLayoutInitName: false,
 		tonExporterInitName:      false,
 		tonBinariesInitName:      false,
+		restoreBootstrapName:     false,
 		"key-restore":            false,
 		"bootstrap-config":       false,
 	}

@@ -71,6 +71,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_del_test.sh
 	bash test/kubeton_restore_keys_test.sh
 	python3 test/kubeton_targeted_restore_test.py
+	python3 test/kubeton_restore_bootstrap_test.py
 	python3 test/kubeton_fleet_test.py
 	python3 test/kubeton_fleet_tools_test.py
 	bash test/kubeton_status_test.sh
@@ -99,6 +100,10 @@ test-kubeton: ## Run kubeton CLI shell tests.
 .PHONY: test-main-wallet-runtime
 test-main-wallet-runtime: ## Run optional real-Fift wallet integration in an isolated TON Docker image.
 	bash test/main_wallet_runtime_test.sh
+
+.PHONY: test-restore-bootstrap-runtime
+test-restore-bootstrap-runtime: ## Run optional offline dump recovery integration in the MyTonCtrl Docker image.
+	bash test/kubeton_restore_bootstrap_runtime_test.sh
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.

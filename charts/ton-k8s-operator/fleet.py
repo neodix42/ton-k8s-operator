@@ -215,8 +215,79 @@ def rebind(source, target, address, port):
             "bundle lacks current validator/controller state")
 
 
+def restore_bootstrap():
+    """Import a replacement node's dump without reinstalling its controller.
+
+    Runs as the last init container, after key restore and before any node
+    service. The request lives on the encrypted-bundle PVC so an interrupted
+    import survives both container restarts and recreation of the Pod.
+    """
+    import fcntl
+    import subprocess
+    from types import SimpleNamespace
+
+    request = Path("/var/ton-key-bundle/.restore-node-bootstrap.json")
+    if not request.exists():
+        return
+    value = json.loads(request.read_text())
+    require(isinstance(value, dict) and type(value.get("version")) is int and
+            value["version"] == 1 and isinstance(value.get("args"), list) and
+            all(isinstance(arg, str) for arg in value["args"]),
+            "invalid node recovery bootstrap request; request was preserved")
+    # Use the same parser and precedence as the controller's entrypoint,
+    # including MYTONCTRL_ARGS and literal environment options such as DUMP.
+    sys.path.insert(0, "/usr/local/lib/mytonctrl")
+    from mytonctrl_docker_args import installation_environment
+
+    import os
+
+    env = installation_environment(os.environ, value["args"])
+    work = Path(env["TON_WORK_DIR"])
+    require(work == Path("/var/ton-work"), "unsupported node recovery work directory")
+    dump = env.get("DUMP", "false").lower()
+    require(dump in ("true", "false", "1", "0", "yes", "no"), "DUMP must be true or false")
+    state, database = work / "controller", work / "db"
+    require((state / "initialized.json").is_file() and (database / "config.json").is_file(),
+            "node identity must be restored before recovery bootstrap")
+    with (state / ".container.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if dump in ("true", "1", "yes"):
+            from mytoninstaller.dump import cleanup_completed_dump, download_dump, get_dump_cache_dir
+
+            require((state / "global.config.json").is_file(), "restored node global.config.json is missing")
+            os.environ.update(env)
+            paths = SimpleNamespace(ton_work_dir=str(work), ton_db_dir=str(database),
+                                    global_config_path=str(state / "global.config.json"))
+
+            class Logger:
+                @staticmethod
+                def add_log(message, level="info"):
+                    print(f"[restore-keys] [{level}] {message}", flush=True)
+
+            print("[restore-keys] Downloading/resuming the blockchain dump requested by the preserved installation arguments.", flush=True)
+            require(download_dump(Logger(), SimpleNamespace(paths=paths)) is True,
+                    "node recovery dump import failed; request and download cache were preserved for retry")
+            # Extraction runs as root. Repair ownership before the restored
+            # validator service opens the database as its unprivileged user.
+            subprocess.run(["chown", "-R", "validator:validator", str(database)], check=True)
+            cleanup_completed_dump(get_dump_cache_dir(str(work)), str(database))
+            print("[restore-keys] Blockchain dump imported; restored wallet, ADNL keys and controller settings retained.", flush=True)
+        else:
+            print("[restore-keys] Preserved installation arguments do not request a dump; synchronizing normally.", flush=True)
+        request.unlink()
+        # Commit acknowledgement before allowing the normal entrypoint to run.
+        directory = os.open(str(request.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 def main():
     action = sys.argv[1]
+    if action == "restore-bootstrap":
+        restore_bootstrap()
+        return
     if action == "rebind":
         rebind(*sys.argv[2:])
         return

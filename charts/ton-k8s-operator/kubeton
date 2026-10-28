@@ -17757,6 +17757,11 @@ try:
     if len(set(running.values())) != replicas:
         raise ValueError("targeted recovery requires one TON replica per server")
     spec = sts["spec"]["template"]["spec"]
+    main = next(c for c in spec["containers"] if c["name"] == "ton-node")
+    if not any(c.get("name") == "restore-node-bootstrap" and c.get("image") == main.get("image") and
+               c.get("command", [])[:2] == ["/opt/mytonctrl/venv/bin/python", "-c"] and
+               c["command"][-1] == "restore-bootstrap" for c in spec.get("initContainers", [])):
+        raise ValueError("targeted recovery requires an updated operator with restore-node-bootstrap support; run ./kubeton upgrade first")
     selector = dict(spec.get("nodeSelector", {})); network = cr["spec"].get("network", {})
     if selector != cr["spec"].get("nodeSelector", {}):
         raise ValueError("TonNode and StatefulSet selectors differ")
@@ -18013,14 +18018,27 @@ run_restore_keys_targeted() (
   kubectl -n "$ns" exec "$helper" -- mkdir -p "$staging"
   kubectl -n "$ns" cp "$checkpoint/rebound/." "$helper:$staging" >/dev/null
   commit_uploaded_key_bundle "$ns" "$helper" /bundle "$staging" "$checksums"
+  # A restored initialized.json intentionally retains controller settings.
+  # Request database bootstrap separately, so -d is honored on fresh storage
+  # without reinstalling MyTonCtrl or recreating validator/wallet identities.
+  local bootstrap_request
+  bootstrap_request="$(python3 -c 'import json,sys; print(json.dumps({"version":1,"args":json.load(sys.stdin)["spec"].get("args",[])}))' < "$checkpoint/tonnode.json")"
+  kubectl -n "$ns" exec "$helper" -- sh -ec 'umask 077; printf "%s\n" "$1" > /bundle/.restore-node-bootstrap.json.tmp; mv /bundle/.restore-node-bootstrap.json.tmp /bundle/.restore-node-bootstrap.json; sync' _ "$bootstrap_request"
   printf 'identity-staged\n' > "$checkpoint/phase"
   kubectl -n "$ns" delete pod "$helper" --wait=true --timeout=120s >/dev/null; helper=""
   kubectl get nodes -o json > "$checkpoint/nodes.json"
   python3 -c '
-import json,sys
+import copy,json,sys
 root=sys.argv[1]; node=sys.argv[2]; map_key=sys.argv[3]; s=json.load(open(root+"/statefulset.json")); c=json.load(open(root+"/plan.json")); nodes=json.load(open(root+"/nodes.json")); hosts={n["metadata"]["name"]:n["metadata"].get("labels",{}).get("kubernetes.io/hostname",n["metadata"]["name"]) for n in nodes["items"]}; mapping=dict(c["running"]); mapping[str(c["ordinal"])]=node
-s["metadata"]={k:v for k,v in s["metadata"].items() if k in ("name","namespace","labels","annotations","ownerReferences")}; s.pop("status",None); s["metadata"].setdefault("annotations",{})[map_key]=",".join(k+"="+v for k,v in sorted(mapping.items(),key=lambda x:int(x[0]))); s["spec"]["updateStrategy"]={"type":"OnDelete"}; s["spec"]["template"]["spec"].setdefault("affinity",{})["nodeAffinity"]={"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":sorted({hosts[n] for n in mapping.values()})}]}]}}; print(json.dumps(s))
-' "$checkpoint" "$destination" "$STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY" > "$checkpoint/replacement-statefulset.json"
+s["metadata"]={k:v for k,v in s["metadata"].items() if k in ("name","namespace","labels","annotations","ownerReferences")}; s.pop("status",None); s["metadata"].setdefault("annotations",{})[map_key]=",".join(k+"="+v for k,v in sorted(mapping.items(),key=lambda x:int(x[0]))); s["spec"]["updateStrategy"]={"type":"OnDelete"}; spec=s["spec"]["template"]["spec"]; spec.setdefault("affinity",{})["nodeAffinity"]={"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":sorted({hosts[n] for n in mapping.values()})}]}]}}
+# Refresh the shared helper while retaining the operator-managed recovery
+# init. Only the fresh target bundle has a bootstrap request.
+main=next(container for container in spec["containers"] if container["name"]=="ton-node")
+bootstrap={key:copy.deepcopy(main[key]) for key in ("image","imagePullPolicy","env","envFrom","resources","volumeMounts") if key in main}
+bootstrap.update(name="restore-node-bootstrap",command=["/opt/mytonctrl/venv/bin/python","-c",open(sys.argv[4]).read(),"restore-bootstrap"],terminationMessagePolicy="FallbackToLogsOnError")
+spec["initContainers"]=[container for container in spec.get("initContainers",[]) if container["name"]!="restore-node-bootstrap"]+[bootstrap]
+print(json.dumps(s))
+' "$checkpoint" "$destination" "$STICKY_ORDINAL_NODE_MAP_ANNOTATION_KEY" "$CHART_DIR/fleet.py" > "$checkpoint/replacement-statefulset.json"
   kubectl create -f "$checkpoint/replacement-statefulset.json" >/dev/null
   printf 'statefulset-recreated\n' > "$checkpoint/phase"
   # Adoption is an API operation, independent of the recovered node syncing.
@@ -18028,7 +18046,7 @@ s["metadata"]={k:v for k,v in s["metadata"].items() if k in ("name","namespace",
   while (( $(date +%s) < deadline )); do
     current="$(kubectl -n "$ns" get statefulset "$sts" -o jsonpath='{.metadata.uid}')"
     checked="$(kubectl -n "$ns" get pods -o json)"
-    if printf '%s\0%s' "$context" "$checked" | python3 -c 'import json,sys; c,p=map(json.loads,sys.stdin.read().split("\0")); actual={x["metadata"]["name"]:x for x in p["items"]}; owned=lambda x:any(o.get("controller") and o.get("uid")==sys.argv[1] for o in x["metadata"].get("ownerReferences",[])); target=actual.get(c["pod"]); ok=all(name in actual and actual[name]["metadata"]["uid"]==uid and owned(actual[name]) for name,uid in c["siblings"].items()) and (not target or (target["metadata"]["uid"]!=c["pod_uid"] and owned(target) and target.get("spec",{}).get("nodeName",sys.argv[2])==sys.argv[2])); sys.exit(0 if ok else 1)' "$current" "$destination"; then adopted=true; break; fi
+    if printf '%s\0%s' "$context" "$checked" | python3 -c 'import json,sys; c,p=map(json.loads,sys.stdin.read().split("\0")); actual={x["metadata"]["name"]:x for x in p["items"]}; owned=lambda x:any(o.get("controller") and o.get("uid")==sys.argv[1] for o in x["metadata"].get("ownerReferences",[])); target=actual.get(c["pod"]); ok=all(name in actual and actual[name]["metadata"]["uid"]==uid and owned(actual[name]) for name,uid in c["siblings"].items()) and target and target["metadata"]["uid"]!=c["pod_uid"] and owned(target) and target.get("spec",{}).get("nodeName",sys.argv[2])==sys.argv[2]; sys.exit(0 if ok else 1)' "$current" "$destination"; then adopted=true; break; fi
     sleep 2
   done
   is_true "$adopted" || { echo 'Error: could not verify adoption of every unchanged sibling pod; operator remains paused.' >&2; exit 1; }
@@ -18036,6 +18054,7 @@ s["metadata"]={k:v for k,v in s["metadata"].items() if k in ("name","namespace",
   operator_paused=0; orphaned=0; finished=1
   printf 'complete\n' > "$checkpoint/phase"
   echo "[restore-keys] ${ns}/${pod} recovery started on ${destination}; wallet keys and ADNL identity from the verified backup preserved, advertised IPv4 updated to ${address}."
+  echo '[restore-keys] Preserved installation arguments are used for recovery, including dump download when -d/DUMP is enabled.'
   echo '[restore-keys] Blockchain synchronization continues in the background. Check: ./kubeton status'
   echo "[restore-keys] Original target volumes and protected recovery checkpoint retained: ${checkpoint}"
 )

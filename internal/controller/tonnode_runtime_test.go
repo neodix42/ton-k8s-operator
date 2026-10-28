@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	tonv1alpha1 "github.com/neodix/ton-k8s-operator/api/v1alpha1"
+	chartassets "github.com/neodix/ton-k8s-operator/charts"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestRuntimePodStagesOfficialTonArtifacts(t *testing.T) {
@@ -86,6 +88,81 @@ func TestRuntimePodStagesOfficialTonArtifacts(t *testing.T) {
 	}
 	if pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds != 75 {
 		t.Errorf("termination grace = %v, want 75 seconds for upstream supervisor shutdown", pod.TerminationGracePeriodSeconds)
+	}
+}
+
+func TestRuntimeRecoveryBootstrapFollowsIdentityAndConfig(t *testing.T) {
+	for _, withConfig := range []bool{false, true} {
+		t.Run(map[bool]string{false: "restored config", true: "config secret"}[withConfig], func(t *testing.T) {
+			node := &tonv1alpha1.TonNode{Spec: tonv1alpha1.TonNodeSpec{
+				Image: "ghcr.io/example/mytonctrl@sha256:" + strings.Repeat("a", 64),
+				Args:  []string{"-m", "validator", "-n", "mainnet", "-d"},
+				Env: []corev1.EnvVar{
+					{Name: "DUMP_EXTRACT_THREADS", Value: "2"},
+					{Name: "CUSTOM_PARAMETERS", Value: "--archive-ttl 86400"},
+				},
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("16"), corev1.ResourceMemory: resource.MustParse("64Gi"),
+				}},
+				KeyManagement: &tonv1alpha1.TonNodeKeyManagementSpec{Enabled: true},
+			}}
+			if withConfig {
+				node.Spec.ConfigRef = &corev1.LocalObjectReference{Name: "node-config"}
+			}
+			pod := (&TonNodeReconciler{}).desiredPodTemplate(node, nil, corev1.EnvVar{}, nil).Spec
+			wantOrder := []string{persistentLayoutInitName, tonExporterInitName, tonBinariesInitName, "key-restore"}
+			if withConfig {
+				wantOrder = append(wantOrder, "bootstrap-config")
+			}
+			wantOrder = append(wantOrder, restoreBootstrapName)
+			gotOrder := make([]string, len(pod.InitContainers))
+			for index, init := range pod.InitContainers {
+				gotOrder[index] = init.Name
+			}
+			if !reflect.DeepEqual(gotOrder, wantOrder) {
+				t.Fatalf("recovery must follow identity and config restoration: got %v, want %v", gotOrder, wantOrder)
+			}
+			main := pod.Containers[0]
+			recovery := pod.InitContainers[len(pod.InitContainers)-1]
+			if recovery.Image != main.Image || recovery.ImagePullPolicy != main.ImagePullPolicy {
+				t.Fatalf("recovery must use the node's own controller image and pull policy: %+v", recovery)
+			}
+			if !reflect.DeepEqual(recovery.Env, main.Env) || !reflect.DeepEqual(recovery.Resources, main.Resources) || !reflect.DeepEqual(recovery.VolumeMounts, main.VolumeMounts) {
+				t.Fatalf("recovery must retain the node's installation environment, resources and mounts: %+v", recovery)
+			}
+			wantCommand := []string{"/opt/mytonctrl/venv/bin/python", "-c", chartassets.FleetScript, "restore-bootstrap"}
+			if !reflect.DeepEqual(recovery.Command, wantCommand) || len(recovery.Args) != 0 {
+				t.Fatal("recovery must invoke the shared fleet recovery helper without the normal entrypoint")
+			}
+			if len(recovery.Ports) != 0 || recovery.ReadinessProbe != nil || recovery.LivenessProbe != nil || recovery.StartupProbe != nil {
+				t.Fatal("recovery must not reserve service host ports or run application probes")
+			}
+		})
+	}
+}
+
+func TestRuntimeRecoveryBootstrapDisabledWithoutKeyManagement(t *testing.T) {
+	for _, keys := range []*tonv1alpha1.TonNodeKeyManagementSpec{nil, {Enabled: false}} {
+		node := &tonv1alpha1.TonNode{Spec: tonv1alpha1.TonNodeSpec{
+			KeyManagement: keys, ConfigRef: &corev1.LocalObjectReference{Name: "node-config"},
+		}}
+		pod := (&TonNodeReconciler{}).desiredPodTemplate(node, nil, corev1.EnvVar{}, nil).Spec
+		for _, init := range pod.InitContainers {
+			if init.Name == restoreBootstrapName {
+				t.Fatal("keyless nodes must not run encrypted-bundle recovery bootstrap")
+			}
+		}
+	}
+}
+
+func TestRuntimeRecoveryBootstrapRetainsEnvironmentSources(t *testing.T) {
+	main := corev1.Container{
+		Image:   "mytonctrl:testing",
+		EnvFrom: []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "node-settings"}}}},
+	}
+	recovery := desiredRestoreNodeBootstrapInitContainer(main)
+	if !reflect.DeepEqual(recovery.EnvFrom, main.EnvFrom) {
+		t.Fatal("recovery must retain environment configuration sources")
 	}
 }
 

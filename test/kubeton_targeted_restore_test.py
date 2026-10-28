@@ -21,6 +21,20 @@ def fixtures():
     data = add_fixtures()
     data["sts"].update(apiVersion="apps/v1", kind="StatefulSet")
     data["cr"]["spec"]["keyManagement"] = {"enabled": True, "provider": "vault"}
+    install_args = ["-m", "validator", "-n", "mainnet", "-d"]
+    install_env = [{"name": "DUMP_EXTRACT_THREADS", "value": "1"},
+                   {"name": "CUSTOM_PARAMETERS", "value": "--exporter-address 0.0.0.0:9777"}]
+    data["cr"]["spec"].update(args=install_args, env=install_env)
+    template = data["sts"]["spec"]["template"]["spec"]
+    template["containers"][0].update(args=["run", *install_args], env=install_env,
+        imagePullPolicy="IfNotPresent",
+        envFrom=[{"configMapRef": {"name": "ton-runtime-settings"}}],
+        volumeMounts=[{"name": "ton-work", "mountPath": "/var/ton-work"},
+                      {"name": "keybundle", "mountPath": "/var/ton-key-bundle"}])
+    template["initContainers"] = [{"name": "persistent-layout", "image": "alpine:fixture"},
+                                  {"name": "key-restore", "image": "alpine:fixture"},
+                                  {"name": "restore-node-bootstrap", "image": template["containers"][0]["image"],
+                                   "command": ["/opt/mytonctrl/venv/bin/python", "-c", "previous runtime helper", "restore-bootstrap"]}]
     data["sts"]["spec"]["template"]["spec"]["containers"].append({
         "name": "key-backup", "env": [{"name": "KEY_BUNDLE_FILE", "value": "keys.bundle.enc"},
                                          {"name": "KEY_BUNDLE_META_FILE", "value": "keys.bundle.meta"}],
@@ -52,7 +66,9 @@ def output(value): print(json.dumps(value))
 if args[0]=="event":
  event=" ".join(args[1:]); record(event)
  if event=="pause": s["operator_paused"]=True; save()
- if event=="resume": s["operator_paused"]=False; save()
+ if event=="resume":
+  assert mode!="delayed-target" or any(p["metadata"]["name"]=="tonnode-2" for p in s["pods"]["items"]), "operator resumed before recovered Pod existed"
+  s["operator_paused"]=False; save()
  if event=="commit": s["identity_staged"]=True; save()
  sys.exit(0)
 a=args[1:]
@@ -75,11 +91,13 @@ elif a[:2]==["create","-f"]:
   assert s.get("sts")==None and len(s["pvcs"]["items"])==0
   s["pvcs"]["items"]=[dict(x,metadata={**x["metadata"],"uid":"new-"+x["metadata"]["name"]}) for x in obj["items"]]; save(); record("create claims")
  elif obj["kind"]=="StatefulSet":
-  assert s.get("identity_staged") and s.get("sts")==None
+  assert s.get("identity_staged") and s.get("bootstrap_request") and s.get("sts")==None
   if mode=="recreate-failure": sys.exit(1)
   obj["metadata"]["uid"]="replacement-sts"; s["sts"]=obj
   for p in s["pods"]["items"]: p["metadata"]["ownerReferences"]=[{"kind":"StatefulSet","uid":"replacement-sts","controller":True}]
-  s["pods"]["items"].append({"metadata":{"name":"tonnode-2","uid":"recovered-2","ownerReferences":[{"kind":"StatefulSet","uid":"replacement-sts","controller":True}]},"spec":{"nodeName":"worker-5"},"status":{"phase":"Pending"}})
+  recovered={"metadata":{"name":"tonnode-2","uid":"recovered-2","ownerReferences":[{"kind":"StatefulSet","uid":"replacement-sts","controller":True}]},"spec":{"nodeName":"worker-5"},"status":{"phase":"Pending"}}
+  if mode=="delayed-target": s["pending_target"]=recovered
+  else: s["pods"]["items"].append(recovered)
   save(); record("recreate sts")
  else: raise AssertionError(obj)
 elif a[:2]==["-n","ton-k8s-operator-system"] and a[2:4]==["wait","--for=delete"]: record("operator stopped")
@@ -89,7 +107,13 @@ elif a[:2]==["-n","unit-ns"]:
   if "jsonpath" in " ".join(a): print("30001" if "validator-udp" in " ".join(a) else s["sts"]["metadata"]["uid"])
   else: output(s["sts"])
  elif op=="get" and kind=="tonnodes.ton.ton.org": output(s["cr"])
- elif op=="get" and kind=="pods": output(s["pods"])
+ elif op=="get" and kind=="pods":
+  if s.get("pending_target"):
+   if s.get("target_creation_observed"):
+    s["pods"]["items"].append(s.pop("pending_target")); record("target created")
+   else: s["target_creation_observed"]=True; record("target creation pending")
+   save()
+  output(s["pods"])
  elif op=="get" and kind=="pvc":
   if len(a)>4 and a[4]!="-o":
    item=next(x for x in s["pvcs"]["items"] if x["metadata"]["name"]==a[4]); print(item["metadata"]["uid"]) if "jsonpath" in " ".join(a) else output(item)
@@ -125,7 +149,13 @@ elif a[:2]==["-n","unit-ns"]:
    filename=src.rsplit("/",1)[-1]; pathlib.Path(dst).write_bytes((root/filename).read_bytes())
   record("copy")
  elif op=="exec":
-  if "sha256sum" in " ".join(a):
+  if ".restore-node-bootstrap.json" in " ".join(a):
+   request=json.loads(a[-1]); assert request=={"version":1,"args":s["cr"]["spec"].get("args",[])}
+   assert a[3] in s["helpers"] and "stage" in a[3]
+   record("bootstrap request")
+   if mode=="bootstrap-stage-failure": sys.exit(1)
+   s["bootstrap_request"]=request; save()
+  elif "sha256sum" in " ".join(a):
    for filename in ("keys.bundle.enc","keys.bundle.meta"): print(hashlib.sha256((root/filename).read_bytes()).hexdigest()+"  "+filename)
   elif "crypto=" in " ".join(a):
    record("validate rebind 203.0.113.45")
@@ -188,6 +218,29 @@ class TargetedRestoreTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Vault", result.stderr)
 
+    def test_recovery_requires_operator_bootstrap_support_before_mutation(self):
+        for change in ("missing", "image", "python", "action"):
+            with self.subTest(capability=change):
+                data = fixtures()
+                initializers = data["sts"]["spec"]["template"]["spec"]["initContainers"]
+                if change == "missing": initializers.pop()
+                if change == "image": initializers[-1]["image"] = "different:controller"
+                if change == "python": initializers[-1]["command"][0] = "/usr/bin/python"
+                if change == "action": initializers[-1]["command"][-1] = "run"
+                result = self.plan(data)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("restore-node-bootstrap", result.stderr)
+                self.assertIn("upgrade", result.stderr)
+        data = fixtures()
+        data["sts"]["spec"]["template"]["spec"]["initContainers"].pop()
+        result, state, events, phase = self.flow("success", data=data)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(events, "")
+        self.assertEqual(phase, "")
+        self.assertFalse(state["operator_paused"])
+        self.assertEqual(state["pvcs"], data["pvcs"])
+        self.assertEqual(state["pods"], data["pods"])
+
     def test_rejects_unhealthy_sibling_missing_pv_or_changed_ownership(self):
         for change in ("sibling", "pv", "owner"):
             data = fixtures()
@@ -208,9 +261,9 @@ class TargetedRestoreTests(unittest.TestCase):
         current = json.loads(self.plan(data).stdout)
         self.assertNotEqual(old["fingerprint"], current["fingerprint"])
 
-    def flow(self, mode, external=False):
+    def flow(self, mode, external=False, data=None):
         with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory); data = fixtures()
+            root = pathlib.Path(directory); data = fixtures() if data is None else data
             (root / "state.json").write_text(json.dumps(data)); (root / "events").write_text("")
             for filename in ("keys.bundle.enc", "keys.bundle.meta"): (root / filename).write_bytes(filename.encode())
             helper = root / "fake.py"; helper.write_text(FAKE)
@@ -252,6 +305,62 @@ class TargetedRestoreTests(unittest.TestCase):
         self.assertTrue(all(p["spec"]["persistentVolumeReclaimPolicy"] == "Retain" for p in state["pvs"]["items"]))
         self.assertIn("synchronization continues in the background", result.stdout)
 
+    def test_recovery_preserves_installation_arguments_environment_and_tonnode_spec(self):
+        for external in (False, True):
+            with self.subTest(external_backup=external):
+                original = fixtures()
+                containers = original["sts"]["spec"]["template"]["spec"]["containers"]
+                self.assertEqual(containers[0]["args"], ["run", "-m", "validator", "-n", "mainnet", "-d"])
+                result, state, _, phase = self.flow("success", external=external, data=original)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(phase, "complete")
+                self.assertEqual(state["sts"]["spec"]["template"]["spec"]["containers"], containers)
+                self.assertEqual(state["cr"], original["cr"])
+
+    def test_fresh_database_bootstrap_runs_after_key_restore_with_original_runtime_settings(self):
+        original = fixtures()
+        template = original["sts"]["spec"]["template"]["spec"]
+        result, state, events, phase = self.flow("success", data=original)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(phase, "complete")
+        self.assertEqual(state["bootstrap_request"], {"version": 1, "args": original["cr"]["spec"]["args"]})
+        self.assertLess(events.index("commit"), events.index("bootstrap request"))
+        self.assertLess(events.index("bootstrap request"), events.index("recreate sts"))
+        actual = state["sts"]["spec"]["template"]["spec"]["initContainers"]
+        self.assertEqual(actual[:-1], [init for init in template["initContainers"] if init["name"] != "restore-node-bootstrap"])
+        bootstrap = actual[-1]
+        self.assertEqual(bootstrap["name"], "restore-node-bootstrap")
+        main = template["containers"][0]
+        for field in ("image", "imagePullPolicy", "env", "envFrom", "resources", "volumeMounts"):
+            self.assertEqual(bootstrap[field], main[field], field)
+        self.assertEqual(bootstrap["terminationMessagePolicy"], "FallbackToLogsOnError")
+        self.assertEqual(bootstrap["command"][:2], ["/opt/mytonctrl/venv/bin/python", "-c"])
+        self.assertEqual(bootstrap["command"][2], (CLI.parent / "fleet.py").read_text())
+        self.assertEqual(bootstrap["command"][3:], ["restore-bootstrap"])
+        recovered = next(p for p in state["pods"]["items"] if p["metadata"]["name"] == "tonnode-2")
+        self.assertEqual(recovered["status"]["phase"], "Pending")
+        self.assertLess(events.index("recreate sts"), events.index("resume"))
+
+    def test_previous_bootstrap_init_is_replaced_once_and_kept_after_all_other_init_containers(self):
+        original = fixtures()
+        template = original["sts"]["spec"]["template"]["spec"]
+        template["initContainers"].insert(0, {"name": "restore-node-bootstrap", "image": "outdated:fixture"})
+        result, state, _, phase = self.flow("success", data=original)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(phase, "complete")
+        actual = state["sts"]["spec"]["template"]["spec"]["initContainers"]
+        self.assertEqual([item["name"] for item in actual], ["persistent-layout", "key-restore", "restore-node-bootstrap"])
+        self.assertEqual(actual[-1]["image"], template["containers"][0]["image"])
+
+    def test_operator_resume_requires_recovered_pod_creation_without_waiting_for_readiness(self):
+        result, state, events, phase = self.flow("delayed-target")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(phase, "complete")
+        self.assertLess(events.index("target creation pending"), events.index("target created"))
+        self.assertLess(events.index("target created"), events.index("resume"))
+        recovered = next(p for p in state["pods"]["items"] if p["metadata"]["name"] == "tonnode-2")
+        self.assertEqual(recovered["status"]["phase"], "Pending")
+
     def test_capacity_backup_or_crypto_failure_cannot_touch_target_storage(self):
         for mode in ("no-capacity", "backup-failure", "bad-bundle"):
             result, state, events, _ = self.flow(mode)
@@ -288,7 +397,7 @@ class TargetedRestoreTests(unittest.TestCase):
             self.assertIn("operator reconciliation remains paused", result.stderr)
 
     def test_staging_or_recreation_failure_never_resumes_operator(self):
-        for mode in ("stage-failure", "recreate-failure"):
+        for mode in ("stage-failure", "bootstrap-stage-failure", "recreate-failure"):
             result, state, events, phase = self.flow(mode)
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(state["operator_paused"])

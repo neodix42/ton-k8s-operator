@@ -251,6 +251,20 @@ the sibling pod UIDs were retained and adopted before restoring the operator.
 The replacement initializes and synchronizes in the background; follow it with
 `./kubeton status` and `./kubeton logs tonnode-2`.
 
+Recovery preserves the TonNode's installation arguments and container
+environment. If dump download was enabled with `-d` in `spec.args` or
+`MYTONCTRL_ARGS`, or with `DUMP=true`, a `restore-node-bootstrap` init container downloads and imports the
+dump before starting the validator. It uses the restored `global.config.json`
+to select the network, keeps wallet/ADNL keys, `config.json`, and controller
+settings, and resumes an interrupted download or extraction on retry. The
+command returns without waiting for the dump or blockchain synchronization.
+Without dump download enabled, the replacement synchronizes normally. Inspect
+dump progress with `kubectl -n default logs tonnode-2 -c restore-node-bootstrap -f`.
+Upgrade the operator with `./kubeton upgrade` before using this recovery path
+on an older installation. Recovery checks that the running operator supports
+the bootstrap init before changing storage, so a recreated Pod can also resume
+an unfinished import.
+
 This path requires a single live TonNode fleet with automatic sticky placement,
 Vault key management, dynamic local-path or Longhorn storage, and healthy
 siblings. The source Kubernetes server must be reachable for an ordinary pod

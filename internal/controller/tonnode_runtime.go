@@ -5,12 +5,14 @@ import (
 	"strings"
 
 	tonv1alpha1 "github.com/neodix/ton-k8s-operator/api/v1alpha1"
+	chartassets "github.com/neodix/ton-k8s-operator/charts"
 	corev1 "k8s.io/api/core/v1"
 )
 
 const (
 	tonExporterInitName   = "stage-ton-exporter"
 	tonBinariesInitName   = "export-ton-binaries"
+	restoreBootstrapName  = "restore-node-bootstrap"
 	tonExporterVolume     = "ton-exporter-script"
 	tonArtifactsVolume    = "ton-artifacts"
 	controllerWalletsPath = "/var/ton-work/controller/mytoncore/wallets"
@@ -107,6 +109,24 @@ func desiredRuntimeReadinessProbe() *corev1.Probe {
 		PeriodSeconds:    15,
 		TimeoutSeconds:   5,
 		FailureThreshold: 3,
+	}
+}
+
+func desiredRestoreNodeBootstrapInitContainer(main corev1.Container) corev1.Container {
+	// Recovery needs the controller image and its installation environment,
+	// including the main container's resource budget for dump extraction. Keep
+	// the normal entrypoint, host ports and service probes on the main container.
+	source := main.DeepCopy()
+	return corev1.Container{
+		Name:                     restoreBootstrapName,
+		Image:                    source.Image,
+		ImagePullPolicy:          source.ImagePullPolicy,
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+		Command:                  []string{"/opt/mytonctrl/venv/bin/python", "-c", chartassets.FleetScript, "restore-bootstrap"},
+		Env:                      source.Env,
+		EnvFrom:                  source.EnvFrom,
+		Resources:                source.Resources,
+		VolumeMounts:             source.VolumeMounts,
 	}
 }
 

@@ -763,6 +763,12 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 			},
 		})
 	}
+	if keyManagementEnabled(tonNode) {
+		// The recovery request survives Pod replacement on the bundle PVC.
+		// Restore identity/configuration first, then seed a fresh database before
+		// either validator or MyTonCore can start. Ordinary starts return at once.
+		podSpec.InitContainers = append(podSpec.InitContainers, desiredRestoreNodeBootstrapInitContainer(container))
+	}
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
