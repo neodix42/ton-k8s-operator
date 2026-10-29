@@ -63,6 +63,8 @@ KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME="${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME
 KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE="${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE:-}"
 # Internal dynamic scope; environment variables cannot authorize retained-data deletion.
 KUBETON_RETAIN_PURGE_CONFIRMED=false
+# Ownership proofs are scoped to one verified Longhorn teardown invocation.
+KUBETON_LONGHORN_OWNER_CACHE_ACTIVE=false
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-false}"
 KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START="${KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
@@ -8333,14 +8335,112 @@ storage_release_present() {
   return 1
 }
 
+# Longhorn creates some child objects without its managed-by/Helm labels.
+# Follow live, UID-matched ownership instead of treating their name prefix as
+# ownership. EngineImage references intentionally lack controller=true.
+longhorn_object_has_release_owner() {
+  local ns="$1" release="$2" resource="$3" object="$4"
+  local expected_uid="${5:-}" depth="${6:-0}" seen="${7:-}"
+  local expected_kind="${8:-}" expected_group="${9:-}"
+  local rows header tag api kind object_ns name uid instance release_label helm_release helm_ns longhorn_owner app app_name helm_owner helm_name extra
+  local ref_api ref_kind ref_name ref_uid parent_resource ref_group actual_group key value delimiters cache_key cache_value
+  (( depth < 8 )) || return 1
+  if ! rows="$(kubectl -n "$ns" get "$resource" "$object" --ignore-not-found \
+      -o 'jsonpath={"META|"}{.apiVersion}{"|"}{.kind}{"|"}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.uid}{"|"}{.metadata.labels.app\.kubernetes\.io/instance}{"|"}{.metadata.labels.release}{"|"}{.metadata.annotations.meta\.helm\.sh/release-name}{"|"}{.metadata.annotations.meta\.helm\.sh/release-namespace}{"|"}{.metadata.labels.longhorn\.io/managed-by}{"|"}{.metadata.labels.app}{"|"}{.metadata.labels.app\.kubernetes\.io/name}{"|"}{.metadata.labels.owner}{"|"}{.metadata.labels.name}{"\n"}{range .metadata.ownerReferences[*]}{"OWNER|"}{.apiVersion}{"|"}{.kind}{"|"}{.name}{"|"}{.uid}{"\n"}{end}' 2>/dev/null)"; then
+    return 1
+  fi
+  [[ "$rows" != *$'\t'* && "$rows" != *$'\r'* ]] || return 1
+  header="${rows%%$'\n'*}"
+  delimiters="${header//[^|]/}"
+  (( ${#delimiters} == 14 )) || return 1
+  IFS='|' read -r tag api kind object_ns name uid instance release_label helm_release helm_ns longhorn_owner app app_name helm_owner helm_name extra <<<"$header"
+  [[ "$tag" == META && "$object_ns" == "$ns" && "$name" == "$object" && -n "$uid" && -n "$api" && -n "$kind" && -z "$extra" ]] || return 1
+  [[ -z "$expected_uid" || "$uid" == "$expected_uid" ]] || return 1
+  actual_group="${api%/*}"
+  [[ "$api" == */* ]] || actual_group=core
+  if [[ -n "$expected_kind" ]]; then
+    [[ "$kind" == "$expected_kind" && "$actual_group" == "$expected_group" ]] || return 1
+  fi
+  key="|${actual_group}/${kind}/${name}/${uid}|"
+  [[ "$seen" != *"$key"* ]] || return 1
+  seen+="$key"
+  # A child of this release may not carry an explicit identity for another
+  # release. Evaluate these conflicts before either labels or parent links.
+  for value in "$instance" "$release_label" "$helm_release"; do
+    [[ -z "$value" || "$value" == "$release" ]] || return 1
+  done
+  [[ -z "$helm_ns" || "$helm_ns" == "$ns" ]] || return 1
+  [[ "$helm_owner" != helm || -z "$helm_name" || "$helm_name" == "$release" ]] || return 1
+  cache_key="${ns}/${release}/${resource}/${object}"
+  cache_value="${actual_group}/${kind}/${uid}"
+  # The teardown caller owns this ephemeral cache. Helm may delete parents
+  # before a previously verified child finishes terminating; re-read the
+  # child's UID and Helm identity above before reusing that same-call proof.
+  if [[ "${KUBETON_LONGHORN_OWNER_CACHE_ACTIVE:-false}" == true \
+    && "${KUBETON_LONGHORN_PROVEN_OWNERS[$cache_key]:-}" == "$cache_value" ]]; then
+    return 0
+  fi
+  [[ "$instance" == "$release" || "$release_label" == "$release" \
+    || ( "$helm_release" == "$release" && "$helm_ns" == "$ns" ) \
+    || ( "$helm_owner" == helm && "$helm_name" == "$release" ) ]] && return 0
+  [[ "$longhorn_owner" == longhorn-manager || "$actual_group" == longhorn.io || "$app_name" == longhorn ]] && return 0
+  case "$app" in
+    longhorn-manager|longhorn-driver-deployer|longhorn-ui|csi-attacher|csi-provisioner|csi-resizer|csi-snapshotter|longhorn-csi-plugin) return 0 ;;
+  esac
+  while IFS= read -r header; do
+    [[ "$header" == OWNER\|* ]] || continue
+    delimiters="${header//[^|]/}"
+    (( ${#delimiters} == 4 )) || return 1
+    IFS='|' read -r tag ref_api ref_kind ref_name ref_uid extra <<<"$header"
+    [[ "$tag" == OWNER && -n "$ref_name" && -n "$ref_uid" && -z "$extra" ]] || continue
+    parent_resource=""
+    # Resolve only supported namespace-scoped parent kinds. The API group and
+    # kind are checked again against the live parent returned by Kubernetes.
+    case "${ref_api}/${ref_kind}" in
+      apps/v1/DaemonSet) parent_resource=daemonsets.apps ;;
+      apps/v1/ReplicaSet) parent_resource=replicasets.apps ;;
+      apps/v1/Deployment) parent_resource=deployments.apps ;;
+      batch/v1/Job) parent_resource=jobs.batch ;;
+      batch/v1/CronJob) parent_resource=cronjobs.batch ;;
+      v1/Service) parent_resource=services ;;
+      v1/ServiceAccount) parent_resource=serviceaccounts ;;
+      longhorn.io/v1beta[12]/EngineImage) parent_resource=engineimages.longhorn.io ;;
+      longhorn.io/v1beta[12]/InstanceManager) parent_resource=instancemanagers.longhorn.io ;;
+      longhorn.io/v1beta[12]/BackingImageManager) parent_resource=backingimagemanagers.longhorn.io ;;
+      longhorn.io/v1beta[12]/BackingImageDataSource) parent_resource=backingimagedatasources.longhorn.io ;;
+      longhorn.io/v1beta[12]/ShareManager) parent_resource=sharemanagers.longhorn.io ;;
+      longhorn.io/v1beta[12]/SystemRestore) parent_resource=systemrestores.longhorn.io ;;
+      longhorn.io/v1beta[12]/SupportBundle) parent_resource=supportbundles.longhorn.io ;;
+    esac
+    [[ -n "$parent_resource" ]] || continue
+    ref_group="${ref_api%/*}"
+    [[ "$ref_api" == */* ]] || ref_group=core
+    if longhorn_object_has_release_owner "$ns" "$release" "$parent_resource" "$ref_name" "$ref_uid" "$((depth + 1))" "$seen" "$ref_kind" "$ref_group"; then
+      if [[ "${KUBETON_LONGHORN_OWNER_CACHE_ACTIVE:-false}" == true ]]; then
+        KUBETON_LONGHORN_PROVEN_OWNERS["$cache_key"]="$cache_value"
+      fi
+      return 0
+    fi
+  done <<<"$rows"
+  return 1
+}
+
 storage_namespace_is_release_owned() {
   local ns="$1" release="$2" component="$3"
-  local marker resources resource rows name instance release_label helm_release helm_ns app app_name helm_owner helm_name longhorn_owner service_name selector_owner selector_app
+  local marker resources resource rows name instance release_label helm_release helm_ns app app_name helm_owner helm_name longhorn_owner service_name selector_owner selector_app value namespace_uid
   if ! marker="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
     echo "Error: cannot inspect storage namespace ${ns}." >&2
     return 1
   fi
   [[ -n "$(trim_whitespace "$marker")" ]] || return 0
+  if [[ "${KUBETON_LONGHORN_OWNER_CACHE_ACTIVE:-false}" == true && "$component" == longhorn ]]; then
+    if ! namespace_uid="$(kubectl get namespace "$ns" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)" \
+      || [[ -z "${KUBETON_LONGHORN_OWNER_CACHE_NAMESPACE_UID:-}" \
+        || "$namespace_uid" != "$KUBETON_LONGHORN_OWNER_CACHE_NAMESPACE_UID" ]]; then
+      echo "Error: storage namespace ${ns} changed during teardown; refusing to reuse prior ownership evidence." >&2
+      return 1
+    fi
+  fi
   if ! rows="$(storage_list_helm_releases "$ns" 2>/dev/null)"; then
     echo "Error: cannot verify whether storage namespace ${ns} is shared with other Helm releases." >&2
     return 1
@@ -8359,11 +8459,27 @@ storage_namespace_is_release_owned() {
     case "$resource" in events|events.events.k8s.io) continue ;; esac
     if ! rows="$(kubectl -n "$ns" get "$resource" --ignore-not-found --no-headers \
         -o custom-columns='NAME:.metadata.name,INSTANCE:.metadata.labels.app\.kubernetes\.io/instance,RELEASE:.metadata.labels.release,HELM:.metadata.annotations.meta\.helm\.sh/release-name,HELMNS:.metadata.annotations.meta\.helm\.sh/release-namespace,APP:.metadata.labels.app,APPNAME:.metadata.labels.app\.kubernetes\.io/name,OWNER:.metadata.labels.owner,HELMNAME:.metadata.labels.name,LONGHORN:.metadata.labels.longhorn\.io/managed-by,SERVICE:.metadata.labels.kubernetes\.io/service-name,SELECTOROWNER:.spec.selector.matchLabels.longhorn\.io/managed-by,SELECTORAPP:.spec.selector.matchLabels.app' 2>/dev/null)"; then
+      if [[ "$component" == longhorn ]] && longhorn_resource_api_is_absent "$resource"; then
+        continue
+      fi
       echo "Error: cannot inspect ${resource} in ${ns}; refusing namespace-wide storage cleanup." >&2
       return 1
     fi
     while read -r name instance release_label helm_release helm_ns app app_name helm_owner helm_name longhorn_owner service_name selector_owner selector_app; do
       [[ -n "$name" ]] || continue
+      if [[ "$component" == longhorn ]]; then
+        for value in "$instance" "$release_label" "$helm_release"; do
+          if [[ -n "$value" && "$value" != '<none>' && "$value" != "$release" ]]; then
+            echo "Error: retaining shared namespace ${ns}: ${resource}/${name} belongs to Helm release ${value}, not ${release}." >&2
+            return 1
+          fi
+        done
+        if [[ ( -n "$helm_ns" && "$helm_ns" != '<none>' && "$helm_ns" != "$ns" ) \
+          || ( "$helm_owner" == helm && -n "$helm_name" && "$helm_name" != '<none>' && "$helm_name" != "$release" ) ]]; then
+          echo "Error: retaining shared namespace ${ns}: ${resource}/${name} has conflicting Helm ownership." >&2
+          return 1
+        fi
+      fi
       [[ "$helm_owner" == helm && "$helm_name" == "$release" ]] && continue
       [[ "$instance" == "$release" || "$release_label" == "$release" ]] && continue
       [[ "$helm_release" == "$release" && "$helm_ns" == "$ns" ]] && continue
@@ -8392,6 +8508,9 @@ storage_namespace_is_release_owned() {
         esac
         [[ "$app_name" == longhorn ]] && continue
         [[ "$resource" == secrets && "$name" == "$LONGHORN_CRYPTO_SECRET_NAME" ]] && continue
+        if longhorn_object_has_release_owner "$ns" "$release" "$resource" "$name"; then
+          continue
+        fi
       fi
       echo "Error: retaining shared namespace ${ns}: ownership of ${resource}/${name} by ${release} is not proven." >&2
       return 1
@@ -8478,8 +8597,10 @@ collect_storage_release_cluster_rows() {
   (( other_manager == 0 )) || return 0
   if ! marker="$(kubectl get csidriver driver.longhorn.io --ignore-not-found -o name 2>/dev/null)"; then return 1; fi
   [[ -z "$(trim_whitespace "$marker")" ]] || append_unique_item "${marker}" cluster_rows_ref
-  if ! marker="$(kubectl get storageclass longhorn --ignore-not-found -o jsonpath='{.provisioner}' 2>/dev/null)"; then return 1; fi
-  [[ "$marker" != driver.longhorn.io ]] || append_unique_item "storageclass/longhorn" cluster_rows_ref
+  for name in longhorn longhorn-static; do
+    if ! marker="$(kubectl get storageclass "$name" --ignore-not-found -o jsonpath='{.provisioner}' 2>/dev/null)"; then return 1; fi
+    [[ "$marker" != driver.longhorn.io ]] || append_unique_item "storageclass/${name}" cluster_rows_ref
+  done
   for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
     if [[ "$kind" == validatingwebhookconfiguration ]]; then name=longhorn-webhook-validator; else name=longhorn-webhook-mutator; fi
     if ! rows="$(kubectl get "$kind" "$name" --ignore-not-found \
@@ -19982,6 +20103,18 @@ cleanup_kubectl_debug_pods() {
   fi
 }
 
+# A successful uninstall hook can remove a Longhorn CRD between discovery and
+# LIST/DELETE. Only an independently verified missing CRD makes that API error
+# an already-completed cleanup; permission and connectivity failures do not.
+longhorn_resource_api_is_absent() {
+  local resource="$1" marker
+  [[ "$resource" == *.longhorn.io ]] || return 1
+  if ! marker="$(kubectl get crd "$resource" --ignore-not-found -o name 2>/dev/null)"; then
+    return 1
+  fi
+  [[ -z "$(trim_whitespace "$marker")" ]]
+}
+
 cleanup_longhorn_force() {
   local marker resources resource rows object rc=0
   local -a cluster_rows=()
@@ -20009,12 +20142,27 @@ cleanup_longhorn_force() {
   fi
   if ! resources="$(kubectl api-resources --api-group=longhorn.io --namespaced=true -o name 2>/dev/null)"; then return 1; fi
   for resource in $resources; do
-    if ! rows="$(kubectl -n "$LONGHORN_NAMESPACE" get "$resource" -o name 2>/dev/null)"; then rc=1; continue; fi
+    if ! rows="$(kubectl -n "$LONGHORN_NAMESPACE" get "$resource" -o name 2>/dev/null)"; then
+      longhorn_resource_api_is_absent "$resource" || rc=1
+      continue
+    fi
     while IFS= read -r object; do
       [[ -n "$object" ]] || continue
-      kubectl -n "$LONGHORN_NAMESPACE" patch "$object" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || rc=1
+      if ! kubectl -n "$LONGHORN_NAMESPACE" patch "$object" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1; then
+        if longhorn_resource_api_is_absent "$resource"; then
+          continue
+        fi
+        # Controllers or an overlapping uninstall hook can finish deleting
+        # this exact object after LIST. A denied/failed GET stays a failure.
+        if ! marker="$(kubectl -n "$LONGHORN_NAMESPACE" get "$object" --ignore-not-found -o name 2>/dev/null)" \
+          || [[ -n "$(trim_whitespace "$marker")" ]]; then
+          rc=1
+        fi
+      fi
     done <<<"$rows"
-    kubectl -n "$LONGHORN_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+    if ! kubectl -n "$LONGHORN_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1; then
+      longhorn_resource_api_is_absent "$resource" || rc=1
+    fi
   done
   (( rc == 0 )) || return "$rc"
   if ! rows="$(kubectl get crd -o name 2>/dev/null)"; then return 1; fi
@@ -21008,6 +21156,9 @@ cleanup_encrypted_storage_class() {
 
 cleanup_longhorn_release() {
   local rc=0 ledger_rc=0
+  local KUBETON_LONGHORN_OWNER_CACHE_ACTIVE=false
+  local KUBETON_LONGHORN_OWNER_CACHE_NAMESPACE_UID=""
+  local -A KUBETON_LONGHORN_PROVEN_OWNERS=()
 
   if (( KUBETON_RETAIN_VICTORIA_LOGS_GUARDS == 1 )); then
     echo "Error: refusing to uninstall Longhorn while a VictoriaLogs backend or its PVC cleanup is unresolved. Retry uninstall after VictoriaLogs is proven gone so launch evidence is not stranded." >&2
@@ -21026,6 +21177,13 @@ cleanup_longhorn_release() {
   fi
 
   longhorn_storage_is_unused || return 1
+  if ! KUBETON_LONGHORN_OWNER_CACHE_NAMESPACE_UID="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+    echo "Error: cannot verify Longhorn namespace identity before uninstall." >&2
+    return 1
+  fi
+  if [[ -n "$KUBETON_LONGHORN_OWNER_CACHE_NAMESPACE_UID" ]]; then
+    KUBETON_LONGHORN_OWNER_CACHE_ACTIVE=true
+  fi
   storage_namespace_is_release_owned "$LONGHORN_NAMESPACE" "$LONGHORN_RELEASE_NAME" longhorn || return 1
   uninstall_longhorn || rc=$?
   cleanup_longhorn_force || return 1

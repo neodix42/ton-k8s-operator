@@ -73,6 +73,8 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_purge_live_retained_pvc_test.sh
 	bash test/kubeton_uninstall_observability_test.sh
 	bash test/kubeton_storage_uninstall_test.sh
+	bash test/kubeton_longhorn_ownership_test.sh
+	bash test/kubeton_longhorn_teardown_test.sh
 	bash test/kubeton_purge_test.sh
 	bash test/kubeton_partial_uninstall_test.sh
 	bash test/kubeton_launch_logging_test.sh
