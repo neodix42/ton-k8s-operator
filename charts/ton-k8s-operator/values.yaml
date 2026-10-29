@@ -6,7 +6,7 @@ namespace:
 
 image:
   repository: ghcr.io/neodix42/ton-k8s-operator
-  tag: 0.4.9
+  tag: 0.5.0
   pullPolicy: IfNotPresent
   pullSecrets: []
 
