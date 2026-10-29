@@ -6,11 +6,27 @@ kubeton="$repo_root/charts/ton-k8s-operator/kubeton"
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
 
-for scenario in prometheus-failure prometheus-discovery-empty vm-custom vm-failure vm-shared vm-invalid-state vm-inventory-denied vm-pvc vm-no-ledger vm-empty-namespace vm-shared-namespace vm-other-operator vm-policies vm-external-policy vm-external-state-cm vm-orphan-unknown vm-untracked-shared vm-untracked-other-operator wallet-custom sweep-failure; do
+for scenario in owned-all-namespaces owned-namespace prometheus-failure prometheus-discovery-empty vm-custom vm-failure vm-shared vm-invalid-state vm-inventory-denied vm-pvc vm-no-ledger vm-empty-namespace vm-shared-namespace vm-other-operator vm-policies vm-external-policy vm-external-state-cm vm-orphan-unknown vm-untracked-shared vm-untracked-other-operator wallet-custom sweep-failure; do
   log="$test_dir/$scenario.log"
   SCENARIO="$scenario" EVENT_LOG="$log" bash -c '
     source "$1"
+    validate_kubectl_argv() {
+      local arg
+      # -A is a command flag, unlike the global -n flag. Reject it before
+      # a verb just as real kubectl does, before the resource mock can match.
+      for arg in "$@"; do
+        case "$arg" in
+          get|delete|api-resources|apply|patch|wait) return 0 ;;
+          -A|--all-namespaces)
+            echo "Error: flags cannot be placed before plugin name: $arg" >&2
+            return 64
+            ;;
+        esac
+      done
+      return 0
+    }
     kubectl() {
+      validate_kubectl_argv "$@" || return $?
       printf "%s\n" "$*" >>"$EVENT_LOG"
       case "$*" in
         *"api-resources"*"--namespaced=false"*) printf "clusterroles.rbac.authorization.k8s.io\n" ;;
@@ -97,6 +113,14 @@ for scenario in prometheus-failure prometheus-discovery-empty vm-custom vm-failu
       return 0
     }
     case "$SCENARIO" in
+      owned-all-namespaces)
+        if validate_kubectl_argv -A delete pods >/dev/null 2>&1; then exit 26; fi
+        if validate_kubectl_argv -n old-metrics -A delete pods >/dev/null 2>&1; then exit 27; fi
+        cleanup_owned_namespaced_kinds "app.kubernetes.io/managed-by=kubeton" "deployments pods"
+        ;;
+      owned-namespace)
+        cleanup_owned_namespaced_kinds "app.kubernetes.io/managed-by=kubeton" "deployments pods" old-metrics
+        ;;
       prometheus-failure|prometheus-discovery-empty)
         if cleanup_prometheus_resources; then exit 21; fi
         ;;
@@ -122,13 +146,17 @@ for scenario in prometheus-failure prometheus-discovery-empty vm-custom vm-failu
   ' _ "$kubeton"
 done
 
-grep -Fq 'delete secrets -l app.kubernetes.io/name=kubeton-prometheus,app.kubernetes.io/managed-by=kubeton' "$test_dir/prometheus-failure.log"
+grep -Fq 'delete deployments.apps -A -l app.kubernetes.io/managed-by=kubeton' "$test_dir/owned-all-namespaces.log"
+grep -Fq 'delete pods -A -l app.kubernetes.io/managed-by=kubeton' "$test_dir/owned-all-namespaces.log"
+grep -Fq 'delete deployments.apps -n old-metrics -l app.kubernetes.io/managed-by=kubeton' "$test_dir/owned-namespace.log"
+grep -Fq 'delete pods -n old-metrics -l app.kubernetes.io/managed-by=kubeton' "$test_dir/owned-namespace.log"
+grep -Fq 'delete secrets -A -l app.kubernetes.io/name=kubeton-prometheus,app.kubernetes.io/managed-by=kubeton' "$test_dir/prometheus-failure.log"
 grep -Fq close-prometheus "$test_dir/prometheus-failure.log"
 grep -Fq -- '--cascade=foreground --wait=true --timeout=60s' "$test_dir/prometheus-failure.log"
-grep -Fq -- '-n old-metrics delete deployments.apps -l app.kubernetes.io/name=vmauth,app.kubernetes.io/instance=old-fleet' "$test_dir/vm-custom.log"
-grep -Fq -- '-n old-operator delete deployments.apps -l app.kubernetes.io/name=victoria-metrics-operator' "$test_dir/vm-custom.log"
+grep -Fq -- 'delete deployments.apps -n old-metrics -l app.kubernetes.io/name=vmauth,app.kubernetes.io/instance=old-fleet' "$test_dir/vm-custom.log"
+grep -Fq -- 'delete deployments.apps -n old-operator -l app.kubernetes.io/name=victoria-metrics-operator' "$test_dir/vm-custom.log"
 grep -Fq 'delete configmap -A -l app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton' "$test_dir/vm-custom.log"
-grep -Fq -- '-n old-operator delete serviceaccounts -l app.kubernetes.io/name=vm-operator' "$test_dir/vm-custom.log"
+grep -Fq -- 'delete serviceaccounts -n old-operator -l app.kubernetes.io/name=vm-operator' "$test_dir/vm-custom.log"
 grep -Fq -- '-n old-operator delete role vm-leader-election-role' "$test_dir/vm-custom.log"
 grep -Fq 'delete clusterrole vm-operator' "$test_dir/vm-custom.log"
 grep -Fq -- '-n old-operator delete networkpolicy vm-allow-metrics-traffic' "$test_dir/vm-policies.log"
@@ -143,11 +171,11 @@ grep -Fq 'unverified VictoriaMetrics operator remains at vm/vm-operator' "$test_
 grep -Fq cleanup-logs "$test_dir/vm-orphan-unknown.log"
 grep -Fq 'delete vmservicescrapes.operator.victoriametrics.com' "$test_dir/vm-orphan-unknown.log"
 for scenario in vm-orphan-unknown vm-untracked-shared vm-untracked-other-operator; do
-  if grep -Eq -- '-n vm delete|delete clusterrole|delete customresourcedefinition' "$test_dir/$scenario.log"; then
+  if grep -Eq -- '-n vm delete|delete [^ ]+ -n vm|delete clusterrole|delete customresourcedefinition' "$test_dir/$scenario.log"; then
     echo 'cleanup deleted an operator without a kubeton ownership record' >&2; exit 1
   fi
 done
-grep -Fq -- '-n vm delete deployments.apps -l app.kubernetes.io/name=victoria-metrics-operator' "$test_dir/vm-no-ledger.log"
+grep -Fq -- 'delete deployments.apps -n vm -l app.kubernetes.io/name=victoria-metrics-operator' "$test_dir/vm-no-ledger.log"
 grep -Fq 'delete namespace old-metrics' "$test_dir/vm-empty-namespace.log"
 if grep -Fq 'delete namespace old-metrics' "$test_dir/vm-shared-namespace.log"; then
   echo 'cleanup deleted a namespace containing unrelated credentials' >&2; exit 1
@@ -164,7 +192,7 @@ if grep -Fq 'delete configmap -A -l app.kubernetes.io/name=kubeton-victoria-metr
   echo 'failed VM cleanup deleted its state ledger' >&2; exit 1
 fi
 grep -Fq 'app.kubernetes.io/name!=kubeton-victoria-metrics' "$test_dir/vm-failure.log"
-if grep -Eq 'delete (persistentvolumeclaims|clusterrole|customresourcedefinition)|old-operator delete' "$test_dir/vm-shared.log"; then
+if grep -Eq 'delete (persistentvolumeclaims|clusterrole|customresourcedefinition)|old-operator delete|delete [^ ]+ -n old-operator' "$test_dir/vm-shared.log"; then
   echo 'shared VM infrastructure was selected for deletion' >&2; exit 1
 fi
 if grep -Fq 'delete persistentvolumeclaims' "$test_dir/vm-failure.log"; then

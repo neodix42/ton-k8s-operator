@@ -68,9 +68,11 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/main_wallet_memory_test.sh
 	bash test/kubeton_check_test.sh
 	bash test/kubeton_cleanup_test.sh
+	bash test/kubeton_legacy_pv_cleanup_test.sh
 	bash test/kubeton_uninstall_observability_test.sh
 	bash test/kubeton_storage_uninstall_test.sh
 	bash test/kubeton_purge_test.sh
+	bash test/kubeton_partial_uninstall_test.sh
 	bash test/kubeton_launch_logging_test.sh
 	bash test/kubeton_upgrade_test.sh
 	python3 test/kubeton_add_test.py

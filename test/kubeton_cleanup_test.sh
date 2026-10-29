@@ -1402,6 +1402,9 @@ ton_force_mode_events="$test_dir/ton-force-mode-events.out"
 bash -c '
   source "$1"
   event_log="$2"
+  # This fixture covers PVC force authorization; orphan PV discovery has its
+  # own inventory/deletion regressions in kubeton_legacy_pv_cleanup_test.sh.
+  cleanup_legacy_ton_pvs_for_statefulsets() { :; }
   collect_expected_ton_pvc_rows_from_values() {
     local -n out="$1"
     out+=($'"'"'default\tton-work-tonnode-0'"'"')

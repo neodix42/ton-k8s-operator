@@ -11836,6 +11836,141 @@ pvc_row_has_trusted_ton_statefulset_provenance() {
   return 1
 }
 
+# A previous uninstall can remove both the PVC and StatefulSet before their
+# PVs are deleted. Recover only dynamically provisioned, Delete-policy TON
+# claims from that partial teardown. Exact claimRef names are an explicit
+# uninstall/drop fallback; ordinary start/repair must never adopt these PVs.
+cleanup_legacy_ton_pvs_for_statefulsets() {
+  local trusted_sts_rows_name="$1"
+  local label="${2:-cleanup}"
+  local -n trusted_sts_rows_ref="$trusted_sts_rows_name"
+  local snapshot row rechecked pv pv_uid ns pvc pvc_uid reclaim driver handle provisioner managed_by app_name resource_policy extra
+  local sts_row sts_ns sts_name prefix ordinal trusted live_uid path node longhorn_identity longhorn_uid longhorn_state longhorn_node longhorn_current_node rc=0
+  local -a exact_rows=() pv_rows=() local_nodes=()
+  local -A matching_claim_counts=()
+  local snapshot_path='{.metadata.name}{"|"}{.metadata.uid}{"|"}{.spec.claimRef.namespace}{"|"}{.spec.claimRef.name}{"|"}{.spec.claimRef.uid}{"|"}{.spec.persistentVolumeReclaimPolicy}{"|"}{.spec.csi.driver}{"|"}{.spec.csi.volumeHandle}{"|"}{.metadata.annotations.pv\.kubernetes\.io/provisioned-by}{"|"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"|"}{.metadata.labels.app\.kubernetes\.io/name}{"|"}{.metadata.annotations.helm\.sh/resource-policy}'
+  local -a candidate_rows=()
+
+  case "$label" in uninstall|drop) ;; *) return 0 ;; esac
+  if ! snapshot="$(kubectl get pv -o "jsonpath={range .items[*]}${snapshot_path}{\"\\n\"}{end}" 2>/dev/null)"; then
+    echo "Error: could not inspect legacy TON PVs left by a partial ${label}." >&2
+    return 1
+  fi
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS='|' read -r pv pv_uid ns pvc pvc_uid reclaim driver handle provisioner managed_by app_name resource_policy extra <<<"$row"
+    [[ -n "$pv" && -n "$ns" && -n "$pvc" ]] || continue
+    trusted=false
+    if pvc_is_configured_ton_claim_template "$ns" "$pvc"; then
+      trusted=true
+    else
+      for sts_row in "${trusted_sts_rows_ref[@]}"; do
+        IFS=$'\t' read -r sts_ns sts_name _ <<<"$sts_row"
+        [[ -n "$sts_name" && "$ns" == "$sts_ns" ]] || continue
+        for prefix in ton-work ton-src mytoncore mytonctrl keybundle; do
+          prefix="${prefix}-${sts_name}-"
+          [[ "$pvc" == "$prefix"* ]] || continue
+          ordinal="${pvc#"$prefix"}"
+          [[ "$ordinal" =~ ^(0|[1-9][0-9]*)$ ]] && trusted=true
+        done
+      done
+    fi
+    [[ "$trusted" == true ]] || continue
+    candidate_rows+=("$row")
+    matching_claim_counts["$ns/$pvc"]=$(( ${matching_claim_counts["$ns/$pvc"]:-0} + 1 ))
+  done <<<"$snapshot"
+
+  for row in "${candidate_rows[@]}"; do
+    IFS='|' read -r pv pv_uid ns pvc pvc_uid reclaim driver handle provisioner managed_by app_name resource_policy extra <<<"$row"
+    if ! live_uid="$(kubectl -n "$ns" get pvc "$pvc" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)"; then
+      echo "Error: could not inspect PVC ${ns}/${pvc} before legacy PV cleanup." >&2
+      rc=1
+      continue
+    fi
+    # Live claims belong to the normal PVC cleanup path. In particular, never
+    # adopt an old PV when a same-name claim has since been recreated.
+    [[ -z "$live_uid" ]] || continue
+    if [[ -n "$extra" || -z "$pv_uid" || -z "$pvc_uid" || "$pv" != "pvc-${pvc_uid}" \
+      || "$reclaim" != Delete || "$resource_policy" == keep \
+      || ( -n "$managed_by" && "$managed_by" != kubeton && "$managed_by" != ton-k8s-operator ) \
+      || ( -n "$app_name" && "$app_name" != ton-node ) \
+      || "${matching_claim_counts["$ns/$pvc"]}" != 1 ]]; then
+      echo "Error: retaining legacy TON PV ${pv} (${ns}/${pvc}): static, Retain, foreign or ambiguous storage identity." >&2
+      rc=1
+      continue
+    fi
+    # Re-read all provenance before adopting the immutable record. Missing or
+    # changed objects must not become a newly invented cleanup authorization.
+    if ! rechecked="$(kubectl get pv "$pv" --ignore-not-found -o "jsonpath=${snapshot_path}" 2>/dev/null)" \
+      || [[ "$rechecked" != "$row" ]]; then
+      echo "Error: retaining legacy TON PV ${pv}: its identity or provisioning metadata changed during discovery." >&2
+      rc=1
+      continue
+    fi
+    if ! recorded_pv_matches_cleanup_ledger "$pv" "$ns/$pvc" "$pv_uid" "$pvc_uid" Delete "$driver" "$handle" \
+      || ! wait_volume_attachments_gone "$pv" 1; then
+      echo "Error: retaining legacy TON PV ${pv}: its absent claim and detached state could not be verified." >&2
+      rc=1
+      continue
+    fi
+
+    path=""
+    longhorn_uid=""
+    if [[ "$driver" == driver.longhorn.io && "$provisioner" == driver.longhorn.io && -n "$handle" ]]; then
+      if ! csi_volume_handle_is_exclusive_to_recorded_pv "$pv" "$pv_uid" "$driver" "$handle" "$pv_uid"; then
+        rc=1
+        continue
+      fi
+      if ! longhorn_identity="$(kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$handle" --ignore-not-found \
+        -o jsonpath='{.metadata.uid}{"|"}{.status.state}{"|"}{.spec.nodeID}{"|"}{.status.currentNodeID}' 2>/dev/null)"; then
+        echo "Error: could not inspect Longhorn volume ${handle} for legacy TON PV ${pv}." >&2
+        rc=1
+        continue
+      fi
+      IFS='|' read -r longhorn_uid longhorn_state longhorn_node longhorn_current_node <<<"$longhorn_identity"
+      if [[ -n "$longhorn_uid" && ( "$longhorn_state" != detached || -n "$longhorn_node$longhorn_current_node" ) ]]; then
+        echo "Error: retaining Longhorn volume ${handle}: it is not verified detached." >&2
+        rc=1
+        continue
+      fi
+    elif [[ -z "$driver" && -z "$handle" ]] && local_path_pv_is_provisioned_by_local_path "$pv"; then
+      if ! is_true "$KUBETON_LOCAL_PATH_CLEANUP" \
+        || ! path="$(local_path_pv_host_path "$pv")" \
+        || ! path="$(local_path_absolute_target "$path")"; then
+        echo "Error: retaining legacy local-path PV ${pv}: exact host cleanup is disabled or its path is unsafe." >&2
+        rc=1
+        continue
+      fi
+      local_nodes=()
+      if ! collect_local_path_nodes_for_pv "$pv" local_nodes || [[ ${#local_nodes[@]} -ne 1 ]]; then
+        echo "Error: retaining legacy local-path PV ${pv}: its owning node cannot be proven." >&2
+        rc=1
+        continue
+      fi
+      node="${local_nodes[0]}"
+      if ! local_path_recorded_pv_can_be_deleted "$pv" "$path" "$ns/$pvc" "$pv_uid" "$pvc_uid" "$node"; then
+        rc=1
+        continue
+      fi
+      append_unique_item "$node"$'\t'"$path"$'\t'"$pv"$'\t'"$ns/$pvc"$'\t'"$pv_uid"$'\t'"$pvc_uid" exact_rows
+    else
+      echo "Error: retaining legacy TON PV ${pv}: dynamic Longhorn/local-path provisioning could not be proven." >&2
+      rc=1
+      continue
+    fi
+    echo "[${label}] Recovering cleanup state for legacy TON PV ${pv}, formerly ${ns}/${pvc}."
+    append_unique_item "$pv"$'\t'"$ns/$pvc"$'\t'"$pv_uid"$'\t'"$pvc_uid"$'\t'"$reclaim"$'\t'"$driver"$'\t'"$handle"$'\t'"$longhorn_uid" pv_rows
+  done
+
+  if [[ ${#pv_rows[@]} -gt 0 ]]; then
+    # Persist before either a host directory or a CSI backend is deleted, then
+    # use the same retry/UID/handle checks as ordinary PVC cleanup.
+    record_local_path_cleanup_ledger exact_rows pv_rows || return 1
+    cleanup_recorded_local_path_data "$label" || rc=1
+  fi
+  return "$rc"
+}
+
 collect_existing_pvc_rows() {
   local -n candidate_rows_ref="$1"
   local -n existing_rows_ref="$2"
@@ -13976,7 +14111,7 @@ delete_ton_pvcs_for_statefulsets() {
   local -n sts_rows_ref="$1"
   local label="${2:-cleanup}"
   local force_unresolved_local_pvcs=false
-  local row ns sts
+  local row ns sts cleanup_rc=0
   local -a candidate_rows=()
   local -a trusted_sts_claim_rows=()
   local -a pvc_rows=()
@@ -14008,6 +14143,7 @@ delete_ton_pvcs_for_statefulsets() {
   collect_existing_kubeton_pvc_rows candidate_rows pvc_rows "$label" trusted_sts_claim_rows
 
   if [[ ${#pvc_rows[@]} -eq 0 ]]; then
+    cleanup_legacy_ton_pvs_for_statefulsets "$1" "$label" || return 1
     return 0
   fi
 
@@ -14032,7 +14168,9 @@ delete_ton_pvcs_for_statefulsets() {
       force_unresolved_local_pvcs=true
       ;;
   esac
-  delete_pvc_rows_and_backing_volumes pvc_rows "$label" "$force_unresolved_local_pvcs"
+  delete_pvc_rows_and_backing_volumes pvc_rows "$label" "$force_unresolved_local_pvcs" || cleanup_rc=1
+  cleanup_legacy_ton_pvs_for_statefulsets "$1" "$label" || cleanup_rc=1
+  return "$cleanup_rc"
 }
 
 ton_fleet_resources_exist() {
@@ -16470,9 +16608,13 @@ wait_statefulset_pods_gone() {
   next_diag=$(( start_ts + 20 ))
   while (( $(date +%s) < deadline )); do
     local now
-    local count
+    local count pod_inventory
     now="$(date +%s)"
-    count="$(kubectl -n "$ns" get pods -l "$selector" -o name 2>/dev/null | wc -l | tr -d '[:space:]')"
+    if ! pod_inventory="$(kubectl -n "$ns" get pods -l "$selector" -o name)"; then
+      echo "Error: cannot verify whether TON pods of ${ns}/${sts} have terminated." >&2
+      return 1
+    fi
+    count="$(printf '%s\n' "$pod_inventory" | awk 'NF{n++} END{print n+0}')"
     if [[ "${count:-0}" == "0" ]]; then
       return 0
     fi
@@ -16496,14 +16638,18 @@ wait_statefulset_pods_gone() {
 
 scale_statefulset_rows_to_zero() {
   local -n sts_rows_ref="$1"
-  local row ns sts
+  local row ns sts rc=0
 
   for row in "${sts_rows_ref[@]}"; do
     [[ -z "$row" ]] && continue
     IFS=$'\t' read -r ns sts _ <<<"$row"
     [[ -z "$ns" || -z "$sts" ]] && continue
-    kubectl -n "$ns" scale statefulset "$sts" --replicas=0 >/dev/null 2>&1 || true
+    if ! kubectl -n "$ns" scale statefulset "$sts" --replicas=0 >/dev/null; then
+      echo "Error: could not stop StatefulSet ${ns}/${sts} before storage cleanup." >&2
+      rc=1
+    fi
   done
+  return "$rc"
 }
 
 clear_stopped_metadata_for_statefulset_rows() {
@@ -16550,20 +16696,42 @@ wait_statefulset_rows_pods_gone() {
 
 stop_ton_for_destructive_cleanup() {
   local sts_rows_name="$1"
+  local deployed_releases crd_marker rc=0
 
-  if ! run_stop_without_backup; then
-    echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing with direct TonNode/StatefulSet cleanup." >&2
+  # Failed/uninstalled Helm history cannot be upgraded. A partial purge can
+  # also remove the CRD before the storage teardown completes.
+  if deployed_releases="$(helm list -n "$OP_NAMESPACE" --deployed --short --filter "^${RELEASE_NAME}$")"; then
+    if grep -Fxq -- "$RELEASE_NAME" <<<"$deployed_releases"; then
+      if ! run_stop_without_backup; then
+        echo "Warning: failed to disable TON resources in Helm release ${RELEASE_NAME}; continuing with direct TonNode/StatefulSet cleanup." >&2
+      fi
+    else
+      echo "[uninstall] No deployed operator Helm release; using direct TON cleanup."
+    fi
+  else
+    echo "Error: cannot inspect operator Helm release; attempting direct TON cleanup." >&2
+    rc=1
   fi
 
   clear_stopped_metadata_for_statefulset_rows "$sts_rows_name"
-  kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found || true
+  if crd_marker="$(kubectl get crd tonnodes.ton.ton.org --ignore-not-found -o name)"; then
+    if [[ -n "$(trim_whitespace "$crd_marker")" ]]; then
+      kubectl delete tonnodes.ton.ton.org --all -A --ignore-not-found || rc=1
+    else
+      echo "[uninstall] TonNode CRD already absent; continuing remaining-resource cleanup."
+    fi
+  else
+    echo "Error: cannot verify TonNode CRD before fleet shutdown." >&2
+    rc=1
+  fi
 
   # If the operator or Helm path is unhealthy, scaling the captured StatefulSets
   # still prevents live pods from holding PVCs while deletion starts.
-  scale_statefulset_rows_to_zero "$sts_rows_name"
+  scale_statefulset_rows_to_zero "$sts_rows_name" || rc=1
 
   echo "Waiting for TON pods to terminate before PVC deletion ..."
-  wait_statefulset_rows_pods_gone "$sts_rows_name"
+  wait_statefulset_rows_pods_gone "$sts_rows_name" || rc=1
+  return "$rc"
 }
 
 wait_ton_statefulsets_present() {
@@ -19825,7 +19993,7 @@ cleanup_owned_namespaced_kinds() {
   for kind in $kinds; do
     resource="$(printf '%s\n' "$inventory" | awk -F. -v kind="$kind" '$1 == kind {print; exit}')"
     [[ -n "$resource" ]] || continue
-    if ! kubectl "${scope[@]}" delete "$resource" -l "$selector" --ignore-not-found --cascade=foreground --wait=true --timeout=60s >/dev/null; then
+    if ! kubectl delete "$resource" "${scope[@]}" -l "$selector" --ignore-not-found --cascade=foreground --wait=true --timeout=60s >/dev/null; then
       echo "Error: cleanup of ${resource} matching ${selector} did not complete." >&2
       rc=1
     fi
@@ -20925,12 +21093,19 @@ verify_uninstall_leftovers() {
 run_uninstall_core() {
   local -a uninstall_sts_rows=()
   local -a uninstall_failures=()
-  local item
+  local item sts_inventory
 
   KUBETON_RETAIN_VICTORIA_LOGS_GUARDS=0
   KUBETON_RETAIN_VICTORIA_METRICS_STATE=0
 
-  mapfile -t uninstall_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
+  if sts_inventory="$(list_ton_statefulsets)"; then
+    if [[ -n "$(trim_whitespace "$sts_inventory")" ]]; then
+      mapfile -t uninstall_sts_rows <<<"$sts_inventory"
+    fi
+  else
+    echo "Error: cannot inventory TON StatefulSets; cleanup will report this unresolved read failure." >&2
+    uninstall_failures+=("TON StatefulSet inventory")
+  fi
 
   run_uninstall_step uninstall_failures "Step 1/10: stopping TON resources and waiting for pods to terminate ..." \
     stop_ton_for_destructive_cleanup uninstall_sts_rows

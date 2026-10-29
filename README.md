@@ -1066,6 +1066,21 @@ unrelated applications or their data merely to make a shared dependency
 disappear. Successful cleanup is limited to verified managed resources;
 provider snapshots and external backups require separate handling.
 
+When retrying removal of an older fleet, keep `TON_VALUES_FILE` pointed at its
+original namespace/name settings. Cleanup also discovers remaining dynamic,
+`Delete`-policy TON PVs whose PVCs were already removed by an earlier teardown,
+including higher replica ordinals. It records verified PV/claim UIDs and
+Longhorn volume identity before removing supported backing storage; retained,
+static, mounted, rebound or unrelated volumes remain protected. Missing
+TonNode CRDs and non-deployed Helm history are handled as partial-cleanup
+state, without requiring the operator to be reinstalled.
+
+If `0.5.5` prints `flags cannot be placed before plugin name: -A`, update the
+`kubeton` script before retrying. That version placed `-A` before the `delete`
+command in one monitoring-cleanup helper, preventing its deletions. The CLI
+fix also handles the leftover-PV discovery above; an operator image reinstall
+is not required to run the corrected purge.
+
 </details>
 
 ### Environment overrides
