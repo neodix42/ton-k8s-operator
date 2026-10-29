@@ -111,362 +111,6 @@ The partial-service `-l` / `--only-node` and `-o` / `--only-mtc` modes are rejec
 
 Diagnostic `--help`, `-h`, `--print-env` and `MYTONCTRL_PRINT_ENV` settings are rejected because they exit without running services. `--archive`, `ARCHIVE` and `ARCHIVE_BLOCKS` are also unsupported with the standard official TON image because that mode requires the additional `tonutils-storage` binary.
 
-## Key and Secret Strategy
-
-Each replica stores TON state in per-pod PVCs and generates keys on the first start.
-
-With `spec.keyManagement.enabled: true` (the default in `tonnode-values.yaml`):
-- `/var/ton-work/keys` and `/var/ton-work/controller/mytoncore/wallets` are mounted on tmpfs; live wallet private-key files are plaintext in memory
-- encrypted key bundle persisted on dedicated `keybundle` PVC
-- init container restores/decrypts a bundle before TON start
-- sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
-- `kubeton wallet ...` runs in a separate ephemeral pod with its own encrypted bundle PVC; it is intentionally excluded from `kubeton status` and `kubeton backup-keys` flows
-- when the wallet bundle PVC uses Longhorn storage, `kubeton wallet ...` pins the helper pod to nodes exposing `driver.longhorn.io` (from `CSINode`) to avoid attach failures on non-Longhorn nodes
-
-<details>
-<summary>Key backup, restore, scaling and cleanup behavior</summary>
-
-Encryption applies to the saved bundle, not the whole `ton-work` PVC.
-`mytoncore.db` stores controller settings and wallet metadata; standard wallet
-private keys are separate `.pk` files in the wallet directory. The live database,
-configuration, service files and `/var/ton-work/db/keyring` remain on `ton-work`
-without encryption from this feature. Storage-layer encryption is independent.
-
-Backup and restore also stage plaintext files and archives under the key-agent
-container's `/tmp`, which the current Pod specification does not mount as tmpfs.
-The in-memory wallet mount therefore does not guarantee that plaintext never
-touches disk. Enabling key management on an existing volume also does not erase
-historical wallet files beneath that mount.
-
-Manual encrypted bundle backup is available with:
-- `./kubeton backup-keys [output-dir]`
-- `./kubeton stop` scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
-- `./kubeton start` restores TON replicas from stop metadata (and also performs normal start/upgrade flow when no stop metadata exists)
-- TON StatefulSets are created with parallel pod management; `kubeton start` restores stopped replicas in parallel after preapplying saved node placement metadata. Set `KUBETON_SEQUENTIAL_TON_START=true` only as a compatibility fallback.
-- stop-time backup is skipped by default; enable it with: `SKIP_STOP_KEY_BACKUP=false ./kubeton stop`
-- restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
-- per replica (default names):
-- `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.enc`
-- `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.meta`
-- `<output-dir>/<namespace>/<statefulset>/<ordinal>/SHA256SUMS`
-- `keys.bundle.enc` is an encrypted tar archive containing all files from pod paths:
-- `/var/ton-work/keys/**` (for example: `client.pub`, `liteserver.pub`, `client`, `server.pub`)
-- `/var/ton-work/db/config.json`
-- `/var/ton-work/db/keyring/**`
-- `/var/ton-work/controller/**` (initialization marker, controller databases, wallets, network configurations, service units and enabled-service state)
-- `keys.bundle.meta` contains bundle metadata: `provider`, `wrapped_key`, `algorithm`, `created_at`
-- TON DB data outside this set (for example `/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`) is not part of this key bundle backup.
-- if `spec.keyManagement.encryptedBundle.fileName` or `metaFileName` is customized, exported filenames follow those values.
-
-Manual backup is still required for external/exported copies and destructive workflows:
-- run `./kubeton backup-keys` immediately after first key generation/initial setup when you need an external/off-cluster copy
-- run it again after any key change/rotation before maintenance, upgrade, or cluster-level operations
-
-Restore prerequisites:
-- `./kubeton restore-keys <input-dir>` automatically scales TON StatefulSets to `0`, restores available replica bundles, then scales back to previous replica counts.
-- An ordinary pod restart refills tmpfs keys and wallets while keeping the committed controller state and any interrupted installation checkpoint. An explicit `restore-keys` or `recreate` verifies uploaded bytes, then records `.restore-controller-state` on the encrypted bundle PVC so startup replaces controller state, validator configuration and keyring together from that selected bundle. The request is removed only after restoration succeeds; a failed restoration keeps it for retry.
-- Interrupted encrypted-bundle publication leaves a `.backup-publish` journal; run or restart `key-backup` to recover it before exporting a backup, and export again rather than restoring a directory that still contains that journal.
-- if the backup directory is missing for some replica ordinal, restore reports it and continues with other replicas.
-- If a replica restore fails (for example, checksum verification, missing PVC, or upload failure), `restore-keys` restores the previous replica counts and operator reconciliation, prints the restore summary, and exits non-zero without printing a completion message. Missing backup directories remain reported skips.
-- for one-by-one scaling, use:
-- `./kubeton add` to add one replica.
-- `./kubeton del` to remove one replica; it always removes the highest ordinal (tail) pod and does not accept a pod name.
-- encrypted bundles can be decrypted only if the same root-of-trust is still available:
-- Vault mode: same Vault Transit key history/material (same logical key with old versions available).
-- KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
-- `kubeton drop` removes TON resources/PVCs, verified local-path backing directories, and supported CSI/Longhorn backing volumes.
-- `kubeton uninstall` is a full cleanup: it removes TON resources/PVCs, verified local-path backing directories, supported CSI/Longhorn backing volumes, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, main-wallet/debug helper resources, operator release/namespace, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
-- for an explicit `kubeton uninstall` or `kubeton drop`, legacy TON claim-template names are also recognized when their ownership labels are missing. This covers all per-ordinal claims, including `mytoncore-...`, so a partial `mytoncore.db` cannot survive a successful cleanup merely because it was created by an older controller. The fallback is limited to an exact configured or captured TON StatefulSet claim-template identity; it does not delete PVCs merely because they share a prefix.
-- before deleting a PVC, `kubeton` stores the bound PV/PVC UIDs; local-path host paths and Longhorn CSI volume handles are recorded as well. A later `./kubeton uninstall` can therefore retry storage cleanup even after Kubernetes has deleted the PVC object.
-- if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and exits non-zero rather than claiming completion while a cleanup ledger remains. `Retain`, static, or unknown backing storage is intentionally left in the ledger for manual removal rather than being force-deleted. Rerun `./kubeton uninstall` after resolving the reported issue.
-- `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
-- if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
-
-`kubeton add` checks one additional, unoccupied worker against the live
-StatefulSet's CPU, memory, storage, host ports, selectors, and retained volume
-placement. Reusing Vault and StorageClasses does not skip that check. It can
-extend kubeton's managed placement labels on an approved worker while retaining
-the labels on existing workers. Explicit selectors and manually disabled storage
-labels remain constraints. Longhorn-backed claims also require the selected
-worker's CSI plugin to become ready before scaling.
-
-After applying placement and the replica count and restoring operator
-reconciliation, `kubeton add` returns immediately without waiting for the new
-TON pod to become Ready. It reports that startup has been initiated on the
-selected worker; initialization and blockchain synchronization continue in the
-background. Use `./kubeton status` and `./kubeton logs <node>` to follow progress,
-then run `./kubeton backup-keys` after the new keys have been generated.
-
-If an earlier add left an unassigned Pending tail such as `tonnode-5`, retrying
-`kubeton add` resumes that replica without increasing the count to seven. The
-command refreshes placement and recreates only that unscheduled tail pod. It
-retains every existing PVC, including an already-bound encrypted key bundle.
-For a new ordinal, Kubernetes creates claims from the current StatefulSet
-templates; `add` does not clone old PVC settings or delete retained volumes.
-`WaitForFirstConsumer` claims normally remain Pending until the pod is scheduled,
-and an unscheduled pod has neither a node nor a pod IP.
-
-This fix requires the updated operator image as well as the updated CLI. The
-operator preserves existing validators during placement-only growth using
-`OnDelete`; an intentional non-replica TonNode spec change, such as an image
-upgrade, restores rolling updates. Operator-only installs preserve the live
-TON replica count, including counts previously changed by `add` or `del`.
-To recover an unfinished add from an older release, use the updated release
-bundle with its updated operator image configured, then run:
-
-```bash
-# Upgrade the operator without requalifying disk capacity on existing replicas.
-KUBETON_SKIP_NODE_PREREQ_CHECK=true ./kubeton install
-./kubeton add
-```
-
-`add` still performs fresh admission for the extra worker. If no worker passes,
-it reports the failed prerequisites before changing replica counts or PVCs.
-
-`kubeton del` inventories every wallet on the tail pod, including address-only
-wallets, and displays its on-chain status and balance without reading private
-key contents. A positive balance or an existing non-empty account state requires
-an additional confirmation. Failed queries, an unavailable pod, or an incomplete
-wallet inventory produce a separate unknown-balance warning and confirmation;
-they are never treated as empty wallets.
-
-Before any scale-down or storage deletion, `del` also asks whether you have a
-current backup of that pod's keys and wallets stored outside the cluster, then
-asks for final approval of the deletion. Answering `n`, pressing Enter, or
-closing input cancels. Backup confirmation is your acknowledgement; the command
-does not verify a backup archive. Use `./kubeton backup-fleet <backup-dir>` for
-portable recovery, or `./kubeton backup-keys <backup-dir>` while retaining the
-original Vault/KMS key. If the fleet count or tail pod identity changes
-during the checks, `del` aborts so that a fresh run can inspect the new target.
-
-`configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
-
-</details>
-
-### Recovering one damaged validator on a replacement server
-
-Use a server name, pod name, or namespace/pod to recover one validator whose
-blockchain database is damaged:
-
-```bash
-# Select a compatible free server automatically.
-./kubeton restore-keys devnet-16
-
-# Select the replacement server explicitly.
-./kubeton restore-keys tonnode-2 --to-node devnet-21
-
-# Use a previously exported backup for this ordinal instead of the live bundle.
-./kubeton restore-keys default/tonnode-2 ./key-backups/20261027T120000Z --to-node devnet-21
-```
-
-<details>
-<summary>Single-validator recovery behavior, requirements and failure handling</summary>
-
-The selected validator keeps its pod name and ordinal. Recovery checks the
-replacement's live resource, storage, selector, host-port, and Longhorn CSI
-requirements. By default it triggers a fresh backup on only the selected pod
-and captures its committed encrypted bundle. An explicit backup directory must
-contain that ordinal's bundle and matching `SHA256SUMS`; it restores the keys
-and wallets captured at that backup's date.
-
-Before replacing storage, a temporary helper decrypts and validates the bundle
-using the existing Vault key. It preserves wallet key/address files, validator
-and ADNL keys, the controller database, and node configuration. Only advertised
-IPv4 addresses in `config.json` and the validator service's `--ip` endpoint are
-rebound to the replacement server. Plaintext and unwrapped keys remain in the
-helper's memory-backed volumes. The original encrypted backup remains intact.
-
-Recovery pauses the operator and temporarily removes the StatefulSet controller
-with orphan propagation, so sibling pods keep running. It stops only the
-selected pod, retains its original backing PVs, creates fresh claims from the
-live templates, and stages the verified identity before recreating the
-StatefulSet. The recreated workload uses `OnDelete`, and recovery verifies that
-the sibling pod UIDs were retained and adopted before restoring the operator.
-The replacement initializes and synchronizes in the background; follow it with
-`./kubeton status` and `./kubeton logs tonnode-2`.
-
-Recovery preserves the TonNode's installation arguments and container
-environment. If dump download was enabled with `-d` in `spec.args` or
-`MYTONCTRL_ARGS`, or with `DUMP=true`, a `restore-node-bootstrap` init container downloads and imports the
-dump before starting the validator. It uses the restored `global.config.json`
-to select the network, keeps wallet/ADNL keys, `config.json`, and controller
-settings, and resumes an interrupted download or extraction on retry. The
-command returns without waiting for the dump or blockchain synchronization.
-Without dump download enabled, the replacement synchronizes normally. Inspect
-dump progress with `kubectl -n default logs tonnode-2 -c restore-node-bootstrap -f`.
-Upgrade the operator with `./kubeton upgrade` before using this recovery path
-on an older installation. Recovery checks that the running operator supports
-the bootstrap init before changing storage, so a recreated Pod can also resume
-an unfinished import.
-
-This path requires a single live TonNode fleet with automatic sticky placement,
-Vault key management, dynamic local-path or Longhorn storage, and healthy
-siblings. The source Kubernetes server must be reachable for an ordinary pod
-shutdown; this command does not force-delete an unreachable validator or fence
-a failed physical server. An inaccessible or incomplete identity bundle is an
-error, never a reason to generate replacement keys. No snapshot can recover
-wallets created after that snapshot.
-
-The command retains a private `kubeton-recovery-...` checkpoint and the original
-target PVs for review. These occupy storage until you explicitly remove them.
-If a failure occurs after removing the StatefulSet controller, the operator
-remains paused and the checkpoint records the completed phase. Review the
-saved resources and staged identity before resuming reconciliation; running
-`start`, `add`, or `install` at that point can bypass the recovery staging.
-
-The original `./kubeton restore-keys <existing-backup-dir>` syntax still restores
-all available replica bundles and restarts the fleet. Use the node/pod form
-above for isolated replacement onto another server.
-
-</details>
-
-### Moving a fleet to another Kubernetes cluster
-
-`backup-fleet` and `restore-fleet` move TON identities and controller state to
-fresh storage on another cluster. Fleet restore creates the TonNode resources,
-StatefulSets and PVCs and uses the saved replica counts. It installs the operator
-using the destination `operator-values.yaml`; `replicaCount` in that file
-controls operator pods, not the saved TON replica counts.
-
-The installer downloads `kubeton`, `main-wallet.sh`, `fleet.sh`, `fleet.py`, and `fleet-crypto.sh`
-together from the selected GitHub release. The fleet commands need only Bash,
-`kubectl`, and `tar` on the machine running them. They launch a temporary tools
-pod using `ghcr.io/neodix42/ton-k8s-operator:fleet-tools-0.3.4`, which includes
-Python, GnuPG, OpenSSL, kubectl, Helm, curl, jq, and the shell utilities used by
-backup and restore. Destination migration helpers use the same image. The
-installer itself also needs Helm and either curl or wget.
-
-On the source cluster, run:
-
-```bash
-./kubeton backup-fleet
-# Or choose the output directory:
-./kubeton backup-fleet ./fleet-backups/migration
-```
-
-Enter a recovery passphrase twice when prompted, and keep it in your password
-manager. No passphrase-generation command or local passphrase file is required.
-With no directory argument, the backup is saved under
-`./fleet-backups/<UTC timestamp>`. Passphrase input is hidden and is passed to
-the tools pod over `kubectl exec` stdin, not in command arguments or Pod env.
-
-The source fleets must be running and initialized, with matching TonNode and
-StatefulSet replica counts. Backup restarts the source pods, using the existing
-`backup-keys` workflow, and captures all TonNode specifications and replica
-bundles. The output directory must not already exist. The directory is
-published only after every bundle and recovery key has been verified.
-
-`fleet.json` records the specifications, counts and bundle checksums.
-`recovery.gpg` contains passphrase-encrypted recovery keys and authenticates the
-manifest and bundle inventory. Recovery keys are streamed through GnuPG; they
-are not written to plaintext files; GnuPG runs inside the tools pod. The
-backup and its passphrase together can recover the validator identities.
-Transfer the directory and keep its passphrase separately. Do not change
-`fleet.json` or the bundle files after backup.
-
-Stop the source validators before starting their restored identities:
-
-```bash
-./kubeton stop
-```
-
-On the destination, select its Kubernetes context and provision the desired
-StorageClasses. For the default bare-metal/k3d storage and Vault setup, restore
-can bootstrap the prerequisites:
-
-```bash
-./kubeton restore-fleet ./fleet-backups/migration \
-  --storage-class local-path \
-  --bundle-storage-class encrypted-sc \
-  --bootstrap
-```
-
-Enter the same recovery passphrase when prompted.
-
-<details>
-<summary>Fleet restore requirements and advanced options</summary>
-
-For an existing storage/Vault setup, omit `--bootstrap`. Each restored namespace
-must already contain `TON_VAULT_CREDS_SECRET` (default `ton-vault-creds`) with
-`VAULT_ADDR`, `VAULT_TOKEN`, and optionally `VAULT_NAMESPACE`. Its token must
-allow encrypt/decrypt on the destination `VAULT_TRANSIT_KEY` (default
-`ton-validator`). Fleet restore verifies encryption/decryption with that Vault
-and rewraps each replica's recovery key. **The destination Vault may be entirely
-new; the original Vault is not required once fleet backup has completed.**
-Vault root/unseal credentials and source Kubernetes Secrets are not exported.
-
-Tools pods use short-lived ServiceAccounts. Backup receives a role limited to
-the resource reads, pod exec/copy and workload scaling needed by the backup
-workflow. Restore temporarily binds its tools ServiceAccount to `cluster-admin`
-because it installs CRDs, operator RBAC, storage/Vault prerequisites and fleet
-resources. The caller must already be allowed to create those bindings. The
-pod, ServiceAccount and bindings are removed after the command finishes. If a
-connection is lost and remote cleanup cannot be confirmed, `kubeton` reports
-the retained pod and binding names so cleanup can finish before access is revoked.
-
-Use `KUBETON_FLEET_TOOLS_NAMESPACE` to select the tools namespace (default
-`default`), `KUBETON_FLEET_TOOLS_IMAGE` to override the image, and
-`KUBETON_FLEET_TOOLS_MEMORY` to change the tools pod memory limit (default `2Gi`).
-The published tools image targets Linux amd64, matching the default TON image.
-The tools namespace must allow its pod to reach the Kubernetes API.
-
-For automation, `--passphrase-file /secure/fleet.passphrase` remains available;
-the file is read locally and its contents are streamed to the pod. For an
-explicit local execution with all tools already installed, set
-`KUBETON_FLEET_RUNTIME=native`. The current backup format supports Vault-backed
-fleets; KMS-backed fleets and external `configRef` or `env.valueFrom` dependencies
-are rejected to avoid an incomplete migration backup.
-
-Destination data and bundle StorageClasses are independent. Defaults come from
-`TON_STORAGE_CLASS_NAME` (`local-path`) and `ENCRYPTED_SC_NAME` (`encrypted-sc`);
-the command flags override them. An explicit data class is required; `auto`
-is not accepted. Both classes must support the requested claim sizes and
-scheduling all of a replica's volumes onto the same worker. The destination
-needs enough eligible workers, CPU, memory and disk for the saved workload.
-One replica of each fleet is allowed per worker; host ports can require more
-workers when multiple fleets share their port numbers.
-
-Source node selectors, node names and explicit public IP settings are discarded.
-Use `--node-selector 'pool=validators'` to restrict destination placement. Helper
-pods reserve the TON resources and host ports while the scheduler provisions
-all five PVCs per replica. Restore chooses the worker's `ExternalIP`, falling
-back to its host IP, and updates the saved validator advertised IPv4 addresses
-and any service `--ip` argument. Ports and validator identities are retained.
-For NAT/private workers, supply publicly forwarded addresses explicitly:
-
-```json
-{
-  "default/tonnode/0": "203.0.113.10",
-  "default/tonnode/1": "203.0.113.11"
-}
-```
-
-Pass that JSON file with `--public-ips /path/to/public-ips.json`; keys are
-`namespace/TonNode-name/ordinal`. Configured ports must be reachable at those
-addresses. Unknown replica names and invalid IPv4 addresses are rejected.
-
-Restore validates the passphrase, authenticated manifest and all bundle hashes
-before any cluster writes. It refuses existing TonNode resources, TON
-StatefulSets or matching PVCs. Every identity is staged and re-encrypted before
-any TON process starts, and replicas start on their newly selected workers.
-On failure, restore attempts to stop destination fleets and retains PVCs for
-inspection. If those stop requests fail, it leaves the operator paused and
-reports the need to check replica counts before resuming reconciliation. Remove
-the partial destination fleets before retrying.
-
-Bulk blockchain databases, `kubeton wallet`'s separate main-wallet bundle,
-and its outgoing-payment journal are excluded. TON must synchronize blockchain data on its fresh volumes.
-The restored TonNodes are created directly rather than owned by a Helm chart.
-Before using `kubeton start` for later changes, align destination
-`tonnode-values.yaml` (or `TON_VALUES_FILE`) with the restored names, namespace,
-replica count, images and storage choices; the local values file is not
-rewritten by restore. For multiple TonNodes, manage each specification explicitly.
-
-For full design, threat model, provider requirements, and hardening steps, see:
-- `SECURITY.md`
-
-</details>
-
 ## Prerequisites
 
 For deployment to an existing Kubernetes cluster:
@@ -512,9 +156,23 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton check
 ./kubeton install
 ./kubeton start
+
+# required: refresh and export encrypted recovery backups
+./kubeton backup-keys
 ```
 
 `kubeton start` handles the default bare-metal/k3d bootstrap automatically.
+
+After a successful `./kubeton start`, **you must run `./kubeton backup-keys`**
+as part of this production deployment workflow. It refreshes each node's
+in-cluster encrypted bundle and exports a current recovery copy to the machine
+running kubeton. The automatic first-start bundle stays inside the cluster and
+does not replace this required export. The backup command temporarily stops and
+restarts the TON fleet while exporting.
+
+Keep the exported directory outside the cluster and take a fresh backup after
+creating wallets or changing keys. These bundles still require the original
+Vault Transit or cloud KMS key for decryption; retain that root of trust.
 
 ### VictoriaLogs dashboard access
 
@@ -2345,7 +2003,8 @@ For `kubeton`-based full destructive cleanup (including CRD), use:
 
 ### Alternative: Run Controller On Host (`make run`)
 
-`make run` starts the operator manager process on your local machine (not as a Pod in Kubernetes).  
+`make run` starts the operator manager process on your local machine (not as a Pod in Kubernetes).
+
 It uses your current `kubectl` context and watches/reconciles resources in that cluster.
 
 ```bash
@@ -2399,3 +2058,382 @@ spec:
   configRef:
     name: ton-config
 ```
+
+## Key and Secret Strategy
+
+Each replica stores TON state in per-pod PVCs and generates keys on the first start.
+
+With `spec.keyManagement.enabled: true` (the default in `tonnode-values.yaml`):
+- `/var/ton-work/keys` and `/var/ton-work/controller/mytoncore/wallets` are mounted on tmpfs; live wallet private-key files are plaintext in memory
+- encrypted key bundle persisted on dedicated `keybundle` PVC
+- init container restores/decrypts a bundle before TON start
+- the `key-backup` sidecar automatically creates the first in-cluster encrypted bundle after initialization when no bundle exists
+- later bundle refreshes run on explicit backup requests, managed image upgrades, or `kubeton stop` when stop-time backup is enabled
+- `kubeton wallet ...` runs in a separate ephemeral pod with its own encrypted bundle PVC; it is intentionally excluded from `kubeton status` and `kubeton backup-keys` flows
+- when the wallet bundle PVC uses Longhorn storage, `kubeton wallet ...` pins the helper pod to nodes exposing `driver.longhorn.io` (from `CSINode`) to avoid attach failures on non-Longhorn nodes
+
+<details>
+<summary>Key backup, restore, scaling and cleanup behavior</summary>
+
+Encryption applies to the saved bundle, not the whole `ton-work` PVC.
+`mytoncore.db` stores controller settings and wallet metadata; standard wallet
+private keys are separate `.pk` files in the wallet directory. The live database,
+configuration, service files and `/var/ton-work/db/keyring` remain on `ton-work`
+without encryption from this feature. Storage-layer encryption is independent.
+
+Backup and restore also stage plaintext files and archives under the key-agent
+container's `/tmp`, which the current Pod specification does not mount as tmpfs.
+The in-memory wallet mount therefore does not guarantee that plaintext never
+touches disk. Enabling key management on an existing volume also does not erase
+historical wallet files beneath that mount.
+
+Manual encrypted bundle backup is available with:
+- `./kubeton backup-keys [output-dir]`
+- `./kubeton stop` scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
+- `./kubeton start` restores TON replicas from stop metadata (and also performs normal start/upgrade flow when no stop metadata exists)
+- TON StatefulSets are created with parallel pod management; `kubeton start` restores stopped replicas in parallel after preapplying saved node placement metadata. Set `KUBETON_SEQUENTIAL_TON_START=true` only as a compatibility fallback.
+- stop-time backup is skipped by default; enable it with: `SKIP_STOP_KEY_BACKUP=false ./kubeton stop`
+- restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
+- per replica (default names):
+- `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.enc`
+- `<output-dir>/<namespace>/<statefulset>/<ordinal>/bundle/keys.bundle.meta`
+- `<output-dir>/<namespace>/<statefulset>/<ordinal>/SHA256SUMS`
+- `keys.bundle.enc` is an encrypted tar archive containing all files from pod paths:
+- `/var/ton-work/keys/**` (for example: `client.pub`, `liteserver.pub`, `client`, `server.pub`)
+- `/var/ton-work/db/config.json`
+- `/var/ton-work/db/keyring/**`
+- `/var/ton-work/controller/**` (initialization marker, controller databases, wallets, network configurations, service units and enabled-service state)
+- `keys.bundle.meta` contains bundle metadata: `provider`, `wrapped_key`, `algorithm`, `created_at`
+- TON DB data outside this set (for example `/var/ton-work/db/celldb/**`, `/var/ton-work/db/archive/**`) is not part of this key bundle backup.
+- if `spec.keyManagement.encryptedBundle.fileName` or `metaFileName` is customized, exported filenames follow those values.
+
+The initial in-cluster bundle is automatic with key management enabled:
+`key-backup` waits for committed initialization and key material, then creates
+the bundle if none exists. This default is controlled by the sidecar's
+`KEY_AUTO_BOOTSTRAP_BUNDLE` setting (default `true`). Successful `kubeton start`
+verifies initialization, but does not wait for or verify this initial backup.
+Once a bundle exists, the sidecar does not automatically refresh it when wallets,
+keys or controller settings change.
+
+Manual backup is still needed for a current external/off-cluster copy:
+
+- Run `./kubeton backup-keys [output-dir]` after initial setup to refresh the
+  in-cluster bundle and export a copy to the machine running kubeton.
+- Run it again after creating wallets, changing or rotating keys, or changing
+  recovery-relevant configuration, before maintenance or destructive operations.
+- The command temporarily stops and restarts the TON fleet while exporting;
+  move its output outside the cluster for off-cluster recovery.
+
+`kubeton upgrade` refreshes the in-cluster bundle before replacing initialized
+pods for image changes, but does not export a copy. `kubeton stop` skips backup
+by default; `SKIP_STOP_KEY_BACKUP=false` enables an in-cluster refresh, also
+without export. Neither replaces an external backup.
+
+Exported `backup-keys` bundles still require the original Vault Transit key or
+cloud KMS key to decrypt. Before deleting that root of trust, use
+`backup-fleet` for portable recovery of a supported Vault-backed fleet.
+
+Restore prerequisites:
+- `./kubeton restore-keys <input-dir>` automatically scales TON StatefulSets to `0`, restores available replica bundles, then scales back to previous replica counts.
+- An ordinary pod restart refills tmpfs keys and wallets while keeping the committed controller state and any interrupted installation checkpoint. An explicit `restore-keys` or `recreate` verifies uploaded bytes, then records `.restore-controller-state` on the encrypted bundle PVC so startup replaces controller state, validator configuration and keyring together from that selected bundle. The request is removed only after restoration succeeds; a failed restoration keeps it for retry.
+- Interrupted encrypted-bundle publication leaves a `.backup-publish` journal; run or restart `key-backup` to recover it before exporting a backup, and export again rather than restoring a directory that still contains that journal.
+- if the backup directory is missing for some replica ordinal, restore reports it and continues with other replicas.
+- If a replica restore fails (for example, checksum verification, missing PVC, or upload failure), `restore-keys` restores the previous replica counts and operator reconciliation, prints the restore summary, and exits non-zero without printing a completion message. Missing backup directories remain reported skips.
+- for one-by-one scaling, use:
+- `./kubeton add` to add one replica.
+- `./kubeton del` to remove one replica; it always removes the highest ordinal (tail) pod and does not accept a pod name.
+- encrypted bundles can be decrypted only if the same root-of-trust is still available:
+- Vault mode: same Vault Transit key history/material (same logical key with old versions available).
+- KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
+- `kubeton drop` removes TON resources/PVCs, verified local-path backing directories, and supported CSI/Longhorn backing volumes.
+- `kubeton uninstall` is a full cleanup: it removes TON resources/PVCs, verified local-path backing directories, supported CSI/Longhorn backing volumes, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, main-wallet/debug helper resources, operator release/namespace, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- for an explicit `kubeton uninstall` or `kubeton drop`, legacy TON claim-template names are also recognized when their ownership labels are missing. This covers all per-ordinal claims, including `mytoncore-...`, so a partial `mytoncore.db` cannot survive a successful cleanup merely because it was created by an older controller. The fallback is limited to an exact configured or captured TON StatefulSet claim-template identity; it does not delete PVCs merely because they share a prefix.
+- before deleting a PVC, `kubeton` stores the bound PV/PVC UIDs; local-path host paths and Longhorn CSI volume handles are recorded as well. A later `./kubeton uninstall` can therefore retry storage cleanup even after Kubernetes has deleted the PVC object.
+- if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and exits non-zero rather than claiming completion while a cleanup ledger remains. `Retain`, static, or unknown backing storage is intentionally left in the ledger for manual removal rather than being force-deleted. Rerun `./kubeton uninstall` after resolving the reported issue.
+- `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
+- if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
+
+`kubeton add` checks one additional, unoccupied worker against the live
+StatefulSet's CPU, memory, storage, host ports, selectors, and retained volume
+placement. Reusing Vault and StorageClasses does not skip that check. It can
+extend kubeton's managed placement labels on an approved worker while retaining
+the labels on existing workers. Explicit selectors and manually disabled storage
+labels remain constraints. Longhorn-backed claims also require the selected
+worker's CSI plugin to become ready before scaling.
+
+After applying placement and the replica count and restoring operator
+reconciliation, `kubeton add` returns immediately without waiting for the new
+TON pod to become Ready. It reports that startup has been initiated on the
+selected worker; initialization and blockchain synchronization continue in the
+background. Use `./kubeton status` and `./kubeton logs <node>` to follow progress,
+then run `./kubeton backup-keys` after the new keys have been generated.
+
+If an earlier add left an unassigned Pending tail such as `tonnode-5`, retrying
+`kubeton add` resumes that replica without increasing the count to seven. The
+command refreshes placement and recreates only that unscheduled tail pod. It
+retains every existing PVC, including an already-bound encrypted key bundle.
+For a new ordinal, Kubernetes creates claims from the current StatefulSet
+templates; `add` does not clone old PVC settings or delete retained volumes.
+`WaitForFirstConsumer` claims normally remain Pending until the pod is scheduled,
+and an unscheduled pod has neither a node nor a pod IP.
+
+This fix requires the updated operator image as well as the updated CLI. The
+operator preserves existing validators during placement-only growth using
+`OnDelete`; an intentional non-replica TonNode spec change, such as an image
+upgrade, restores rolling updates. Operator-only installs preserve the live
+TON replica count, including counts previously changed by `add` or `del`.
+To recover an unfinished add from an older release, use the updated release
+bundle with its updated operator image configured, then run:
+
+```bash
+# Upgrade the operator without requalifying disk capacity on existing replicas.
+KUBETON_SKIP_NODE_PREREQ_CHECK=true ./kubeton install
+./kubeton add
+```
+
+`add` still performs fresh admission for the extra worker. If no worker passes,
+it reports the failed prerequisites before changing replica counts or PVCs.
+
+`kubeton del` inventories every wallet on the tail pod, including address-only
+wallets, and displays its on-chain status and balance without reading private
+key contents. A positive balance or an existing non-empty account state requires
+an additional confirmation. Failed queries, an unavailable pod, or an incomplete
+wallet inventory produce a separate unknown-balance warning and confirmation;
+they are never treated as empty wallets.
+
+Before any scale-down or storage deletion, `del` also asks whether you have a
+current backup of that pod's keys and wallets stored outside the cluster, then
+asks for final approval of the deletion. Answering `n`, pressing Enter, or
+closing input cancels. Backup confirmation is your acknowledgement; the command
+does not verify a backup archive. Use `./kubeton backup-fleet <backup-dir>` for
+portable recovery, or `./kubeton backup-keys <backup-dir>` while retaining the
+original Vault/KMS key. If the fleet count or tail pod identity changes
+during the checks, `del` aborts so that a fresh run can inspect the new target.
+
+`configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
+
+</details>
+
+### Recovering one damaged validator on a replacement server
+
+Use a server name, pod name, or namespace/pod to recover one validator whose
+blockchain database is damaged:
+
+```bash
+# Select a compatible free server automatically.
+./kubeton restore-keys devnet-16
+
+# Select the replacement server explicitly.
+./kubeton restore-keys tonnode-2 --to-node devnet-21
+
+# Use a previously exported backup for this ordinal instead of the live bundle.
+./kubeton restore-keys default/tonnode-2 ./key-backups/20261027T120000Z --to-node devnet-21
+```
+
+<details>
+<summary>Single-validator recovery behavior, requirements and failure handling</summary>
+
+The selected validator keeps its pod name and ordinal. Recovery checks the
+replacement's live resource, storage, selector, host-port, and Longhorn CSI
+requirements. By default it triggers a fresh backup on only the selected pod
+and captures its committed encrypted bundle. An explicit backup directory must
+contain that ordinal's bundle and matching `SHA256SUMS`; it restores the keys
+and wallets captured at that backup's date.
+
+Before replacing storage, a temporary helper decrypts and validates the bundle
+using the existing Vault key. It preserves wallet key/address files, validator
+and ADNL keys, the controller database, and node configuration. Only advertised
+IPv4 addresses in `config.json` and the validator service's `--ip` endpoint are
+rebound to the replacement server. Plaintext and unwrapped keys remain in the
+helper's memory-backed volumes. The original encrypted backup remains intact.
+
+Recovery pauses the operator and temporarily removes the StatefulSet controller
+with orphan propagation, so sibling pods keep running. It stops only the
+selected pod, retains its original backing PVs, creates fresh claims from the
+live templates, and stages the verified identity before recreating the
+StatefulSet. The recreated workload uses `OnDelete`, and recovery verifies that
+the sibling pod UIDs were retained and adopted before restoring the operator.
+The replacement initializes and synchronizes in the background; follow it with
+`./kubeton status` and `./kubeton logs tonnode-2`.
+
+Recovery preserves the TonNode's installation arguments and container
+environment. If dump download was enabled with `-d` in `spec.args` or
+`MYTONCTRL_ARGS`, or with `DUMP=true`, a `restore-node-bootstrap` init container downloads and imports the
+dump before starting the validator. It uses the restored `global.config.json`
+to select the network, keeps wallet/ADNL keys, `config.json`, and controller
+settings, and resumes an interrupted download or extraction on retry. The
+command returns without waiting for the dump or blockchain synchronization.
+Without dump download enabled, the replacement synchronizes normally. Inspect
+dump progress with `kubectl -n default logs tonnode-2 -c restore-node-bootstrap -f`.
+Upgrade the operator with `./kubeton upgrade` before using this recovery path
+on an older installation. Recovery checks that the running operator supports
+the bootstrap init before changing storage, so a recreated Pod can also resume
+an unfinished import.
+
+This path requires a single live TonNode fleet with automatic sticky placement,
+Vault key management, dynamic local-path or Longhorn storage, and healthy
+siblings. The source Kubernetes server must be reachable for an ordinary pod
+shutdown; this command does not force-delete an unreachable validator or fence
+a failed physical server. An inaccessible or incomplete identity bundle is an
+error, never a reason to generate replacement keys. No snapshot can recover
+wallets created after that snapshot.
+
+The command retains a private `kubeton-recovery-...` checkpoint and the original
+target PVs for review. These occupy storage until you explicitly remove them.
+If a failure occurs after removing the StatefulSet controller, the operator
+remains paused and the checkpoint records the completed phase. Review the
+saved resources and staged identity before resuming reconciliation; running
+`start`, `add`, or `install` at that point can bypass the recovery staging.
+
+The original `./kubeton restore-keys <existing-backup-dir>` syntax still restores
+all available replica bundles and restarts the fleet. Use the node/pod form
+above for isolated replacement onto another server.
+
+</details>
+
+### Moving a fleet to another Kubernetes cluster
+
+`backup-fleet` and `restore-fleet` move TON identities and controller state to
+fresh storage on another cluster. Fleet restore creates the TonNode resources,
+StatefulSets and PVCs and uses the saved replica counts. It installs the operator
+using the destination `operator-values.yaml`; `replicaCount` in that file
+controls operator pods, not the saved TON replica counts.
+
+The installer downloads `kubeton`, `main-wallet.sh`, `fleet.sh`, `fleet.py`, and `fleet-crypto.sh`
+together from the selected GitHub release. The fleet commands need only Bash,
+`kubectl`, and `tar` on the machine running them. They launch a temporary tools
+pod using `ghcr.io/neodix42/ton-k8s-operator:fleet-tools-0.3.4`, which includes
+Python, GnuPG, OpenSSL, kubectl, Helm, curl, jq, and the shell utilities used by
+backup and restore. Destination migration helpers use the same image. The
+installer itself also needs Helm and either curl or wget.
+
+On the source cluster, run:
+
+```bash
+./kubeton backup-fleet
+# Or choose the output directory:
+./kubeton backup-fleet ./fleet-backups/migration
+```
+
+Enter a recovery passphrase twice when prompted, and keep it in your password
+manager. No passphrase-generation command or local passphrase file is required.
+With no directory argument, the backup is saved under
+`./fleet-backups/<UTC timestamp>`. Passphrase input is hidden and is passed to
+the tools pod over `kubectl exec` stdin, not in command arguments or Pod env.
+
+The source fleets must be running and initialized, with matching TonNode and
+StatefulSet replica counts. Backup restarts the source pods, using the existing
+`backup-keys` workflow, and captures all TonNode specifications and replica
+bundles. The output directory must not already exist. The directory is
+published only after every bundle and recovery key has been verified.
+
+`fleet.json` records the specifications, counts and bundle checksums.
+`recovery.gpg` contains passphrase-encrypted recovery keys and authenticates the
+manifest and bundle inventory. Recovery keys are streamed through GnuPG; they
+are not written to plaintext files; GnuPG runs inside the tools pod. The
+backup and its passphrase together can recover the validator identities.
+Transfer the directory and keep its passphrase separately. Do not change
+`fleet.json` or the bundle files after backup.
+
+Stop the source validators before starting their restored identities:
+
+```bash
+./kubeton stop
+```
+
+On the destination, select its Kubernetes context and provision the desired
+StorageClasses. For the default bare-metal/k3d storage and Vault setup, restore
+can bootstrap the prerequisites:
+
+```bash
+./kubeton restore-fleet ./fleet-backups/migration \
+  --storage-class local-path \
+  --bundle-storage-class encrypted-sc \
+  --bootstrap
+```
+
+Enter the same recovery passphrase when prompted.
+
+<details>
+<summary>Fleet restore requirements and advanced options</summary>
+
+For an existing storage/Vault setup, omit `--bootstrap`. Each restored namespace
+must already contain `TON_VAULT_CREDS_SECRET` (default `ton-vault-creds`) with
+`VAULT_ADDR`, `VAULT_TOKEN`, and optionally `VAULT_NAMESPACE`. Its token must
+allow encrypt/decrypt on the destination `VAULT_TRANSIT_KEY` (default
+`ton-validator`). Fleet restore verifies encryption/decryption with that Vault
+and rewraps each replica's recovery key. **The destination Vault may be entirely
+new; the original Vault is not required once fleet backup has completed.**
+Vault root/unseal credentials and source Kubernetes Secrets are not exported.
+
+Tools pods use short-lived ServiceAccounts. Backup receives a role limited to
+the resource reads, pod exec/copy and workload scaling needed by the backup
+workflow. Restore temporarily binds its tools ServiceAccount to `cluster-admin`
+because it installs CRDs, operator RBAC, storage/Vault prerequisites and fleet
+resources. The caller must already be allowed to create those bindings. The
+pod, ServiceAccount and bindings are removed after the command finishes. If a
+connection is lost and remote cleanup cannot be confirmed, `kubeton` reports
+the retained pod and binding names so cleanup can finish before access is revoked.
+
+Use `KUBETON_FLEET_TOOLS_NAMESPACE` to select the tools namespace (default
+`default`), `KUBETON_FLEET_TOOLS_IMAGE` to override the image, and
+`KUBETON_FLEET_TOOLS_MEMORY` to change the tools pod memory limit (default `2Gi`).
+The published tools image targets Linux amd64, matching the default TON image.
+The tools namespace must allow its pod to reach the Kubernetes API.
+
+For automation, `--passphrase-file /secure/fleet.passphrase` remains available;
+the file is read locally and its contents are streamed to the pod. For an
+explicit local execution with all tools already installed, set
+`KUBETON_FLEET_RUNTIME=native`. The current backup format supports Vault-backed
+fleets; KMS-backed fleets and external `configRef` or `env.valueFrom` dependencies
+are rejected to avoid an incomplete migration backup.
+
+Destination data and bundle StorageClasses are independent. Defaults come from
+`TON_STORAGE_CLASS_NAME` (`local-path`) and `ENCRYPTED_SC_NAME` (`encrypted-sc`);
+the command flags override them. An explicit data class is required; `auto`
+is not accepted. Both classes must support the requested claim sizes and
+scheduling all of a replica's volumes onto the same worker. The destination
+needs enough eligible workers, CPU, memory and disk for the saved workload.
+One replica of each fleet is allowed per worker; host ports can require more
+workers when multiple fleets share their port numbers.
+
+Source node selectors, node names and explicit public IP settings are discarded.
+Use `--node-selector 'pool=validators'` to restrict destination placement. Helper
+pods reserve the TON resources and host ports while the scheduler provisions
+all five PVCs per replica. Restore chooses the worker's `ExternalIP`, falling
+back to its host IP, and updates the saved validator advertised IPv4 addresses
+and any service `--ip` argument. Ports and validator identities are retained.
+For NAT/private workers, supply publicly forwarded addresses explicitly:
+
+```json
+{
+  "default/tonnode/0": "203.0.113.10",
+  "default/tonnode/1": "203.0.113.11"
+}
+```
+
+Pass that JSON file with `--public-ips /path/to/public-ips.json`; keys are
+`namespace/TonNode-name/ordinal`. Configured ports must be reachable at those
+addresses. Unknown replica names and invalid IPv4 addresses are rejected.
+
+Restore validates the passphrase, authenticated manifest and all bundle hashes
+before any cluster writes. It refuses existing TonNode resources, TON
+StatefulSets or matching PVCs. Every identity is staged and re-encrypted before
+any TON process starts, and replicas start on their newly selected workers.
+On failure, restore attempts to stop destination fleets and retains PVCs for
+inspection. If those stop requests fail, it leaves the operator paused and
+reports the need to check replica counts before resuming reconciliation. Remove
+the partial destination fleets before retrying.
+
+Bulk blockchain databases, `kubeton wallet`'s separate main-wallet bundle,
+and its outgoing-payment journal are excluded. TON must synchronize blockchain data on its fresh volumes.
+The restored TonNodes are created directly rather than owned by a Helm chart.
+Before using `kubeton start` for later changes, align destination
+`tonnode-values.yaml` (or `TON_VALUES_FILE`) with the restored names, namespace,
+replica count, images and storage choices; the local values file is not
+rewritten by restore. For multiple TonNodes, manage each specification explicitly.
+
+For full design, threat model, provider requirements, and hardening steps, see:
+- `SECURITY.md`
+
+</details>
