@@ -84,6 +84,41 @@ spec:
                       HoldOnFailure wraps the TON entrypoint so non-zero exits sleep forever instead of
                       letting the StatefulSet restart the container. This is intended only for debugging.
                     type: boolean
+                  jemalloc:
+                    description: Jemalloc configures optional sampled allocation profiles
+                      for validator-engine.
+                    properties:
+                      enabled:
+                        default: false
+                        description: Enabled collects sampled allocation profiles
+                          when the TON binary supports jemalloc profiling.
+                        type: boolean
+                      intervalLog2:
+                        default: 34
+                        description: |-
+                          IntervalLog2 is the base-two logarithm of allocated bytes between automatic profile dumps.
+                          This measures cumulative allocation, not elapsed time or live heap size.
+                        format: int32
+                        maximum: 40
+                        minimum: 20
+                        type: integer
+                      maxProfiles:
+                        default: 8
+                        description: MaxProfiles bounds retained profile files on
+                          a best-effort basis.
+                        format: int32
+                        maximum: 100
+                        minimum: 2
+                        type: integer
+                      sampleLog2:
+                        default: 19
+                        description: SampleLog2 is the base-two logarithm of the average
+                          allocation sampling interval in bytes.
+                        format: int32
+                        maximum: 30
+                        minimum: 10
+                        type: integer
+                    type: object
                 type: object
               env:
                 description: Env allows passing extra environment variables to the

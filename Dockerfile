@@ -17,6 +17,7 @@ COPY api/ api/
 COPY internal/ internal/
 COPY charts/assets.go charts/assets.go
 COPY charts/ton-k8s-operator/fleet.py charts/ton-k8s-operator/fleet.py
+COPY charts/ton-k8s-operator/jemalloc-profile.py charts/ton-k8s-operator/jemalloc-profile.py
 
 # Build
 # the GOARCH has not a default value to allow the binary be built according to the host where the command

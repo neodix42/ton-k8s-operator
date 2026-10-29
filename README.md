@@ -80,6 +80,7 @@ The CRD includes:
 - `configRef`
 - `keyManagement`
 - `env`
+- `debug` (including optional jemalloc allocation profiling)
 
 See sample:
 - `config/samples/ton_v1alpha1_tonnode.yaml`
@@ -110,6 +111,75 @@ If `spec.args` and `MYTONCTRL_ARGS` are omitted, upstream defaults select a main
 The partial-service `-l` / `--only-node` and `-o` / `--only-mtc` modes are rejected because operator readiness requires both TON and MyTonCore services. With encrypted key management enabled, `-u` supports only `root` or `validator`, matching restored key ownership.
 
 Diagnostic `--help`, `-h`, `--print-env` and `MYTONCTRL_PRINT_ENV` settings are rejected because they exit without running services. `--archive`, `ARCHIVE` and `ARCHIVE_BLOCKS` are also unsupported with the standard official TON image because that mode requires the additional `tonutils-storage` binary.
+
+<details>
+<summary>Optional jemalloc profiling for validator OOM investigation</summary>
+
+After deploying an operator build with profiling support, enable it in
+`tonnode-values.yaml` and run `./kubeton start` to apply the configuration.
+This changes the Pod template and restarts the fleet; existing node data and
+installation arguments are retained. Profiling is disabled by default.
+
+```yaml
+tonNode:
+  debug:
+    jemalloc:
+      enabled: true
+      sampleLog2: 19
+      intervalLog2: 34
+      maxProfiles: 8
+```
+
+The standard TON `v2026.10-amd64` binary and MyTonCtrl `v1.0.5` runtime support
+this without rebuilding the images or using `LD_PRELOAD`. Startup probes the
+actual validator binary and runtime allocator; an unsupported custom image
+fails with an explicit profiling error before node services start. Do not also
+set `MALLOC_CONF` in `tonNode.env`: the optional profiler manages it.
+
+`sampleLog2: 19` samples approximately every 512 KiB allocated.
+`intervalLog2: 34` requests a profile approximately every 16 GiB of cumulative
+allocation activity, rather than every 16 GiB of live memory or a time interval.
+Reduce it for more frequent snapshots, allowing for profiling and disk I/O
+overhead. Both settings follow [jemalloc's profiling options](https://jemalloc.net/jemalloc.3.html).
+OOM/SIGKILL cannot run an exit handler; the retained profiles show allocations
+before the kill, with no guarantee of a snapshot at the exact failure instant.
+
+Each container launch gets a unique private directory under
+`/var/ton-work/diagnostics/jemalloc` on the `ton-work` PVC. It includes `.heap`
+profiles, the exact `validator-engine` executable, its SHA256/image reference,
+and `memory.json` with the latest available cgroup counters (v1 or v2).
+Profiles survive container/Pod recreation while that PVC is retained. They
+are removed with the work volume during destructive recovery/uninstall.
+Every ten seconds, retention keeps the newest `maxProfiles` heap files across
+launches and removes unused old binary directories. The count is best effort
+and can temporarily be exceeded between checks; it is not a disk quota.
+
+Export diagnostics from a running/restarted Pod:
+
+```bash
+kubectl -n default exec tonnode-0 -c ton-node -- ls -lt /var/ton-work/diagnostics/jemalloc
+kubectl -n default cp tonnode-0:/var/ton-work/diagnostics/jemalloc ./tonnode-0-jemalloc -c ton-node
+```
+
+On an analysis machine with `jeprof` installed, select one `.heap` and the
+binary from the same launch directory:
+
+```bash
+jeprof --text ./<launch>/validator-engine ./<launch>/<profile>.heap
+# Compare growth between two snapshots from the same binary:
+jeprof --text --base=./<launch>/<earlier>.heap ./<launch>/validator-engine ./<launch>/<later>.heap
+```
+
+See the official [heap profiling guide](https://github.com/jemalloc/jemalloc/wiki/Use-Case:-Heap-Profiling).
+Resolving library frames may additionally require matching runtime libraries
+and debug symbols. Profiles contain sampled allocation sizes, stack addresses
+and mappings, rather than the contents of allocations; this is not a core dump.
+Keep diagnostics private. Heap profiles alone do not cover all mmap, page-cache,
+tmpfs or kernel memory; compare them with `memory.json`, container limits and
+Kubernetes `OOMKilled` events. Disable `debug.jemalloc.enabled` and apply
+`./kubeton start` again to stop collecting; retained diagnostics remain on the PVC.
+
+</details>
 
 ## Prerequisites
 

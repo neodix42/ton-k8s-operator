@@ -10,6 +10,8 @@ import (
 	tonv1alpha1 "github.com/neodix/ton-k8s-operator/api/v1alpha1"
 )
 
+const keyScriptBackupOperation = "backup"
+
 // Real tar/OpenSSL exercise the bundle format. The local KMS stub keeps these
 // tests independent of credentials, network calls, host users and cluster PVCs.
 func runKeyScript(t *testing.T, script, work, bundle string, extraEnv ...string) ([]byte, error) {
@@ -882,14 +884,14 @@ mktemp() {
 }
 
 func TestKeyScriptsRejectDiskBackedStaging(t *testing.T) {
-	for _, operation := range []string{"backup", "restore"} {
+	for _, operation := range []string{keyScriptBackupOperation, "restore"} {
 		t.Run(operation, func(t *testing.T) {
 			work, bundle := keyRAMTempDir(t), keyRAMTempDir(t)
 			for name, content := range migrationKeyFixtures() {
 				writeKeyFixture(t, work, name, content)
 			}
 			script := keyRestoreScript
-			if operation == "backup" {
+			if operation == keyScriptBackupOperation {
 				script = keyBackupOnceScript(t)
 			}
 			// Fault the mount verification without privileged host mount changes.
@@ -906,14 +908,14 @@ func TestKeyScriptsRejectDiskBackedStaging(t *testing.T) {
 }
 
 func TestKeyScriptsRejectEnabledSwap(t *testing.T) {
-	for _, operation := range []string{"backup", "restore"} {
+	for _, operation := range []string{keyScriptBackupOperation, "restore"} {
 		t.Run(operation, func(t *testing.T) {
 			work, bundle := keyRAMTempDir(t), keyRAMTempDir(t)
 			for name, content := range migrationKeyFixtures() {
 				writeKeyFixture(t, work, name, content)
 			}
 			script := keyRestoreScript
-			if operation == "backup" {
+			if operation == keyScriptBackupOperation {
 				script = keyBackupOnceScript(t)
 			}
 			swapFault := `

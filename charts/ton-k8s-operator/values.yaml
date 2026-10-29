@@ -100,6 +100,14 @@ tonNode:
   configRefName: ""
   debug:
     holdOnFailure: false
+    jemalloc:
+      enabled: false
+      # Average bytes between sampled allocations: 2^19 (512 KiB).
+      sampleLog2: 19
+      # Dump every 2^34 allocated bytes (16 GiB), not a time interval or live heap limit.
+      intervalLog2: 34
+      # Best-effort retention in /var/ton-work/diagnostics/jemalloc on the TON PVC.
+      maxProfiles: 8
   keyManagement:
     enabled: true
     provider: vault

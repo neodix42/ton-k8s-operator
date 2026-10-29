@@ -157,6 +157,41 @@ type TonNodeDebugSpec struct {
 	// +kubebuilder:default:=false
 	// +optional
 	HoldOnFailure bool `json:"holdOnFailure,omitempty"`
+
+	// Jemalloc configures optional sampled allocation profiles for validator-engine.
+	// +optional
+	Jemalloc *TonNodeJemallocSpec `json:"jemalloc,omitempty"`
+}
+
+// TonNodeJemallocSpec configures jemalloc allocation profiling for validator-engine.
+// Profiles persist on the TON PVC at /var/ton-work/diagnostics/jemalloc.
+type TonNodeJemallocSpec struct {
+	// Enabled collects sampled allocation profiles when the TON binary supports jemalloc profiling.
+	// +kubebuilder:default:=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// SampleLog2 is the base-two logarithm of the average allocation sampling interval in bytes.
+	// +kubebuilder:default:=19
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=30
+	// +optional
+	SampleLog2 *int32 `json:"sampleLog2,omitempty"`
+
+	// IntervalLog2 is the base-two logarithm of allocated bytes between automatic profile dumps.
+	// This measures cumulative allocation, not elapsed time or live heap size.
+	// +kubebuilder:default:=34
+	// +kubebuilder:validation:Minimum=20
+	// +kubebuilder:validation:Maximum=40
+	// +optional
+	IntervalLog2 *int32 `json:"intervalLog2,omitempty"`
+
+	// MaxProfiles bounds retained profile files on a best-effort basis.
+	// +kubebuilder:default:=8
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	MaxProfiles *int32 `json:"maxProfiles,omitempty"`
 }
 
 // TonNodeKeyManagementSpec defines key protection workflow.

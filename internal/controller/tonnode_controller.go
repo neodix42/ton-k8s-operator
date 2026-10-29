@@ -800,6 +800,7 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		podSpec.InitContainers = append(podSpec.InitContainers, desiredRestoreNodeBootstrapInitContainer(container))
 	}
 
+	configureJemallocProfiling(tonNode, &podSpec.Containers[0])
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
 		Spec:       podSpec,

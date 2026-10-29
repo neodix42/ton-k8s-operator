@@ -63,6 +63,7 @@ test: manifests generate fmt vet setup-envtest test-kubeton ## Run tests.
 
 .PHONY: test-kubeton
 test-kubeton: ## Run kubeton CLI shell tests.
+	python3 test/kubeton_jemalloc_profile_test.py
 	bash test/main_wallet_memory_test.sh
 	bash test/kubeton_check_test.sh
 	bash test/kubeton_cleanup_test.sh
@@ -111,6 +112,10 @@ test-main-wallet-runtime: ## Run optional real-Fift wallet integration in an iso
 .PHONY: test-restore-bootstrap-runtime
 test-restore-bootstrap-runtime: ## Run optional offline dump recovery integration in the MyTonCtrl Docker image.
 	bash test/kubeton_restore_bootstrap_runtime_test.sh
+
+.PHONY: test-jemalloc-runtime
+test-jemalloc-runtime: ## Check optional jemalloc profiling with cached TON/MyTonCtrl Docker images (offline).
+	bash test/jemalloc_profile_runtime_test.sh
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.

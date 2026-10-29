@@ -138,6 +138,9 @@ func desiredRestoreNodeBootstrapInitContainer(main corev1.Container) corev1.Cont
 }
 
 func validateRuntimeSpec(tonNode *tonv1alpha1.TonNode) string {
+	if message := validateJemallocSpec(tonNode); message != "" {
+		return message
+	}
 	for _, env := range tonNode.Spec.Env {
 		switch env.Name {
 		case "AUTHOR", "REPO", "BRANCH", "NODE_REPO", "NODE_VERSION", "MYTONCTRL_VERSION", "TON_BRANCH":
