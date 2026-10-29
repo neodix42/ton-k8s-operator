@@ -172,9 +172,10 @@ source "$1"
 kubectl() { python3 "$RECOVER_HELPER" kubectl "$@"; }
 get_single_ton_statefulset() { local -n a="$1" b="$2" c="$3"; a=unit-ns; b=tonnode; c=5; }
 run_node_prerequisite_check() {
-  [[ "$1" == 1 && "$2" == pool=ton && "$KUBETON_ADD_CPU_MILLI" == 16000 && "$KUBETON_ADD_DATA_BYTES" == 816043786240 ]] || return 97
+  [[ "$1" == 1 && "$2" == pool=ton && "$KUBETON_ADD_CPU_MILLI" == 16000 && "$KUBETON_ADD_DATA_BYTES" == "${RECOVER_EXPECTED_DATA:-816043786240}" ]] || return 97
   [[ "${KUBETON_ADD_OCCUPIED_NODES[worker-2]:-}" == 1 ]] || return 98
-  python3 "$RECOVER_HELPER" event admission
+  [[ "${#KUBETON_ADD_STORAGE_REQUIREMENTS[@]}" == 10 ]] || return 99
+  python3 "$RECOVER_HELPER" event admission "$KUBETON_ADD_DATA_BYTES" "${KUBETON_ADD_STORAGE_REQUIREMENTS[@]}"
   [[ "$RECOVER_CASE" != no-capacity ]] || return 1
   KUBETON_NODE_CHECK_COMPATIBLE_NODES=(worker-5)
 }
@@ -211,6 +212,43 @@ class TargetedRestoreTests(unittest.TestCase):
             self.assertEqual(len(context["siblings"]), 4)
             self.assertEqual(len(context["old_claims"]), 5)
             self.assertEqual(context["data"], 760 * 1024**3)
+            requirements = context["storage_requirements"]
+            self.assertEqual(requirements[::2], ["local-path", "encrypted-sc", "local-path", "local-path", "local-path"])
+            self.assertEqual(sum(map(int, requirements[1::2])), 765 * 1024**3)
+
+    def test_longhorn_recovery_preserves_full_claim_capacity_without_charging_root_filesystem(self):
+        data = fixtures()
+        for template in data["sts"]["spec"]["volumeClaimTemplates"]:
+            template["spec"]["storageClassName"] = "encrypted-sc"
+        for claim in data["pvcs"]["items"]:
+            claim["spec"]["storageClassName"] = "encrypted-sc"
+        result = self.plan(data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        context = json.loads(result.stdout)
+        self.assertEqual(context["data"], 0)
+        self.assertTrue(context["longhorn"])
+        requirements = context["storage_requirements"]
+        self.assertEqual(requirements[::2], ["encrypted-sc"] * 5)
+        self.assertEqual(sum(map(int, requirements[1::2])), 765 * 1024**3)
+        result, state, events, phase = self.flow("success", data=data, expected_data=0)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(phase, "complete")
+        self.assertIn(f"admission 0 encrypted-sc {700 * 1024**3}", events)
+        self.assertIn("csi\n", events)
+        self.assertFalse(state["operator_paused"])
+
+    def test_gce_persistent_disk_recovery_remains_unsupported_before_any_mutation(self):
+        data = fixtures()
+        data["classes"]["items"][0]["provisioner"] = "pd.csi.storage.gke.io"
+        result = self.plan(data)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dynamic local-path or Longhorn claim templates", result.stderr)
+        result, state, events, phase = self.flow("success", data=data)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(events, "")
+        self.assertEqual(phase, "")
+        self.assertFalse(state["operator_paused"])
+        self.assertEqual(state["pvcs"], data["pvcs"])
 
     def test_rejects_unsupported_provider_before_mutation(self):
         data = fixtures(); data["cr"]["spec"]["keyManagement"]["provider"] = "kms"
@@ -261,13 +299,15 @@ class TargetedRestoreTests(unittest.TestCase):
         current = json.loads(self.plan(data).stdout)
         self.assertNotEqual(old["fingerprint"], current["fingerprint"])
 
-    def flow(self, mode, external=False, data=None):
+    def flow(self, mode, external=False, data=None, expected_data=None):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory); data = fixtures() if data is None else data
             (root / "state.json").write_text(json.dumps(data)); (root / "events").write_text("")
             for filename in ("keys.bundle.enc", "keys.bundle.meta"): (root / filename).write_bytes(filename.encode())
             helper = root / "fake.py"; helper.write_text(FAKE)
             env = dict(os.environ, RECOVER_STATE=directory, RECOVER_CASE=mode, RECOVER_HELPER=str(helper))
+            if expected_data is not None:
+                env["RECOVER_EXPECTED_DATA"] = str(expected_data)
             if external:
                 backup = root / "backup"
                 item = backup / "unit-ns" / "tonnode" / "2"

@@ -2091,6 +2091,134 @@ resolve_ton_replicas_for_node_check() {
   printf '%s' "$replicas"
 }
 
+# Match the operator's selection order when the configured data StorageClass is
+# omitted: preferred local classes, Longhorn, sorted defaults, sorted fallback.
+node_check_autodetect_storage_class() {
+  local rows name provisioner stable_default legacy_default preferred
+  local -a names=() defaults=()
+  if ! rows="$(kubectl get storageclass -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.provisioner}}{{"|"}}{{index .metadata.annotations "storageclass.kubernetes.io/is-default-class"}}{{"|"}}{{index .metadata.annotations "storageclass.beta.kubernetes.io/is-default-class"}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot list StorageClasses to resolve TON data storage for node preflight." >&2
+    return 1
+  fi
+  while IFS='|' read -r name provisioner stable_default legacy_default; do
+    [[ -n "$name" && -n "$provisioner" ]] || continue
+    names+=("$name")
+    if [[ "$stable_default" == true || "$legacy_default" == true ]]; then defaults+=("$name"); fi
+  done <<<"$rows"
+  for preferred in local-path local-storage openebs-hostpath hostpath longhorn; do
+    for name in "${names[@]}"; do
+      if [[ "$name" == "$preferred" ]]; then printf '%s' "$name"; return 0; fi
+    done
+  done
+  if (( ${#defaults[@]} > 0 )); then
+    printf '%s\n' "${defaults[@]}" | sort | head -n1
+  elif (( ${#names[@]} > 0 )); then
+    printf '%s\n' "${names[@]}" | sort | head -n1
+  else
+    echo "Error: no readable StorageClass is available for TON data node preflight." >&2
+    return 1
+  fi
+}
+
+node_check_configured_storage_class() {
+  local storage_class values_file explicit
+  storage_class="$(ton_storage_class_name)"
+  if [[ "$storage_class" == auto ]]; then
+    storage_class=""
+    for values_file in "$TON_VALUES_FILE" "$CHART_DIR/values.yaml"; do
+      # Preserve an explicit empty/null scalar, which Helm uses to remove the
+      # chart default. The generic scalar reader treats empty values as absent.
+      explicit="$(awk '
+        /^[[:space:]]*#/ { next }
+        { sub(/[[:space:]]*#.*/, "") }
+        /^[[:space:]]*tonNode:[[:space:]]*$/ { ton=1; match($0,/[^[:space:]]/); ti=RSTART; next }
+        ton {
+          match($0,/[^[:space:]]/); indent=RSTART
+          if (!indent) next
+          if (indent <= ti) exit
+          if (storage && indent <= si) storage=0
+          if ($0 ~ /^[[:space:]]*storage:[[:space:]]*$/) { storage=1; si=indent; next }
+          if (storage && $0 ~ /^[[:space:]]*storageClassName:/) {
+            sub(/^[[:space:]]*storageClassName:[[:space:]]*/, "")
+            sub(/[[:space:]]*#.*/, "")
+            sub(/[[:space:]]*$/, "")
+            print "defined:" $0; exit
+          }
+        }
+      ' "$values_file" 2>/dev/null || true)"
+      if [[ "$explicit" == defined:* ]]; then
+        storage_class="${explicit#defined:}"
+        storage_class="${storage_class#\"}"; storage_class="${storage_class%\"}"
+        storage_class="${storage_class#\'}"; storage_class="${storage_class%\'}"
+        break
+      fi
+    done
+  fi
+  case "$storage_class" in ''|null|'~'|'<no value>') node_check_autodetect_storage_class ;; *) printf '%s' "$storage_class" ;; esac
+}
+
+# Arguments are alternating StorageClass name / capacity bytes pairs, allowing
+# live StatefulSets with mixed claim templates to use the same policy. An empty
+# class name is deliberately rejected: callers must resolve defaulted PVCs first.
+node_check_set_storage_disk_requirements() {
+  local storage_class bytes provisioner detail planned
+  KUBETON_NODE_CHECK_TON_DATA_BYTES=0
+  KUBETON_NODE_CHECK_LOCAL_DATA_BYTES=0
+  KUBETON_NODE_CHECK_STORAGE_DESCRIPTION=""
+  KUBETON_NODE_CHECK_DISTRIBUTED_STORAGE=false
+  (( $# > 0 && $# % 2 == 0 )) || {
+    echo "Error: incomplete TON StorageClass capacity information for node preflight." >&2
+    return 1
+  }
+  while (( $# > 0 )); do
+    storage_class="$1"; bytes="$2"; shift 2
+    if [[ -z "$storage_class" || ! "$bytes" =~ ^[0-9]+$ ]]; then
+      echo "Error: unresolved TON StorageClass or capacity for node preflight." >&2
+      return 1
+    fi
+    KUBETON_NODE_CHECK_TON_DATA_BYTES=$((KUBETON_NODE_CHECK_TON_DATA_BYTES + bytes))
+    if ! provisioner="$(kubectl get storageclass "$storage_class" --ignore-not-found -o jsonpath='{.provisioner}' 2>/dev/null)"; then
+      echo "Error: TON data StorageClass '${storage_class}' is missing or its provisioner cannot be read; cannot determine node disk requirements." >&2
+      return 1
+    fi
+    provisioner="$(trim_whitespace "$provisioner")"
+    planned=""
+    if [[ -z "$provisioner" ]]; then
+      # A fresh, explicitly authorized bootstrap creates these Longhorn classes
+      # after preflight. --ignore-not-found still fails on authorization/API
+      # errors, so this exception never converts unreadable storage into a pass.
+      if [[ "$storage_class" == longhorn || "$storage_class" == "$ENCRYPTED_SC_NAME" ]] \
+        && should_bootstrap_baremetal && ! cluster_is_k3d; then
+        provisioner=driver.longhorn.io
+        planned="planned by bootstrap; "
+      else
+        echo "Error: TON data StorageClass '${storage_class}' is missing or its provisioner cannot be read; cannot determine node disk requirements." >&2
+        return 1
+      fi
+    fi
+    case "$provisioner" in
+      pd.csi.storage.gke.io|kubernetes.io/gce-pd)
+        detail="${storage_class} (${provisioner}; attached Persistent Disk)"
+        KUBETON_NODE_CHECK_DISTRIBUTED_STORAGE=true
+        ;;
+      driver.longhorn.io)
+        detail="${storage_class} (${provisioner}; ${planned}distributed Longhorn storage)"
+        KUBETON_NODE_CHECK_DISTRIBUTED_STORAGE=true
+        ;;
+      *)
+        # Keep the established local-path guard, and be conservative for any
+        # backend whose relationship to the node filesystem is not known.
+        KUBETON_NODE_CHECK_LOCAL_DATA_BYTES=$((KUBETON_NODE_CHECK_LOCAL_DATA_BYTES + bytes))
+        detail="${storage_class} (${provisioner}; local filesystem capacity check)"
+        ;;
+    esac
+    if [[ "; ${KUBETON_NODE_CHECK_STORAGE_DESCRIPTION}; " != *"; ${detail}; "* ]]; then
+      KUBETON_NODE_CHECK_STORAGE_DESCRIPTION+="${KUBETON_NODE_CHECK_STORAGE_DESCRIPTION:+; }${detail}"
+    fi
+  done
+  KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=$((KUBETON_NODE_CHECK_LOCAL_DATA_BYTES + KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES))
+}
+
 resolve_node_check_requirements() {
   local ton_cpu ton_memory min_cpu min_memory work source core ctrl headroom
   local ton_cpu_milli ton_memory_bytes min_cpu_milli min_memory_bytes
@@ -2136,7 +2264,9 @@ resolve_node_check_requirements() {
   fi
   KUBETON_NODE_CHECK_TON_DATA_BYTES=$((work_bytes + source_bytes + core_bytes + ctrl_bytes))
   KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES="$headroom_bytes"
-  KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=$((KUBETON_NODE_CHECK_TON_DATA_BYTES + headroom_bytes))
+  local storage_class
+  storage_class="$(node_check_configured_storage_class)" || return 1
+  node_check_set_storage_disk_requirements "$storage_class" "$KUBETON_NODE_CHECK_TON_DATA_BYTES"
 }
 
 node_filesystem_available_bytes() {
@@ -2314,7 +2444,16 @@ run_node_prerequisite_check() {
     KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES="$KUBETON_ADD_MEMORY_BYTES"
     KUBETON_NODE_CHECK_TON_DATA_BYTES="$KUBETON_ADD_DATA_BYTES"
     KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES="$(quantity_to_bytes "$KUBETON_CHECK_DISK_HEADROOM")" || return 1
-    KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=$((KUBETON_ADD_DATA_BYTES + KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES))
+    if declare -p KUBETON_ADD_STORAGE_REQUIREMENTS >/dev/null 2>&1 && (( ${#KUBETON_ADD_STORAGE_REQUIREMENTS[@]} > 0 )); then
+      node_check_set_storage_disk_requirements "${KUBETON_ADD_STORAGE_REQUIREMENTS[@]}" || return 1
+    else
+      # Older callers without claim metadata retain the conservative local
+      # requirement; production add/restore callers supply the live classes.
+      KUBETON_NODE_CHECK_LOCAL_DATA_BYTES="$KUBETON_ADD_DATA_BYTES"
+      KUBETON_NODE_CHECK_STORAGE_DESCRIPTION="live claim metadata unavailable; conservative local filesystem capacity check"
+      KUBETON_NODE_CHECK_DISTRIBUTED_STORAGE=false
+      KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES=$((KUBETON_ADD_DATA_BYTES + KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES))
+    fi
   else
     resolve_node_check_requirements || return 1
   fi
@@ -2344,8 +2483,16 @@ run_node_prerequisite_check() {
     echo "Node prerequisites from ${TON_VALUES_FILE}:"
   fi
   echo "  per TON pod: cpu >= $(node_check_format_cpu "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI") cores, memory >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES")"
-  echo "  local TON PVC capacity: $(node_check_format_bytes "$KUBETON_NODE_CHECK_TON_DATA_BYTES") (tonWork + tonSource + myTonCore + myTonCtrl)"
-  echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES") (configured local TON PVC capacity + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom); disk data comes from the kubelet summary API"
+  echo "  TON data storage: ${KUBETON_NODE_CHECK_STORAGE_DESCRIPTION}"
+  if is_true "${KUBETON_ADD_MODE:-false}"; then
+    echo "  local TON PVC capacity: $(node_check_format_bytes "$KUBETON_NODE_CHECK_LOCAL_DATA_BYTES") of $(node_check_format_bytes "$KUBETON_NODE_CHECK_TON_DATA_BYTES") new claim capacity"
+  else
+    echo "  local TON PVC capacity: $(node_check_format_bytes "$KUBETON_NODE_CHECK_LOCAL_DATA_BYTES") of $(node_check_format_bytes "$KUBETON_NODE_CHECK_TON_DATA_BYTES") configured (tonWork + tonSource + myTonCore + myTonCtrl)"
+  fi
+  echo "  node filesystem requirement: >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES") (local TON PVC capacity + $(node_check_format_bytes "$KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES") headroom); disk data comes from the kubelet summary API"
+  if is_true "$KUBETON_NODE_CHECK_DISTRIBUTED_STORAGE"; then
+    echo "  Attached/distributed PVC capacity is separate from this node filesystem check; verify provisioner capacity and Longhorn replica space separately."
+  fi
   if [[ "$KUBETON_NODE_CHECK_HOST_PORTS_ENABLED" == "true" ]]; then
     echo "  required host ports: ${KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS[*]} (other assigned Pod reservations make a node ineligible)"
   else
@@ -6203,6 +6350,45 @@ restrict_existing_victoria_logs_after_failed_preflight() {
   [[ "$failed" != "true" ]]
 }
 
+resolve_victoria_logs_backend_storage() {
+  local configured_class="$1"
+  local rows name provisioner stable_default legacy_default
+  local preferred_row="" configured_row=""
+  local -a defaults=()
+
+  if ! rows="$(kubectl get storageclass -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.provisioner}}{{"|"}}{{index .metadata.annotations "storageclass.kubernetes.io/is-default-class"}}{{"|"}}{{index .metadata.annotations "storageclass.beta.kubernetes.io/is-default-class"}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+    echo "Error: cannot read StorageClasses to resolve VictoriaLogs backend storage; Helm was not started." >&2
+    return 1
+  fi
+  while IFS='|' read -r name provisioner stable_default legacy_default; do
+    [[ -n "$name" ]] || continue
+    if [[ -z "$provisioner" ]]; then
+      echo "Error: StorageClass '${name}' has no readable provisioner; VictoriaLogs placement cannot be verified." >&2
+      return 1
+    fi
+    if [[ "$name" == "$configured_class" ]]; then configured_row="${name}"$'\t'"${provisioner}"; fi
+    if [[ "$name" == longhorn ]]; then preferred_row="${name}"$'\t'"${provisioner}"; fi
+    if [[ "$stable_default" == true || "$legacy_default" == true ]]; then
+      defaults+=("${name}"$'\t'"${provisioner}")
+    fi
+  done <<<"$rows"
+  if [[ -n "$configured_class" ]]; then
+    if [[ -z "$configured_row" ]]; then
+      echo "Error: VictoriaLogs StorageClass '${configured_class}' is missing; Helm was not started." >&2
+      return 1
+    fi
+    printf '%s' "$configured_row"
+  elif [[ -n "$preferred_row" ]]; then
+    # Keep the established Longhorn preference for existing installations.
+    printf '%s' "$preferred_row"
+  elif (( ${#defaults[@]} == 1 )); then
+    printf '%s' "${defaults[0]}"
+  else
+    echo "Error: VictoriaLogs requires one unambiguous default StorageClass (found ${#defaults[@]}); set VICTORIA_LOGS_STORAGE_CLASS explicitly." >&2
+    return 1
+  fi
+}
+
 ensure_victoria_logs_stack() {
   local ns="$1"
   local release_name="$2"
@@ -6214,7 +6400,9 @@ ensure_victoria_logs_stack() {
   local helm_timeout_seconds="$8"
   local repo_name repo_url single_chart collector_chart
   local single_chart_version collector_chart_version
-  local logs_storage_class logs_node_selector collector_node_selector logs_pin_to_longhorn_csi
+  local logs_storage_class logs_storage_provisioner logs_storage_row
+  local logs_node_selector collector_node_selector logs_pin_to_longhorn_csi
+  local logs_storage_is_longhorn="false"
   local logs_require_longhorn_csi="false"
   local vls_selector_values_file="" vls_affinity_values_file=""
   local matched_nodes=0
@@ -6239,10 +6427,6 @@ ensure_victoria_logs_stack() {
   logs_node_selector="$(trim_whitespace "${VICTORIA_LOGS_NODE_SELECTOR:-}")"
   collector_node_selector="$(trim_whitespace "${VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR:-}")"
   logs_pin_to_longhorn_csi="$(trim_whitespace "${VICTORIA_LOGS_PIN_TO_LONGHORN_CSI:-true}")"
-  if [[ -z "$logs_node_selector" && ! cluster_is_k3d ]]; then
-    logs_node_selector="$(trim_whitespace "${LONGHORN_NODE_SELECTOR:-}")"
-  fi
-
   if ! [[ "$rollout_timeout_seconds" =~ ^[0-9]+$ ]] || (( rollout_timeout_seconds < 60 )); then
     rollout_timeout_seconds=300
   fi
@@ -6252,14 +6436,30 @@ ensure_victoria_logs_stack() {
   if ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
     remote_port=9428
   fi
-  if [[ -z "$logs_storage_class" ]] && kubectl get storageclass longhorn >/dev/null 2>&1; then
-    logs_storage_class="longhorn"
+  if ! logs_storage_row="$(resolve_victoria_logs_backend_storage "$logs_storage_class")"; then
+    return 1
   fi
-  if is_true "$logs_pin_to_longhorn_csi"; then
-    if [[ "$logs_storage_class" == "longhorn" ]] \
-      || { [[ -n "$logs_storage_class" ]] && storage_class_is_longhorn "$logs_storage_class"; }; then
-      logs_require_longhorn_csi="true"
+  IFS=$'\t' read -r logs_storage_class logs_storage_provisioner <<<"$logs_storage_row"
+  if [[ "$logs_storage_provisioner" == driver.longhorn.io ]]; then
+    logs_storage_is_longhorn="true"
+  fi
+  # Cloud Persistent Disk deployments do not carry kubeton's Longhorn node
+  # labels. Only inherit that placement when the selected backend actually
+  # uses Longhorn. Exact fresh-PASS hostname affinity below remains required
+  # for every storage provider.
+  if [[ -z "$logs_node_selector" ]] && ! cluster_is_k3d \
+    && is_true "$logs_storage_is_longhorn"; then
+    if (( KUBETON_NODE_CHECK_EXISTING_LONGHORN == 1 )); then
+      # A manually installed Longhorn may have no create-default-disk labels.
+      # The preflight captured its actual manager placement; retain that even
+      # when it is empty instead of imposing kubeton's bootstrap-only label.
+      logs_node_selector="$(trim_whitespace "${KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR:-}")"
+    else
+      logs_node_selector="$(trim_whitespace "${LONGHORN_NODE_SELECTOR:-}")"
     fi
+  fi
+  if is_true "$logs_pin_to_longhorn_csi" && is_true "$logs_storage_is_longhorn"; then
+    logs_require_longhorn_csi="true"
   fi
   if ! victoria_logs_resolve_allowed_nodes "$collector_node_selector" false collector_allowed_nodes \
     || ! victoria_logs_validate_ton_nodes_covered collector_allowed_nodes; then
@@ -6364,10 +6564,12 @@ ensure_victoria_logs_stack() {
     kubectl -n "$ns" get pod "${service_name}-0" -o wide >/dev/null 2>&1 && kubectl -n "$ns" get pod "${service_name}-0" -o wide >&2 || true
     kubectl -n "$ns" get pvc 2>/dev/null | awk -v prefix="server-volume-${service_name}-" 'NR==1 || index($1, prefix)==1 {print}' >&2 || true
     kubectl -n "$ns" get events --field-selector "involvedObject.name=${service_name}-0" --sort-by=.lastTimestamp 2>/dev/null | tail -n 8 >&2 || true
-    if [[ -z "$logs_node_selector" ]]; then
-      echo "Warning: if Longhorn CSI runs only on selected nodes, set VICTORIA_LOGS_NODE_SELECTOR (for example: ${LONGHORN_NODE_SELECTOR})." >&2
-    else
-      echo "Warning: verify that nodes matching VICTORIA_LOGS_NODE_SELECTOR run Longhorn CSI driver." >&2
+    if is_true "$logs_require_longhorn_csi"; then
+      if [[ -z "$logs_node_selector" ]]; then
+        echo "Warning: if Longhorn CSI runs only on selected nodes, set VICTORIA_LOGS_NODE_SELECTOR (for example: ${LONGHORN_NODE_SELECTOR})." >&2
+      else
+        echo "Warning: verify that nodes matching VICTORIA_LOGS_NODE_SELECTOR run Longhorn CSI driver." >&2
+      fi
     fi
     return 1
   fi
@@ -15004,6 +15206,7 @@ def main():
     volumes = {item["metadata"]["name"]: item for item in pvs["items"]}
     storage = {item["metadata"]["name"]: item for item in classes["items"]}
     data, require_csi, constraints = 0, False, []
+    storage_requirements = []
     for template in sts["spec"].get("volumeClaimTemplates", []):
         claim = claims.get(template["metadata"]["name"] + "-" + name + "-" + str(ordinal))
         claim_spec = (claim or template)["spec"]
@@ -15011,13 +15214,15 @@ def main():
                       or quantity(claim_spec["resources"]["requests"]["storage"]) < quantity(template["spec"]["resources"]["requests"]["storage"])):
             raise ValueError("retained target PVC does not match the live claim template; PVCs were preserved")
         storage_name = claim_spec.get("storageClassName")
-        if storage_name and storage_name not in storage:
-            raise ValueError("StorageClass " + storage_name + " is missing")
+        if not storage_name or storage_name not in storage:
+            raise ValueError("StorageClass " + str(storage_name or "(unresolved)") + " is missing")
         provisioner = storage.get(storage_name, {}).get("provisioner", "")
         require_csi |= provisioner == "driver.longhorn.io"
         bound = bool(claim_spec.get("volumeName"))
-        if not bound and provisioner in ("rancher.io/local-path", "kubernetes.io/no-provisioner", ""):
-            data += math.ceil(quantity(claim_spec["resources"]["requests"]["storage"]))
+        capacity = 0 if bound else math.ceil(quantity(claim_spec["resources"]["requests"]["storage"]))
+        storage_requirements.extend((storage_name, str(capacity)))
+        if provisioner not in ("driver.longhorn.io", "pd.csi.storage.gke.io", "kubernetes.io/gce-pd"):
+            data += capacity
         if claim:
             selected = claim.get("metadata", {}).get("annotations", {}).get("volume.kubernetes.io/selected-node")
             if selected:
@@ -15034,7 +15239,7 @@ def main():
     print(json.dumps({"namespace": namespace, "name": name, "uid": uid, "cr_uid": cr.get("metadata", {}).get("uid"), "replicas": replicas, "ordinal": ordinal,
                       "target": replicas if resume else replicas + 1, "resume": resume, "pod_uid": owned.get(ordinal, {}).get("metadata", {}).get("uid"),
                       "cpu": math.ceil(max(cpu, quantity(minimum_cpu)) * 1000), "memory": math.ceil(max(memory, quantity(minimum_memory))),
-                      "data": data, "ports": ports, "selector": selector, "managed": managed, "running": running,
+                      "data": data, "storage_requirements": storage_requirements, "ports": ports, "selector": selector, "managed": managed, "running": running,
                       "automatic": automatic, "affinity": affinity, "constraints": constraints, "longhorn": require_csi,
                       "scope": ",".join(label + "=" + wanted for label, wanted in sorted(selector.items()) if label not in managed)}))
 
@@ -15095,6 +15300,8 @@ ton_add_admit_node() {
   KUBETON_ADD_CPU_MILLI="$(ton_add_field "$context" cpu)"
   KUBETON_ADD_MEMORY_BYTES="$(ton_add_field "$context" memory)"
   KUBETON_ADD_DATA_BYTES="$(ton_add_field "$context" data)"
+  KUBETON_ADD_STORAGE_REQUIREMENTS=()
+  mapfile -t KUBETON_ADD_STORAGE_REQUIREMENTS < <(ton_add_field "$context" storage_requirements)
   mapfile -t KUBETON_ADD_HOST_PORTS < <(ton_add_field "$context" ports | awk NF)
   KUBETON_ADD_OCCUPIED_NODES=()
   while IFS= read -r node; do
@@ -15136,7 +15343,7 @@ run_add() (
   local KUBETON_ADD_MODE=true KUBETON_ADD_CPU_MILLI KUBETON_ADD_MEMORY_BYTES KUBETON_ADD_DATA_BYTES
   local KUBETON_ADD_STS
   local KUBETON_ADD_SELECTED_NODE KUBETON_ADD_SELECTED_HOSTNAME
-  local -a KUBETON_ADD_HOST_PORTS=() operator_names=() operator_replicas=()
+  local -a KUBETON_ADD_HOST_PORTS=() KUBETON_ADD_STORAGE_REQUIREMENTS=() operator_names=() operator_replicas=()
   local -A KUBETON_ADD_OCCUPIED_NODES=()
   trap 'if (( operator_paused )); then ton_add_resume_operator operator_names operator_replicas; fi' EXIT
 
@@ -17774,6 +17981,7 @@ try:
         raise ValueError("unsupported claim layout; all original volumes were preserved")
     claims = {p["metadata"]["name"]: p for p in pvcs["items"]}; volumes = {p["metadata"]["name"]: p for p in pvs["items"]}; storage = {c["metadata"]["name"]: c for c in classes["items"]}
     old, data, longhorn = [], 0, False
+    storage_requirements = []
     for prefix, template in templates.items():
         claim_name = prefix + "-" + name + "-" + str(ordinal); claim = claims.get(claim_name)
         if not claim or claim["metadata"].get("deletionTimestamp"):
@@ -17789,7 +17997,9 @@ try:
             raise ValueError("targeted recovery supports dynamic local-path or Longhorn claim templates")
         if template["spec"].get("volumeName") or template["spec"].get("selector"):
             raise ValueError("prebound claim templates cannot be relocated automatically")
-        if provisioner == "rancher.io/local-path": data += math.ceil(quantity(template["spec"]["resources"]["requests"]["storage"]))
+        capacity = math.ceil(quantity(template["spec"]["resources"]["requests"]["storage"]))
+        storage_requirements.extend((sc, str(capacity)))
+        if provisioner == "rancher.io/local-path": data += capacity
         longhorn |= provisioner == "driver.longhorn.io"
         old.append({"name": claim_name, "uid": claim["metadata"]["uid"], "pv": volume["metadata"]["name"], "pv_uid": volume["metadata"]["uid"]})
     agent = next(c for c in spec["containers"] if c["name"] == "key-backup")
@@ -17801,7 +18011,7 @@ try:
     managed = {k:v for k,v in selector.items() if (k == key and v == value) or (k == "node.longhorn.io/create-default-disk" and v == "true")}
     ports = sorted({p.get("protocol", "TCP") + "/" + str(p["hostPort"]) for c in spec.get("containers", []) + spec.get("initContainers", []) for p in c.get("ports", []) if p.get("hostPort", 0) > 0})
     fingerprint = hashlib.sha256(json.dumps({"sts_spec": sts["spec"], "cr_spec": cr["spec"], "sts_annotations": sts["metadata"].get("annotations", {}), "cr_annotations": cr["metadata"].get("annotations", {})}, sort_keys=True).encode()).hexdigest()
-    print(json.dumps({"namespace": namespace, "name": name, "uid": uid, "cr_uid": cr["metadata"]["uid"], "fingerprint": fingerprint, "replicas": replicas, "ordinal": ordinal, "pod": pod["metadata"]["name"], "pod_uid": pod["metadata"]["uid"], "source": pod["spec"]["nodeName"], "siblings": siblings, "old_claims": old, "cpu": math.ceil(max(cpu, quantity(minimum_cpu))*1000), "memory": math.ceil(max(memory, quantity(minimum_memory))), "data": data, "ports": ports, "selector": selector, "managed": managed, "running": running, "automatic": automatic, "affinity": spec.get("affinity", {}).get("nodeAffinity", {}), "constraints": [], "longhorn": longhorn, "scope": ",".join(k+"="+v for k,v in sorted(selector.items()) if k not in managed), "enc": enc, "meta": meta}))
+    print(json.dumps({"namespace": namespace, "name": name, "uid": uid, "cr_uid": cr["metadata"]["uid"], "fingerprint": fingerprint, "replicas": replicas, "ordinal": ordinal, "pod": pod["metadata"]["name"], "pod_uid": pod["metadata"]["uid"], "source": pod["spec"]["nodeName"], "siblings": siblings, "old_claims": old, "cpu": math.ceil(max(cpu, quantity(minimum_cpu))*1000), "memory": math.ceil(max(memory, quantity(minimum_memory))), "data": data, "storage_requirements": storage_requirements, "ports": ports, "selector": selector, "managed": managed, "running": running, "automatic": automatic, "affinity": spec.get("affinity", {}).get("nodeAffinity", {}), "constraints": [], "longhorn": longhorn, "scope": ",".join(k+"="+v for k,v in sorted(selector.items()) if k not in managed), "enc": enc, "meta": meta}))
 except (KeyError, TypeError, ValueError, StopIteration, ArithmeticError) as error:
     sys.exit("Error: cannot prepare targeted restore: " + str(error))
 PY
@@ -17889,7 +18099,7 @@ run_restore_keys_targeted() (
   get_single_ton_statefulset ns sts replicas || exit 1
   local KUBETON_ADD_MODE=true KUBETON_ADD_CPU_MILLI KUBETON_ADD_MEMORY_BYTES KUBETON_ADD_DATA_BYTES KUBETON_ADD_STS="$sts"
   local KUBETON_ADD_SELECTED_NODE KUBETON_ADD_SELECTED_HOSTNAME
-  local -a KUBETON_ADD_HOST_PORTS=() operator_names=() operator_replicas=()
+  local -a KUBETON_ADD_HOST_PORTS=() KUBETON_ADD_STORAGE_REQUIREMENTS=() operator_names=() operator_replicas=()
   local -A KUBETON_ADD_OCCUPIED_NODES=()
   TON_NAMESPACE="$ns"
   context="$(ton_restore_plan "$ns" "$sts" "$target")"

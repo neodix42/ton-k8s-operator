@@ -169,6 +169,50 @@ class AddTests(unittest.TestCase):
         data["classes"]["items"] = []
         self.assertNotEqual(self.context(data).returncode, 0)
 
+    def test_live_claim_classes_drive_disk_requirements(self):
+        for provisioner, expected_local_gib in (("rancher.io/local-path", 700),
+                                                 ("pd.csi.storage.gke.io", 0),
+                                                 ("driver.longhorn.io", 0),
+                                                 ("example.com/unknown", 700)):
+            with self.subTest(provisioner=provisioner):
+                data = fixtures()
+                data["classes"]["items"][0]["provisioner"] = provisioner
+                result = self.context(data)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = json.loads(result.stdout)
+                self.assertEqual(plan["storage_requirements"], ["local-path", str(700 * 1024**3),
+                                                               "encrypted-sc", str(5 * 1024**3)])
+                script = r'''
+source "$1"
+kubectl() {
+  [[ "$1" == get && "$2" == storageclass ]] || return 99
+  if [[ "$3" == local-path ]]; then printf '%s' "$TEST_STORAGE_PROVISIONER"; else printf '%s' driver.longhorn.io; fi
+}
+KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES=$((20 * 1024**3))
+mapfile -t KUBETON_ADD_STORAGE_REQUIREMENTS < <(ton_add_field "$2" storage_requirements)
+node_check_set_storage_disk_requirements "${KUBETON_ADD_STORAGE_REQUIREMENTS[@]}"
+printf '%s %s\n' "$KUBETON_NODE_CHECK_LOCAL_DATA_BYTES" "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES"
+'''
+                resolved = subprocess.run(["bash", "-euo", "pipefail", "-c", script, "_", str(CLI), json.dumps(plan)],
+                                          env=dict(os.environ, TEST_STORAGE_PROVISIONER=provisioner),
+                                          text=True, capture_output=True)
+                self.assertEqual(resolved.returncode, 0, resolved.stderr)
+                self.assertEqual(resolved.stdout.strip(),
+                                 f"{expected_local_gib * 1024**3} {(expected_local_gib + 20) * 1024**3}")
+
+    def test_bound_retained_claims_do_not_reserve_their_capacity_again(self):
+        data = fixtures(resume=True)
+        data["pvcs"]["items"].append({"metadata": {"name": "ton-work-tonnode-5", "uid": "retained-work"},
+                                      "spec": {"storageClassName": "local-path", "volumeName": "work-pv",
+                                               "resources": {"requests": {"storage": "700Gi"}}}})
+        data["pvs"]["items"].append({"metadata": {"name": "work-pv"},
+                                     "spec": {"claimRef": {"uid": "retained-work"}}})
+        result = self.context(data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["data"], 0)
+        self.assertEqual(plan["storage_requirements"], ["local-path", "0", "encrypted-sc", "0"])
+
     def test_node_selector_and_retained_volume_constraints(self):
         data = fixtures()
         plan = json.loads(self.context(data).stdout)

@@ -28,6 +28,10 @@ if [[ "${1:-}" == "get" && "${2:-}" == "--raw" ]]; then
     available_bytes=1099511627776
   elif [[ "$mode" == "large-work" ]]; then
     available_bytes=3298534883328
+  elif [[ "$mode" == remote-small-root ]]; then
+    available_bytes=53687091200
+  elif [[ "$mode" == remote-low-headroom ]]; then
+    available_bytes=10737418240
   elif [[ "$mode" == "ranked" ]]; then
     case "${3:-}" in
       */node-good-1/*) available_bytes=2199023255552 ;;
@@ -146,6 +150,30 @@ fi
 
 if [[ "${1:-}" == "get" && "${2:-}" == "storageclass" && "${3:-}" == "encrypted-sc" ]]; then
   [[ "$mode" == "longhorn-sc-manager-missing" ]] && printf '%s' 'driver.longhorn.io'
+  exit 0
+fi
+
+if [[ "${1:-}" == get && "${2:-}" == storageclass ]]; then
+  case "${3:-}" in
+    local-path) printf '%s' rancher.io/local-path ;;
+    premium-rwo) printf '%s' pd.csi.storage.gke.io ;;
+    longhorn)
+      [[ "$mode" == storage-rbac-longhorn ]] && exit 1
+      [[ "$mode" == storage-planned-longhorn ]] || printf '%s' driver.longhorn.io
+      ;;
+    mystery) printf '%s' example.com/custom-storage ;;
+    missing|unreadable) exit 1 ;;
+    empty-provisioner) exit 0 ;;
+    -o)
+      [[ "$mode" == storage-list-unreadable ]] && exit 1
+      if [[ "$mode" == storage-list-local-preferred ]]; then
+        printf '%s\n' 'premium-rwo|pd.csi.storage.gke.io|true|<no value>' 'local-path|rancher.io/local-path|<no value>|<no value>'
+      elif [[ "$mode" != storage-list-empty ]]; then
+        printf '%s\n' 'premium-rwo|pd.csi.storage.gke.io|true|<no value>' 'mystery|example.com/custom-storage|<no value>|<no value>'
+      fi
+      ;;
+    *) exit 1 ;;
+  esac
   exit 0
 fi
 
@@ -290,6 +318,113 @@ if [[ -s "$test_dir/curl.log" ]]; then
   cat "$test_dir/curl.log" >&2
   exit 1
 fi
+
+# Remote/cloud and distributed PVC capacity must not be charged against a small
+# worker boot filesystem. Node headroom and DiskPressure remain mandatory.
+for remote_class in premium-rwo longhorn; do
+  output="$test_dir/$remote_class-small-root.out"
+  PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME="$remote_class" KUBETON_TEST_MODE=remote-small-root \
+    "$kubeton" check >"$output" 2>&1
+  assert_contains 'local TON PVC capacity: 0 B of 760.00 Gi configured' "$output"
+  assert_contains 'node filesystem requirement: >= 20.00 Gi' "$output"
+  assert_contains 'Compatible target nodes: 3/3 required.' "$output"
+  assert_contains 'FAIL: DiskPressure' "$output"
+  assert_contains 'verify provisioner capacity and Longhorn replica space separately' "$output"
+  output="$test_dir/$remote_class-low-headroom.out"
+  if PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME="$remote_class" KUBETON_TEST_MODE=remote-low-headroom \
+    "$kubeton" check >"$output" 2>&1; then
+    echo "expected $remote_class to retain node filesystem headroom check" >&2
+    exit 1
+  fi
+  assert_contains 'insufficient disk' "$output"
+done
+
+# A custom values class is effective only with the normal CLI override disabled.
+remote_values="$test_dir/remote-values.yaml"
+cat >"$remote_values" <<'EOF'
+tonNode:
+  storage:
+    storageClassName: premium-rwo
+EOF
+PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$remote_values" KUBETON_TEST_MODE=remote-small-root \
+  "$kubeton" check >"$test_dir/remote-values.out" 2>&1
+assert_contains 'premium-rwo (pd.csi.storage.gke.io; attached Persistent Disk)' "$test_dir/remote-values.out"
+sed -e 's/^tonNode:/tonNode: # TON fleet/' -e 's/^  storage:/  storage: # data volumes/' "$remote_values" >"$test_dir/commented-storage-values.yaml"
+PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$test_dir/commented-storage-values.yaml" KUBETON_TEST_MODE=remote-small-root \
+  "$kubeton" check >"$test_dir/commented-storage.out" 2>&1
+assert_contains 'premium-rwo (pd.csi.storage.gke.io; attached Persistent Disk)' "$test_dir/commented-storage.out"
+if PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=local-path TON_VALUES_FILE="$remote_values" KUBETON_TEST_MODE=remote-small-root \
+  "$kubeton" check >"$test_dir/remote-override.out" 2>&1; then
+  echo 'expected explicit local-path override to retain local capacity requirements' >&2
+  exit 1
+fi
+assert_contains 'node filesystem requirement: >= 780.00 Gi' "$test_dir/remote-override.out"
+
+# An omitted class follows the operator's priority order, including its preferred
+# local classes before a cloud default. Unreadable/missing inventory fails closed.
+auto_values="$test_dir/auto-storage-values.yaml"
+cat >"$auto_values" <<'EOF'
+tonNode:
+  storage:
+    storageClassName: null
+EOF
+PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$auto_values" KUBETON_TEST_MODE=remote-small-root \
+  "$kubeton" check >"$test_dir/default-storage.out" 2>&1
+assert_contains 'premium-rwo (pd.csi.storage.gke.io' "$test_dir/default-storage.out"
+sed 's/storageClassName: null/storageClassName: ""/' "$auto_values" >"$test_dir/empty-class-values.yaml"
+PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$test_dir/empty-class-values.yaml" KUBETON_TEST_MODE=remote-small-root \
+  "$kubeton" check >"$test_dir/empty-class-default-storage.out" 2>&1
+assert_contains 'premium-rwo (pd.csi.storage.gke.io' "$test_dir/empty-class-default-storage.out"
+PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$auto_values" KUBETON_TEST_MODE=storage-list-local-preferred \
+  "$kubeton" check >"$test_dir/preferred-local-storage.out" 2>&1
+assert_contains 'local TON PVC capacity: 760.00 Gi' "$test_dir/preferred-local-storage.out"
+for storage_mode in storage-list-unreadable storage-list-empty; do
+  if PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$auto_values" KUBETON_TEST_MODE="$storage_mode" \
+    "$kubeton" check >"$test_dir/$storage_mode.out" 2>&1; then
+    echo "expected $storage_mode to fail closed" >&2
+    exit 1
+  fi
+done
+for invalid_class in missing unreadable empty-provisioner; do
+  if PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME="$invalid_class" \
+    "$kubeton" check >"$test_dir/$invalid_class.out" 2>&1; then
+    echo "expected unavailable StorageClass $invalid_class to fail closed" >&2
+    exit 1
+  fi
+  assert_contains 'cannot determine node disk requirements' "$test_dir/$invalid_class.out"
+done
+# Fresh bootstrap is the sole exception for an absent, known Longhorn class;
+# an API/authorization failure remains fatal even with bootstrap forced.
+PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=longhorn FORCE_BAREMETAL_BOOTSTRAP=true KUBETON_TEST_MODE=storage-planned-longhorn \
+  "$kubeton" check >"$test_dir/planned-longhorn.out" 2>&1
+assert_contains 'planned by bootstrap; distributed Longhorn storage' "$test_dir/planned-longhorn.out"
+assert_contains 'node filesystem requirement: >= 20.00 Gi' "$test_dir/planned-longhorn.out"
+for storage_mode in storage-planned-longhorn storage-rbac-longhorn; do
+  force=false
+  [[ "$storage_mode" != storage-rbac-longhorn ]] || force=true
+  if PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=longhorn FORCE_BAREMETAL_BOOTSTRAP="$force" KUBETON_TEST_MODE="$storage_mode" \
+    "$kubeton" check >"$test_dir/$storage_mode.out" 2>&1; then
+    echo "expected $storage_mode to reject missing/unreadable Longhorn without authorized planning" >&2
+    exit 1
+  fi
+  assert_contains 'cannot determine node disk requirements' "$test_dir/$storage_mode.out"
+done
+if PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=mystery KUBETON_TEST_MODE=remote-small-root \
+  "$kubeton" check >"$test_dir/unknown-backend.out" 2>&1; then
+  echo 'expected unknown backend to retain conservative filesystem capacity check' >&2
+  exit 1
+fi
+assert_contains 'node filesystem requirement: >= 780.00 Gi' "$test_dir/unknown-backend.out"
+
+# Mixed live claim classes add only locally stored capacity to root headroom.
+PATH="$fake_bin:$PATH" bash -euo pipefail -c '
+  source "$1"
+  KUBETON_NODE_CHECK_DISK_HEADROOM_BYTES=21474836480
+  node_check_set_storage_disk_requirements premium-rwo 751619276800 local-path 21474836480 longhorn 21474836480
+  [[ "$KUBETON_NODE_CHECK_TON_DATA_BYTES" == 794568949760 ]]
+  [[ "$KUBETON_NODE_CHECK_LOCAL_DATA_BYTES" == 21474836480 ]]
+  [[ "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES" == 42949672960 ]]
+' _ "$kubeton"
 
 # Longhorn's aggregate CSI readiness can be satisfied by registrations on
 # other nodes. The start gate must instead inspect every node selected for TON

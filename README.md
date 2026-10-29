@@ -518,9 +518,13 @@ myTonCoreSize: 20Gi
 myTonCtrlSize: 20Gi
 ```
 
-The node filesystem minimum is controlled entirely by these configured storage
-sizes plus `KUBETON_CHECK_DISK_HEADROOM` (default `20Gi`). `kubeton check` does
-not fetch dump metadata or automatically increase the requirement when
+For local-path and other local or unrecognized provisioners, the node filesystem
+minimum is these configured storage sizes plus `KUBETON_CHECK_DISK_HEADROOM`
+(default `20Gi`). GKE Persistent Disk and Longhorn data PVCs use separate storage
+capacity, so only the headroom is charged against the node filesystem; their
+provisioning quotas and storage-pool capacity must be verified separately. Mixed
+live StatefulSet claim templates charge only their local storage requests to the
+node filesystem. `kubeton check` does not fetch dump metadata or automatically increase the requirement when
 `DUMP=true`. Because the compressed archive and extracted database coexist
 under `/var/ton-work` during bootstrap, the operator must set `tonWorkSize`
 large enough for that peak and the desired kubelet eviction reserve before
@@ -1484,8 +1488,8 @@ Behavior:
 - runs a fresh node prerequisite preflight, then installs/updates the VictoriaLogs backend (`victoria-logs-single`) and collector (`victoria-logs-collector` DaemonSet) only on the exact nodes that pass it, with `remoteWrite[0].url` pointed at VictoriaLogs
 - caps the collector's per-destination on-node buffer and sets explicit CPU, memory, and ephemeral-storage requests/limits
 - waits for collectors on nodes removed from the approved set to disappear and strictly requires a Ready current-revision collector on every selected TON node
-- constrains VictoriaLogs single to the preflight-approved set and, on bare-metal, also to Longhorn-selected nodes by default to avoid CSI attach failures on non-Longhorn nodes
-- when using `longhorn` storageClass, also adds Longhorn CSI-based nodeAffinity fallback (from `CSINode`) so VictoriaLogs single cannot schedule to nodes without `driver.longhorn.io`
+- constrains VictoriaLogs single to the fresh preflight-approved set; when its PVC uses Longhorn, also respects existing Longhorn manager placement (or the bootstrap selector for a new installation)
+- detects Longhorn by the selected StorageClass provisioner, including custom class names, and by default requires registered, Ready Longhorn CSI on backend nodes; GKE Persistent Disk does not require Longhorn labels or CSI
 - starts background `kubectl port-forward` to `VMAuth` on `127.0.0.1` and prints VMUI/targets URLs and the credentials Secret reference
 - exposes VictoriaLogs UI/query through VMAuth (`/select/vmui/`, `/select/logsql/query`) so the same VMAuth username/password is required
 - does not expose unauthenticated external `:9428` by default; remote logs access uses the VMAuth endpoint/port
@@ -1519,14 +1523,15 @@ Main environment overrides:
 - `VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_REQUEST` / `VICTORIA_LOGS_COLLECTOR_EPHEMERAL_STORAGE_LIMIT`
 - `VICTORIA_LOGS_SINGLE_CHART_VERSION` (tested default `0.13.9`)
 - `VICTORIA_LOGS_COLLECTOR_CHART_VERSION` (tested default `0.3.7`)
-- `VICTORIA_LOGS_STORAGE_CLASS` (default auto; uses `longhorn` when available)
+- `VICTORIA_LOGS_STORAGE_CLASS` (explicit class wins; otherwise uses an existing class named `longhorn`, then exactly one annotated Kubernetes default; missing or ambiguous defaults require an explicit override)
 - `VICTORIA_LOGS_NODE_SELECTOR` (optional additional restriction for the
-  backend; it is intersected with the fresh preflight-approved placement and,
-  on bare-metal, the default Longhorn selector)
+  backend; it is intersected with the fresh preflight-approved placement;
+  inferred Longhorn selectors apply only to a Longhorn-backed PVC or planned
+  Longhorn bootstrap)
 - `VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR` (optional additional restriction for
   collectors; it is intersected with the fresh preflight-approved placement
   and can never restore rejected nodes)
-- `VICTORIA_LOGS_PIN_TO_LONGHORN_CSI` (default `true`; adds nodeAffinity to nodes exposing `driver.longhorn.io`)
+- `VICTORIA_LOGS_PIN_TO_LONGHORN_CSI` (default `true`; verifies registered, Ready CSI nodes for Longhorn-backed storage; other backends retain fresh-preflight affinity without a Longhorn requirement)
 - `VICTORIA_LOGS_NETWORK_POLICY_ENABLED` (default `true`; isolates the unauthenticated backend so only the kubeton collector and VMAuth can connect; requires enforcement by the cluster CNI)
 - `VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS` (default `300`; keeps backend ingress protection and cleanup state when uninstall cannot prove that logging workloads are gone)
 - `VICTORIA_LOGS_PORT`
@@ -1548,6 +1553,204 @@ For AWS/GCP/AliCloud, you can use any of these install paths:
 - Terraform: use `helm_release` to install/upgrade declaratively.
 
 Cloud provider dashboards can help create the cluster and open Cloud Shell, but this operator is not currently a managed one-click marketplace add-on. Installation is still done by Helm/kubectl.
+
+### Install on Google Cloud (GKE)
+
+Use **GKE Standard** with Linux/amd64 workers. For Longhorn, choose
+**Ubuntu with containerd** (`ubuntu_containerd`) for the node pool. The current
+TON deployment reserves fixed host ports, and Longhorn needs privileged host
+access; the default Autopilot policies do not permit this setup. See
+[GKE node images](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-images)
+and [Autopilot restrictions](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/autopilot-security).
+
+Size workers for at least **16 CPU and 64 GiB of free allocatable memory per
+TON replica**, plus Kubernetes, Longhorn, Vault and logging overhead. A machine
+with exactly 16 vCPU/64 GiB total will not have that much available to the Pod.
+Each TON replica needs a different worker. The default Longhorn bootstrap also
+requires at least three compatible workers for its three storage replicas.
+Keep node preflight enabled; it checks resources, pressure, placement and host
+ports before deployment.
+
+**Connect and download the installer.** Run these commands in Google Cloud
+Shell or an administration machine with `gcloud`, `gke-gcloud-auth-plugin`,
+`kubectl`, Helm, Bash, Python 3 and OpenSSL installed. The account needs
+permission to install CRDs, RBAC, workloads and the selected storage stack.
+Replace the placeholders; `LOCATION` is the cluster's region or zone. See
+[GKE cluster access](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl).
+
+```bash
+gcloud container clusters get-credentials CLUSTER_NAME \
+  --location LOCATION --project PROJECT_ID
+kubectl config current-context
+kubectl get nodes -o wide
+kubectl get storageclass
+
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.4.9/install.sh" | bash
+cd ton-k8s-operator-0.4.9
+```
+
+The GKE preflight and logging fixes described here are not in the already
+published `0.4.9` assets. Until a release includes them, use the chart and
+`kubeton` from this repository checkout for the remaining commands:
+
+```bash
+cd /path/to/ton-k8s-operator/charts/ton-k8s-operator
+```
+
+Review `operator-values.yaml` and `tonnode-values.yaml` before installing.
+Set `tonNode.replicas`, keep the desired installation arguments (for example
+`["-m", "validator", "-n", "mainnet", "-d"]`), and size `tonWorkSize` for the
+database plus peak dump download/extraction space. The examples below change
+only the shown fields; merge them into the existing `tonNode` section.
+Complete the networking requirements below before running `kubeton start`,
+particularly when deploying more than one replica.
+
+**Option A: Longhorn and Vault on GKE.** Longhorn can run on GCP. Its V1 engine
+needs `open-iscsi` with `iscsid` running, the `iscsi_tcp` module, mount
+propagation, and an ext4/XFS backing filesystem. Encrypted `encrypted-sc`
+volumes additionally need host `cryptsetup` with Argon2i support. Verify these
+on every worker that will mount or store a Longhorn volume; kubeton does not
+install host packages. See the pinned version's
+[Longhorn prerequisites](https://longhorn.io/docs/archives/1.10.0/deploy/install/)
+and [GKE guidance](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/csi-on-gke/).
+
+Ubuntu is the straightforward choice for this bootstrap. Longhorn 1.10.0 also
+supports GKE Container-Optimized OS using an additional node-agent DaemonSet,
+but kubeton does not install that agent, and some COS images need a different
+encryption KDF from kubeton's `argon2i` default. Follow the
+[Longhorn COS procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/container-optimized-os-support/)
+if choosing that route.
+
+Provision persistent backing disks and arrange for host prerequisites, disk
+mounts and labels to be restored when GKE replaces or upgrades a worker.
+Longhorn's three replicas consume roughly three times the written volume data,
+before snapshots and rebuild headroom; budget storage and inter-node traffic
+accordingly. A worker's boot disk size alone is not proof that the Longhorn
+storage pool can provision the requested PVCs. Inspect Longhorn disk capacity
+and volume health separately. Coordinate managed node upgrades with
+[Longhorn's GKE maintenance procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/support-managed-k8s-service/upgrade-k8s-on-gke/).
+
+For TON data on Longhorn and encrypted key bundles on its encrypted class:
+
+```yaml
+tonNode:
+  storage:
+    storageClassName: longhorn
+  keyManagement:
+    provider: vault
+    encryptedBundle:
+      storageClassName: encrypted-sc
+```
+
+GKE advertises a cloud provider ID, so kubeton skips automatic bare-metal
+bootstrap by default. For a **fresh** installation where you intentionally want
+kubeton to provision Longhorn, encrypted storage and Vault, enable it explicitly:
+
+```bash
+export TON_STORAGE_CLASS_NAME=longhorn
+export FORCE_BAREMETAL_BOOTSTRAP=true
+
+./kubeton bootstrap-baremetal
+./kubeton install
+./kubeton start
+```
+
+The bootstrap uses the same Longhorn/Vault workflow as bare metal, including
+the default compatible-node selection and per-node CSI readiness checks.
+Keep these environment selections for subsequent `check`, `start` and `add`
+commands. If you prefer GKE Persistent Disk for the large TON database, use
+`premium-rwo` for `tonNode.storage.storageClassName` and
+`TON_STORAGE_CLASS_NAME`, while keeping `encrypted-sc` for key bundles.
+
+For **existing** Longhorn/Vault installations, keep their StorageClass names,
+Vault Transit key and credentials. Prepare the credentials described in
+Option B, omit `bootstrap-baremetal`, and leave
+`FORCE_BAREMETAL_BOOTSTRAP=false` unless you intend kubeton to manage those
+dependencies. A healthy existing Longhorn deployment is reused without an
+automatic Helm upgrade; kubeton does not automatically change selectors on
+storage nodes that hold volumes.
+
+**Option B: GKE Persistent Disk and an existing Vault.** Enable the
+[Persistent Disk CSI driver](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver)
+and choose a class actually listed by `kubectl get storageclass`, such as
+`premium-rwo` (SSD) or `standard-rwo` (balanced). Set both data and bundle
+classes explicitly:
+
+```yaml
+tonNode:
+  storage:
+    storageClassName: premium-rwo
+  keyManagement:
+    enabled: true
+    provider: vault
+    credentialsSecretRef: ton-vault-creds
+    vaultTransitKey: ton-validator
+    encryptedBundle:
+      storageClassName: premium-rwo
+```
+
+Provide a reachable, initialized and unsealed Vault with a Transit key named
+`ton-validator`. Its TON token needs `update` on
+`transit/encrypt/ton-validator` and `transit/decrypt/ton-validator`; retain the
+key's old versions for existing backups. Create `default/ton-vault-creds`
+from a private environment file containing `VAULT_ADDR`, `VAULT_TOKEN`, and
+optionally the Vault Enterprise `VAULT_NAMESPACE`:
+
+```bash
+# Prepare this file securely with your existing Vault connection details.
+chmod 600 /secure/ton-vault.env
+kubectl -n default create secret generic ton-vault-creds \
+  --from-env-file=/secure/ton-vault.env
+
+export TON_STORAGE_CLASS_NAME=premium-rwo
+export ENCRYPTED_SC_NAME=premium-rwo
+export FORCE_BAREMETAL_BOOTSTRAP=false
+
+./kubeton check
+./kubeton install
+./kubeton start
+```
+
+This route does not install Vault or Longhorn. Wallet/ADNL bundles remain
+encrypted with Vault even though the class is named `premium-rwo` rather than
+`encrypted-sc`. Google-managed disk encryption or a CMEK setting is an
+additional infrastructure layer; neither replaces Vault Transit. The targeted
+`restore-keys ... --to-node ...` recovery currently supports local-path and
+Longhorn volumes; do not assume that workflow supports native GKE PD volumes.
+
+With the storage-aware preflight, GKE PD and Longhorn data PVC sizes are not
+charged against the worker's root filesystem. The local filesystem must still
+pass the configured headroom and pressure checks. Local-path data continues to
+require its full configured capacity plus headroom. VictoriaLogs selects an
+available storage class and requires Longhorn CSI placement only when its own
+PVC uses Longhorn; ordinary GKE PD logging does not require Longhorn labels.
+Set `VICTORIA_LOGS_STORAGE_CLASS` if you want a specific log backend class.
+
+**Networking and verification.** Public worker addresses are the simplest
+starting point. Allow inbound UDP `30001` and `31001` to the TON workers in the
+VPC firewall; open TCP `30003` only to the clients that need the lite-server.
+Keep the validator console, Vault and unauthenticated logging backend private.
+Private workers need per-replica public forwarding and an advertised address
+that matches that forwarding; Cloud NAT alone does not provide inbound access.
+
+For a single replica, the operator can use its worker's `ExternalIP`. For
+multiple replicas, the current fallback is `status.hostIP`, which is normally
+a private GKE address. Plan per-replica advertised public addresses before
+funding wallets or enabling validation; one shared `network.publicIP` and the
+same host ports are insufficient for several separately reachable validators.
+Verify the generated validator addresses against the external mapping.
+
+```bash
+kubectl -n ton-k8s-operator-system get deployments,pods
+./kubeton verify
+./kubeton status
+./kubeton logs
+```
+
+The monitoring stack is installed by `kubeton start`. Its local port-forwards
+run on the machine executing kubeton; Cloud Shell is not a permanent public
+dashboard host. Use the printed port-forward instructions or an authenticated
+HTTPS access layer for ongoing access.
 
 ### Upgrade Workflow (When Image Changes)
 

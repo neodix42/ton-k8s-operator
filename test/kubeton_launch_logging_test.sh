@@ -1841,8 +1841,9 @@ test_victoria_logs_helm_durability_settings() (
   }
   kubectl() {
     local args="$*"
-    if [[ "$args" == "get storageclass longhorn" ]]; then
-      return 1
+    if [[ "$args" == 'get storageclass -o go-template='* ]]; then
+      printf 'standard|pd.csi.storage.gke.io|true|<no value>\n'
+      return 0
     fi
     if [[ "$args" == *" rollout status "* ]]; then
       return 0
@@ -1908,6 +1909,188 @@ test_victoria_logs_helm_durability_settings() (
   fi
 )
 
+test_victoria_logs_autostart_storage_placement() (
+  local mode="$1" cluster_kind=gke expected_selector="" expected_csi=false
+  local helm_log="$test_dir/victoria-storage-$mode.helm"
+  local backend_overlays="$test_dir/victoria-storage-$mode.backend.yaml"
+  local collector_overlays="$test_dir/victoria-storage-$mode.collector.yaml"
+  local csi_log="$test_dir/victoria-storage-$mode.csi"
+  local output="$test_dir/victoria-storage-$mode.out"
+  export VICTORIA_LOGS_STORAGE_CLASS=""
+  export VICTORIA_LOGS_NODE_SELECTOR=""
+  export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR=""
+  export LONGHORN_NODE_SELECTOR='node.longhorn.io/create-default-disk=true'
+  export VICTORIA_LOGS_PIN_TO_LONGHORN_CSI=true
+  export KUBETON_START_VICTORIA_LOGS_ENABLED=true
+  export VICTORIA_LOGS_ENABLED=true
+  export FORCE_BAREMETAL_BOOTSTRAP=false
+  export AUTO_BAREMETAL_BOOTSTRAP=true
+  case "$mode" in
+    gke-pd) VICTORIA_LOGS_STORAGE_CLASS=premium-rwo ;;
+    gke-default-pd) : ;;
+    gke-default-longhorn)
+      expected_selector="$LONGHORN_NODE_SELECTOR"
+      expected_csi=true
+      ;;
+    gke-manual-longhorn) expected_csi=true ;;
+    baremetal-longhorn)
+      cluster_kind=baremetal
+      expected_selector="$LONGHORN_NODE_SELECTOR"
+      expected_csi=true
+      ;;
+    gke-longhorn)
+      VICTORIA_LOGS_STORAGE_CLASS=cloud-longhorn
+      expected_selector="$LONGHORN_NODE_SELECTOR"
+      expected_csi=true
+      ;;
+    inventory-failure|ambiguous-default) : ;;
+    explicit-pd)
+      VICTORIA_LOGS_STORAGE_CLASS=premium-rwo
+      VICTORIA_LOGS_NODE_SELECTOR='logs-backend=true'
+      expected_selector="$VICTORIA_LOGS_NODE_SELECTOR"
+      ;;
+    k3d)
+      cluster_kind=k3d
+      ;;
+    *) fail "unknown VictoriaLogs storage fixture: $mode" ;;
+  esac
+  source "$kubeton"
+  : >"$helm_log"
+  : >"$backend_overlays"
+  : >"$collector_overlays"
+  : >"$csi_log"
+
+  require_bin() { :; }
+  cluster_is_k3d() { [[ "$cluster_kind" == k3d ]]; }
+  cluster_is_baremetal() { [[ "$cluster_kind" == baremetal ]]; }
+  storage_class_is_longhorn() { [[ "$1" == longhorn || "$1" == cloud-longhorn ]]; }
+  ensure_namespace() { :; }
+  ensure_helm_repo() { :; }
+  write_victoria_logs_state() { :; }
+  victoria_logs_service_name() { printf '%s' vlogs-server; }
+  victoria_logs_collector_daemonset_name() { printf '%s' vlogs-collector; }
+  ensure_victoria_logs_access_service() { printf '%s' vlogs-access; }
+  wait_victoria_logs_collector_ready_on_selected_nodes() { :; }
+  list_longhorn_csi_node_names_checked() {
+    printf '%s\n' registration >>"$csi_log"
+    printf '%s\n' gke-worker-pass
+  }
+  list_ready_longhorn_csi_plugin_node_names_checked() {
+    printf '%s\n' plugin >>"$csi_log"
+    printf '%s\n' gke-worker-pass
+  }
+  node_check_list_selector_nodes() {
+    case "$1" in
+      ton-ready=true) printf '%s\n' gke-worker-pass ;;
+      logs-backend=true) printf '%s\n' gke-worker-pass gke-worker-rejected ;;
+      node.longhorn.io/create-default-disk=true)
+        # Native GKE workers deliberately have no Longhorn labels. The old
+        # unconditional selector inheritance makes automatic logging fail.
+        if is_true "$expected_csi"; then printf '%s\n' gke-worker-pass; fi
+        ;;
+      *) fail "unexpected VictoriaLogs selector: $1" ;;
+    esac
+  }
+  run_with_timeout() { shift; "$@"; }
+  helm() {
+    local arg previous="" overlay_file=""
+    printf '%s\n' "$*" >>"$helm_log"
+    if [[ "${1:-}" == upgrade && "${2:-}" == --install ]]; then
+      if [[ "${3:-}" == kubeton-vlogs ]]; then
+        overlay_file="$backend_overlays"
+      else
+        overlay_file="$collector_overlays"
+      fi
+      for arg in "$@"; do
+        if [[ "$previous" == -f ]]; then cat "$arg" >>"$overlay_file"; fi
+        previous="$arg"
+      done
+    fi
+  }
+  kubectl() {
+    local args="$*"
+    if [[ "$args" == 'get storageclass -o go-template='* ]]; then
+      case "$mode" in
+        inventory-failure) return 1 ;;
+        ambiguous-default)
+          printf 'premium-rwo|pd.csi.storage.gke.io|true|<no value>\n'
+          printf 'cloud-longhorn|driver.longhorn.io|true|<no value>\n'
+          ;;
+        baremetal-longhorn)
+          # Preserve the literal Longhorn class preference even when PD is
+          # the Kubernetes default class.
+          printf 'longhorn|driver.longhorn.io|false|<no value>\n'
+          printf 'premium-rwo|pd.csi.storage.gke.io|true|<no value>\n'
+          ;;
+        gke-default-longhorn|gke-longhorn|gke-manual-longhorn)
+          printf 'cloud-longhorn|driver.longhorn.io|true|<no value>\n'
+          ;;
+        *) printf 'premium-rwo|pd.csi.storage.gke.io|true|<no value>\n' ;;
+      esac
+      return 0
+    fi
+    if [[ "$args" == *' rollout status '* ]]; then return 0; fi
+    if [[ "$args" == *' get pod vlogs-server-0 '* ]]; then
+      printf 'gke-worker-pass\x1fRunning\x1f\x1fready'
+      return 0
+    fi
+    if [[ "$args" == *' get daemonset vlogs-collector '* \
+      && ( "$args" == *desiredNumberScheduled* || "$args" == *numberReady* ) ]]; then
+      printf '%s' 1
+      return 0
+    fi
+    fail "unexpected kubectl in VictoriaLogs storage fixture: $args"
+  }
+
+  KUBETON_VICTORIA_LOGS_ELIGIBLE_NODES=(gke-worker-pass)
+  KUBETON_NODE_CHECK_TON_SELECTOR=ton-ready=true
+  if [[ "$mode" == gke-manual-longhorn ]]; then
+    KUBETON_NODE_CHECK_EXISTING_LONGHORN=1
+    KUBETON_NODE_CHECK_LONGHORN_MANAGER_SELECTOR=""
+  fi
+  if [[ "$mode" == inventory-failure || "$mode" == ambiguous-default ]]; then
+    if ensure_start_victoria_logs >"$output" 2>&1; then
+      fail "VictoriaLogs accepted unresolved storage in $mode"
+    fi
+    assert_not_contains 'upgrade --install' "$helm_log"
+    [[ ! -s "$csi_log" ]] || fail 'unresolved storage triggered CSI mutations'
+    if [[ "$mode" == inventory-failure ]]; then
+      assert_contains 'cannot read StorageClasses' "$output"
+    else
+      assert_contains 'one unambiguous default StorageClass (found 2)' "$output"
+    fi
+    return
+  fi
+  ensure_start_victoria_logs >"$output" 2>&1 || {
+    cat "$output" >&2
+    fail "automatic VictoriaLogs startup failed for $mode"
+  }
+  assert_contains 'Durable container-log collection is active' "$output"
+  for overlay_file in "$backend_overlays" "$collector_overlays"; do
+    assert_contains 'kubernetes.io/hostname' "$overlay_file"
+    assert_contains gke-worker-pass "$overlay_file"
+    assert_not_contains gke-worker-rejected "$overlay_file"
+  done
+  if [[ -n "$expected_selector" ]]; then
+    assert_contains "VictoriaLogs single nodeSelector: $expected_selector" "$output"
+  else
+    assert_not_contains 'nodeSelector:' "$backend_overlays"
+    assert_not_contains 'node.longhorn.io/create-default-disk' "$backend_overlays"
+  fi
+  if is_true "$expected_csi"; then
+    assert_contains registration "$csi_log"
+    assert_contains plugin "$csi_log"
+    assert_contains 'requires registered, Ready Longhorn CSI' "$output"
+  else
+    [[ ! -s "$csi_log" ]] || fail "$mode unexpectedly required Longhorn CSI"
+  fi
+  if [[ "$VICTORIA_LOGS_STORAGE_CLASS" == premium-rwo || "$mode" == gke-default-pd ]]; then
+    assert_contains 'server.persistentVolume.storageClassName=premium-rwo' "$helm_log"
+  elif [[ "$mode" == gke-default-longhorn || "$mode" == gke-manual-longhorn ]]; then
+    assert_contains 'server.persistentVolume.storageClassName=cloud-longhorn' "$helm_log"
+  fi
+)
+
 test_victoria_logs_helm_affinity_uses_only_checked_hostnames() (
   export VICTORIA_LOGS_STORAGE_CLASS=""
   export VICTORIA_LOGS_NODE_SELECTOR='logs-backend=true'
@@ -1957,8 +2140,9 @@ test_victoria_logs_helm_affinity_uses_only_checked_hostnames() (
   }
   kubectl() {
     local args="$*"
-    if [[ "$args" == "get storageclass longhorn" ]]; then
-      return 1
+    if [[ "$args" == 'get storageclass -o go-template='* ]]; then
+      printf 'standard|pd.csi.storage.gke.io|true|<no value>\n'
+      return 0
     fi
     if [[ "$args" == get\ nodes\ -l\ logs-backend=true* \
       || "$args" == get\ nodes\ -l\ logs-collector=true* ]]; then
@@ -2056,7 +2240,9 @@ test_victoria_logs_refuses_unknown_checked_hostname_set_before_upgrade() (
   }
   helm() { printf '%s\n' "$*" >>"$helm_log"; }
   kubectl() {
-    [[ "$*" == "get storageclass longhorn" ]] && return 1
+    if [[ "$*" == 'get storageclass -o go-template='* ]]; then
+      printf 'standard|pd.csi.storage.gke.io|true|<no value>\n'
+    fi
     return 0
   }
 
@@ -2093,8 +2279,9 @@ test_unconstrained_ton_rejects_collector_selector_that_drops_checked_node() (
   }
   helm() { printf '%s\n' "$*" >>"$helm_log"; }
   kubectl() {
-    if [[ "$*" == "get storageclass longhorn" ]]; then
-      return 1
+    if [[ "$*" == 'get storageclass -o go-template='* ]]; then
+      printf 'standard|pd.csi.storage.gke.io|true|<no value>\n'
+      return 0
     fi
     if [[ "$*" == get\ nodes\ -l\ logs-only=true* ]]; then
       printf '%s\n' node-a
@@ -2148,7 +2335,9 @@ test_victoria_logs_restricts_collector_before_backend_mutation() (
     return 0
   }
   kubectl() {
-    [[ "$*" == "get storageclass longhorn" ]] && return 1
+    if [[ "$*" == 'get storageclass -o go-template='* ]]; then
+      printf 'standard|pd.csi.storage.gke.io|true|<no value>\n'
+    fi
     return 0
   }
 
@@ -2215,8 +2404,9 @@ test_victoria_logs_collector_buffer_path_matches_early_and_full_install() (
   }
   kubectl() {
     local args="$*"
-    if [[ "$args" == "get storageclass longhorn" ]]; then
-      return 1
+    if [[ "$args" == 'get storageclass -o go-template='* ]]; then
+      printf 'standard|pd.csi.storage.gke.io|true|<no value>\n'
+      return 0
     fi
     if [[ "$args" == *" rollout status "* ]]; then
       return 0
@@ -3149,8 +3339,9 @@ test_victoria_logs_access_service_failure_blocks_collector() (
   }
   kubectl() {
     local payload
-    if [[ "$*" == "get storageclass longhorn" ]]; then
-      return 1
+    if [[ "$*" == 'get storageclass -o go-template='* ]]; then
+      printf 'standard|pd.csi.storage.gke.io|true|<no value>\n'
+      return 0
     fi
     if [[ "$*" == *" apply -f -"* ]]; then
       payload="$(cat)"
@@ -3885,6 +4076,16 @@ test_bootstrap_wait_requires_every_replica
 test_bootstrap_wait_fails_repeated_crashloop
 test_victoria_logs_requires_ready_collector_per_selected_node
 test_victoria_logs_helm_durability_settings
+test_victoria_logs_autostart_storage_placement gke-pd
+test_victoria_logs_autostart_storage_placement gke-default-pd
+test_victoria_logs_autostart_storage_placement gke-default-longhorn
+test_victoria_logs_autostart_storage_placement gke-manual-longhorn
+test_victoria_logs_autostart_storage_placement baremetal-longhorn
+test_victoria_logs_autostart_storage_placement gke-longhorn
+test_victoria_logs_autostart_storage_placement explicit-pd
+test_victoria_logs_autostart_storage_placement k3d
+test_victoria_logs_autostart_storage_placement inventory-failure
+test_victoria_logs_autostart_storage_placement ambiguous-default
 test_victoria_logs_helm_affinity_uses_only_checked_hostnames
 test_victoria_logs_refuses_unknown_checked_hostname_set_before_upgrade
 test_unconstrained_ton_rejects_collector_selector_that_drops_checked_node
