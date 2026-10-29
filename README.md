@@ -1605,76 +1605,21 @@ only the shown fields; merge them into the existing `tonNode` section.
 Complete the networking requirements below before running `kubeton start`,
 particularly when deploying more than one replica.
 
-**Option A: Longhorn and Vault on GKE.** Longhorn can run on GCP. Its V1 engine
-needs `open-iscsi` with `iscsid` running, the `iscsi_tcp` module, mount
-propagation, and an ext4/XFS backing filesystem. Encrypted `encrypted-sc`
-volumes additionally need host `cryptsetup` with Argon2i support. Verify these
-on every worker that will mount or store a Longhorn volume; kubeton does not
-install host packages. See the pinned version's
-[Longhorn prerequisites](https://longhorn.io/docs/archives/1.10.0/deploy/install/)
-and [GKE guidance](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/csi-on-gke/).
+**Storage layout.** Keep the validator database and dump files on GKE
+Persistent Disk, and use Longhorn for encrypted key bundles. Vault's own
+persistent state also uses Longhorn in the managed bootstrap. This follows the
+same separation as bare metal, where TON data defaults to `local-path` and
+encrypted key bundles use `encrypted-sc`.
 
-Ubuntu is the straightforward choice for this bootstrap. Longhorn 1.10.0 also
-supports GKE Container-Optimized OS using an additional node-agent DaemonSet,
-but kubeton does not install that agent, and some COS images need a different
-encryption KDF from kubeton's `argon2i` default. Follow the
-[Longhorn COS procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/container-optimized-os-support/)
-if choosing that route.
+| Data | GKE StorageClass | Configuration |
+|---|---|---|
+| TON database, controller state and dump files | `premium-rwo` | `tonNode.storage.storageClassName` |
+| Encrypted wallet/ADNL key bundles | `encrypted-sc` (Longhorn) | `tonNode.keyManagement.encryptedBundle.storageClassName` |
 
-Provision persistent backing disks and arrange for host prerequisites, disk
-mounts and labels to be restored when GKE replaces or upgrades a worker.
-Longhorn's three replicas consume roughly three times the written volume data,
-before snapshots and rebuild headroom; budget storage and inter-node traffic
-accordingly. A worker's boot disk size alone is not proof that the Longhorn
-storage pool can provision the requested PVCs. Inspect Longhorn disk capacity
-and volume health separately. Coordinate managed node upgrades with
-[Longhorn's GKE maintenance procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/support-managed-k8s-service/upgrade-k8s-on-gke/).
-
-For TON data on Longhorn and encrypted key bundles on its encrypted class:
-
-```yaml
-tonNode:
-  storage:
-    storageClassName: longhorn
-  keyManagement:
-    provider: vault
-    encryptedBundle:
-      storageClassName: encrypted-sc
-```
-
-GKE advertises a cloud provider ID, so kubeton skips automatic bare-metal
-bootstrap by default. For a **fresh** installation where you intentionally want
-kubeton to provision Longhorn, encrypted storage and Vault, enable it explicitly:
-
-```bash
-export TON_STORAGE_CLASS_NAME=longhorn
-export FORCE_BAREMETAL_BOOTSTRAP=true
-
-./kubeton bootstrap-baremetal
-./kubeton install
-./kubeton start
-```
-
-The bootstrap uses the same Longhorn/Vault workflow as bare metal, including
-the default compatible-node selection and per-node CSI readiness checks.
-Keep these environment selections for subsequent `check`, `start` and `add`
-commands. If you prefer GKE Persistent Disk for the large TON database, use
-`premium-rwo` for `tonNode.storage.storageClassName` and
-`TON_STORAGE_CLASS_NAME`, while keeping `encrypted-sc` for key bundles.
-
-For **existing** Longhorn/Vault installations, keep their StorageClass names,
-Vault Transit key and credentials. Prepare the credentials described in
-Option B, omit `bootstrap-baremetal`, and leave
-`FORCE_BAREMETAL_BOOTSTRAP=false` unless you intend kubeton to manage those
-dependencies. A healthy existing Longhorn deployment is reused without an
-automatic Helm upgrade; kubeton does not automatically change selectors on
-storage nodes that hold volumes.
-
-**Option B: GKE Persistent Disk and an existing Vault.** Enable the
+Enable the
 [Persistent Disk CSI driver](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver)
-and choose a class actually listed by `kubectl get storageclass`, such as
-`premium-rwo` (SSD) or `standard-rwo` (balanced). Set both data and bundle
-classes explicitly:
+and choose a data class actually listed by `kubectl get storageclass`, such as
+`premium-rwo` (SSD). Merge these settings into `tonnode-values.yaml`:
 
 ```yaml
 tonNode:
@@ -1686,10 +1631,64 @@ tonNode:
     credentialsSecretRef: ton-vault-creds
     vaultTransitKey: ton-validator
     encryptedBundle:
-      storageClassName: premium-rwo
+      storageClassName: encrypted-sc
 ```
 
-Provide a reachable, initialized and unsealed Vault with a Transit key named
+**Prepare key management.** Longhorn's V1 engine needs `open-iscsi` with
+`iscsid` running, the `iscsi_tcp` module, mount propagation, and an ext4/XFS
+backing filesystem. Encrypted `encrypted-sc` volumes additionally need host
+`cryptsetup` with Argon2i support. Verify these on every worker that will mount
+or store a key-bundle volume; kubeton does not install host packages. See the
+pinned version's
+[Longhorn prerequisites](https://longhorn.io/docs/archives/1.10.0/deploy/install/)
+and [GKE guidance](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/csi-on-gke/).
+
+Ubuntu is the straightforward choice for this bootstrap. Longhorn 1.10.0 also
+supports GKE Container-Optimized OS using an additional node-agent DaemonSet,
+but kubeton does not install that agent, and some COS images need a different
+encryption KDF from kubeton's `argon2i` default. Follow the
+[Longhorn COS procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/container-optimized-os-support/)
+if choosing that route.
+
+Provision persistent backing storage for key management and arrange for host
+prerequisites, disk mounts and labels to be restored when GKE replaces or
+upgrades a worker. Budget Longhorn replication, snapshots and rebuild headroom
+for key bundles and Vault state separately from the large TON data disks.
+Coordinate managed node upgrades with
+[Longhorn's GKE maintenance procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/support-managed-k8s-service/upgrade-k8s-on-gke/).
+
+GKE advertises a cloud provider ID, so kubeton skips automatic bare-metal
+bootstrap by default. For a **fresh** installation where you intentionally want
+kubeton to provision Longhorn, encrypted storage and Vault, enable it explicitly:
+
+```bash
+export TON_STORAGE_CLASS_NAME=premium-rwo
+export ENCRYPTED_SC_NAME=encrypted-sc
+export VICTORIA_LOGS_STORAGE_CLASS=premium-rwo
+export FORCE_BAREMETAL_BOOTSTRAP=true
+
+./kubeton bootstrap-baremetal
+./kubeton install
+./kubeton start
+```
+
+The bootstrap uses the same Longhorn/Vault workflow as bare metal, including
+the default compatible-node selection and per-node CSI readiness checks.
+Keep these environment selections for subsequent `check`, `start` and `add`
+commands. `TON_STORAGE_CLASS_NAME` keeps TON data on GKE Persistent Disk;
+`VICTORIA_LOGS_STORAGE_CLASS` also places log data there. Longhorn serves key
+management storage rather than the validator database.
+
+For **existing** Longhorn/Vault installations, keep their StorageClass names,
+Vault Transit key and credentials. Prepare the credentials described below,
+omit `bootstrap-baremetal`, and leave
+`FORCE_BAREMETAL_BOOTSTRAP=false` unless you intend kubeton to manage those
+dependencies. A healthy existing Longhorn deployment is reused without an
+automatic Helm upgrade; kubeton does not automatically change selectors on
+storage nodes that hold volumes.
+
+For an existing Vault, provide a reachable, initialized and unsealed service
+with a Transit key named
 `ton-validator`. Its TON token needs `update` on
 `transit/encrypt/ton-validator` and `transit/decrypt/ton-validator`; retain the
 key's old versions for existing backups. Create `default/ton-vault-creds`
@@ -1703,7 +1702,8 @@ kubectl -n default create secret generic ton-vault-creds \
   --from-env-file=/secure/ton-vault.env
 
 export TON_STORAGE_CLASS_NAME=premium-rwo
-export ENCRYPTED_SC_NAME=premium-rwo
+export ENCRYPTED_SC_NAME=encrypted-sc
+export VICTORIA_LOGS_STORAGE_CLASS=premium-rwo
 export FORCE_BAREMETAL_BOOTSTRAP=false
 
 ./kubeton check
@@ -1711,8 +1711,8 @@ export FORCE_BAREMETAL_BOOTSTRAP=false
 ./kubeton start
 ```
 
-This route does not install Vault or Longhorn. Wallet/ADNL bundles remain
-encrypted with Vault even though the class is named `premium-rwo` rather than
+The existing-infrastructure route requires Longhorn, `encrypted-sc` and Vault
+to be ready. Wallet/ADNL bundles are encrypted with Vault and stored on
 `encrypted-sc`. Google-managed disk encryption or a CMEK setting is an
 additional infrastructure layer; neither replaces Vault Transit. The targeted
 `restore-keys ... --to-node ...` recovery currently supports local-path and
