@@ -843,7 +843,7 @@ If your cloud setup uses custom names, override with env vars:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.2/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.3/install.sh" | bash
 ```
 
 The script:
@@ -1513,6 +1513,47 @@ groups, collation/validation rates and timing, mempool messages, ADNL/QUIC traff
 actor worker activity, and scrape health. Choose **Prometheus**, **TON job** and
 **Node target** at the top; each managed Prometheus instance is selectable.
 
+Expand the four additional sections for session-style charts from native TON
+metrics:
+
+| Section | Charts |
+| --- | --- |
+| Block production and workload | Successful collated candidates/s, candidate TPS, mean block and collated-data sizes, gas/block, transactions/block, external messages offered and their outcomes |
+| Message queues and overload | Latest outbound queue size, outbound cleanup/block, inbound messages processed/skipped per block, overload causes, blocks requesting a shard split |
+| Collation and validation time | Mean end-to-end elapsed time and instrumented real/CPU time, with separate masterchain and shard traces |
+| Storage-stat cache | Lookups and account cells per block by hit/miss/small outcome, eligible lookup hit rate, lookups/s |
+
+The **Chain** selector chooses masterchain, shards or both. **Leader-window
+position** selects the first block, later blocks or both for candidate rate,
+candidate TPS, transactions/block and end-to-end collation elapsed time. Other
+charts include all positions because their exporter counters have no `first`
+label. On legacy/non-window collation paths, TON reports `first=0`; interpret the
+first/later comparison on validators or collators using leader windows.
+
+**Window size** offers `10s`, `1m`, `5m`, `15m` and `1h` for these four sections.
+The current scrape interval is 15 seconds, so the effective rate window is at
+least one minute, including for `10s`. Rates and per-block averages use counter
+changes over that window; they are not exact event buckets. With no successful
+blocks in a window, per-block charts show **No data**. The existing overview
+charts continue to use Grafana's automatic rate interval.
+
+Recent-range links offer `1h`, `2h`, `6h`, `1d`, `1w`, `30d`, `90d`, `180d` and
+`365d` while preserving dashboard filters. They show only history retained by
+the selected Prometheus server; selecting a year does not configure retention
+or persistent storage. The optional **Test runs** annotation layer displays
+Grafana annotations tagged `ton-run`; add an annotation or time region in Grafana
+to mark a run. It does not automatically import runs from `ton-mesh`.
+
+The session-stats service used by `ton-mesh` parses session logs and correlates
+candidates with accepted blocks. These Prometheus charts measure each node's
+collated candidates, so candidate TPS and candidate rate can differ from
+on-chain TPS or block rate. The queue gauge is the most recent collation for
+each chain; on a multi-shard collator it is whichever shard finished last,
+rather than one series per shard. Size estimates, load fractions, the remaining
+first/later splits and LiteServer TPS/block rate need session-log or LiteServer
+data that this exporter does not supply. No session-log collector is installed
+by this dashboard.
+
 Panels use the raw metrics documented for
 [TON v2026.10](https://github.com/ton-blockchain/ton/blob/v2026.10/metrics/METRICS.md).
 Synchronization series appear after initialization. Validator groups and timing
@@ -1655,7 +1696,7 @@ kubectl config current-context
 kubectl get nodes -o wide
 kubectl get storageclass
 
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.2/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.3/install.sh" | bash
 cd ton-k8s-operator-0.5.0
 ```
 
@@ -1875,7 +1916,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.2/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.3/install.sh" | bash
 cd ./ton-k8s-operator-0.3.0
 
 # review values before upgrade

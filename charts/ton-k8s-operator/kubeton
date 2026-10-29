@@ -4901,12 +4901,19 @@ build_grafana_ton_overview_dashboard_json() {
   python3 - "$dashboard_uid" "$dashboard_title" "$datasource_name" "$datasource_uid" <<'PY'
 import json
 import sys
+from contextlib import contextmanager
 
 uid, dashboard_title, datasource_name, datasource_uid = sys.argv[1:]
 source = {"type": "prometheus", "uid": "${datasource}"}
 selector = 'job=~"${job:regex}",instance=~"${instance:regex}"'
 panels = []
 y = 0
+panel_id = 0
+
+def next_panel_id():
+    global panel_id
+    panel_id += 1
+    return panel_id
 
 def metric(name, extra=""):
     return name + "{" + selector + ("," + extra if extra else "") + "}"
@@ -4914,26 +4921,40 @@ def metric(name, extra=""):
 def rate(name, group="job,instance", extra=""):
     return "sum by (" + group + ") (rate(" + metric(name, extra) + "[$__rate_interval]))"
 
-def panel(title, expressions, unit="short", *, kind="timeseries", x=0, width=12, height=8, description=""):
+def panel(title, expressions, unit="short", *, kind="timeseries", x=0, width=12, height=8,
+          description="", interval=None):
     targets = []
     for index, expression in enumerate(expressions):
         expr, legend = expression if isinstance(expression, tuple) else (expression, "{{instance}}")
         targets.append({"refId": chr(65 + index), "expr": expr, "legendFormat": legend,
                         "datasource": source, "range": kind != "stat", "instant": kind == "stat"})
+        if interval:
+            targets[-1]["interval"] = interval
     options = ({"reduceOptions": {"calcs": ["lastNotNull"], "values": False},
                 "colorMode": "value", "graphMode": "none", "textMode": "auto"}
                if kind == "stat" else {"legend": {"displayMode": "list", "placement": "bottom"},
                                        "tooltip": {"mode": "multi", "sort": "desc"}})
-    panels.append({"id": len(panels) + 1, "type": kind, "title": title, "description": description,
+    panels.append({"id": next_panel_id(), "type": kind, "title": title, "description": description,
                    "datasource": source, "gridPos": {"x": x, "y": y, "w": width, "h": height},
                    "targets": targets, "fieldConfig": {"defaults": {"unit": unit, "noValue": "No data"},
                                                          "overrides": []}, "options": options})
 
 def row(title):
     global y
-    panels.append({"id": len(panels) + 1, "type": "row", "title": title, "collapsed": False,
+    panels.append({"id": next_panel_id(), "type": "row", "title": title, "collapsed": False,
                    "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
     y += 1
+
+@contextmanager
+def collapsed_section(title):
+    global y
+    row(title)
+    index, next_y = len(panels) - 1, y
+    yield
+    panels[index]["collapsed"] = True
+    panels[index]["panels"] = panels[index + 1:]
+    del panels[index + 1:]
+    y = next_y
 
 def pair(left, right):
     global y
@@ -4941,14 +4962,19 @@ def pair(left, right):
     panel(**right, x=12)
     y += 8
 
-panels.append({"id": 1, "type": "text", "title": "TON fleet overview",
-               "gridPos": {"x": 0, "y": 0, "w": 24, "h": 3},
+panels.append({"id": next_panel_id(), "type": "text", "title": "TON fleet overview",
+               "gridPos": {"x": 0, "y": 0, "w": 24, "h": 4},
                "options": {"mode": "markdown", "content":
                    "Select **Prometheus**, **TON job** and **Node target** above. "
                    "Synchronization metrics appear after node initialization; validator groups and "
                    "timing histograms appear when the node participates. Rate charts need a few scrapes. "
-                   "**No data** means that the exporter has not reported that series."}})
-y = 3
+                   "**No data** means that the exporter has not reported that series.\n\n"
+                   "Expand the workload, queue, timing and cache sections below for native session-style statistics. "
+                   "**Chain** and **Window size** control these sections. **Leader-window position** applies only "
+                   "to candidate rate, TPS, transactions/block and end-to-end elapsed time. "
+                   "Rates use at least **1m** with the configured **15s** scrape interval, including when 10s is selected. "
+                   "Recent-range links show only retained history; they do not extend retention."}})
+y = 4
 up = metric("up")
 for index, (label, expression, unit) in enumerate([
         ("Targets up", "sum(" + up + ")", "short"),
@@ -5006,21 +5032,136 @@ row("Scrape health")
 pair(dict(title="Scrape duration", expressions=[metric("scrape_duration_seconds")], unit="s"),
      dict(title="Scraped samples", expressions=[metric("scrape_samples_scraped")]))
 
+# These counters describe collator candidates, unlike session-stats' correlation
+# with accepted blocks. Retain the exporter identity instead of summing nodes.
+chain_filter = 'chain=~"${chain:regex}"'
+first_filter = 'first=~"${first:regex}"'
+dimensions = "job,instance,chain"
+legend = "{{instance}} {{chain}}"
+all_positions = "All leader-window positions; this metric has no first-block split. "
+candidate_note = "Successful final collated candidates, which may differ from accepted on-chain blocks. "
+
+def window_rate(name, extra="", group=dimensions):
+    labels = chain_filter + ("," + extra if extra else "")
+    series = metric(name, labels)
+    # Range selectors require a literal after Grafana interpolation. A 10s range
+    # cannot contain two 15s scrapes; use four scrapes as the minimum rate window.
+    value = ("((rate(" + series + "[${window}s]) and on() (vector(${window}) >= 60)) or "
+             "(rate(" + series + "[1m]) and on() (vector(${window}) < 60)))")
+    return "sum by (" + group + ") (" + value + ")"
+
+def successful_blocks(*, first=False, operation="collate"):
+    return window_rate("ton_collated_blocks_total" if operation == "collate" else "ton_validated_blocks_total",
+                       'result="ok"' + ("," + first_filter if first else ""))
+
+def per_block(name, *, first=False, extra="", axis="", operation="collate"):
+    labels = extra + ("," if extra and first else "") + (first_filter if first else "")
+    numerator = window_rate(name, labels, dimensions + ("," + axis if axis else ""))
+    matching = " on (" + dimensions + ") group_left()" if axis else ""
+    return numerator + " /" + matching + " (" + successful_blocks(first=first, operation=operation) + " > 0)"
+
+def stats_panel(title, expression, unit="short", description="", axis=""):
+    return dict(title=title, expressions=[(expression, legend + (" {{" + axis + "}}" if axis else ""))],
+                unit=unit, description=description, interval="15s")
+
+with collapsed_section("Block production and workload"):
+    pair(stats_panel("Successful collated candidates/s", successful_blocks(first=True), "ops",
+                     candidate_note + "Uses the selected leader-window position."),
+         stats_panel("Candidate TPS", window_rate("ton_collation_transactions_total", first_filter), "tps",
+                     candidate_note + "Transactions/s per node, not LiteServer TPS. Uses the selected leader-window position."))
+    pair(stats_panel("Mean serialized block size", per_block("ton_collation_block_bytes_total"), "bytes",
+                     candidate_note + all_positions),
+         stats_panel("Mean collated data size", per_block("ton_collation_collated_data_bytes_total"), "bytes",
+                     candidate_note + all_positions))
+    pair(stats_panel("Mean gas per block", per_block("ton_collation_gas_total"), description=candidate_note + all_positions),
+         stats_panel("Mean transactions per block", per_block("ton_collation_transactions_total", first=True),
+                     description=candidate_note + "Uses the selected leader-window position."))
+    pair(stats_panel("External messages offered per block", per_block("ton_collation_ext_messages_offered_total"),
+                     description="External messages offered to successful final collation attempts. " + all_positions),
+         stats_panel("External message outcomes per block", per_block("ton_collation_ext_messages_total",
+                     extra='result="ok"', axis="outcome"), axis="outcome",
+                     description="Outcomes in completed candidates; included does not prove on-chain execution. " + all_positions))
+
+with collapsed_section("Message queues and overload"):
+    pair(stats_panel("Latest outbound queue size", metric("ton_collation_out_queue_size", chain_filter),
+                     description="Last successful collation on each chain. On a multi-shard collator this is whichever "
+                                 "shard finished last, not a complete inventory of shard queues. " + all_positions),
+         stats_panel("Outbound queue cleaned per block", per_block("ton_collation_out_queue_cleaned_total"),
+                     description="Already-delivered outbound messages removed during budgeted cleanup. " + all_positions))
+    pair(stats_panel("Inbound queue processed per block", per_block("ton_collation_out_queue_processed_total"),
+                     description="Inbound internal messages imported from neighboring outbound queues. " + all_positions),
+         stats_panel("Inbound queue skipped per block", per_block("ton_collation_out_queue_skipped_total"),
+                     description="Inbound messages skipped as already processed; not the outbound cleanup tally. " + all_positions))
+    pair(stats_panel("Overload causes", "100 * " + per_block("ton_collation_overload_total", axis="reason"), "percent",
+                     "Percentage of successful collated candidates contributing an overload-history bit, by selected cause. " +
+                     all_positions, axis="reason"),
+         stats_panel("Blocks requesting shard split", "100 * " + per_block("ton_collation_want_split_total"), "percent",
+                     "Percentage of successful candidates setting want_split, based on weighted overload history. " + all_positions))
+
+with collapsed_section("Collation and validation time"):
+    pair(stats_panel("Mean end-to-end collation elapsed time", per_block("ton_collation_elapsed_seconds_total", first=True), "s",
+                     "Successful final attempts; includes waiting. Uses the selected leader-window position."),
+         stats_panel("Mean end-to-end validation elapsed time", per_block("ton_block_processing_seconds_total",
+                     extra='operation="validate",result="ok",phase="total",clock="elapsed"', operation="validate"), "s",
+                     "Mean total elapsed time per successful validation, including waiting. " + all_positions))
+    for operation, label in (("collate", "collation"), ("validate", "validation")):
+        pair(*[stats_panel("Mean " + label + " " + clock + " time", per_block("ton_block_processing_seconds_total",
+                           extra='operation="' + operation + '",result="ok",phase="total",clock="' + clock + '"',
+                           operation=operation), "s",
+                           "Instrumented total " + clock + " time per successful " + label + ". " + all_positions)
+               for clock in ("real", "cpu")])
+
+with collapsed_section("Storage-stat cache"):
+    pair(stats_panel("Storage-stat lookups per block", per_block("ton_collation_storage_cache_lookups_total", axis="outcome"),
+                     description="Storage-dict lookups by cache outcome. Small accounts are not eligible for caching. " +
+                     all_positions, axis="outcome"),
+         stats_panel("Storage-stat cells per block", per_block("ton_collation_storage_cache_cells_total", axis="outcome"),
+                     description="Account cells behind lookups by cache outcome; hit cells represent avoided work. " +
+                     all_positions, axis="outcome"))
+    pair(stats_panel("Storage-stat eligible lookup hit rate", "100 * " +
+                     window_rate("ton_collation_storage_cache_lookups_total", 'outcome="hit"') + " / (" +
+                     window_rate("ton_collation_storage_cache_lookups_total", 'outcome=~"hit|miss"') + " > 0)", "percent",
+                     "Hits / (hits + misses). Small accounts are excluded because they are never cached. " + all_positions),
+         stats_panel("Storage-stat lookups/s", window_rate("ton_collation_storage_cache_lookups_total",
+                     group=dimensions + ",outcome"), "ops", "Lookups by hit, miss or small outcome. " + all_positions, axis="outcome"))
+
 def query_variable(name, label, query):
     return {"name": name, "label": label, "type": "query", "datasource": source,
             "query": query, "definition": query, "refresh": 1, "sort": 1, "multi": True,
             "includeAll": True, "allValue": "ton-exporter-.*" if name == "job" else ".*",
             "current": {"text": "All", "value": "$__all"}}
 
+def custom_variable(name, label, choices, *, all_value=None, default=None):
+    options = [{"text": text, "value": value, "selected": value == default} for text, value in choices]
+    if all_value is not None:
+        options.insert(0, {"text": "All", "value": "$__all", "selected": True})
+        current = {"text": "All", "value": "$__all"}
+    else:
+        current = next(option.copy() for option in options if option["selected"])
+    return {"name": name, "label": label, "type": "custom", "multi": False,
+            "includeAll": all_value is not None, "allValue": all_value,
+            "query": ",".join(text + " : " + value for text, value in choices),
+            "options": options, "current": current}
+
 dashboard = {"uid": uid, "title": dashboard_title, "tags": ["kubeton", "ton", "exporter"],
-             "timezone": "browser", "schemaVersion": 39, "version": 2, "refresh": "15s", "editable": True,
+             "timezone": "browser", "schemaVersion": 39, "version": 3, "refresh": "15s", "editable": True,
              "time": {"from": "now-1h", "to": "now"}, "panels": panels,
+             "links": [{"title": duration, "type": "link", "url": "/d/" + uid + "?from=now-" + duration + "&to=now",
+                        "includeVars": True, "keepTime": False, "targetBlank": False}
+                       for duration in ("1h", "2h", "6h", "1d", "1w", "30d", "90d", "180d", "365d")],
+             "annotations": {"list": [{"name": "Test runs", "enable": True, "hide": False,
+                 "iconColor": "rgba(255, 170, 0, 1)", "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+                 "target": {"limit": 100, "matchAny": False, "tags": ["ton-run"], "type": "tags"}}]},
              "templating": {"list": [
                  {"name": "datasource", "label": "Prometheus", "type": "datasource", "query": "prometheus",
                   "regex": "/^kubeton-prometheus-/", "refresh": 1,
                   "current": {"text": datasource_name, "value": datasource_uid}},
                  query_variable("job", "TON job", 'label_values(up{job=~"ton-exporter-.*"}, job)'),
-                 query_variable("instance", "Node target", 'label_values(up{job=~"${job:regex}"}, instance)')]}}
+                 query_variable("instance", "Node target", 'label_values(up{job=~"${job:regex}"}, instance)'),
+                 custom_variable("chain", "Chain", [("Masterchain", "master"), ("Shards", "shard")], all_value="master|shard"),
+                 custom_variable("first", "Leader-window position", [("First", "1"), ("Later / unspecified", "0")], all_value="0|1"),
+                 custom_variable("window", "Window size", [("10s", "10"), ("1m", "60"), ("5m", "300"),
+                                                         ("15m", "900"), ("1h", "3600")], default="60")]}}
 json.dump(dashboard, sys.stdout, indent=2)
 print()
 PY

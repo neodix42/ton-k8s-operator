@@ -9,6 +9,7 @@ import shlex
 import sys
 import threading
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 sys.dont_write_bytecode = True
 import kubeton_dashboard_auth_test as auth
@@ -73,6 +74,24 @@ class GrafanaDashboardTest(unittest.TestCase):
             "build_grafana_ton_overview_dashboard_json "
             "kubeton-prometheus-fixture-ns-kubeton-prometheus-tonnode\n"))
 
+    @classmethod
+    def all_panels(cls, dashboard):
+        """Collapsed Grafana rows store their queries in nested panels."""
+        for panel in dashboard.get("panels", []):
+            yield panel
+            yield from cls.all_panels(panel)
+
+    @classmethod
+    def all_targets(cls, dashboard):
+        return [target for panel in cls.all_panels(dashboard)
+                for target in panel.get("targets", [])]
+
+    @staticmethod
+    def metric_selectors(expression):
+        # Grafana template interpolation braces are not PromQL selector braces.
+        untemplated = re.sub(r"\$\{[^}]+\}", "TEMPLATE", expression)
+        return re.findall(r"\b(ton_[a-zA-Z0-9_]+)\{([^}]*)\}", untemplated)
+
     @staticmethod
     def parse_datasources(document):
         result = []
@@ -117,7 +136,7 @@ class GrafanaDashboardTest(unittest.TestCase):
         self.assertEqual(dashboard["title"], title)
         self.assertEqual(dashboard["uid"], "kubeton-ton-overview")
         self.assertTrue(dashboard["refresh"], "fleet status should refresh automatically")
-        panels = dashboard["panels"]
+        panels = list(self.all_panels(dashboard))
         self.assertGreater(len(panels), 3,
                            "the old starter dashboard only described Prometheus scraping")
         panel_ids = [panel["id"] for panel in panels]
@@ -141,7 +160,7 @@ class GrafanaDashboardTest(unittest.TestCase):
                          "Grafana's datasource dropdown requires its provisioned UID")
         variable_name = datasource["name"]
         variable_refs = {"$" + variable_name, "${" + variable_name + "}"}
-        for panel in dashboard["panels"]:
+        for panel in self.all_panels(dashboard):
             if not panel.get("targets"):
                 continue
             self.assertEqual(panel["datasource"]["type"], "prometheus")
@@ -164,7 +183,7 @@ class GrafanaDashboardTest(unittest.TestCase):
                           "All TON jobs must not include Prometheus or other exporters")
         instance_query = json.dumps(variables["instance"]["query"])
         self.assertIn("${job:regex}", instance_query)
-        for panel in dashboard["panels"]:
+        for panel in self.all_panels(dashboard):
             for target in panel.get("targets", []):
                 expression = target["expr"]
                 self.assertIn('${job:regex}', expression,
@@ -182,8 +201,7 @@ class GrafanaDashboardTest(unittest.TestCase):
 
     def test_native_ton_queries_cover_sync_and_node_activity(self):
         # Families verified in TON v2026.10/metrics/METRICS.md, the shipped image.
-        targets = [target for panel in self.dashboard()["panels"]
-                   for target in panel.get("targets", [])]
+        targets = self.all_targets(self.dashboard())
         expressions = [target["expr"] for target in targets]
         combined = "\n".join(expressions)
         for metric in ("ton_masterchain_seqno", "ton_masterchain_block_age_seconds",
@@ -194,9 +212,235 @@ class GrafanaDashboardTest(unittest.TestCase):
         for expression in expressions:
             if "_total" in expression or "_bucket" in expression:
                 self.assertIn("rate(", expression, "cumulative counters should be shown as rates")
-                self.assertIn("$__rate_interval", expression)
+                if "$__rate_interval" not in expression:
+                    self.assertIn("[${window}s]", expression)
+                    self.assertIn("[1m]", expression,
+                                  "10s windows cannot estimate a rate with 15s scrapes")
+                    compact = re.sub(r"\s+", "", expression)
+                    self.assertIn("vector(${window})>=60", compact)
+                    self.assertIn("vector(${window})<60", compact)
         self.assertNotRegex(combined, r"ton_(?:celldb|archive_db|memory|filesystem)_",
                             "the native TON exporter does not expose OS or database-size families")
+
+    def test_requested_recent_ranges_keep_dashboard_filters(self):
+        dashboard = self.dashboard()
+        links = {link["title"]: link for link in dashboard.get("links", [])}
+        for duration in ("1h", "2h", "6h", "1d", "1w", "30d", "90d", "180d", "365d"):
+            with self.subTest(duration=duration):
+                self.assertIn(duration, links, "requested recent range is missing")
+                link = links[duration]
+                query = parse_qs(urlsplit(link["url"]).query)
+                self.assertEqual(query.get("from"), ["now-" + duration])
+                self.assertEqual(query.get("to"), ["now"])
+                self.assertTrue(link.get("includeVars"),
+                                "changing the range must preserve the selected nodes and datasource")
+
+    def test_recent_range_links_follow_a_custom_dashboard_uid(self):
+        self.fixture.env["GRAFANA_DASHBOARD_UID"] = "custom-ton-fleet"
+        dashboard = self.dashboard()
+        self.assertTrue(dashboard["links"])
+        for link in dashboard["links"]:
+            self.assertEqual(urlsplit(link["url"]).path, "/d/custom-ton-fleet",
+                             "changing the range must not navigate to an unprovisioned default UID")
+            self.assertFalse(link.get("keepTime", False),
+                             "the old time range must not override the clicked recent range")
+
+    def test_window_choices_use_safe_scrape_ranges(self):
+        dashboard = self.dashboard()
+        variables = {variable["name"]: variable for variable in dashboard["templating"]["list"]}
+        window = variables["window"]
+        self.assertEqual(window["type"], "custom")
+        self.assertEqual(window["label"], "Window size")
+        self.assertFalse(window.get("multi", False))
+        self.assertEqual(str(window["current"]["value"]), "60")
+        choices = {option["text"]: str(option["value"]) for option in window["options"]}
+        self.assertEqual(choices, {"10s": "10", "1m": "60", "5m": "300",
+                                   "15m": "900", "1h": "3600"})
+        session_targets = [target for target in self.all_targets(dashboard)
+                           if "[${window}s]" in target["expr"]]
+        self.assertTrue(session_targets, "Window size must actually change the new statistics queries")
+        for target in session_targets:
+            self.assertEqual(target.get("interval"), "15s",
+                             "a selected 10s window must not lower the actual 15s scrape minimum")
+            compact = re.sub(r"\s+", "", target["expr"])
+            self.assertIn("[1m]", compact)
+            self.assertIn("vector(${window})>=60", compact)
+            self.assertIn("vector(${window})<60", compact)
+
+    def test_native_session_workload_queue_and_cache_metrics_are_available(self):
+        dashboard = self.dashboard()
+        panels = list(self.all_panels(dashboard))
+        rows = {panel["title"] for panel in panels if panel["type"] == "row"}
+        self.assertTrue({"Block production and workload", "Message queues and overload",
+                         "Collation and validation time", "Storage-stat cache"} <= rows)
+        expressions = "\n".join(target["expr"] for target in self.all_targets(dashboard))
+        for family in ("ton_collated_blocks_total", "ton_collation_transactions_total",
+                       "ton_collation_gas_total", "ton_collation_block_bytes_total",
+                       "ton_collation_collated_data_bytes_total", "ton_collation_ext_messages_offered_total",
+                       "ton_collation_out_queue_size", "ton_collation_out_queue_cleaned_total",
+                       "ton_collation_out_queue_processed_total", "ton_collation_out_queue_skipped_total",
+                       "ton_collation_want_split_total", "ton_collation_overload_total",
+                       "ton_collation_storage_cache_lookups_total", "ton_collation_storage_cache_cells_total",
+                       "ton_collation_elapsed_seconds_total", "ton_block_processing_seconds_total"):
+            with self.subTest(family=family):
+                self.assertIn(family + "{", expressions)
+        self.assertNotRegex(expressions, r"ton_(?:liteserver_tps|session_tps|test_runs|load_fraction|.*_estimate)(?:_|\{)")
+        for panel in panels:
+            if panel.get("targets"):
+                self.assertNotIn("LiteServer", panel["title"],
+                                 "native collator measurements are not LiteServer chain statistics")
+                self.assertNotRegex(panel["title"].lower(), r"(?:test runs|size estimate|load fractions)")
+                self.assertNotIn("or vector(0)", " ".join(target["expr"] for target in panel["targets"]),
+                                 "an absent exporter family must remain No data")
+
+    def test_first_slot_filters_only_apply_to_supported_metric_families(self):
+        dashboard = self.dashboard()
+        variables = {variable["name"]: variable for variable in dashboard["templating"]["list"]}
+        self.assertFalse(variables["chain"].get("multi", False))
+        self.assertFalse(variables["first"].get("multi", False))
+        for name, all_value, choices in (("chain", "master|shard", {"master", "shard"}),
+                                          ("first", "0|1", {"0", "1"})):
+            variable = variables[name]
+            self.assertTrue(variable["includeAll"])
+            self.assertEqual(variable["allValue"], all_value,
+                             "All must use Grafana's unescaped regex override")
+            self.assertEqual({str(option["value"]) for option in variable["options"]}
+                             - {"$__all"}, choices)
+            self.assertEqual(variable["current"]["value"], "$__all")
+        allowed = {"ton_collated_blocks_total", "ton_collation_transactions_total",
+                   "ton_collation_elapsed_seconds_total"}
+        filtered = set()
+        for target in self.all_targets(dashboard):
+            expression = target["expr"]
+            selectors = self.metric_selectors(expression)
+            for family, labels in selectors:
+                if re.search(r"(?:^|,)\s*first\s*=", labels):
+                    self.assertIn(family, allowed,
+                                  f"{family} does not expose a first-in-window label")
+                    filtered.add(family)
+            if "/" in expression and any(family in {"ton_collation_transactions_total",
+                                                      "ton_collation_elapsed_seconds_total"}
+                                         for family, _labels in selectors):
+                first_filters = {re.search(r'first\s*=~?\s*"[^"]*"', labels)[0]
+                                 for family, labels in selectors if family in allowed
+                                 and re.search(r'first\s*=~?\s*"[^"]*"', labels)}
+                self.assertEqual(len(first_filters), 1,
+                                 "per-block numerator and denominator must select the same window population")
+                for family, labels in selectors:
+                    if family in allowed:
+                        self.assertRegex(labels, r'first\s*=~?\s*"',
+                                         "a filtered numerator cannot be divided by all blocks")
+        self.assertEqual(filtered, allowed)
+
+    def test_workload_averages_use_successful_blocks_without_first_filter_leakage(self):
+        unsplit = {"ton_collation_gas_total", "ton_collation_block_bytes_total",
+                   "ton_collation_collated_data_bytes_total", "ton_collation_ext_messages_offered_total",
+                   "ton_collation_out_queue_cleaned_total", "ton_collation_out_queue_processed_total",
+                   "ton_collation_out_queue_skipped_total"}
+        checked = set()
+        for target in self.all_targets(self.dashboard()):
+            selectors = self.metric_selectors(target["expr"])
+            families = {family for family, _labels in selectors}
+            if not (families & unsplit) or "ton_collated_blocks_total" not in families:
+                continue
+            checked.update(families & unsplit)
+            for family, labels in selectors:
+                self.assertNotRegex(labels, r"(?:^|,)\s*first\s*=",
+                                    "unsplit workload must use an unsplit block denominator")
+                if family == "ton_collated_blocks_total":
+                    self.assertIn('result="ok"', labels,
+                                  "workload counters count only successful final candidates")
+            self.assertNotIn("clamp_min", target["expr"],
+                             "clamping the block rate to 1 distorts per-block averages at low activity")
+        self.assertEqual(checked, unsplit)
+
+    def test_per_block_charts_omit_zero_activity_instead_of_dividing_by_zero(self):
+        checked = 0
+        for target in self.all_targets(self.dashboard()):
+            expression = target["expr"]
+            if "[${window}s]" not in expression or "/" not in expression:
+                continue
+            selectors = self.metric_selectors(expression)
+            if not any(family in {"ton_collated_blocks_total", "ton_validated_blocks_total"}
+                       for family, _labels in selectors):
+                continue
+            checked += 1
+            self.assertRegex(expression, r">\s*0\s*\)\s*$",
+                             "a validator with no successful blocks must produce No data, not infinity")
+        self.assertGreater(checked, 10, "block-normalized workload and timing charts are missing")
+
+    def test_axis_ratios_disambiguate_group_left_from_the_denominator(self):
+        # Without the explicit (), Prometheus parses the following parenthesized
+        # denominator as group_left's label list and rejects the expression.
+        axis_metrics = {"ton_collation_overload_total", "ton_collation_ext_messages_total",
+                        "ton_collation_storage_cache_lookups_total",
+                        "ton_collation_storage_cache_cells_total"}
+        checked = set()
+        for target in self.all_targets(self.dashboard()):
+            expression = target["expr"]
+            families = {family for family, _labels in self.metric_selectors(expression)}
+            if "ton_collated_blocks_total" not in families or not (families & axis_metrics):
+                continue
+            checked.update(families & axis_metrics)
+            self.assertRegex(expression, r"\bgroup_left\s*\(\s*\)\s*\(",
+                             "per-outcome/reason ratios need an explicit empty group_left label list")
+        self.assertEqual(checked, axis_metrics)
+
+    def test_cache_hit_rate_excludes_small_uncacheable_accounts(self):
+        panels = {panel["title"]: panel for panel in self.all_panels(self.dashboard())}
+        target = panels["Storage-stat eligible lookup hit rate"]["targets"][0]
+        selectors = self.metric_selectors(target["expr"])
+        outcomes = {re.search(r'outcome\s*=~?\s*"([^"]+)"', labels)[1]
+                    for family, labels in selectors
+                    if family == "ton_collation_storage_cache_lookups_total"}
+        self.assertEqual(outcomes, {"hit", "hit|miss"},
+                         "small accounts are never cached and must not lower eligible cache effectiveness")
+        self.assertRegex(target["expr"], r">\s*0\s*\)\s*$")
+
+    def test_test_runs_are_real_tagged_grafana_annotations(self):
+        annotations = self.dashboard()["annotations"]["list"]
+        test_runs = next(annotation for annotation in annotations if annotation["name"] == "Test runs")
+        self.assertTrue(test_runs["enable"])
+        self.assertEqual(test_runs["datasource"]["type"], "grafana")
+        self.assertEqual(test_runs["target"]["type"], "tags")
+        self.assertEqual(test_runs["target"]["tags"], ["ton-run"],
+                         "test markers must come from explicitly recorded runs")
+
+    def test_timing_charts_use_actual_operation_clocks(self):
+        clocks = set()
+        for target in self.all_targets(self.dashboard()):
+            for family, labels in self.metric_selectors(target["expr"]):
+                if family != "ton_block_processing_seconds_total":
+                    continue
+                self.assertIn('phase="total"', labels)
+                self.assertIn('result="ok"', labels)
+                self.assertNotIn("first=", labels,
+                                 "timing counters have no first-in-window axis")
+                operation = re.search(r'operation="([^"]+)"', labels)
+                clock = re.search(r'clock="([^"]+)"', labels)
+                self.assertIsNotNone(operation)
+                self.assertIsNotNone(clock)
+                clocks.add((operation[1], clock[1]))
+        self.assertTrue({("collate", "real"), ("collate", "cpu"),
+                         ("validate", "real"), ("validate", "cpu")} <= clocks)
+
+    def test_collated_tps_is_per_node_and_out_queue_is_not_claimed_per_shard(self):
+        for panel in self.all_panels(self.dashboard()):
+            for target in panel.get("targets", []):
+                expression = target["expr"]
+                if "ton_collation_transactions_total{" in expression:
+                    groups = re.findall(r"\bsum\s+by\s*\(([^)]*)\)", expression)
+                    self.assertTrue(groups)
+                    self.assertTrue(all("instance" in {label.strip() for label in group.split(",")}
+                                        for group in groups),
+                                    "candidate transaction curves must retain node identity")
+                if "ton_collation_out_queue_size{" in expression:
+                    self.assertNotIn("per shard", panel["title"].lower())
+                    self.assertNotIn("{{shard}}", target.get("legendFormat", ""))
+                    for family, labels in self.metric_selectors(expression):
+                        if family == "ton_collation_out_queue_size":
+                            self.assertNotRegex(labels, r"(?:^|,)\s*shard\s*=",
+                                                "queue gauge is last collation per chain, not per shard")
 
     def test_default_home_and_provider_resolve_to_the_mounted_dashboard(self):
         row = "fixture-ns\tkubeton-prometheus-tonnode\tdeployment\t9777"
