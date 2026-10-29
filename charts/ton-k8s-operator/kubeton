@@ -4787,6 +4787,7 @@ build_grafana_datasources_yaml() {
       is_default="true"
     fi
     echo "  - name: $(yaml_quote "$datasource_name")"
+    echo "    uid: $(yaml_quote "$(grafana_datasource_uid_for_name "$datasource_name")")"
     echo "    type: prometheus"
     echo "    access: proxy"
     echo "    url: $(yaml_quote "$url")"
@@ -4796,6 +4797,8 @@ build_grafana_datasources_yaml() {
     echo "      basicAuthPassword: $(yaml_quote "$admin_password")"
     echo "    isDefault: ${is_default}"
     echo "    editable: false"
+    echo "    jsonData:"
+    echo "      timeInterval: 15s"
     ((index+=1))
   done
 }
@@ -4807,6 +4810,50 @@ grafana_datasource_name_for_service() {
   ns="$(trim_whitespace "$ns")"
   service_name="$(trim_whitespace "$service_name")"
   printf '%s' "kubeton-prometheus-${ns}-${service_name}"
+}
+
+grafana_datasource_uid_for_name() {
+  # Match Grafana 11's implicit provisioning UID so existing data sources and
+  # user-created dashboards keep the same identity when this field is added.
+  printf '%s' "$1" | python3 -c 'import hashlib,sys; print("P" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16].upper())'
+}
+
+grafana_dashboard_uid() {
+  local uid
+  uid="$(trim_whitespace "${GRAFANA_DASHBOARD_UID:-kubeton-ton-overview}")"
+  [[ -n "$uid" ]] || uid=kubeton-ton-overview
+  if ! [[ "$uid" =~ ^[A-Za-z0-9_-]{1,40}$ ]]; then
+    echo "Error: GRAFANA_DASHBOARD_UID must contain 1-40 letters, digits, underscores or hyphens." >&2
+    return 1
+  fi
+  printf '%s' "$uid"
+}
+
+wait_grafana_dashboard_ready() {
+  local local_port="$1" verify_seconds="$2" username="$3" password="$4" uid="$5"
+  local host="${6:-127.0.0.1}" authorization response deadline
+  [[ "$uid" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || return 1
+  [[ "$verify_seconds" =~ ^[0-9]+$ ]] || verify_seconds=20
+  [[ "$host" != *:* || "$host" == \[*\] ]] || host="[$host]"
+  authorization="$(printf '%s:%s' "$username" "$password" | base64 | tr -d '\r\n')" || return 1
+  deadline=$(( $(date +%s) + verify_seconds ))
+  while :; do
+    response="$(printf 'Authorization: Basic %s\n' "$authorization" | \
+      curl --disable --noproxy '*' -fsS --max-time 3 --header @- \
+        "http://${host}:${local_port}/api/dashboards/uid/${uid}" 2>/dev/null || true)"
+    if printf '%s' "$response" | python3 -c '
+import json,sys
+try:
+    dashboard = json.load(sys.stdin)["dashboard"]
+    sys.exit(not (dashboard.get("uid") == sys.argv[1] and dashboard.get("panels")))
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)
+' "$uid"; then
+      return 0
+    fi
+    (( $(date +%s) < deadline )) || return 1
+    sleep 1
+  done
 }
 
 first_grafana_datasource_name_from_prometheus_rows() {
@@ -4842,88 +4889,141 @@ EOF
 
 build_grafana_ton_overview_dashboard_json() {
   local datasource_name="$1"
-  local dashboard_uid dashboard_title
+  local dashboard_uid dashboard_title datasource_uid
 
-  dashboard_uid="$(trim_whitespace "${GRAFANA_DASHBOARD_UID:-kubeton-ton-overview}")"
+  dashboard_uid="$(grafana_dashboard_uid)" || return 1
   dashboard_title="$(trim_whitespace "${GRAFANA_DASHBOARD_TITLE:-TON Exporter Overview}")"
-  [[ -z "$dashboard_uid" ]] && dashboard_uid="kubeton-ton-overview"
   [[ -z "$dashboard_title" ]] && dashboard_title="TON Exporter Overview"
+  datasource_uid="$(grafana_datasource_uid_for_name "$datasource_name")" || return 1
 
-  cat <<EOF
-{
-  "uid": $(json_quote "$dashboard_uid"),
-  "title": $(json_quote "$dashboard_title"),
-  "tags": ["kubeton", "ton", "exporter"],
-  "timezone": "browser",
-  "schemaVersion": 39,
-  "version": 1,
-  "refresh": "10s",
-  "editable": true,
-  "time": {
-    "from": "now-30m",
-    "to": "now"
-  },
-  "panels": [
-    {
-      "type": "timeseries",
-      "title": "Exporter Up",
-      "datasource": $(json_quote "$datasource_name"),
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "up{job=~\"ton-exporter-.*\"}",
-          "legendFormat": "{{instance}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Scrape Duration (s)",
-      "datasource": $(json_quote "$datasource_name"),
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "scrape_duration_seconds{job=~\"ton-exporter-.*\"}",
-          "legendFormat": "{{instance}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Samples Scraped",
-      "datasource": $(json_quote "$datasource_name"),
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "scrape_samples_scraped{job=~\"ton-exporter-.*\"}",
-          "legendFormat": "{{instance}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      }
-    }
-  ]
-}
-EOF
+  # Raw metric names and units follow TON v2026.10 metrics/METRICS.md. Keep the
+  # dashboard self-contained: no recording rules or additional exporters needed.
+  python3 - "$dashboard_uid" "$dashboard_title" "$datasource_name" "$datasource_uid" <<'PY'
+import json
+import sys
+
+uid, dashboard_title, datasource_name, datasource_uid = sys.argv[1:]
+source = {"type": "prometheus", "uid": "${datasource}"}
+selector = 'job=~"${job:regex}",instance=~"${instance:regex}"'
+panels = []
+y = 0
+
+def metric(name, extra=""):
+    return name + "{" + selector + ("," + extra if extra else "") + "}"
+
+def rate(name, group="job,instance", extra=""):
+    return "sum by (" + group + ") (rate(" + metric(name, extra) + "[$__rate_interval]))"
+
+def panel(title, expressions, unit="short", *, kind="timeseries", x=0, width=12, height=8, description=""):
+    targets = []
+    for index, expression in enumerate(expressions):
+        expr, legend = expression if isinstance(expression, tuple) else (expression, "{{instance}}")
+        targets.append({"refId": chr(65 + index), "expr": expr, "legendFormat": legend,
+                        "datasource": source, "range": kind != "stat", "instant": kind == "stat"})
+    options = ({"reduceOptions": {"calcs": ["lastNotNull"], "values": False},
+                "colorMode": "value", "graphMode": "none", "textMode": "auto"}
+               if kind == "stat" else {"legend": {"displayMode": "list", "placement": "bottom"},
+                                       "tooltip": {"mode": "multi", "sort": "desc"}})
+    panels.append({"id": len(panels) + 1, "type": kind, "title": title, "description": description,
+                   "datasource": source, "gridPos": {"x": x, "y": y, "w": width, "h": height},
+                   "targets": targets, "fieldConfig": {"defaults": {"unit": unit, "noValue": "No data"},
+                                                         "overrides": []}, "options": options})
+
+def row(title):
+    global y
+    panels.append({"id": len(panels) + 1, "type": "row", "title": title, "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+def pair(left, right):
+    global y
+    panel(**left)
+    panel(**right, x=12)
+    y += 8
+
+panels.append({"id": 1, "type": "text", "title": "TON fleet overview",
+               "gridPos": {"x": 0, "y": 0, "w": 24, "h": 3},
+               "options": {"mode": "markdown", "content":
+                   "Select **Prometheus**, **TON job** and **Node target** above. "
+                   "Synchronization metrics appear after node initialization; validator groups and "
+                   "timing histograms appear when the node participates. Rate charts need a few scrapes. "
+                   "**No data** means that the exporter has not reported that series."}})
+y = 3
+up = metric("up")
+for index, (label, expression, unit) in enumerate([
+        ("Targets up", "sum(" + up + ")", "short"),
+        ("Targets down", "count(" + up + ") - sum(" + up + ")", "short"),
+        ("Oldest masterchain block", "max(" + metric("ton_masterchain_block_age_seconds") + ")", "s"),
+        ("Largest shard lag", "max(clamp_min(" + metric("ton_masterchain_seqno") + " - " +
+         metric("ton_shardclient_seqno") + ", 0))", "short")]):
+    panel(label, [expression], unit, kind="stat", x=index * 6, width=6, height=4)
+y += 4
+
+row("Synchronization")
+pair(dict(title="Masterchain sequence number", expressions=[metric("ton_masterchain_seqno")]),
+     dict(title="Masterchain block age", expressions=[metric("ton_masterchain_block_age_seconds")], unit="s"))
+pair(dict(title="Shard processing lag", expressions=["clamp_min(" + metric("ton_masterchain_seqno") + " - " +
+                                                    metric("ton_shardclient_seqno") + ", 0)"]),
+     dict(title="Active shards", expressions=[metric("ton_active_shards")]))
+
+row("Validator activity")
+pair(dict(title="Validator groups", expressions=[(metric("ton_validator_groups"), "{{instance}} {{chain}}")]),
+     dict(title="External messages in mempool", expressions=[("sum by (job,instance,state) (" +
+          metric("ton_mempool_ext_messages") + ")", "{{instance}} {{state}}")]))
+pair(dict(title="Collation rate", expressions=[(rate("ton_collated_blocks_total", "job,instance,chain,result"),
+                                                "{{instance}} {{chain}} {{result}}")], unit="ops"),
+     dict(title="Validation rate", expressions=[(rate("ton_validated_blocks_total", "job,instance,chain,result"),
+                                                 "{{instance}} {{chain}} {{result}}")], unit="ops"))
+processing = []
+for operation in ("collate", "validate"):
+    expression = ('histogram_quantile(0.95, sum by (job,instance,chain,le) (rate(' + metric(
+        "ton_block_processing_duration_seconds_bucket", 'operation="' + operation + '",clock="elapsed",result="ok"') +
+        '[$__rate_interval])))')
+    processing.append((expression, "{{instance}} {{chain}} " + operation))
+pair(dict(title="Successful block processing p95", expressions=processing, unit="s"),
+     dict(title="Longest actor dispatch", expressions=["max by (job,instance) (" +
+          metric("ton_actor_scheduler_current_execute_seconds") + ")"], unit="s"))
+
+row("Networking")
+for family, title in (("bytes", "throughput"), ("packets", "datagrams")):
+    pair(*[dict(title=protocol.upper() + " " + title,
+                expressions=[(rate("ton_" + protocol + "_wire_" + family + "_total", "job,instance,direction"),
+                              "{{instance}} {{direction}}")], unit="Bps" if family == "bytes" else "pps")
+           for protocol in ("adnl", "quic")])
+workers = []
+for worker in ("cpu", "io"):
+    workers.append(("100 * " + rate("ton_actor_worker_busy_ticks_total", extra='worker="' + worker + '"') +
+                    " / max by (job,instance) (" + metric("ton_actor_ticks_per_second") + ") / " +
+                    "sum by (job,instance) (" + metric("ton_actor_worker_threads", 'worker="' + worker + '"') + ")",
+                    "{{instance}} " + worker.upper()))
+pair(dict(title="UDP receive queue drops", expressions=[(rate("ton_" + protocol + "_wire_dropped_total",
+          extra='direction="in",reason="limited"'), "{{instance}} " + protocol.upper())
+          for protocol in ("adnl", "quic")], unit="pps"),
+     dict(title="Actor worker busy time", expressions=workers, unit="percent",
+          description="Busy fraction of TON CPU/IO scheduler workers, not host or process CPU utilization."))
+
+row("Scrape health")
+pair(dict(title="Scrape duration", expressions=[metric("scrape_duration_seconds")], unit="s"),
+     dict(title="Scraped samples", expressions=[metric("scrape_samples_scraped")]))
+
+def query_variable(name, label, query):
+    return {"name": name, "label": label, "type": "query", "datasource": source,
+            "query": query, "definition": query, "refresh": 1, "sort": 1, "multi": True,
+            "includeAll": True, "allValue": "ton-exporter-.*" if name == "job" else ".*",
+            "current": {"text": "All", "value": "$__all"}}
+
+dashboard = {"uid": uid, "title": dashboard_title, "tags": ["kubeton", "ton", "exporter"],
+             "timezone": "browser", "schemaVersion": 39, "version": 2, "refresh": "15s", "editable": True,
+             "time": {"from": "now-1h", "to": "now"}, "panels": panels,
+             "templating": {"list": [
+                 {"name": "datasource", "label": "Prometheus", "type": "datasource", "query": "prometheus",
+                  "regex": "/^kubeton-prometheus-/", "refresh": 1,
+                  "current": {"text": datasource_name, "value": datasource_uid}},
+                 query_variable("job", "TON job", 'label_values(up{job=~"ton-exporter-.*"}, job)'),
+                 query_variable("instance", "Node target", 'label_values(up{job=~"${job:regex}"}, instance)')]}}
+json.dump(dashboard, sys.stdout, indent=2)
+print()
+PY
 }
 
 ensure_grafana_stack() {
@@ -5037,6 +5137,8 @@ spec:
               value: "false"
             - name: GF_SERVER_HTTP_PORT
               value: $(yaml_quote "$GRAFANA_PORT")
+            - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
+              value: /var/lib/grafana/dashboards/kubeton/ton-overview.json
           ports:
             - name: http
               containerPort: ${GRAFANA_PORT}
@@ -20693,9 +20795,11 @@ run_grafana_start() {
   local grafana_row ns service_name deploy_name admin_user admin_password
   local -a forwarded_rows=()
   local forward_row log_file
-  local base_port local_port remote_port bind_address remote_access_host
+  local base_port local_port remote_port bind_address remote_access_host dashboard_uid dashboard_path probe_host
   local attempt quiet_attempt
 
+  dashboard_uid="$(grafana_dashboard_uid)" || return 1
+  dashboard_path="/d/${dashboard_uid}"
   cleanup_grafana_port_forwards
   configure_prometheus_for_exporter_targets prometheus_rows || true
   if [[ ${#prometheus_rows[@]} -eq 0 ]]; then
@@ -20715,7 +20819,7 @@ run_grafana_start() {
     echo "Error: failed to resolve default Grafana datasource name." >&2
     return 1
   fi
-  dashboard_json="$(build_grafana_ton_overview_dashboard_json "$default_datasource_name")"
+  dashboard_json="$(build_grafana_ton_overview_dashboard_json "$default_datasource_name")" || return 1
   if [[ -z "$dashboard_json" || "$dashboard_json" != *"\"panels\""* ]]; then
     echo "Error: failed to build Grafana dashboard JSON." >&2
     return 1
@@ -20761,8 +20865,18 @@ run_grafana_start() {
   fi
 
   IFS=$'\t' read -r ns service_name local_port _pid log_file <<<"${forwarded_rows[0]}"
+  probe_host=127.0.0.1
+  if ! address_list_allows_loopback "$bind_address"; then
+    probe_host="$(first_non_loopback_bind_address "$bind_address")" || return 1
+  fi
+  if ! wait_grafana_dashboard_ready "$local_port" "$GRAFANA_PORT_FORWARD_VERIFY_SECONDS" \
+      "$admin_user" "$admin_password" "$dashboard_uid" "$probe_host"; then
+    cleanup_grafana_port_forwards
+    echo "Error: the provisioned TON dashboard is not available in Grafana; check deployment ${ns}/${deploy_name} logs." >&2
+    return 1
+  fi
   if address_list_allows_loopback "$bind_address"; then
-    echo "[grafana] Background access: http://127.0.0.1:${local_port}/ (service ${ns}/${service_name})"
+    echo "[grafana] Background access: http://127.0.0.1:${local_port}${dashboard_path} (service ${ns}/${service_name})"
   fi
   if address_list_exposes_non_loopback "$bind_address"; then
     remote_access_host="$(first_non_loopback_bind_address "$bind_address" || true)"
@@ -20772,14 +20886,14 @@ run_grafana_start() {
       remote_access_host="$(trim_whitespace "$remote_access_host")"
     fi
     if [[ -n "$remote_access_host" ]]; then
-      echo "[grafana] Remote access: http://${remote_access_host}:${local_port}/"
+      echo "[grafana] Remote access: http://${remote_access_host}:${local_port}${dashboard_path}"
     fi
   fi
   echo "[grafana] Admin user: ${admin_user}"
   echo "[grafana] Admin password: ${admin_password}"
   echo "[grafana] Credentials Secret: ${ns}/${GRAFANA_ADMIN_SECRET_NAME}"
   echo "[grafana] Datasource: kubeton-managed Prometheus service(s) provisioned."
-  echo "[grafana] Dashboard: starter TON overview provisioned (folder: Kubeton)."
+  echo "[grafana] Dashboard: TON overview provisioned and set as the home dashboard (folder: Kubeton)."
   echo "[grafana] Port-forward log: ${log_file}"
   return 0
 }

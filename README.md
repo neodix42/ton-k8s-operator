@@ -1484,7 +1484,7 @@ Behavior:
 - ensures kubeton-managed Prometheus stack exists (from TonNode `CUSTOM_PARAMETERS --exporter-address`)
 - deploys `kubeton-grafana` (`grafana/grafana`)
 - provisions authenticated Prometheus datasources using credentials from Kubernetes Secrets, so dashboard queries continue to work with Prometheus authentication enabled
-- provisions dashboard provider + starter TON dashboard
+- provisions the TON overview dashboard and opens it as the default home dashboard
 - starts background `kubectl port-forward` and prints local/remote URL
 - requires login, disables anonymous access and self-registration, and prints Grafana admin credentials on every start
 
@@ -1498,6 +1498,32 @@ stored credentials. `GRAFANA_ADMIN_USER` defaults to `admin`;
 [grafana] Admin user: admin
 [grafana] Admin password: <generated-password>
 ```
+
+The TON overview is installed automatically; no manual dashboard import is
+needed. With the updated CLI, run the command again to provision or refresh it:
+
+```bash
+./kubeton grafana start
+```
+
+Open the printed `/d/kubeton-ton-overview` URL, or find **TON Exporter Overview**
+under **Dashboards → Kubeton**. The dashboard includes target availability,
+masterchain sequence number and block age, shard processing lag, validator
+groups, collation/validation rates and timing, mempool messages, ADNL/QUIC traffic,
+actor worker activity, and scrape health. Choose **Prometheus**, **TON job** and
+**Node target** at the top; each managed Prometheus instance is selectable.
+
+Panels use the raw metrics documented for
+[TON v2026.10](https://github.com/ton-blockchain/ton/blob/v2026.10/metrics/METRICS.md).
+Synchronization series appear after initialization. Validator groups and timing
+histograms may show **No data** until the node participates; rate charts need a
+few scrapes. The native exporter does not provide CellDB/archive sizes or host
+memory/filesystem metrics, so those are not included. `kubeton status` still
+reports database sizes.
+
+The command checks that the provisioned dashboard is available before printing
+its access URL. `GRAFANA_DASHBOARD_UID` and `GRAFANA_DASHBOARD_TITLE` customize its
+identity and title; existing datasource UIDs and login credentials are preserved.
 
 Main environment overrides:
 

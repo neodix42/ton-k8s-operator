@@ -462,6 +462,7 @@ prometheus_port_forward_address() { printf 127.0.0.1; }
 grafana_port_forward_address() { printf 127.0.0.1; }
 ensure_prometheus_port_forward() { printf 'fixture-ns\\tkubeton-prometheus-tonnode\\t9090\\t123\\t/tmp/fixture.log\\n'; }
 ensure_grafana_port_forward() { printf 'fixture-ns\\tkubeton-grafana\\t3000\\t123\\t/tmp/fixture.log\\n'; }
+wait_grafana_dashboard_ready() { :; }
 '''
         result = self.run_cli(common + "run_prometheus_start\n")
         self.assertIn(USERNAME, result.stdout)
