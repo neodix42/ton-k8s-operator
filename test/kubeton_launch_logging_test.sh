@@ -2733,11 +2733,11 @@ test_failed_victoria_logs_cleanup_retains_guards_and_generic_sweep_excludes_them
     if [[ "$*" == "-n operator-ns get configmap $VICTORIA_LOGS_STATE_CONFIGMAP" ]]; then
       return 0
     fi
-    if [[ "$*" == "api-resources --verbs=list --namespaced=true -o name" ]]; then
+    if [[ "$*" == "api-resources --verbs=list,delete --namespaced=true -o name" ]]; then
       printf '%s\n' configmaps networkpolicies.networking.k8s.io services
       return 0
     fi
-    if [[ "$*" == "api-resources --verbs=list --namespaced=false -o name" ]]; then
+    if [[ "$*" == "api-resources --verbs=list,delete --namespaced=false -o name" ]]; then
       return 0
     fi
     return 0

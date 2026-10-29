@@ -6,8 +6,8 @@ Bootstrap a local installation bundle from a pinned release for your existing
 Kubernetes cluster:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.5/install.sh" | bash
-cd ./ton-k8s-operator-0.5.3
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.6/install.sh" | bash
+cd ./ton-k8s-operator-0.5.5
 ./kubeton
 ```
 
@@ -195,7 +195,7 @@ For deployment to an existing Kubernetes cluster:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.5/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.6/install.sh" | bash
 ```
 
 The script:
@@ -216,7 +216,7 @@ The extracted chart already includes:
 Then follow:
 
 ```bash
-cd ./ton-k8s-operator-0.5.3
+cd ./ton-k8s-operator-0.5.5
 
 # review defaults
 ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
@@ -231,7 +231,34 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton backup-keys
 ```
 
-`kubeton start` handles the default bare-metal/k3d bootstrap automatically.
+### Longhorn and Vault bootstrap
+
+Longhorn does not need to be installed before `./kubeton install` on bare metal.
+`install` installs or updates the TON operator and waits for its Deployment;
+`start` prepares the storage/key-management dependencies before deploying TON.
+
+| Cluster | What `kubeton start` bootstraps |
+| --- | --- |
+| Bare metal | Longhorn, encrypted StorageClass `encrypted-sc`, Vault, its Transit key and TON credentials. Existing healthy Longhorn is reused. |
+| Local k3d | Vault and a local StorageClass fallback; Longhorn is skipped. This fallback does not provide Longhorn disk encryption. |
+| GKE / other cloud | Automatic bootstrap is off by default. Prepare the dependencies yourself or explicitly opt in with `FORCE_BAREMETAL_BOOTSTRAP=true`. |
+
+`AUTO_BAREMETAL_BOOTSTRAP` defaults to `true`; setting it to `false` disables
+automatic bootstrap even when `FORCE_BAREMETAL_BOOTSTRAP=true`.
+To prepare dependencies separately, use `./kubeton bootstrap-baremetal`.
+
+The command `FORCE_BAREMETAL_BOOTSTRAP=true ./kubeton install` still installs
+only the operator. The prefix also applies only to that one command; export it
+or repeat it when running `start`. For GKE, follow the
+[GKE setup instructions](#install-on-google-cloud-gke), including worker and
+StorageClass preparation, before enabling bootstrap.
+
+With the default storage layout, Longhorn holds encrypted key bundles and
+Vault state; the validator database uses `local-path` on bare metal or the
+selected GKE Persistent Disk class. VictoriaLogs uses its separately selected
+storage class and may also use Longhorn. Worker requirements such as iSCSI,
+mount propagation and encryption tools remain administrator responsibilities;
+kubeton does not install host packages.
 
 After a successful `./kubeton start`, **you must run `./kubeton backup-keys`**
 as part of this production deployment workflow. It refreshes each node's
@@ -1563,8 +1590,8 @@ kubectl config current-context
 kubectl get nodes -o wide
 kubectl get storageclass
 
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.5/install.sh" | bash
-cd ton-k8s-operator-0.5.3
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.6/install.sh" | bash
+cd ton-k8s-operator-0.5.5
 ```
 
 Review `operator-values.yaml` and `tonnode-values.yaml` before installing.
@@ -1638,12 +1665,20 @@ kubeton to provision Longhorn, encrypted storage and Vault, enable it explicitly
 export TON_STORAGE_CLASS_NAME=premium-rwo
 export ENCRYPTED_SC_NAME=encrypted-sc
 export VICTORIA_LOGS_STORAGE_CLASS=premium-rwo
+export AUTO_BAREMETAL_BOOTSTRAP=true
 export FORCE_BAREMETAL_BOOTSTRAP=true
 
-./kubeton bootstrap-baremetal
+./kubeton check
 ./kubeton install
-./kubeton start
+./kubeton start   # installs/reuses Longhorn + encrypted-sc + Vault before TON
+./kubeton backup-keys
 ```
+
+The exports above remain active for every subsequent command in this shell.
+If you prefer to prepare Longhorn and Vault before installing the operator,
+run `./kubeton bootstrap-baremetal` after `check` and before `install`.
+Prefixing only `install` with `FORCE_BAREMETAL_BOOTSTRAP=true` neither installs
+these dependencies nor enables bootstrap for a later unprefixed `start`.
 
 The bootstrap uses the same Longhorn/Vault workflow as bare metal, including
 the default compatible-node selection and per-node CSI readiness checks.
@@ -1651,6 +1686,30 @@ Keep these environment selections for subsequent `check`, `start` and `add`
 commands. `TON_STORAGE_CLASS_NAME` keeps TON data on GKE Persistent Disk;
 `VICTORIA_LOGS_STORAGE_CLASS` also places log data there. Longhorn serves key
 management storage rather than the validator database.
+
+**GKE readiness and validation limits.** This path has code review and offline
+regression coverage; it is not a completed installation test on your GKE
+cluster. A successful `kubeton check` verifies Kubernetes resource/disk/placement
+requirements, not every Longhorn host prerequisite. Before `start`, confirm
+the Ubuntu workers have the iSCSI/encryption prerequisites above, enough
+persistent space for Longhorn replicas, and policies permitting its privileged
+host access. The invoking account needs CRD/RBAC/Secret/Helm permissions and
+access to kubelet summary data (`kubectl auth can-i get nodes/proxy`). Private
+clusters also need working access to the chart/image registries and required
+TON network endpoints. The force flag opts into bootstrap; it does not prepare
+worker operating systems, cloud disks, firewall rules or permissions.
+
+Check control-plane access to Longhorn's conversion/admission webhooks as well.
+Where the GKE firewall does not already allow it, permit TCP `9501` and `9502`
+from the cluster's actual control-plane source range to the Longhorn workers;
+keep these ports private. Otherwise API requests can time out even when the
+Longhorn Pods are running. See [Longhorn networking](https://longhorn.io/docs/archives/1.10.0/references/networking/)
+and [GKE webhook connectivity troubleshooting](https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/network-isolation#api_request_that_triggers_admission_webhook_timing_out).
+
+Bootstrap stops on failed Longhorn setup/readiness, encryption Secret or
+StorageClass creation, Vault startup, initialization/unseal or Transit
+configuration. These checks surface installation failures; they do not imply
+that arbitrary GKE configurations are guaranteed to work.
 
 For **existing** Longhorn/Vault installations, keep their StorageClass names,
 Vault Transit key and credentials. Prepare the credentials described below,
@@ -1977,8 +2036,8 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.5/install.sh" | bash
-cd ./ton-k8s-operator-0.5.3
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.6/install.sh" | bash
+cd ./ton-k8s-operator-0.5.5
 
 # review values before upgrade
 cat operator-values.yaml

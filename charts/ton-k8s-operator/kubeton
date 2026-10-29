@@ -8776,7 +8776,7 @@ wait_longhorn_storage_ready() {
   fi
 
   if kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-manager >/dev/null 2>&1; then
-    kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/longhorn-manager --timeout="${timeout_seconds}s" >/dev/null
+    kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/longhorn-manager --timeout="${timeout_seconds}s" >/dev/null || return $?
   fi
 
   while (( $(date +%s) < deadline )); do
@@ -8789,11 +8789,11 @@ wait_longhorn_storage_ready() {
     echo "Error: Longhorn CSI daemonset ${LONGHORN_NAMESPACE}/longhorn-csi-plugin was not created." >&2
     return 1
   fi
-  kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/longhorn-csi-plugin --timeout="${timeout_seconds}s" >/dev/null
+  kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/longhorn-csi-plugin --timeout="${timeout_seconds}s" >/dev/null || return $?
 
   for dep in csi-attacher csi-provisioner csi-resizer csi-snapshotter longhorn-driver-deployer; do
     if kubectl -n "$LONGHORN_NAMESPACE" get deployment "$dep" >/dev/null 2>&1; then
-      kubectl -n "$LONGHORN_NAMESPACE" rollout status "deployment/${dep}" --timeout="${timeout_seconds}s" >/dev/null
+      kubectl -n "$LONGHORN_NAMESPACE" rollout status "deployment/${dep}" --timeout="${timeout_seconds}s" >/dev/null || return $?
     fi
   done
 
@@ -8801,7 +8801,7 @@ wait_longhorn_storage_ready() {
     expected_ready="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset longhorn-csi-plugin -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
     csi_nodes_count="$(list_longhorn_csi_node_names | awk 'NF{c++} END{print c+0}')"
     if [[ "${expected_ready:-0}" != "0" && "${csi_nodes_count:-0}" -ge "${expected_ready:-0}" ]]; then
-      verify_longhorn_multipathd_safe
+      verify_longhorn_multipathd_safe || return $?
       return 0
     fi
     sleep 2
@@ -9103,11 +9103,11 @@ ensure_longhorn_installed() {
     exit 1
   fi
 
-  recover_stuck_longhorn_namespace
+  recover_stuck_longhorn_namespace || return $?
 
   # Previous failed uninstall can leave namespace in Terminating state.
   # Helm install cannot create release secrets there until namespace recovers.
-  ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+  ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240 || return $?
 
   local lh_status=""
   lh_status="$(longhorn_release_status || true)"
@@ -9115,15 +9115,15 @@ ensure_longhorn_installed() {
     if recover_longhorn_release_non_destructive "$lh_status"; then
       lh_status="$(longhorn_release_status || true)"
     else
-      repair_stale_longhorn_release "$lh_status"
-      recover_stuck_longhorn_namespace
-      ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+      repair_stale_longhorn_release "$lh_status" || return $?
+      recover_stuck_longhorn_namespace || return $?
+      ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240 || return $?
       lh_status="$(longhorn_release_status || true)"
     fi
   elif [[ -z "$lh_status" ]] && kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && longhorn_release_metadata_present; then
-    repair_stale_longhorn_release ""
-    recover_stuck_longhorn_namespace
-    ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240
+    repair_stale_longhorn_release "" || return $?
+    recover_stuck_longhorn_namespace || return $?
+    ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240 || return $?
   fi
 
   local -a longhorn_selector_pairs=()
@@ -9143,14 +9143,14 @@ ensure_longhorn_installed() {
     && longhorn_storage_ready_quick "longhorn"; then
     apply_longhorn_post_start_settings "$longhorn_system_managed_selector_setting" || return 1
     ensure_longhorn_daemonsets_constrained "$LONGHORN_NODE_SELECTOR" || return 1
-    wait_longhorn_storage_ready "longhorn"
-    verify_longhorn_multipathd_safe
+    wait_longhorn_storage_ready "longhorn" || return $?
+    verify_longhorn_multipathd_safe || return $?
     echo "[baremetal] Longhorn is already deployed and CSI/storage are Ready; skipping Helm upgrade."
     return 0
   fi
 
-  ensure_helm_repo "longhorn" "https://charts.longhorn.io"
-  helm repo update longhorn >/dev/null
+  ensure_helm_repo "longhorn" "https://charts.longhorn.io" || return $?
+  helm repo update longhorn >/dev/null || return $?
 
   local longhorn_selector_values_file=""
   local -a longhorn_extra_args=()
@@ -9189,7 +9189,7 @@ ensure_longhorn_installed() {
       echo "Warning: LONGHORN_NODE_SELECTOR matches ${matched_nodes} nodes, which is less than LONGHORN_DEFAULT_REPLICA_COUNT=${LONGHORN_DEFAULT_REPLICA_COUNT}." >&2
     fi
 
-    longhorn_selector_values_file="$(build_longhorn_selector_values_file "$LONGHORN_NODE_SELECTOR")"
+    longhorn_selector_values_file="$(build_longhorn_selector_values_file "$LONGHORN_NODE_SELECTOR")" || return $?
     longhorn_extra_args+=(-f "$longhorn_selector_values_file")
     echo "[baremetal] Restricting Longhorn components to schedulable nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
   fi
@@ -9225,13 +9225,19 @@ ensure_longhorn_installed() {
 
 ensure_longhorn_crypto_secret() {
   require_bin openssl
+  local crypto_key
   if kubectl -n "$LONGHORN_NAMESPACE" get secret "$LONGHORN_CRYPTO_SECRET_NAME" >/dev/null 2>&1; then
     return
   fi
 
   echo "[baremetal] Creating Longhorn encryption secret ${LONGHORN_CRYPTO_SECRET_NAME} ..."
+  crypto_key="$(openssl rand -base64 48)" || return $?
+  if [[ -z "$crypto_key" ]]; then
+    echo "Error: generated Longhorn encryption key is empty." >&2
+    return 1
+  fi
   kubectl -n "$LONGHORN_NAMESPACE" create secret generic "$LONGHORN_CRYPTO_SECRET_NAME" \
-    --from-literal=CRYPTO_KEY_VALUE="$(openssl rand -base64 48)" \
+    --from-literal=CRYPTO_KEY_VALUE="$crypto_key" \
     --from-literal=CRYPTO_KEY_PROVIDER=secret \
     --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
     --from-literal=CRYPTO_KEY_HASH=sha256 \
@@ -9404,9 +9410,9 @@ ensure_vault_installed() {
   if ! [[ "$max_attempts" =~ ^[0-9]+$ ]] || (( max_attempts < 1 )); then
     max_attempts=1
   fi
-  ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240
-  ensure_helm_repo "hashicorp" "https://helm.releases.hashicorp.com"
-  helm repo update hashicorp >/dev/null
+  ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240 || return $?
+  ensure_helm_repo "hashicorp" "https://helm.releases.hashicorp.com" || return $?
+  helm repo update hashicorp >/dev/null || return $?
 
   if cluster_is_k3d; then
     k3d_selector="$(trim_whitespace "${VAULT_LOCALDEV_NODE_SELECTOR:-}")"
@@ -9415,7 +9421,7 @@ ensure_vault_installed() {
       if [[ "${k3d_matched_nodes:-0}" == "0" ]]; then
         echo "Warning: VAULT_LOCALDEV_NODE_SELECTOR='${k3d_selector}' matched 0 nodes; continuing without Vault node selector." >&2
       else
-        vault_selector_values_file="$(build_vault_selector_values_file "$k3d_selector")"
+        vault_selector_values_file="$(build_vault_selector_values_file "$k3d_selector")" || return $?
         vault_selector_values_files+=("$vault_selector_values_file")
         vault_extra_args+=(-f "$vault_selector_values_file")
         echo "[localdev] Restricting Vault server to nodes: ${k3d_selector} (matched ${k3d_matched_nodes} node(s))"
@@ -9442,20 +9448,20 @@ ensure_vault_installed() {
       return 1
     fi
 
-    vault_selector_values_file="$(build_vault_selector_values_file "$LONGHORN_NODE_SELECTOR")"
+    vault_selector_values_file="$(build_vault_selector_values_file "$LONGHORN_NODE_SELECTOR")" || return $?
     vault_selector_values_files+=("$vault_selector_values_file")
     vault_extra_args+=(-f "$vault_selector_values_file")
     echo "[baremetal] Restricting Vault server to schedulable Longhorn nodes: ${LONGHORN_NODE_SELECTOR} (matched ${matched_nodes} node(s))"
   fi
 
   if storage_class_is_longhorn "$vault_storage_class"; then
-    wait_longhorn_storage_ready "$vault_storage_class"
+    wait_longhorn_storage_ready "$vault_storage_class" || return $?
     mapfile -t longhorn_csi_nodes < <(list_longhorn_csi_node_names)
     if [[ ${#longhorn_csi_nodes[@]} -eq 0 ]]; then
       echo "Error: storage class '${vault_storage_class}' uses Longhorn, but no CSINode reports driver.longhorn.io." >&2
       return 1
     fi
-    vault_csi_affinity_values_file="$(build_vault_csi_affinity_values_file longhorn_csi_nodes)"
+    vault_csi_affinity_values_file="$(build_vault_csi_affinity_values_file longhorn_csi_nodes)" || return $?
     vault_selector_values_files+=("$vault_csi_affinity_values_file")
     vault_extra_args+=(-f "$vault_csi_affinity_values_file")
     echo "[bootstrap] Vault Longhorn CSI nodeAffinity enabled for ${#longhorn_csi_nodes[@]} node(s)."
@@ -9483,7 +9489,7 @@ ensure_vault_installed() {
     uninstall_vault || true
     cleanup_vault_force || true
     delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
-    ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240
+    ensure_namespace_not_terminating "$VAULT_NAMESPACE" 240 || return $?
     ((attempt+=1))
   done
 
@@ -9574,7 +9580,7 @@ initialize_and_unseal_vault() {
   initialized="$(printf '%s\n' "$status" | awk '/^Initialized[[:space:]]+/ {print tolower($2); exit}')"
   if [[ "$initialized" == "false" ]]; then
     echo "[baremetal] Initializing Vault ..." >&2
-    init_out="$(vault_exec vault operator init -key-shares=1 -key-threshold=1)"
+    init_out="$(vault_exec vault operator init -key-shares=1 -key-threshold=1)" || return $?
     unseal_key="$(printf '%s\n' "$init_out" | awk -F': ' '/Unseal Key 1:/ {print $2; exit}')"
     root_token="$(printf '%s\n' "$init_out" | awk -F': ' '/Initial Root Token:/ {print $2; exit}')"
     unseal_key="$(sanitize_compact "$unseal_key")"
@@ -9586,7 +9592,7 @@ initialize_and_unseal_vault() {
     kubectl -n "$VAULT_NAMESPACE" create secret generic "$VAULT_BOOTSTRAP_SECRET" \
       --from-literal=unseal_key="$unseal_key" \
       --from-literal=root_token="$root_token" \
-      --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+      --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return $?
   elif [[ "$initialized" != "true" ]]; then
     echo "Error: unable to parse Vault initialized state." >&2
     echo "Vault status output:" >&2
@@ -9607,8 +9613,8 @@ initialize_and_unseal_vault() {
     fi
   fi
 
-  unseal_key="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.unseal_key}' | base64 -d)"
-  root_token="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.root_token}' | base64 -d)"
+  unseal_key="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.unseal_key}' | base64 -d)" || return $?
+  root_token="$(kubectl -n "$VAULT_NAMESPACE" get secret "$VAULT_BOOTSTRAP_SECRET" -o jsonpath='{.data.root_token}' | base64 -d)" || return $?
   unseal_key="$(sanitize_compact "$unseal_key")"
   root_token="$(sanitize_compact "$root_token")"
   if [[ -z "$unseal_key" || -z "$root_token" ]]; then
@@ -9616,11 +9622,14 @@ initialize_and_unseal_vault() {
     exit 1
   fi
 
-  status="$(vault_status_with_retry || true)"
+  status="$(vault_status_with_retry)" || return $?
   sealed="$(printf '%s\n' "$status" | awk '/^Sealed[[:space:]]+/ {print tolower($2); exit}')"
   if [[ "$sealed" == "true" ]]; then
     echo "[baremetal] Unsealing Vault ..." >&2
-    vault_exec vault operator unseal "$unseal_key" >/dev/null
+    vault_exec vault operator unseal "$unseal_key" >/dev/null || return $?
+  elif [[ "$sealed" != "false" ]]; then
+    echo "Error: unable to parse Vault sealed state; refusing to continue bootstrap." >&2
+    return 1
   fi
 
   printf '%s' "$root_token"
@@ -9648,7 +9657,7 @@ configure_vault_for_ton() {
     return 1
   fi
 
-  ensure_namespace "$TON_NAMESPACE"
+  ensure_namespace "$TON_NAMESPACE" || return $?
   kubectl -n "$TON_NAMESPACE" create secret generic "$TON_VAULT_CREDS_SECRET" \
     --from-literal=VAULT_ADDR="$VAULT_ADDR_INTERNAL" \
     --from-literal=VAULT_TOKEN="$ton_token" \
@@ -9663,12 +9672,12 @@ ensure_baremetal_stack() {
   require_bin openssl
   require_bin base64
 
-  ensure_longhorn_installed
-  ensure_longhorn_crypto_secret
-  ensure_encrypted_storage_class
-  ensure_vault_installed "longhorn"
+  ensure_longhorn_installed || return $?
+  ensure_longhorn_crypto_secret || return $?
+  ensure_encrypted_storage_class || return $?
+  ensure_vault_installed "longhorn" || return $?
   local root_token
-  root_token="$(initialize_and_unseal_vault)"
+  root_token="$(initialize_and_unseal_vault)" || return $?
   configure_vault_for_ton "$root_token"
 }
 
@@ -9679,16 +9688,16 @@ ensure_localdev_stack() {
 
   local base_sc
   local root_token
-  base_sc="$(resolve_localdev_storage_class)"
-  ensure_localdev_encrypted_storage_class "$base_sc"
-  ensure_vault_installed "$base_sc"
-  root_token="$(initialize_and_unseal_vault)"
+  base_sc="$(resolve_localdev_storage_class)" || return $?
+  ensure_localdev_encrypted_storage_class "$base_sc" || return $?
+  ensure_vault_installed "$base_sc" || return $?
+  root_token="$(initialize_and_unseal_vault)" || return $?
 
   if ! configure_vault_for_ton "$root_token"; then
     echo "[localdev] Vault configuration failed; reinstalling Vault and reinitializing ..." >&2
-    reset_localdev_vault
-    ensure_vault_installed "$base_sc"
-    root_token="$(initialize_and_unseal_vault)"
+    reset_localdev_vault || return $?
+    ensure_vault_installed "$base_sc" || return $?
+    root_token="$(initialize_and_unseal_vault)" || return $?
     if ! configure_vault_for_ton "$root_token"; then
       echo "Error: Vault configuration is still failing after local recovery." >&2
       exit 1
@@ -9699,7 +9708,7 @@ ensure_localdev_stack() {
 ensure_auto_bootstrap_stack() {
   if cluster_is_k3d; then
     ensure_localdev_stack
-    return
+    return $?
   fi
   ensure_baremetal_stack
 }
@@ -17686,6 +17695,11 @@ run_install() {
   require_bin kubectl
   local install_ready_timeout
 
+  if is_true "$FORCE_BAREMETAL_BOOTSTRAP"; then
+    echo "[install] Operator-only install: FORCE_BAREMETAL_BOOTSTRAP enables Longhorn/Vault bootstrap in 'kubeton start' or 'kubeton bootstrap-baremetal'."
+    echo "[install] Export FORCE_BAREMETAL_BOOTSTRAP=true or repeat the prefix on that command; an install-only prefix does not carry over."
+  fi
+
   install_ready_timeout="$(trim_whitespace "${KUBETON_INSTALL_READY_TIMEOUT_SECONDS:-600}")"
   if ! [[ "$install_ready_timeout" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: invalid KUBETON_INSTALL_READY_TIMEOUT_SECONDS '${install_ready_timeout}'." >&2
@@ -17820,7 +17834,7 @@ run_bootstrap_baremetal() {
   fi
   prepare_node_prerequisites_for_workload "$replicas" "$bootstrap_uses_longhorn" || return 1
 
-  ensure_auto_bootstrap_stack
+  ensure_auto_bootstrap_stack || return $?
   echo "[bootstrap] Completed."
 }
 
@@ -18096,7 +18110,12 @@ run_start() {
       fi
       return 1
     fi
-    ensure_auto_bootstrap_stack
+    if ! ensure_auto_bootstrap_stack; then
+      if [[ -n "$ton_selector_values_file" ]]; then
+        rm -f "$ton_selector_values_file" >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
     append_baremetal_key_overrides extra_overrides
     if [[ -z "$ton_selector_values_file" ]] && ! cluster_is_k3d && [[ -n "${LONGHORN_NODE_SELECTOR:-}" ]]; then
       ton_selector_values_file="$(build_ton_node_selector_values_file "$LONGHORN_NODE_SELECTOR")"
