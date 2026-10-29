@@ -78,6 +78,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_logs_test.sh
 	bash test/kubeton_logs_access_test.sh
 	python3 test/kubeton_logs_auth_test.py
+	python3 test/kubeton_dashboard_auth_test.py
 	bash test/kubeton_port_forward_test.sh
 	bash test/kubeton_logs_recovery_test.sh
 	bash test/kubeton_observability_test.sh

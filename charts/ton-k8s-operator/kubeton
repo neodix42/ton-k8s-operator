@@ -98,6 +98,9 @@ PROMETHEUS_PORT_FORWARD_DIR="${PROMETHEUS_PORT_FORWARD_DIR:-${TMPDIR:-/tmp}/kube
 PROMETHEUS_PORT_FORWARD_WAIT_SECONDS="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS:-5}"
 PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS="${PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS:-20}"
 PROMETHEUS_PORT_FORWARD_ADDRESS="${PROMETHEUS_PORT_FORWARD_ADDRESS:-}"
+PROMETHEUS_ADMIN_USER="${PROMETHEUS_ADMIN_USER:-admin}"
+PROMETHEUS_ADMIN_PASSWORD="${PROMETHEUS_ADMIN_PASSWORD:-}"
+PROMETHEUS_ADMIN_SECRET_NAME="${PROMETHEUS_ADMIN_SECRET_NAME:-kubeton-prometheus-admin}"
 PROMETHEUS_TARGET_MODE="${PROMETHEUS_TARGET_MODE:-auto}"
 PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX:-true}"
 PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS="${PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS:-420}"
@@ -239,9 +242,9 @@ Commands:
   bootstrap-baremetal  Prepare key prerequisites: Longhorn+Vault on bare-metal, local StorageClass+Vault on k3d.
   start                Ensure VictoriaLogs/metrics, start TON fleet, archive launch evidence, and wait for completed MyTonCtrl bootstrap.
   upgrade              Upgrade changed MyTonCtrl/TON images from tonnode-values.yaml and wait for rollout.
-  prometheus start     Create/update Prometheus pod(s) for TonNode exporter targets and start local background port-forward.
+  prometheus start     Create/update password-protected Prometheus, start background port-forward, and print credentials.
   prometheus stop      Stop/drop kubeton-managed Prometheus resources and local background port-forward(s).
-  grafana start        Create/update Grafana, provision kubeton Prometheus datasource(s) and starter dashboard(s), and start local background port-forward.
+  grafana start        Create/update password-protected Grafana with Prometheus dashboards, start background port-forward, and print credentials.
   grafana stop         Stop/drop kubeton-managed Grafana resources and local background port-forward(s).
   add                  Add one fresh TON replica to the existing TON StatefulSet (resets leftover target-ordinal PVCs if present).
   del                  Delete the tail TON pod replica (highest ordinal) with its PVC/PV/Longhorn volume.
@@ -3938,14 +3941,17 @@ ensure_exporter_prometheus_stack() {
   local tonnode_name="$2"
   local exporter_address="$3"
   local targets_yaml="$4"
-  local name_suffix deploy_name service_name configmap_name
+  local name_suffix deploy_name service_name configmap_name auth_revision
 
   name_suffix="$(sanitize_k8s_name_fragment "$tonnode_name")"
   deploy_name="kubeton-prometheus-${name_suffix}"
   service_name="${deploy_name}"
   configmap_name="${deploy_name}-config"
 
-  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+  ensure_prometheus_admin_secret "$ns" "$PROMETHEUS_ADMIN_SECRET_NAME" >/dev/null || return 1
+  auth_revision="$(dashboard_secret_revision "$ns" "$PROMETHEUS_ADMIN_SECRET_NAME")" || return 1
+
+  if ! cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -3975,6 +3981,9 @@ metadata:
     app.kubernetes.io/managed-by: kubeton
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: kubeton-prometheus
@@ -3986,6 +3995,7 @@ spec:
         app.kubernetes.io/instance: ${deploy_name}
       annotations:
         ton.ton.org/exporter-address: ${exporter_address}
+        ton.ton.org/auth-secret-version: $(yaml_quote "$auth_revision")
     spec:
       containers:
         - name: prometheus
@@ -3995,13 +4005,22 @@ spec:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.path=/prometheus
             - --web.listen-address=:${PROMETHEUS_PORT}
+            - --web.config.file=/etc/prometheus-auth/web-config.yml
           ports:
             - name: http
               containerPort: ${PROMETHEUS_PORT}
               protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
           volumeMounts:
             - name: config
               mountPath: /etc/prometheus
+            - name: web-auth
+              mountPath: /etc/prometheus-auth
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -4013,6 +4032,12 @@ spec:
         - name: config
           configMap:
             name: ${configmap_name}
+        - name: web-auth
+          secret:
+            secretName: ${PROMETHEUS_ADMIN_SECRET_NAME}
+            items:
+              - key: web-config.yml
+                path: web-config.yml
 ---
 apiVersion: v1
 kind: Service
@@ -4033,9 +4058,14 @@ spec:
       port: ${PROMETHEUS_PORT}
       targetPort: http
 EOF
+  then
+    return 1
+  fi
 
   if ! kubectl -n "$ns" rollout status "deployment/${deploy_name}" --timeout=180s >/dev/null 2>&1; then
-    echo "Warning: Prometheus deployment ${ns}/${deploy_name} is not Ready yet." >&2
+    echo "Error: authenticated Prometheus deployment ${ns}/${deploy_name} is not Ready; access was not enabled." >&2
+    cleanup_prometheus_port_forwards
+    return 1
   fi
 
   printf '%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$deploy_name" "$exporter_address"
@@ -4353,31 +4383,37 @@ port_forward_process_matches() {
 }
 
 wait_prometheus_http_ready() {
-  local local_port="$1"
-  local verify_seconds="$2"
-  local deadline now
+  wait_dashboard_http_authenticated prometheus "$@"
+}
 
-  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
-    verify_seconds=20
-  fi
-  if (( verify_seconds <= 0 )); then
-    return 0
-  fi
-  if ! command -v curl >/dev/null 2>&1; then
-    return 0
-  fi
-
+wait_dashboard_http_authenticated() {
+  local product="$1" local_port="$2" verify_seconds="$3"
+  local username="${4:-}" password="${5:-}" host="${6:-127.0.0.1}"
+  local path url authorization anonymous_status authenticated_status deadline
+  [[ -n "$username" && -n "$password" ]] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  [[ "$verify_seconds" =~ ^[0-9]+$ ]] || verify_seconds=20
+  case "$product" in
+    prometheus) path=/api/v1/status/buildinfo ;;
+    grafana) path=/api/user ;;
+    *) return 1 ;;
+  esac
+  [[ "$host" != *:* || "$host" == \[*\] ]] || host="[$host]"
+  url="http://${host}:${local_port}${path}"
+  authorization="$(printf '%s:%s' "$username" "$password" | base64 | tr -d '\r\n')" || return 1
   deadline=$(( $(date +%s) + verify_seconds ))
   while :; do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/-/ready" >/dev/null 2>&1 \
-      || curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/targets" >/dev/null 2>&1; then
-      return 0
-    fi
-
-    now="$(date +%s)"
-    if (( now >= deadline )); then
+    anonymous_status="$(curl --disable --noproxy '*' -sS --max-time 3 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [[ "$anonymous_status" == 401 ]]; then
+      # Read the header from stdin so passwords do not appear in process arguments.
+      authenticated_status="$(printf 'Authorization: Basic %s\n' "$authorization" | \
+        curl --disable --noproxy '*' -sS --max-time 3 --header @- -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+      [[ "$authenticated_status" != 200 ]] || return 0
+    elif [[ "$anonymous_status" == 200 ]]; then
+      # A healthy public endpoint is not an authenticated dashboard.
       return 1
     fi
+    (( $(date +%s) < deadline )) || return 1
     sleep 1
   done
 }
@@ -4393,6 +4429,14 @@ ensure_prometheus_port_forward() {
   local wait_seconds="${PROMETHEUS_PORT_FORWARD_WAIT_SECONDS}"
   local verify_seconds="${PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS}"
   local key pid_file log_file existing_pid pf_pid deadline now
+  local admin_row admin_user admin_password probe_host
+
+  admin_row="$(dashboard_secret_credentials "$ns" "$PROMETHEUS_ADMIN_SECRET_NAME")" || return 1
+  IFS=$'\t' read -r admin_user admin_password <<<"$admin_row"
+  probe_host=127.0.0.1
+  if ! address_list_allows_loopback "$bind_address"; then
+    probe_host="$(first_non_loopback_bind_address "$bind_address")" || return 1
+  fi
 
   if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
     return 1
@@ -4413,12 +4457,14 @@ ensure_prometheus_port_forward() {
     existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" >/dev/null 2>&1; then
       if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" "$bind_address"; then
-        if wait_prometheus_http_ready "$local_port" 2; then
+        if wait_prometheus_http_ready "$local_port" 2 "$admin_user" "$admin_password" "$probe_host"; then
           printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$existing_pid" "$log_file"
           return 0
         fi
       fi
-      kill "$existing_pid" >/dev/null 2>&1 || true
+      if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" ''; then
+        kill "$existing_pid" >/dev/null 2>&1 || true
+      fi
     fi
     rm -f "$pid_file" >/dev/null 2>&1 || true
   fi
@@ -4438,11 +4484,11 @@ ensure_prometheus_port_forward() {
       return 1
     fi
     if grep -q "Forwarding from" "$log_file" 2>/dev/null; then
-      if ! wait_prometheus_http_ready "$local_port" "$verify_seconds"; then
+      if ! wait_prometheus_http_ready "$local_port" "$verify_seconds" "$admin_user" "$admin_password" "$probe_host"; then
         kill "$pf_pid" >/dev/null 2>&1 || true
         rm -f "$pid_file" >/dev/null 2>&1 || true
         if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
-          echo "Warning: port-forward for ${ns}/${service_name} started on localhost:${local_port}, but Prometheus HTTP endpoint is not ready." >&2
+          echo "Warning: port-forward for ${ns}/${service_name} started on localhost:${local_port}, but the Prometheus authentication check failed." >&2
           echo "Warning: see ${log_file}" >&2
         fi
         return 1
@@ -4481,33 +4527,7 @@ grafana_port_forward_address() {
 }
 
 wait_grafana_http_ready() {
-  local local_port="$1"
-  local verify_seconds="$2"
-  local deadline now
-
-  if ! [[ "$verify_seconds" =~ ^[0-9]+$ ]]; then
-    verify_seconds=20
-  fi
-  if (( verify_seconds <= 0 )); then
-    return 0
-  fi
-  if ! command -v curl >/dev/null 2>&1; then
-    return 0
-  fi
-
-  deadline=$(( $(date +%s) + verify_seconds ))
-  while :; do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/api/health" >/dev/null 2>&1 \
-      || curl -fsS --max-time 3 "http://127.0.0.1:${local_port}/login" >/dev/null 2>&1; then
-      return 0
-    fi
-
-    now="$(date +%s)"
-    if (( now >= deadline )); then
-      return 1
-    fi
-    sleep 1
-  done
+  wait_dashboard_http_authenticated grafana "$@"
 }
 
 ensure_grafana_port_forward() {
@@ -4521,6 +4541,14 @@ ensure_grafana_port_forward() {
   local wait_seconds="${GRAFANA_PORT_FORWARD_WAIT_SECONDS}"
   local verify_seconds="${GRAFANA_PORT_FORWARD_VERIFY_SECONDS}"
   local key pid_file log_file existing_pid pf_pid deadline now
+  local admin_row admin_user admin_password probe_host
+
+  admin_row="$(dashboard_secret_credentials "$ns" "$GRAFANA_ADMIN_SECRET_NAME")" || return 1
+  IFS=$'\t' read -r admin_user admin_password <<<"$admin_row"
+  probe_host=127.0.0.1
+  if ! address_list_allows_loopback "$bind_address"; then
+    probe_host="$(first_non_loopback_bind_address "$bind_address")" || return 1
+  fi
 
   if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
     return 1
@@ -4541,12 +4569,14 @@ ensure_grafana_port_forward() {
     existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" >/dev/null 2>&1; then
       if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" "$bind_address"; then
-        if wait_grafana_http_ready "$local_port" 2; then
+        if wait_grafana_http_ready "$local_port" 2 "$admin_user" "$admin_password" "$probe_host"; then
           printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$local_port" "$existing_pid" "$log_file"
           return 0
         fi
       fi
-      kill "$existing_pid" >/dev/null 2>&1 || true
+      if port_forward_process_matches "$existing_pid" "$ns" "$service_name" "$local_port" "$remote_port" ''; then
+        kill "$existing_pid" >/dev/null 2>&1 || true
+      fi
     fi
     rm -f "$pid_file" >/dev/null 2>&1 || true
   fi
@@ -4566,11 +4596,11 @@ ensure_grafana_port_forward() {
       return 1
     fi
     if grep -q "Forwarding from" "$log_file" 2>/dev/null; then
-      if ! wait_grafana_http_ready "$local_port" "$verify_seconds"; then
+      if ! wait_grafana_http_ready "$local_port" "$verify_seconds" "$admin_user" "$admin_password" "$probe_host"; then
         kill "$pf_pid" >/dev/null 2>&1 || true
         rm -f "$pid_file" >/dev/null 2>&1 || true
         if [[ "$quiet" != "1" && "$quiet" != "true" ]]; then
-          echo "Warning: port-forward for ${ns}/${service_name} started on localhost:${local_port}, but Grafana HTTP endpoint is not ready." >&2
+          echo "Warning: port-forward for ${ns}/${service_name} started on localhost:${local_port}, but the Grafana authentication check failed." >&2
           echo "Warning: see ${log_file}" >&2
         fi
         return 1
@@ -4593,54 +4623,138 @@ ensure_grafana_port_forward() {
 }
 
 generate_random_password() {
-  LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+  python3 -c 'import secrets; print(secrets.token_urlsafe(24), end="")'
+}
+
+dashboard_credentials_from_secret_json() {
+  python3 -c '
+import base64, json, sys
+try:
+    data = json.load(sys.stdin)["data"]
+    user, password = (base64.b64decode(data[key], validate=True).decode("utf-8")
+                      for key in ("admin-user", "admin-password"))
+    if not user or not password or ":" in user or any(c in user + password for c in "\r\n\t\0"):
+        raise ValueError("invalid credentials")
+    print(user + "\t" + password)
+except (KeyError, TypeError, ValueError):
+    sys.exit("Error: dashboard credentials Secret is incomplete or invalid; refusing to replace it automatically.")
+'
+}
+
+dashboard_secret_credentials() {
+  local ns="$1" secret_name="$2" secret_json
+  if ! secret_json="$(kubectl -n "$ns" get secret "$secret_name" -o json)"; then
+    echo "Error: cannot read dashboard credentials Secret ${ns}/${secret_name}." >&2
+    return 1
+  fi
+  printf '%s' "$secret_json" | dashboard_credentials_from_secret_json
+}
+
+dashboard_secret_revision() {
+  # Resource versions trigger rollouts without publishing a digest of a password.
+  local secret_json
+  secret_json="$(kubectl -n "$1" get secret "$2" -o json)" || return 1
+  printf '%s' "$secret_json" | python3 -c '
+import json,sys
+revision = json.load(sys.stdin).get("metadata", {}).get("resourceVersion", "")
+if not revision:
+    sys.exit("Error: cannot resolve dashboard credentials Secret resource version.")
+print(revision)
+'
+}
+
+prometheus_password_hash() {
+  python3 -c '
+import ctypes, ctypes.util, secrets, sys
+password = sys.stdin.buffer.read()
+if not password or len(password) > 72:
+    sys.exit("Error: Prometheus passwords must contain between 1 and 72 UTF-8 bytes.")
+try:
+    import bcrypt
+except ImportError:
+    # libcrypt remains available on ordinary Linux hosts even after Python 3.13
+    # removed its crypt module. Keep the password off command-line arguments.
+    try:
+        library = ctypes.CDLL(ctypes.util.find_library("crypt") or None)
+        library.crypt.argtypes = (ctypes.c_char_p, ctypes.c_char_p)
+        library.crypt.restype = ctypes.c_char_p
+        alphabet = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        salt = ("$2b$10$" + "".join(secrets.choice(alphabet) for _ in range(21)) + ".").encode()
+        result = library.crypt(password, salt)
+        if not result or not result.startswith(b"$2") or len(result) != 60:
+            raise ValueError("bcrypt unsupported")
+        print(result.decode())
+    except (AttributeError, OSError, ValueError):
+        sys.exit("Error: bcrypt hashing is unavailable; install python3-bcrypt before starting Prometheus.")
+else:
+    print(bcrypt.hashpw(password, bcrypt.gensalt(rounds=10)).decode())
+'
+}
+
+ensure_prometheus_admin_secret() {
+  ensure_dashboard_admin_secret "$1" "$2" "${PROMETHEUS_ADMIN_USER:-admin}" "${PROMETHEUS_ADMIN_PASSWORD:-}" prometheus
 }
 
 ensure_grafana_admin_secret() {
-  local ns="$1"
-  local secret_name="$2"
-  local admin_user="${GRAFANA_ADMIN_USER:-admin}"
-  local admin_password="${GRAFANA_ADMIN_PASSWORD:-}"
-  local existing_user existing_password
+  ensure_dashboard_admin_secret "$1" "$2" "${GRAFANA_ADMIN_USER:-admin}" "${GRAFANA_ADMIN_PASSWORD:-}" grafana
+}
+
+ensure_dashboard_admin_secret() {
+  local ns="$1" secret_name="$2" admin_user="$3" admin_password="$4" product="$5"
+  local secret_json existing_row password_hash
 
   admin_user="$(trim_whitespace "$admin_user")"
-  if [[ -z "$admin_user" ]]; then
-    admin_user="admin"
+  [[ -n "$admin_user" ]] || admin_user=admin
+  if ! secret_json="$(kubectl -n "$ns" get secret "$secret_name" --ignore-not-found -o json)"; then
+    echo "Error: cannot read ${product} credentials Secret ${ns}/${secret_name}; access was not enabled." >&2
+    return 1
   fi
-
-  if [[ -z "$admin_password" ]] && kubectl -n "$ns" get secret "$secret_name" >/dev/null 2>&1; then
-    existing_user="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.admin-user}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-    existing_password="$(kubectl -n "$ns" get secret "$secret_name" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-    existing_user="$(trim_whitespace "$existing_user")"
-    existing_password="$(trim_whitespace "$existing_password")"
-    if [[ -n "$existing_user" && -n "$existing_password" ]]; then
-      printf '%s\t%s\n' "$existing_user" "$existing_password"
+  if [[ -n "$secret_json" ]]; then
+    existing_row="$(printf '%s' "$secret_json" | dashboard_credentials_from_secret_json)" || return 1
+    if [[ "$product" == prometheus ]]; then
+      if ! printf '%s' "$secret_json" | python3 -c 'import base64,json,sys; sys.exit(not base64.b64decode(json.load(sys.stdin)["data"].get("web-config.yml", "")))'; then
+        echo "Error: Prometheus credentials Secret ${ns}/${secret_name} has no web-config.yml; refusing to expose an unprotected dashboard." >&2
+        return 1
+      fi
+    fi
+    if [[ -z "$admin_password" ]]; then
+      printf '%s\n' "$existing_row"
       return 0
     fi
   fi
 
   if [[ -z "$admin_password" ]]; then
-    admin_password="$(generate_random_password)"
+    admin_password="$(generate_random_password)" || return 1
   fi
-  admin_password="$(trim_whitespace "$admin_password")"
-  if [[ -z "$admin_password" ]]; then
-    echo "Error: failed to resolve Grafana admin password." >&2
+  if ! printf '%s\t%s' "$admin_user" "$admin_password" | python3 -c '
+import sys
+parts = sys.stdin.read().split("\t")
+sys.exit(len(parts) != 2 or not all(parts) or ":" in parts[0] or any(c in "".join(parts) for c in "\r\n\0"))'; then
+    echo "Error: dashboard credentials must be nonempty, the username cannot contain a colon, and credentials cannot contain tabs or line breaks." >&2
     return 1
   fi
 
-  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+  if [[ "$product" == prometheus ]]; then
+    password_hash="$(printf '%s' "$admin_password" | prometheus_password_hash)" || return 1
+  fi
+  {
+    cat <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
   name: ${secret_name}
   labels:
-    app.kubernetes.io/name: kubeton-grafana
+    app.kubernetes.io/name: kubeton-${product}
     app.kubernetes.io/managed-by: kubeton
 type: Opaque
 stringData:
   admin-user: $(yaml_quote "$admin_user")
   admin-password: $(yaml_quote "$admin_password")
 EOF
+    if [[ "$product" == prometheus ]]; then
+      printf '  web-config.yml: |\n    basic_auth_users:\n      %s: %s\n' "$(yaml_quote "$admin_user")" "$(yaml_quote "$password_hash")"
+    fi
+  } | kubectl -n "$ns" apply -f - >/dev/null || return 1
 
   printf '%s\t%s\n' "$admin_user" "$admin_password"
 }
@@ -4648,7 +4762,7 @@ EOF
 build_grafana_datasources_yaml() {
   local row ns service_name deploy_name exporter_address
   local index=0
-  local url datasource_name is_default
+  local url datasource_name is_default admin_row admin_user admin_password
 
   echo "apiVersion: 1"
   echo "datasources:"
@@ -4661,6 +4775,12 @@ build_grafana_datasources_yaml() {
       continue
     fi
     url="http://${service_name}.${ns}.svc:${PROMETHEUS_PORT}"
+    admin_row="$(dashboard_secret_credentials "$ns" "$PROMETHEUS_ADMIN_SECRET_NAME")" || return 1
+    IFS=$'\t' read -r admin_user admin_password <<<"$admin_row"
+    # Grafana expands environment references in provisioning files. Escape dollar
+    # signs so a literal password is not replaced with an environment variable.
+    admin_user="${admin_user//\$/\$\$}"
+    admin_password="${admin_password//\$/\$\$}"
     datasource_name="kubeton-prometheus-${ns}-${service_name}"
     is_default="false"
     if (( index == 0 )); then
@@ -4670,6 +4790,10 @@ build_grafana_datasources_yaml() {
     echo "    type: prometheus"
     echo "    access: proxy"
     echo "    url: $(yaml_quote "$url")"
+    echo "    basicAuth: true"
+    echo "    basicAuthUser: $(yaml_quote "$admin_user")"
+    echo "    secureJsonData:"
+    echo "      basicAuthPassword: $(yaml_quote "$admin_password")"
     echo "    isDefault: ${is_default}"
     echo "    editable: false"
     ((index+=1))
@@ -4809,33 +4933,39 @@ ensure_grafana_stack() {
   local dashboard_json="$4"
   local deploy_name="kubeton-grafana"
   local service_name="${deploy_name}"
-  local datasources_configmap_name="${deploy_name}-datasources"
+  local datasources_secret_name="${deploy_name}-datasources"
   local dashboards_provider_configmap_name="${deploy_name}-dashboards-provider"
   local dashboards_configmap_name="${deploy_name}-dashboards"
   local admin_secret_name="${GRAFANA_ADMIN_SECRET_NAME}"
   local admin_row admin_user admin_password
-  local datasources_hash dashboards_hash
+  local datasources_hash dashboards_hash auth_checksum
 
   ensure_namespace "$ns"
   admin_row="$(ensure_grafana_admin_secret "$ns" "$admin_secret_name")" || return 1
   IFS=$'\t' read -r admin_user admin_password <<<"$admin_row"
   admin_user="$(trim_whitespace "$admin_user")"
-  admin_password="$(trim_whitespace "$admin_password")"
-  datasources_hash="$(printf '%s' "$datasources_yaml" | cksum | awk '{print $1}')"
+  auth_checksum="$(dashboard_secret_revision "$ns" "$admin_secret_name")" || return 1
   dashboards_hash="$(printf '%s' "$dashboards_yaml"$'\n'"$dashboard_json" | cksum | awk '{print $1}')"
 
-  cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
+  if ! cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
-  name: ${datasources_configmap_name}
+  name: ${datasources_secret_name}
   labels:
     app.kubernetes.io/name: kubeton-grafana
     app.kubernetes.io/managed-by: kubeton
-data:
+type: Opaque
+stringData:
   datasources.yaml: |
 $(printf '%s\n' "$datasources_yaml" | sed 's/^/    /')
----
+EOF
+  then
+    return 1
+  fi
+  datasources_hash="$(dashboard_secret_revision "$ns" "$datasources_secret_name")" || return 1
+
+  if ! cat <<EOF | kubectl -n "$ns" apply -f - >/dev/null
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -4878,6 +5008,7 @@ spec:
         ton.ton.org/provisioned-by: kubeton
         ton.ton.org/datasources-checksum: $(yaml_quote "$datasources_hash")
         ton.ton.org/dashboards-checksum: $(yaml_quote "$dashboards_hash")
+        ton.ton.org/auth-checksum: $(yaml_quote "$auth_checksum")
     spec:
       containers:
         - name: grafana
@@ -4896,6 +5027,16 @@ spec:
                   key: admin-password
             - name: GF_USERS_ALLOW_SIGN_UP
               value: "false"
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "false"
+            - name: GF_AUTH_BASIC_ENABLED
+              value: "true"
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "false"
+            - name: GF_AUTH_PROXY_ENABLED
+              value: "false"
+            - name: GF_SERVER_HTTP_PORT
+              value: $(yaml_quote "$GRAFANA_PORT")
           ports:
             - name: http
               containerPort: ${GRAFANA_PORT}
@@ -4931,8 +5072,8 @@ spec:
               memory: 1Gi
       volumes:
         - name: datasources
-          configMap:
-            name: ${datasources_configmap_name}
+          secret:
+            secretName: ${datasources_secret_name}
         - name: dashboards-provider
           configMap:
             name: ${dashboards_provider_configmap_name}
@@ -4957,9 +5098,14 @@ spec:
       port: ${GRAFANA_PORT}
       targetPort: http
 EOF
+  then
+    return 1
+  fi
 
   if ! kubectl -n "$ns" rollout status "deployment/${deploy_name}" --timeout=180s >/dev/null 2>&1; then
-    echo "Warning: Grafana deployment ${ns}/${deploy_name} is not Ready yet." >&2
+    echo "Error: authenticated Grafana deployment ${ns}/${deploy_name} is not Ready; access was not enabled." >&2
+    cleanup_grafana_port_forwards
+    return 1
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$service_name" "$deploy_name" "$admin_user" "$admin_password"
@@ -18927,28 +19073,16 @@ uninstall_vault() {
 }
 
 cleanup_prometheus_port_forwards() {
-  local state_dir="${PROMETHEUS_PORT_FORWARD_DIR}"
-  local pid_file pid
-
-  if [[ ! -d "$state_dir" ]]; then
-    return 0
-  fi
-
-  for pid_file in "$state_dir"/*.pid; do
-    [[ -f "$pid_file" ]] || continue
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then
-      kill "$pid" >/dev/null 2>&1 || true
-    fi
-    rm -f "$pid_file" >/dev/null 2>&1 || true
-  done
-
-  rm -rf "$state_dir" >/dev/null 2>&1 || true
+  cleanup_dashboard_port_forwards "$PROMETHEUS_PORT_FORWARD_DIR" "$PROMETHEUS_PORT"
 }
 
 cleanup_grafana_port_forwards() {
-  local state_dir="${GRAFANA_PORT_FORWARD_DIR}"
-  local pid_file pid
+  cleanup_dashboard_port_forwards "$GRAFANA_PORT_FORWARD_DIR" "$GRAFANA_PORT"
+}
+
+cleanup_dashboard_port_forwards() {
+  local state_dir="$1" remote_port="$2"
+  local pid_file pid filename ns service_name local_port
 
   if [[ ! -d "$state_dir" ]]; then
     return 0
@@ -18957,8 +19091,15 @@ cleanup_grafana_port_forwards() {
   for pid_file in "$state_dir"/*.pid; do
     [[ -f "$pid_file" ]] || continue
     pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then
-      kill "$pid" >/dev/null 2>&1 || true
+    filename="${pid_file##*/}"
+    if [[ "$filename" =~ ^([a-z0-9.-]+)__([a-z0-9.-]+)__([0-9]+)\.pid$ ]]; then
+      ns="${BASH_REMATCH[1]}"
+      service_name="${BASH_REMATCH[2]}"
+      local_port="${BASH_REMATCH[3]}"
+      # Saved process IDs can be reused by unrelated applications.
+      if port_forward_process_matches "$pid" "$ns" "$service_name" "$local_port" "$remote_port" ''; then
+        kill "$pid" >/dev/null 2>&1 || true
+      fi
     fi
     rm -f "$pid_file" >/dev/null 2>&1 || true
   done
@@ -19010,7 +19151,7 @@ cleanup_prometheus_resources() {
   local selector='app.kubernetes.io/name=kubeton-prometheus,app.kubernetes.io/managed-by=kubeton'
 
   echo "[uninstall] Deleting kubeton-managed Prometheus resources ..."
-  kubectl delete deployment,service,configmap -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete deployment,service,configmap,secret -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete pod -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
   cleanup_prometheus_port_forwards
 }
@@ -20417,16 +20558,20 @@ run_status() {
 run_prometheus_start() {
   require_bin kubectl
   require_bin nohup
+  require_bin python3
+  require_bin curl
   if [[ $# -ne 0 ]]; then
     echo "Error: usage: kubeton prometheus start" >&2
     exit 1
   fi
   local -a access_rows=()
   local -a forwarded_rows=()
-  local row ns service_name deploy_name exporter_address forward_row log_file
+  local row ns service_name deploy_name exporter_address forward_row log_file admin_row admin_user admin_password
   local base_port local_port remote_port bind_address remote_access_host
   local i attempt quiet_attempt
 
+  # Close previous managed listeners while upgrading an unauthenticated install.
+  cleanup_prometheus_port_forwards
   configure_prometheus_for_exporter_targets access_rows || true
   if [[ ${#access_rows[@]} -eq 0 ]]; then
     return 1
@@ -20471,6 +20616,8 @@ run_prometheus_start() {
 
   for row in "${forwarded_rows[@]}"; do
     IFS=$'\t' read -r ns service_name local_port _pid log_file <<<"$row"
+    admin_row="$(dashboard_secret_credentials "$ns" "$PROMETHEUS_ADMIN_SECRET_NAME")" || return 1
+    IFS=$'\t' read -r admin_user admin_password <<<"$admin_row"
     if address_list_allows_loopback "$bind_address"; then
       echo "[metrics] Background access: http://127.0.0.1:${local_port}/targets (service ${ns}/${service_name})"
     fi
@@ -20485,6 +20632,9 @@ run_prometheus_start() {
         echo "[metrics] Remote access: http://${remote_access_host}:${local_port}/targets"
       fi
     fi
+    echo "[metrics] Admin user: ${admin_user}"
+    echo "[metrics] Admin password: ${admin_password}"
+    echo "[metrics] Credentials Secret: ${ns}/${PROMETHEUS_ADMIN_SECRET_NAME}"
     echo "[metrics] Port-forward log: ${log_file}"
   done
 
@@ -20528,6 +20678,8 @@ run_prometheus() {
 run_grafana_start() {
   require_bin kubectl
   require_bin nohup
+  require_bin python3
+  require_bin curl
   if [[ $# -ne 0 ]]; then
     echo "Error: usage: kubeton grafana start" >&2
     exit 1
@@ -20544,13 +20696,14 @@ run_grafana_start() {
   local base_port local_port remote_port bind_address remote_access_host
   local attempt quiet_attempt
 
+  cleanup_grafana_port_forwards
   configure_prometheus_for_exporter_targets prometheus_rows || true
   if [[ ${#prometheus_rows[@]} -eq 0 ]]; then
     echo "Error: no kubeton-managed Prometheus service found/configured. Run 'kubeton prometheus start' first." >&2
     return 1
   fi
 
-  datasources_yaml="$(build_grafana_datasources_yaml "${prometheus_rows[@]}")"
+  datasources_yaml="$(build_grafana_datasources_yaml "${prometheus_rows[@]}")" || return 1
   if [[ -z "$datasources_yaml" || "$datasources_yaml" != *"datasources:"* ]]; then
     echo "Error: failed to build Grafana datasources provisioning config." >&2
     return 1
@@ -20624,6 +20777,7 @@ run_grafana_start() {
   fi
   echo "[grafana] Admin user: ${admin_user}"
   echo "[grafana] Admin password: ${admin_password}"
+  echo "[grafana] Credentials Secret: ${ns}/${GRAFANA_ADMIN_SECRET_NAME}"
   echo "[grafana] Datasource: kubeton-managed Prometheus service(s) provisioned."
   echo "[grafana] Dashboard: starter TON overview provisioned (folder: Kubeton)."
   echo "[grafana] Port-forward log: ${log_file}"

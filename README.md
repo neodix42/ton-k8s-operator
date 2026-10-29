@@ -1161,14 +1161,14 @@ The ephemeral main-wallet helper uses the deployed official TON artifact image f
 ./kubeton upgrade
 
 # create/update Prometheus scrapers from TonNode CUSTOM_PARAMETERS --exporter-address
-# and start background local port-forward(s)
+# require a password, start background port-forward(s), and print credentials
 ./kubeton prometheus start
 
 # remove kubeton-managed Prometheus resources and background port-forward(s)
 ./kubeton prometheus stop
 
 # create/update Grafana with kubeton-managed Prometheus datasource(s)
-# and start background local/public port-forward
+# require login, start background local/public port-forward, and print credentials
 ./kubeton grafana start
 
 # remove kubeton-managed Grafana resources and background port-forward(s)
@@ -1326,6 +1326,9 @@ PROMETHEUS_PORT_FORWARD_DIR
 PROMETHEUS_PORT_FORWARD_WAIT_SECONDS
 PROMETHEUS_PORT_FORWARD_VERIFY_SECONDS
 PROMETHEUS_PORT_FORWARD_ADDRESS
+PROMETHEUS_ADMIN_USER
+PROMETHEUS_ADMIN_PASSWORD
+PROMETHEUS_ADMIN_SECRET_NAME
 PROMETHEUS_TARGET_MODE
 PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX
 PROMETHEUS_EXTERNAL_NODEIP_AUTOFIX_TIMEOUT_SECONDS
@@ -1400,6 +1403,34 @@ VICTORIA_LOGS_HELM_TIMEOUT_SECONDS
 VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS
 ```
 
+### kubeton prometheus
+
+`kubeton prometheus start` creates or updates the Prometheus scrapers and
+requires HTTP Basic authentication for the dashboard and API. It generates a
+random password on the first start and stores the credentials in the Kubernetes
+Secret `kubeton-prometheus-admin` in each Prometheus namespace. Later starts
+reuse those credentials and print the username, password, Secret location and
+dashboard address.
+
+Credential overrides:
+
+- `PROMETHEUS_ADMIN_USER` (default `admin`)
+- `PROMETHEUS_ADMIN_PASSWORD` (default empty; generate or reuse the stored password)
+- `PROMETHEUS_ADMIN_SECRET_NAME` (default `kubeton-prometheus-admin`)
+
+For example, the command prints credentials in this form:
+
+```text
+[metrics] Admin user: admin
+[metrics] Admin password: <generated-password>
+```
+
+Prometheus and Grafana keep their existing port-forward bind defaults:
+`0.0.0.0` on bare metal, and `127.0.0.1` on k3d or cloud clusters. Override
+`PROMETHEUS_PORT_FORWARD_ADDRESS` or `GRAFANA_PORT_FORWARD_ADDRESS` to choose
+the listening address. Password authentication does not encrypt external HTTP
+traffic; use an HTTPS reverse proxy for encrypted browser access.
+
 ### PROMETHEUS_TARGET_MODE
 
 `PROMETHEUS_TARGET_MODE` controls how `kubeton prometheus start` builds scrape targets from TonNode `CUSTOM_PARAMETERS` (`--exporter-address`).
@@ -1449,14 +1480,27 @@ Auto-remediation controls:
 `kubeton grafana start` automates Grafana installation/start and wires datasource/dashboard provisioning to kubeton-managed Prometheus service(s).
 
 Behavior:
+
 - ensures kubeton-managed Prometheus stack exists (from TonNode `CUSTOM_PARAMETERS --exporter-address`)
 - deploys `kubeton-grafana` (`grafana/grafana`)
-- provisions datasource file in Grafana (`/etc/grafana/provisioning/datasources/datasources.yaml`)
+- provisions authenticated Prometheus datasources using credentials from Kubernetes Secrets, so dashboard queries continue to work with Prometheus authentication enabled
 - provisions dashboard provider + starter TON dashboard
 - starts background `kubectl port-forward` and prints local/remote URL
-- prints Grafana admin credentials (stored in secret, reused across restarts)
+- requires login, disables anonymous access and self-registration, and prints Grafana admin credentials on every start
+
+The first start generates a random admin password and stores it in the
+`kubeton-grafana-admin` Secret in the Grafana namespace. Later starts reuse the
+stored credentials. `GRAFANA_ADMIN_USER` defaults to `admin`;
+`GRAFANA_ADMIN_PASSWORD` defaults to empty (generate or reuse the password), and
+`GRAFANA_ADMIN_SECRET_NAME` defaults to `kubeton-grafana-admin`.
+
+```text
+[grafana] Admin user: admin
+[grafana] Admin password: <generated-password>
+```
 
 Main environment overrides:
+
 - `GRAFANA_IMAGE`
 - `GRAFANA_NAMESPACE`
 - `GRAFANA_PORT`
@@ -1586,15 +1630,7 @@ kubectl get nodes -o wide
 kubectl get storageclass
 
 wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.0/install.sh" | bash
-cd ton-k8s-operator-0.4.9
-```
-
-The GKE preflight and logging fixes described here are not in the already
-published `0.4.9` assets. Until a release includes them, use the chart and
-`kubeton` from this repository checkout for the remaining commands:
-
-```bash
-cd /path/to/ton-k8s-operator/charts/ton-k8s-operator
+cd ton-k8s-operator-0.5.0
 ```
 
 Review `operator-values.yaml` and `tonnode-values.yaml` before installing.
