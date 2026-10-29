@@ -12,10 +12,13 @@ This operator creates and manages:
 - A headless `Service` per `TonNode`
 - A `StatefulSet` per `TonNode`
 - Persistent TON and controller state on the `ton-work` PVC at `/var/ton-work`.
-- Three deprecated PVC templates (`ton-src`, `mytoncore`, `mytonctrl`) retained for StatefulSet compatibility and recovery of existing deployments; they are no longer mounted into the runtime.
-- `/var/ton-work/controller/mytoncore/mytoncore.db`, wallets, configuration and service settings persist on the `ton-work` PVC.
+- `/var/ton-work/controller/mytoncore/mytoncore.db`, configuration and service settings persist on the `ton-work` PVC. Key-bundle encryption does not encrypt these live files.
+- With `spec.keyManagement.enabled: true`, live wallet files at `/var/ton-work/controller/mytoncore/wallets` use memory-backed tmpfs; their persistent backups are stored in the encrypted bundle on the separate `keybundle` PVC. Without key management, wallet files also persist directly on `ton-work`.
 
 ## Behavior Implemented
+
+<details>
+<summary>Operator behavior, networking and runtime defaults</summary>
 
 - Uses StatefulSet for TON replicas.
 - Uses headless Service (`clusterIP: None`) for stable DNS.
@@ -44,6 +47,8 @@ This operator creates and manages:
 - Applies default pod resources (overridable via `spec.resources`):
   - requests: `cpu=16000m`, `memory=64Gi`
   - limits: `cpu=128000m`, `memory=256Gi`
+
+</details>
 
 ## TonNode Spec
 
@@ -101,13 +106,28 @@ The `tonSourceSize`, `myTonCoreSize` and `myTonCtrlSize` storage fields remain a
 
 Each replica stores TON state in per-pod PVCs and generates keys on the first start.
 
-Secure key workflow is available via `spec.keyManagement`:
-- plaintext key directories mounted on tmpfs (memory only)
+With `spec.keyManagement.enabled: true` (the default in `tonnode-values.yaml`):
+- `/var/ton-work/keys` and `/var/ton-work/controller/mytoncore/wallets` are mounted on tmpfs; live wallet private-key files are plaintext in memory
 - encrypted key bundle persisted on dedicated `keybundle` PVC
 - init container restores/decrypts a bundle before TON start
 - sidecar writes encrypted bundles when explicitly triggered by `kubeton backup-keys` and during `kubeton stop` when stop-time backup is enabled
 - `kubeton wallet ...` runs in a separate ephemeral pod with its own encrypted bundle PVC; it is intentionally excluded from `kubeton status` and `kubeton backup-keys` flows
 - when the wallet bundle PVC uses Longhorn storage, `kubeton wallet ...` pins the helper pod to nodes exposing `driver.longhorn.io` (from `CSINode`) to avoid attach failures on non-Longhorn nodes
+
+<details>
+<summary>Key backup, restore, scaling and cleanup behavior</summary>
+
+Encryption applies to the saved bundle, not the whole `ton-work` PVC.
+`mytoncore.db` stores controller settings and wallet metadata; standard wallet
+private keys are separate `.pk` files in the wallet directory. The live database,
+configuration, service files and `/var/ton-work/db/keyring` remain on `ton-work`
+without encryption from this feature. Storage-layer encryption is independent.
+
+Backup and restore also stage plaintext files and archives under the key-agent
+container's `/tmp`, which the current Pod specification does not mount as tmpfs.
+The in-memory wallet mount therefore does not guarantee that plaintext never
+touches disk. Enabling key management on an existing volume also does not erase
+historical wallet files beneath that mount.
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
@@ -212,6 +232,8 @@ during the checks, `del` aborts so that a fresh run can inspect the new target.
 
 `configRef` safety rule remains: `spec.configRef` is allowed only with `replicas=1`.
 
+</details>
+
 ### Recovering one damaged validator on a replacement server
 
 Use a server name, pod name, or namespace/pod to recover one validator whose
@@ -227,6 +249,9 @@ blockchain database is damaged:
 # Use a previously exported backup for this ordinal instead of the live bundle.
 ./kubeton restore-keys default/tonnode-2 ./key-backups/20261027T120000Z --to-node devnet-21
 ```
+
+<details>
+<summary>Single-validator recovery behavior, requirements and failure handling</summary>
 
 The selected validator keeps its pod name and ordinal. Recovery checks the
 replacement's live resource, storage, selector, host-port, and Longhorn CSI
@@ -283,6 +308,8 @@ saved resources and staged identity before resuming reconciliation; running
 The original `./kubeton restore-keys <existing-backup-dir>` syntax still restores
 all available replica bundles and restarts the fleet. Use the node/pod form
 above for isolated replacement onto another server.
+
+</details>
 
 ### Moving a fleet to another Kubernetes cluster
 
@@ -346,6 +373,9 @@ can bootstrap the prerequisites:
 ```
 
 Enter the same recovery passphrase when prompted.
+
+<details>
+<summary>Fleet restore requirements and advanced options</summary>
 
 For an existing storage/Vault setup, omit `--bootstrap`. Each restored namespace
 must already contain `TON_VAULT_CREDS_SECRET` (default `ton-vault-creds`) with
@@ -425,6 +455,8 @@ rewritten by restore. For multiple TonNodes, manage each specification explicitl
 
 For full design, threat model, provider requirements, and hardening steps, see:
 - `SECURITY.md`
+
+</details>
 
 ## Prerequisites
 
@@ -518,6 +550,9 @@ myTonCoreSize: 20Gi
 myTonCtrlSize: 20Gi
 ```
 
+<details>
+<summary>Node capacity checks and placement details</summary>
+
 For local-path and other local or unrecognized provisioners, the node filesystem
 minimum is these configured storage sizes plus `KUBETON_CHECK_DISK_HEADROOM`
 (default `20Gi`). GKE Persistent Disk and Longhorn data PVCs use separate storage
@@ -574,6 +609,8 @@ Longhorn volumes: kubeton safely rebuilds its placement on compatible nodes.
 Existing TON resources using local-path are also left on their current node
 selector rather than being relabelled onto a new node.
 
+</details>
+
 ### Launch evidence and durable logs
 
 `kubeton install` and `kubeton start` create a private evidence directory on
@@ -582,6 +619,13 @@ the machine where the command is executed. The default location is:
 ```text
 ./kubeton-launch-logs/<UTC timestamp>-<install|start>-<pid>/
 ```
+
+Use `./kubeton logs` for recent container output and dashboard access
+instructions. After starting the fleet, follow the
+[VictoriaLogs dashboard access](#victorialogs-dashboard-access) steps below.
+
+<details>
+<summary>Launch diagnostics, startup waits, log collection and access details</summary>
 
 The directory and its files are owner-only (`0700`/`0600`). It contains the
 complete kubeton command transcript, a timestamped Pod-state timeline, target
@@ -840,6 +884,8 @@ If your cloud setup uses custom names, override with env vars:
 - `TON_VAULT_CREDS_SECRET`
 - `TON_NAMESPACE`
 
+</details>
+
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
@@ -862,7 +908,7 @@ The extracted chart already includes:
 Then follow:
 
 ```bash
-cd ./ton-k8s-operator-0.3.4
+cd ./ton-k8s-operator-0.5.3
 
 # review defaults
 ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
@@ -871,8 +917,50 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton help
 ./kubeton check
 ./kubeton install
-./kubeton bootstrap-baremetal
 ./kubeton start
+```
+
+`kubeton start` handles the default bare-metal/k3d bootstrap automatically.
+
+#### VictoriaLogs dashboard access
+
+After `kubeton start`, open the password-protected VictoriaLogs dashboard:
+
+1. Run this on the server from which you want to expose the dashboard:
+
+   ```bash
+   ./kubeton logs expose
+   ```
+
+   Open the printed URL, typically
+   `http://<server-public-ip>:8427/select/vmui/`. The command starts a background
+   port-forward through VMAuth and verifies that login is required. Allow inbound
+   TCP to the printed port through that server's firewall/NAT. To advertise a
+   specific hostname or use another port:
+
+   ```bash
+   ./kubeton logs expose --public-host logs.example.com --port 18427
+   ```
+
+2. Retrieve the username and password using the command printed by `logs expose`.
+   With the default namespace and Secret name:
+
+   ```bash
+   kubectl -n vm get secret vmuser-kubeton -o go-template='{{printf "Username: %s\nPassword: %s\n" (.data.username | base64decode) (.data.password | base64decode)}}'
+   ```
+
+3. Enter those decoded credentials in the browser's login prompt. `logs expose`
+   prints the retrieval command, not the password itself. Use the discovered
+   namespace and Secret name if you customized them.
+
+The exposed endpoint uses HTTP Basic Auth. Use an HTTPS reverse proxy to encrypt
+credentials and log responses for public access. For local access instructions
+without exposing a public port, run `./kubeton logs`.
+
+<details>
+<summary>Additional administration, wallet and log command examples</summary>
+
+```bash
 ./kubeton upgrade
 ./kubeton prometheus start
 ./kubeton grafana start
@@ -911,6 +999,8 @@ ls -1 values.yaml operator-values.yaml tonnode-values.yaml kubeton
 ./kubeton exec-mtc "set stake 1000000"
 ```
 
+</details>
+
 `kubeton status` shows separate `TON image` and `MyTonCtrl image` tag columns
 (for example, `v2026.08-amd64` and `v1.0.3`) from each pod's image references,
 alongside the validator build date, wallet, ADNL, sync, and database sizes.
@@ -925,6 +1015,9 @@ and pod names match exactly. If a pod name exists in several namespaces, all
 matching pods are shown; use `./kubeton logs default/tonnode-2` to select one
 namespace. Pods can be selected by name even before a server is assigned. If
 no TON pods match, the command prints a message and exits with a nonzero status.
+
+<details>
+<summary>Historical logs and wallet operation details</summary>
 
 The initial message points to VictoriaLogs for full historical container logs.
 It discovers installed Services, including custom names and ports, and prefers
@@ -1149,6 +1242,11 @@ is shown as `unknown`, so binary bytes cannot corrupt the output columns.
 
 The ephemeral main-wallet helper uses the deployed official TON artifact image from `tonImage`, independently of the MyTonCtrl image tag. A digest pin is preserved. Override `MAIN_WALLET_IMAGE` to select a separate helper image.
 
+</details>
+
+<details>
+<summary>Lifecycle, image upgrade, monitoring and cleanup commands</summary>
+
 ```bash
 # install TON k8s operator only
 ./kubeton check
@@ -1156,6 +1254,9 @@ The ephemeral main-wallet helper uses the deployed official TON artifact image f
 
 # start TON nodes (replicas from tonnode-values.yaml)
 ./kubeton start
+
+# expose the password-protected VictoriaLogs dashboard and print its login-retrieval command
+./kubeton logs expose
 
 # apply changed MyTonCtrl/TON images from tonnode-values.yaml
 ./kubeton upgrade
@@ -1202,9 +1303,14 @@ The ephemeral main-wallet helper uses the deployed official TON artifact image f
 ./kubeton purge
 ```
 
+</details>
+
 ### Environment overrides
 
 `kubeton` reads these environment variables:
+
+<details>
+<summary>All supported environment variables</summary>
 
 ```bash
 RELEASE_NAME
@@ -1403,6 +1509,8 @@ VICTORIA_LOGS_HELM_TIMEOUT_SECONDS
 VICTORIA_LOGS_CLEANUP_TIMEOUT_SECONDS
 ```
 
+</details>
+
 ### kubeton prometheus
 
 `kubeton prometheus start` creates or updates the Prometheus scrapers and
@@ -1434,6 +1542,9 @@ traffic; use an HTTPS reverse proxy for encrypted browser access.
 ### PROMETHEUS_TARGET_MODE
 
 `PROMETHEUS_TARGET_MODE` controls how `kubeton prometheus start` builds scrape targets from TonNode `CUSTOM_PARAMETERS` (`--exporter-address`).
+
+<details>
+<summary>Scrape target modes, host-port requirements and remediation controls</summary>
 
 - `auto` (default):
   - bare-metal (non-k3d): uses `external-nodeip`
@@ -1475,6 +1586,8 @@ Auto-remediation controls:
 `operator-values.yaml` is operator-focused (image/resources/metrics); `kubeton install` preserves existing TonNode chart values on upgrade (`--reuse-values`) and does not delete active TON resources.
 `tonnode-values.yaml` enables TON nodes, enables key-management by default (`vault`, `ton-vault-creds`, `encrypted-sc`), and selects both runtime images, MyTonCtrl startup arguments and supported container environment parameters.
 
+</details>
+
 ### kubeton grafana
 
 `kubeton grafana start` automates Grafana installation/start and wires datasource/dashboard provisioning to kubeton-managed Prometheus service(s).
@@ -1512,6 +1625,9 @@ masterchain sequence number and block age, shard processing lag, validator
 groups, collation/validation rates and timing, mempool messages, ADNL/QUIC traffic,
 actor worker activity, and scrape health. Choose **Prometheus**, **TON job** and
 **Node target** at the top; each managed Prometheus instance is selectable.
+
+<details>
+<summary>Grafana charts, filters, time windows and metric availability</summary>
 
 Expand the four additional sections for session-style charts from native TON
 metrics:
@@ -1562,6 +1678,8 @@ few scrapes. The native exporter does not provide CellDB/archive sizes or host
 memory/filesystem metrics, so those are not included. `kubeton status` still
 reports database sizes.
 
+</details>
+
 The command checks that the provisioned dashboard is available before printing
 its access URL. `GRAFANA_DASHBOARD_UID` and `GRAFANA_DASHBOARD_TITLE` customize its
 identity and title; existing datasource UIDs and login credentials are preserved.
@@ -1591,6 +1709,12 @@ first start when no TonNode existed during metrics setup.
 Use `kubeton logs` for access instructions. `kubeton uninstall` and
 `kubeton purge` remove the managed logging/metrics resources and local
 port-forwards.
+
+For browser access and credentials, follow
+[VictoriaLogs dashboard access](#victorialogs-dashboard-access).
+
+<details>
+<summary>VictoriaLogs and VictoriaMetrics resources, placement and environment overrides</summary>
 
 Behavior:
 - applies/updates VictoriaMetrics operator in namespace `vm` (configurable)
@@ -1653,6 +1777,8 @@ overrides can widen access. New defaults do not terminate old public
 port-forwards or remove existing NodePort Services; audit and close previous
 public access separately. `kubeton logs` only prints access instructions and
 does not change Services, NetworkPolicies, credentials or running forwards.
+
+</details>
 
 ### Cloud Install Options
 
@@ -1854,6 +1980,8 @@ The monitoring stack is installed by `kubeton start`. Its local port-forwards
 run on the machine executing kubeton; Cloud Shell is not a permanent public
 dashboard host. Use the printed port-forward instructions or an authenticated
 HTTPS access layer for ongoing access.
+See [VictoriaLogs dashboard access](#victorialogs-dashboard-access) for the
+exposure command and browser login credentials.
 
 ### Upgrade Workflow (When Image Changes)
 
@@ -1892,6 +2020,9 @@ TON binaries before MyTonCtrl starts, including after a MyTonCtrl-only change:
 the exported artifacts belong to each pod, so the same TON image is exported
 again. MyTonCtrl runs the exported TON binaries within its pod.
 
+<details>
+<summary>Release publishing, manual Helm upgrades, rollback and uninstall</summary>
+
 For an operator/chart release, commit and push the versioned changes:
 
 ```bash
@@ -1917,7 +2048,7 @@ Cluster upgrade workflow:
 ```bash
 # fetch new release installer and chart
 wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.3/install.sh" | bash
-cd ./ton-k8s-operator-0.3.0
+cd ./ton-k8s-operator-0.5.3
 
 # review values before upgrade
 cat operator-values.yaml
@@ -2067,6 +2198,8 @@ For `kubeton`-based full destructive cleanup (including CRD), use:
 
 `kubeton purge` includes full uninstall of kubeton-managed resources, then deletes TonNode CRD.
 
+</details>
+
 ### Flow C: Cluster User (raw install.yaml fallback)
 
 If you prefer plain manifests:
@@ -2112,10 +2245,13 @@ Run them from repo root:
 
 Data from all TON pods is not stored in one shared place.
 
+<details>
+<summary>Per-replica volumes, local-path placement and storage cleanup</summary>
+
 With this operator setup:
 - Each TON pod gets its own data PVCs (`ton-work-...`, `ton-src-...`, `mytoncore-...`, and `mytonctrl-...`).
-- `/var/ton-work/controller/mytoncore` stores `mytoncore.db` and wallets on the `ton-work` PVC; `/var/ton-work/controller/mytonctrl` stores console data.
-- When encrypted key management is enabled, `/var/ton-work/controller/mytoncore/wallets` is overlaid with tmpfs and restored from the encrypted key bundle.
+- `/var/ton-work/controller/mytoncore/mytoncore.db` and `/var/ton-work/controller/mytonctrl` console data persist on the `ton-work` PVC; they are not encrypted by the key-bundle feature.
+- With `spec.keyManagement.enabled: true`, `/var/ton-work/controller/mytoncore/wallets` is a separate tmpfs mount restored from the encrypted bundle on the `keybundle` PVC. With key management disabled, wallet files persist directly on `ton-work`.
 - The `ton-src`, `mytoncore` and `mytonctrl` PVCs are retained for compatibility/recovery, and are no longer runtime mounts. TON executables and Fift resources come from the selected official TON image and are refreshed by the init containers on pod creation.
 - `/usr/bin/ton` and `/usr/src/ton/crypto` are compatibility links created by the MyTonCtrl entrypoint to its private `/run/ton-active` snapshot.
 - PVCs are `ReadWriteOnce`, so one PVC is attached to one pod.
@@ -2132,6 +2268,8 @@ If you use `local-path` StorageClass:
 - If an explicit `kubeton uninstall` or `kubeton drop` can record a TON PVC's immutable PV/PVC identity but cannot prove its local-path owning node, it clears that *unmounted PVC object's* finalizers so the claim cannot block teardown. It does not guess at the host directory or force-delete the PV; the unresolved storage record remains in the ledger and the command exits non-zero for manual reconciliation. The provisioner may independently honor a `Delete` reclaim policy after the PVC is removed, but kubeton does not claim that unverified host data was purged. A PVC with no durable identity record, or one still referenced by any pod, is never force-deleted.
 - `LOCAL_PATH_PROVISIONER_ROOT` is only needed for the optional wildcard fallback. `KUBETON_LOCAL_PATH_PATTERN_CLEANUP=true` may remove old, untracked directories by PVC-name pattern and is appropriate only in an isolated kubeton-owned cluster. Unknown historical directories without a PVC/PV or cleanup ledger cannot be safely attributed by default.
 - set `KUBETON_LOCAL_PATH_CLEANUP=false` to opt out of host cleanup. Local-path PVs then remain as an unresolved ledger item (and uninstall exits non-zero) rather than silently deleting unverified host data; CSI PV retry records are still retained. The ledger is stored in `kube-system` by default, because it is an authorization boundary for privileged node cleanup. The invoking identity needs read/write/delete access to that ConfigMap. Use `KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME` and `KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE` only when you need fixed ConfigMap placement for auditing or RBAC; choose an existing admin-only namespace that `kubeton uninstall` does not remove.
+
+</details>
 
 ## Local Development and Testing (k3d)
 
