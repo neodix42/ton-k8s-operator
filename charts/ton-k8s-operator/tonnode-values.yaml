@@ -48,6 +48,9 @@ tonNode:
     inMemory:
       keysSizeLimit: 128Mi
       walletsSizeLimit: 512Mi
+      controllerSizeLimit: 512Mi
+      keyringSizeLimit: 128Mi
+      stagingSizeLimit: 2Gi
     encryptedBundle:
       pvcSize: 5Gi
       storageClassName: encrypted-sc

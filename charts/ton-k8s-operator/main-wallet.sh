@@ -173,6 +173,68 @@ require_bin() {
   fi
 }
 
+main_wallet_require_memory_runtime() {
+  local filesystem
+  ulimit -c 0 || return 1
+  if [[ -L "$MAIN_WALLET_DIR" ]]; then
+    echo 'Error: main-wallet runtime must be a memory-backed directory, not a symlink.' >&2
+    return 1
+  fi
+  mkdir -p "$MAIN_WALLET_DIR" || return 1
+  require_bin stat
+  filesystem="$(stat -f -c %T -- "$MAIN_WALLET_DIR")" || return 1
+  if [[ "$filesystem" != tmpfs ]]; then
+    echo 'Error: main-wallet runtime is not tmpfs; refusing to create or decrypt private keys on disk.' >&2
+    return 1
+  fi
+  if ! awk 'NR > 1 { used = 1 } END { exit used }' /proc/swaps; then
+    echo 'Error: main-wallet requires a worker with swap disabled; refusing to expose plaintext keys to swap.' >&2
+    return 1
+  fi
+}
+
+# Explicit paths keep temporary files on the wallet's memory volume even when
+# the caller provides TMPDIR. The public, durable outbox has its own paths.
+main_wallet_scratch_directory() {
+  local directory="$MAIN_WALLET_DIR/.scratch"
+  [[ ! -L "$directory" ]] || {
+    echo 'Error: main-wallet scratch directory must not be a symlink.' >&2
+    return 1
+  }
+  (umask 077; mkdir -p "$directory") || return 1
+  printf '%s' "$directory"
+}
+
+main_wallet_temporary_file() {
+  local directory
+  directory="$(main_wallet_scratch_directory)" || return 1
+  mktemp "$directory/file.XXXXXX"
+}
+
+main_wallet_temporary_directory() {
+  local directory
+  directory="$(main_wallet_scratch_directory)" || return 1
+  mktemp -d "$directory/work.XXXXXX"
+}
+
+main_wallet_validate_archive() {
+  local archive="$1" scratch="$2"
+  # The official TON helper image has GNU tar and awk, but no Python. Reject
+  # links, devices, traversal and ambiguous names before extracting any bytes.
+  tar -tzf "$archive" >"$scratch/members" || return 1
+  LC_ALL=C awk '
+    !/^[A-Za-z0-9._\/-]+$/ || /^\// || /(^|\/)\.\.(\/|$)/ || /(^|\/)\.scratch(\/|$)/ { exit 1 }
+  ' "$scratch/members" || {
+    echo 'Error: unsafe main-wallet archive path; current wallet preserved.' >&2
+    return 1
+  }
+  tar -tvzf "$archive" >"$scratch/types" || return 1
+  LC_ALL=C awk 'substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { exit 1 }' "$scratch/types" || {
+    echo 'Error: unsupported main-wallet archive member; current wallet preserved.' >&2
+    return 1
+  }
+}
+
 read_meta_value() {
   local key="$1"
   local meta_file="$2"
@@ -185,7 +247,7 @@ write_meta_value() {
   local meta_file="$3"
   local tmp_file
 
-  tmp_file="$(mktemp)"
+  tmp_file="$(main_wallet_temporary_file)" || return 1
   if [[ -f "$meta_file" ]]; then
     awk -F= -v wanted="$key" -v replacement="$value" '
       $1 == wanted {
@@ -516,12 +578,14 @@ vault_decrypt_data_key() {
   esac
 }
 
-restore_bundle() {
+restore_bundle() (
   local bundle_file="${MAIN_WALLET_BUNDLE_DIR}/${MAIN_WALLET_BUNDLE_FILE}"
   local meta_file="${MAIN_WALLET_BUNDLE_DIR}/${MAIN_WALLET_BUNDLE_META_FILE}"
   local wrapped_key wrapped_key_encoding data_key_b64 tmp_dir
 
-  mkdir -p "$MAIN_WALLET_DIR" "$MAIN_WALLET_BUNDLE_DIR"
+  umask 077
+  main_wallet_require_memory_runtime || return 1
+  mkdir -p "$MAIN_WALLET_BUNDLE_DIR" || return 1
   if [[ ! -s "$bundle_file" || ! -s "$meta_file" ]]; then
     return 0
   fi
@@ -551,34 +615,40 @@ restore_bundle() {
   fi
   export DATA_KEY_B64="$data_key_b64"
 
-  tmp_dir="$(mktemp -d)"
+  tmp_dir="$(main_wallet_temporary_directory)" || return 1
+  trap 'rm -rf "$tmp_dir"' EXIT
 
   openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 \
     -pass env:DATA_KEY_B64 \
     -in "$bundle_file" \
-    -out "$tmp_dir/main-wallet.tar.gz"
+    -out "$tmp_dir/main-wallet.tar.gz" || return 1
 
-  mkdir -p "$tmp_dir/unpacked"
-  tar -xzf "$tmp_dir/main-wallet.tar.gz" -C "$tmp_dir/unpacked"
+  main_wallet_validate_archive "$tmp_dir/main-wallet.tar.gz" "$tmp_dir" || return 1
+  mkdir -p "$tmp_dir/unpacked" || return 1
+  tar -xzf "$tmp_dir/main-wallet.tar.gz" -C "$tmp_dir/unpacked" || return 1
 
-  find "$MAIN_WALLET_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
-  cp -a "$tmp_dir/unpacked/." "$MAIN_WALLET_DIR/"
+  find "$MAIN_WALLET_DIR" -mindepth 1 -maxdepth 1 ! -name .scratch -exec rm -rf {} + || return 1
+  cp -a "$tmp_dir/unpacked/." "$MAIN_WALLET_DIR/" || return 1
   rm -rf "$tmp_dir"
-}
+)
 
-backup_bundle() {
+backup_bundle() (
   local bundle_file="${MAIN_WALLET_BUNDLE_DIR}/${MAIN_WALLET_BUNDLE_FILE}"
   local meta_file="${MAIN_WALLET_BUNDLE_DIR}/${MAIN_WALLET_BUNDLE_META_FILE}"
   local data_key_b64 wrapped_key tmp_dir
 
-  mkdir -p "$MAIN_WALLET_DIR" "$MAIN_WALLET_BUNDLE_DIR"
+  umask 077
+  main_wallet_require_memory_runtime || return 1
+  mkdir -p "$MAIN_WALLET_BUNDLE_DIR" || return 1
   require_bin tar
   require_bin openssl
   require_bin mktemp
 
-  tmp_dir="$(mktemp -d)"
+  tmp_dir="$(main_wallet_temporary_directory)" || return 1
+  trap 'rm -rf "$tmp_dir"' EXIT
 
-  tar -czf "$tmp_dir/main-wallet.tar.gz" -C "$MAIN_WALLET_DIR" .
+  tar --exclude='./.scratch' -czf "$tmp_dir/main-wallet.tar.gz" -C "$MAIN_WALLET_DIR" . || return 1
+  main_wallet_validate_archive "$tmp_dir/main-wallet.tar.gz" "$tmp_dir" || return 1
   data_key_b64="$(openssl rand -base64 32 | tr -d '\r\n')"
   if [[ -z "$data_key_b64" ]]; then
     echo "Error: failed to generate random data key." >&2
@@ -589,7 +659,7 @@ backup_bundle() {
   openssl enc -aes-256-cbc -pbkdf2 -md sha256 \
     -pass env:DATA_KEY_B64 \
     -in "$tmp_dir/main-wallet.tar.gz" \
-    -out "$tmp_dir/main-wallet.bundle.enc"
+    -out "$tmp_dir/main-wallet.bundle.enc" || return 1
 
   wrapped_key="$(vault_encrypt_data_key "$data_key_b64")"
   wrapped_key="$(trim_whitespace "$wrapped_key")"
@@ -598,17 +668,17 @@ backup_bundle() {
     return 1
   fi
 
-  cp -f "$tmp_dir/main-wallet.bundle.enc" "$bundle_file"
-  chmod 600 "$bundle_file"
+  cp -f "$tmp_dir/main-wallet.bundle.enc" "$bundle_file" || return 1
+  chmod 600 "$bundle_file" || return 1
   {
     echo "provider=${KEY_PROVIDER:-vault}"
     echo "wrapped_key_encoding=passphrase-b64-v1"
     echo "wrapped_key=${wrapped_key}"
-  } > "$tmp_dir/main-wallet.bundle.meta"
-  cp -f "$tmp_dir/main-wallet.bundle.meta" "$meta_file"
-  chmod 600 "$meta_file"
+  } > "$tmp_dir/main-wallet.bundle.meta" || return 1
+  cp -f "$tmp_dir/main-wallet.bundle.meta" "$meta_file" || return 1
+  chmod 600 "$meta_file" || return 1
   rm -rf "$tmp_dir"
-}
+)
 
 resolve_new_wallet_fif() {
   local candidate
@@ -745,7 +815,7 @@ resolve_local_global_config_path() {
   if [[ -n "$GLOBAL_CONFIG_JSON" ]]; then
     # Config files in a TON pod may use paths that do not exist in this helper
     # pod. Use the exact active config bytes copied by the host CLI.
-    temp_config_file="$(mktemp)"
+    temp_config_file="$(main_wallet_temporary_file)" || return 1
     printf '%s' "$GLOBAL_CONFIG_JSON" >"$temp_config_file"
     printf '%s\t%s' "$temp_config_file" "$temp_config_file"
     return 0
@@ -759,7 +829,7 @@ resolve_local_global_config_path() {
   if [[ "$global_config_source" =~ ^https?:// ]]; then
     require_bin curl
     require_bin mktemp
-    temp_config_file="$(mktemp)"
+    temp_config_file="$(main_wallet_temporary_file)" || return 1
     local timeout
     timeout="$(wallet_request_timeout 15)" || { rm -f "$temp_config_file"; return 1; }
     if ! curl -fsSL --connect-timeout "$timeout" --max-time "$timeout" "$global_config_source" -o "$temp_config_file"; then
@@ -1007,7 +1077,7 @@ main_wallet_create() {
 
   local create_log
   local wallet_address non_bounceable bounceable meta_file network
-  create_log="$(mktemp)"
+  create_log="$(main_wallet_temporary_file)" || return 1
 
   if ! (
     cd "$MAIN_WALLET_DIR" || exit 1
@@ -1470,7 +1540,7 @@ main_wallet_version_by_name() {
   # Historical metadata predates wallet_version. Verify the actual account
   # against the V3 constructor before identifying it; filenames alone prove
   # neither a version nor a contract revision. Show must not rewrite metadata.
-  if [[ -f "$meta_file" ]] && tmp_boc="$(mktemp)"; then
+  if [[ -f "$meta_file" ]] && tmp_boc="$(main_wallet_temporary_file)"; then
     if wallet_build_deploy_boc "$wallet_name" "$tmp_boc" >/dev/null 2>&1; then
       rm -f "$tmp_boc"
       printf '%s' v3
@@ -1545,7 +1615,7 @@ wallet_toncenter_get() (
   [[ "$method" =~ ^[A-Za-z]+$ ]] || return 1
   [[ -z "$TONCENTER_API_KEY" ]] || curl_args+=(-H "X-API-Key: ${TONCENTER_API_KEY}")
   for parameter in "$@"; do curl_args+=(--data-urlencode "$parameter"); done
-  headers="$(mktemp)" || return 1
+  headers="$(main_wallet_temporary_file)" || return 1
   trap 'rm -f "$headers"' EXIT
   for ((attempt = 1; attempt <= 3; attempt++)); do
     wallet_http_pace || return 1
@@ -2781,7 +2851,8 @@ run_with_persistence() {
   local action_rc=0
   local backup_rc=0
 
-  restore_bundle
+  main_wallet_require_memory_runtime || return 1
+  restore_bundle || return 1
   if run_action "$action" "$@"; then
     action_rc=0
   else
@@ -2820,6 +2891,7 @@ main() {
       run_with_persistence "$@"
       ;;
     create|deploy|send|show|export)
+      main_wallet_require_memory_runtime || return 1
       run_action "$command" "$@"
       ;;
     help|-h|--help)

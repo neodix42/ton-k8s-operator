@@ -16,6 +16,10 @@ const (
 	tonExporterVolume     = "ton-exporter-script"
 	tonArtifactsVolume    = "ton-artifacts"
 	controllerWalletsPath = "/var/ton-work/controller/mytoncore/wallets"
+	controllerTmpfsVolume = "controller-tmpfs"
+	keyringTmpfsVolume    = "keyring-tmpfs"
+	secretScratchVolume   = "secret-scratch"
+	runtimeRunVolume      = "runtime-run"
 
 	// Keep the old claims attached so existing StatefulSets do not require an
 	// immutable claim-template change. The new runtime creates compatibility
@@ -24,7 +28,10 @@ const (
 set -eu
 if [ ! -s /mnt/ton-work/controller/initialized.json ] \
   && [ ! -f /mnt/ton-work/controller/.initializing ] \
-  && [ ! -f /mnt/keybundle/.restore-controller-state ]; then
+  && [ ! -f /mnt/keybundle/.restore-controller-state ] \
+  && [ ! -f /mnt/keybundle/.historical-plaintext-exposure ] \
+  && ! { [ -s "/mnt/keybundle/${KEY_BUNDLE_FILE:-keys.bundle.enc}" ] \
+    && [ -s "/mnt/keybundle/${KEY_BUNDLE_META_FILE:-keys.bundle.meta}" ]; }; then
   if [ -f /mnt/ton-work/db/mtc_done ] \
     || [ -s /mnt/mytoncore/mytoncore.db ] \
     || [ -s /mnt/ton-work/usr-local-bin-mytoncore/mytoncore.db ] \

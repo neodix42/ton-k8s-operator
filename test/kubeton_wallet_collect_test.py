@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pathlib
+import resource
 import subprocess
 import sys
 import tempfile
@@ -408,7 +409,9 @@ class CollectDriverTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("synthetic include file")
         self.namespace.update(JOURNAL_ROOT=self.journal_root, WALLET_ROOT=wallet_root,
-                              CONFIG_PATH=self.config, ACTIVE_ROOT=active_root)
+                              CONFIG_PATH=self.config, ACTIVE_ROOT=active_root,
+                              CHECKPOINT_REQUEST_ROOT=self.root / "checkpoint-requests",
+                              CHECKPOINT_ACK_ROOT=self.root / "checkpoint-acks")
         self.journal = self.journal_root / (hashlib.sha256(("mainnet:" + SOURCE).encode()).hexdigest() + ".json")
         self.commands = []
         self.requests = []
@@ -419,6 +422,16 @@ class CollectDriverTests(unittest.TestCase):
         self.command_output = "Failed to send boc: account state unavailable\nWaitTransaction error: Can't get seqno\n"
         self.http_errors = []
         self.deadlines = []
+        self.memory_controller = False
+        self.checkpoint_mode = "ok"
+        self.checkpoint_identifiers = []
+        self.encrypted_journal = None
+        self.core_limit_calls = []
+
+    def enable_memory_controller(self):
+        self.memory_controller = True
+        self.namespace["CHECKPOINT_REQUEST_ROOT"].mkdir()
+        self.namespace["CHECKPOINT_ACK_ROOT"].mkdir()
 
     def run_driver(self, amount="alld", balance="0.756407580", destination=DESTINATION,
                    source=SOURCE, network="mainnet", confirm_timeout=5, inspect=False, expect=None):
@@ -435,6 +448,10 @@ class CollectDriverTests(unittest.TestCase):
             state = json.loads(self.journal.read_text())
             self.assertEqual(state["status"], "pending", "intent must be durable before broadcasting")
             self.assertEqual(state["marker"], tokens[5], "broadcast must use the persisted payment identifier")
+            if self.memory_controller:
+                self.assertIsNotNone(self.encrypted_journal, "mg ran before encrypted persistence was acknowledged")
+                self.assertEqual(json.loads(self.encrypted_journal)["marker"], tokens[5],
+                                 "mg used an intent absent from the acknowledged encrypted snapshot")
             self.commands.append(command)
             if self.command_timeout:
                 return 124, self.command_output
@@ -484,6 +501,26 @@ class CollectDriverTests(unittest.TestCase):
         def sleep(delay):
             self.assertGreaterEqual(delay, 0)
             self.clock += delay + 0.001
+            request_root = self.namespace["CHECKPOINT_REQUEST_ROOT"]
+            if self.memory_controller and request_root.is_dir():
+                for request in request_root.iterdir():
+                    if request.name in self.checkpoint_identifiers:
+                        continue
+                    self.checkpoint_identifiers.append(request.name)
+                    self.assertRegex(request.name, r"^[0-9a-f]{32}$")
+                    self.assertEqual(json.loads(self.journal.read_text())["status"], "pending")
+                    acknowledgement = self.namespace["CHECKPOINT_ACK_ROOT"] / request.name
+                    if self.checkpoint_mode == "ok":
+                        self.encrypted_journal = self.journal.read_bytes()
+                        acknowledgement.write_text("ok\n")
+                    elif self.checkpoint_mode == "failed":
+                        acknowledgement.write_text("failed\n")
+                    elif self.checkpoint_mode == "unrelated":
+                        (acknowledgement.parent / "unrelated-request").write_text("ok\n")
+                    elif self.checkpoint_mode == "symlink":
+                        outside = self.root / "unexpected-ack"
+                        outside.write_text("ok\n")
+                        acknowledgement.symlink_to(outside)
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(self.namespace, run_mytonctrl=mock.Mock(side_effect=run)))
@@ -493,6 +530,10 @@ class CollectDriverTests(unittest.TestCase):
             stack.enter_context(mock.patch("shutil.which", return_value="/fixture/mytonctrl"))
             stack.enter_context(mock.patch("time.monotonic", side_effect=lambda: self.clock))
             stack.enter_context(mock.patch("time.sleep", side_effect=sleep))
+            stack.enter_context(mock.patch("os.path.ismount", side_effect=lambda path:
+                                          self.memory_controller and path == "/var/ton-work/controller"))
+            stack.enter_context(mock.patch("resource.setrlimit", side_effect=lambda *args:
+                                          self.core_limit_calls.append(args)))
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
             try:
@@ -508,6 +549,82 @@ class CollectDriverTests(unittest.TestCase):
 
     def assert_pending(self):
         self.assertEqual(json.loads(self.journal.read_text())["status"], "pending")
+
+    def test_memory_journal_is_encrypted_before_collecting_and_only_matching_ack_counts(self):
+        self.enable_memory_controller()
+        (self.namespace["CHECKPOINT_ACK_ROOT"] / "old-request").write_text("ok\n")
+        rc, _, stderr = self.run_driver()
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(len(self.checkpoint_identifiers), 1)
+        self.assertEqual(json.loads(self.encrypted_journal)["status"], "pending")
+        self.assertEqual(list(self.namespace["CHECKPOINT_REQUEST_ROOT"].iterdir()), [])
+        acknowledgements = list(self.namespace["CHECKPOINT_ACK_ROOT"].iterdir())
+        self.assertEqual([item.name for item in acknowledgements], ["old-request"])
+
+    def test_failed_encrypted_checkpoint_keeps_intent_without_signing_or_querying_history(self):
+        self.enable_memory_controller()
+        self.checkpoint_mode = "failed"
+        rc, _, stderr = self.run_driver()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("checkpoint failed", stderr)
+        self.assert_pending()
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.requests, [])
+        self.assertEqual(list(self.namespace["CHECKPOINT_REQUEST_ROOT"].iterdir()), [])
+        self.assertEqual(list(self.namespace["CHECKPOINT_ACK_ROOT"].iterdir()), [])
+
+    def test_checkpoint_timeout_or_unrelated_ack_never_unlocks_mg(self):
+        self.enable_memory_controller()
+        for mode in ("timeout", "unrelated"):
+            with self.subTest(mode=mode):
+                self.checkpoint_mode = mode
+                rc, _, stderr = self.run_driver()
+                self.assertNotEqual(rc, 0)
+                self.assertIn("checkpoint timed out", stderr)
+                self.assert_pending()
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.requests, [])
+                self.assertEqual(list(self.namespace["CHECKPOINT_REQUEST_ROOT"].iterdir()), [])
+                self.journal.unlink()
+
+    def test_checkpoint_agent_missing_or_symlinked_fails_before_mg(self):
+        self.memory_controller = True
+        rc, _, stderr = self.run_driver()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("checkpoint agent is unavailable", stderr)
+        self.assert_pending()
+        self.assertEqual(self.commands, [])
+        self.journal.unlink()
+        requests = self.namespace["CHECKPOINT_REQUEST_ROOT"]
+        requests.symlink_to(self.root, target_is_directory=True)
+        self.namespace["CHECKPOINT_ACK_ROOT"].mkdir()
+        rc, _, stderr = self.run_driver()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("checkpoint agent is unavailable", stderr)
+        self.assertEqual(self.commands, [])
+
+    def test_checkpoint_ack_symlink_cannot_authorize_payment(self):
+        self.enable_memory_controller()
+        self.checkpoint_mode = "symlink"
+        rc, _, _ = self.run_driver()
+        self.assertNotEqual(rc, 0)
+        self.assert_pending()
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.requests, [])
+
+    def test_each_fresh_collection_has_an_independent_checkpoint_id(self):
+        self.enable_memory_controller()
+        for _ in range(2):
+            rc, _, stderr = self.run_driver()
+            self.assertEqual(rc, 0, stderr)
+        self.assertEqual(len(self.commands), 2)
+        self.assertEqual(len(set(self.checkpoint_identifiers)), 2)
+
+    def test_core_dumps_disabled_before_wallet_operations(self):
+        rc, _, stderr = self.run_driver()
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(self.core_limit_calls, [(resource.RLIMIT_CORE, (0, 0))])
 
     def test_deleted_wallet_receipt_overrides_mytonctrl_timeout(self):
         rc, stdout, stderr = self.run_driver()

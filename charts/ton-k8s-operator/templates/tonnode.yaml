@@ -79,6 +79,9 @@ spec:
     inMemory:
       keysSizeLimit: {{ .inMemory.keysSizeLimit }}
       walletsSizeLimit: {{ .inMemory.walletsSizeLimit }}
+      controllerSizeLimit: {{ .inMemory.controllerSizeLimit | default "512Mi" }}
+      keyringSizeLimit: {{ .inMemory.keyringSizeLimit | default "128Mi" }}
+      stagingSizeLimit: {{ .inMemory.stagingSizeLimit | default "2Gi" }}
     encryptedBundle:
       pvcSize: {{ .encryptedBundle.pvcSize }}
       {{- with .encryptedBundle.storageClassName }}

@@ -200,7 +200,7 @@ type TonNodeKeyManagementSpec struct {
 	Agent TonNodeKeyAgentSpec `json:"agent,omitempty"`
 }
 
-// TonNodeInMemoryKeySpec defines tmpfs sizing for live key directories.
+// TonNodeInMemoryKeySpec bounds memory used for secrets, staging and runtime state.
 type TonNodeInMemoryKeySpec struct {
 	// KeysSizeLimit is the tmpfs size limit for /var/ton-work/keys.
 	// +kubebuilder:default:="128Mi"
@@ -209,6 +209,18 @@ type TonNodeInMemoryKeySpec struct {
 	// WalletsSizeLimit is the tmpfs size limit for /var/ton-work/controller/mytoncore/wallets.
 	// +kubebuilder:default:="512Mi"
 	WalletsSizeLimit string `json:"walletsSizeLimit,omitempty"`
+
+	// ControllerSizeLimit bounds memory-backed MyTonCtrl state and credentials.
+	// +kubebuilder:default:="512Mi"
+	ControllerSizeLimit string `json:"controllerSizeLimit,omitempty"`
+
+	// KeyringSizeLimit bounds the validator's memory-backed private keyring.
+	// +kubebuilder:default:="128Mi"
+	KeyringSizeLimit string `json:"keyringSizeLimit,omitempty"`
+
+	// StagingSizeLimit bounds each memory-backed /tmp and /run volume.
+	// +kubebuilder:default:="2Gi"
+	StagingSizeLimit string `json:"stagingSizeLimit,omitempty"`
 }
 
 // TonNodeEncryptedBundleSpec defines encrypted key bundle persistence settings.

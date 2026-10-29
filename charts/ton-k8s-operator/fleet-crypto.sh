@@ -3,8 +3,26 @@
 # enter/leave over stdin/stdout and are never passed as command arguments.
 set -eu
 umask 077
+ulimit -c 0
+
+# Unwrapped recovery keys are live process memory even when no archive is
+# written. Reject workers that could swap that memory onto persistent storage.
+if ! awk 'NR > 1 { used = 1 } END { exit used }' /proc/swaps; then
+  echo "Refusing fleet key recovery on a worker with swap enabled; disable swap before retrying" >&2
+  exit 1
+fi
+
 bundle_dir="${FLEET_BUNDLE_DIR:-/bundle}"
 recovery_dir="${FLEET_RECOVERY_DIR:-/recovery}"
+
+require_memory_directory() {
+  memory_dir="$1"
+  if [ -L "$memory_dir" ] || [ ! -d "$memory_dir" ] \
+    || [ "$(stat -f -c %T "$memory_dir")" != tmpfs ]; then
+    echo "Refusing fleet plaintext recovery: required memory mount is absent: $memory_dir" >&2
+    exit 1
+  fi
+}
 
 vault_request() {
   operation="$1"
@@ -29,6 +47,9 @@ case "$1" in
     vault_request decrypt "$wrapped" | jq -er '.data.plaintext' | base64 -d
     ;;
   restore)
+    require_memory_directory /tmp
+    require_memory_directory "$recovery_dir"
+    export TMPDIR=/tmp
     read -r data_key
     # Validate before using the key; no secret is placed in the process args.
     key_size="$(printf %s "$data_key" | base64 -d | wc -c | tr -d ' ')"

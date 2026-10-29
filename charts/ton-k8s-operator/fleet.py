@@ -167,6 +167,8 @@ def helper(sts, pod_name, ordinal, session, tools_image=None):
         mounts.append({"name": name, "mountPath": "/bundle" if name == "keybundle" else f"/volumes/{name}"})
     volumes.append({"name": "recovery", "emptyDir": {"medium": "Memory"}})
     mounts.append({"name": "recovery", "mountPath": "/recovery"})
+    volumes.append({"name": "scratch", "emptyDir": {"medium": "Memory"}})
+    mounts.append({"name": "scratch", "mountPath": "/tmp"})
     container = {"name": "restore", "image": tools_image or agent["image"],
                  "command": ["sh", "-c", "sleep 86400"], "env": agent.get("env", []),
                  "envFrom": agent.get("envFrom", []), "volumeMounts": mounts,
@@ -191,6 +193,7 @@ def rebind(source, target, address, port):
         for member in old:
             name = member.name.removeprefix("./")
             require(not name.startswith("/") and ".." not in Path(name).parts, "unsafe bundle member")
+            require(member.isfile() or member.isdir(), "unsafe bundle member type")
             payload = old.extractfile(member) if member.isfile() else None
             if name == "tondb/config.json":
                 config = json.load(payload)
@@ -223,9 +226,11 @@ def restore_bootstrap():
     import survives both container restarts and recreation of the Pod.
     """
     import fcntl
+    import resource
     import subprocess
     from types import SimpleNamespace
 
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     request = Path("/var/ton-key-bundle/.restore-node-bootstrap.json")
     if not request.exists():
         return

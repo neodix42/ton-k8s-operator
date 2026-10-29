@@ -12605,6 +12605,7 @@ import json
 import os
 import pathlib
 import re
+import resource
 import secrets
 import signal
 import shutil
@@ -12615,11 +12616,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 JOURNAL_ROOT = pathlib.Path('/var/ton-work/controller/.kubeton-collect')
 WALLET_ROOT = pathlib.Path('/var/ton-work/controller/mytoncore/wallets')
 CONFIG_PATH = pathlib.Path('/var/ton-work/controller/global.config.json')
 ACTIVE_ROOT = pathlib.Path('/run/ton-active')
+CHECKPOINT_REQUEST_ROOT = pathlib.Path('/tmp/key-backup.requests')
+CHECKPOINT_ACK_ROOT = pathlib.Path('/tmp/key-backup.acks')
 
 
 def normalize_address(address):
@@ -13073,6 +13077,36 @@ def save_journal(path, state):
             os.unlink(temporary)
 
 
+def checkpoint_collection_journal():
+    # Old deployments retain the journal on disk. With memory-backed
+    # controller state, acknowledge its encrypted persistence before signing.
+    if not os.path.ismount('/var/ton-work/controller'):
+        return
+    for directory in (CHECKPOINT_REQUEST_ROOT, CHECKPOINT_ACK_ROOT):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError('encrypted collection checkpoint agent is unavailable; no transfer was submitted')
+    identifier = uuid.uuid4().hex
+    request = CHECKPOINT_REQUEST_ROOT / identifier
+    acknowledgement = CHECKPOINT_ACK_ROOT / identifier
+    descriptor = os.open(request, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+    deadline = time.monotonic() + 60
+    try:
+        while time.monotonic() < deadline:
+            if acknowledgement.exists():
+                descriptor = os.open(acknowledgement, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, 'r') as response:
+                    result = response.read(32).strip()
+                if result != 'ok':
+                    raise ValueError('encrypted collection checkpoint failed; no transfer was submitted')
+                return
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+        raise ValueError('encrypted collection checkpoint timed out; no transfer was submitted')
+    finally:
+        request.unlink(missing_ok=True)
+        acknowledgement.unlink(missing_ok=True)
+
+
 def same_plan(left, right):
     keys = ('wallet', 'source', 'destination', 'network', 'amount_nano')
     return isinstance(left, dict) and all(left.get(key) == right.get(key) for key in keys)
@@ -13240,6 +13274,7 @@ class Collector:
             state = {'version': 1, 'status': 'pending', 'plan': self.plan, 'balance_nano': self.balance,
                      'marker': 'kubeton-collect:' + secrets.token_hex(16), 'created_at': int(time.time()), 'diagnostics': ''}
             save_journal(self.journal_path, state)
+            checkpoint_collection_journal()
             command = 'mg {} {} {} -C {}'.format(self.plan['wallet'], self.plan['destination_input'],
                                                  self.plan['amount_input'], state['marker'])
             environment = os.environ.copy()
@@ -13272,6 +13307,7 @@ class Collector:
 
 
 def main(argv=None):
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     args = sys.argv[1:] if argv is None else argv
     expectation = None
     if len(args) >= 2 and args[0] == '--expect':
@@ -13385,7 +13421,7 @@ try: confirmation=float(sys.argv[2])
 except ValueError: raise SystemExit("Error: invalid WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS")
 if not all(math.isfinite(value) and value>0 for value in (command,confirmation)):
     raise SystemExit("Error: collection timeouts must be positive and finite")
-print(str(command)+"\t"+str(math.ceil(command+confirmation+30)))
+print(str(command)+"\t"+str(math.ceil(command+confirmation+90)))
 ' "$MYTONCTRL_EXEC_TIMEOUT" "$WALLET_COLLECT_CONFIRM_TIMEOUT_SECONDS")" || return 1
   IFS=$'\t' read -r command_timeout outer_timeout <<<"$budgets"
   script="$(tonnode_wallet_collect_script)"
@@ -18423,7 +18459,7 @@ ton_restore_helper_manifest() {
   python3 -c '
 import json,sys
 s=json.load(sys.stdin); name,node,image,stage,ordinal=sys.argv[1:]; spec=s["spec"]["template"]["spec"]; agent=next(c for c in spec["containers"] if c["name"]=="key-backup"); main=next(c for c in spec["containers"] if c["name"]=="ton-node")
-volumes=[{"name":"recovery","emptyDir":{"medium":"Memory"}}]; mounts=[{"name":"recovery","mountPath":"/recovery"}]
+volumes=[{"name":"recovery","emptyDir":{"medium":"Memory"}},{"name":"scratch","emptyDir":{"medium":"Memory"}}]; mounts=[{"name":"recovery","mountPath":"/recovery"},{"name":"scratch","mountPath":"/tmp"}]
 if stage=="stage":
  for claim in s["spec"]["volumeClaimTemplates"]:
   prefix=claim["metadata"]["name"]; volumes.append({"name":prefix,"persistentVolumeClaim":{"claimName":prefix+"-"+s["metadata"]["name"]+"-"+ordinal}}); mounts.append({"name":prefix,"mountPath":"/bundle" if prefix=="keybundle" else "/volumes/"+prefix})
@@ -18554,6 +18590,10 @@ run_restore_keys_targeted() (
   local validation
   validation="$(ton_restore_archive_validation_script)"
   kubectl -n "$ns" exec "$helper" -- sh -ec '
+    ulimit -c 0
+    test ! -L /recovery && test "$(stat -f -c %T /recovery)" = tmpfs
+    test ! -L /tmp && test "$(stat -f -c %T /tmp)" = tmpfs
+    awk '\''NR > 1 { used = 1 } END { exit used }'\'' /proc/swaps || { echo "Error: recovery requires a worker with swap disabled." >&2; exit 1; }
     crypto="$1"; validation="$2"; address="$3"; port="$4"
     metadata="/bundle/$KEY_BUNDLE_META_FILE"
     test "$(awk -F= '\''$1 == "provider" {print $2}'\'' "$metadata")" = vault
@@ -22261,6 +22301,8 @@ run_wallet() {
     printf '          value: %s\n' "$(yaml_quote "$MAIN_WALLET_NAME")"
     echo "        - name: MAIN_WALLET_DIR"
     printf '          value: %s\n' "$(yaml_quote "/var/main-wallet/runtime")"
+    echo "        - name: TMPDIR"
+    echo "          value: /tmp"
     echo "        - name: MAIN_WALLET_BUNDLE_DIR"
     printf '          value: %s\n' "$(yaml_quote "/var/main-wallet/bundle")"
     echo "      envFrom:"
@@ -22276,12 +22318,18 @@ run_wallet() {
     echo "          mountPath: /var/main-wallet/runtime"
     echo "        - name: main-wallet-bundle"
     echo "          mountPath: /var/main-wallet/bundle"
+    echo "        - name: main-wallet-scratch"
+    echo "          mountPath: /tmp"
     echo "  volumes:"
     echo "    - name: main-wallet-script"
     echo "      configMap:"
     echo "        name: ${MAIN_WALLET_SCRIPT_CONFIGMAP}"
     echo "        defaultMode: 0555"
     echo "    - name: main-wallet-runtime"
+    echo "      emptyDir:"
+    echo "        medium: Memory"
+    echo "        sizeLimit: ${MAIN_WALLET_RUNTIME_TMPFS_SIZE}"
+    echo "    - name: main-wallet-scratch"
     echo "      emptyDir:"
     echo "        medium: Memory"
     echo "        sizeLimit: ${MAIN_WALLET_RUNTIME_TMPFS_SIZE}"

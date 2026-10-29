@@ -386,6 +386,13 @@ func TestRuntimePersistentLayoutPreservesLegacyData(t *testing.T) {
 			"keybundle/.restore-controller-state": "requested", "ton-work/db/config.json": "retained configuration",
 			"ton-work/db/keyring/private-key": "retained private key",
 		}},
+		{name: "verified memory migration resumes after interrupted plaintext cleanup", files: map[string]string{
+			"keybundle/.historical-plaintext-exposure": "verified encrypted snapshot before cleanup",
+			"keybundle/keys.bundle.enc":                "encrypted identity",
+			"keybundle/keys.bundle.meta":               "wrapped key metadata",
+			"ton-work/db/config.json":                  "retained configuration",
+			"ton-work/db/keyring/private-key":          "remaining plaintext after cleanup interrupted",
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			mounts := t.TempDir()

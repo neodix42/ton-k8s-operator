@@ -389,12 +389,38 @@ main "$@"
                 self.assertEqual(config["addrs"][0], {"ip": -889163510, "port": 30001})
                 self.assertNotIn(b"192.0.2.99", archive.extractfile("./controller/services/validator.service").read())
 
+    def crypto_memory_fixture(self, *, temporary_path=None, swap_enabled=False):
+        """Use real tmpfs without changing host mounts or swap settings."""
+        try:
+            memory = tempfile.TemporaryDirectory(prefix="kubeton-fleet-crypto-", dir="/dev/shm")
+        except OSError as error:
+            self.skipTest(f"fleet crypto integration requires writable tmpfs /dev/shm: {error}")
+        self.addCleanup(memory.cleanup)
+        root = Path(memory.name)
+        filesystem = subprocess.run(["stat", "-f", "-c", "%T", str(root)], text=True,
+                                    capture_output=True, check=True).stdout.strip()
+        if filesystem != "tmpfs":
+            self.skipTest(f"fleet crypto integration requires actual tmpfs, got {filesystem}")
+        recovery, temporary = root / "recovery", root / "tmp"
+        recovery.mkdir()
+        temporary.mkdir()
+        swaps = root / "swaps"
+        swaps.write_text("Filename\tType\tSize\tUsed\tPriority\n" +
+                         ("/test-swap\tfile\t1024\t0\t-1\n" if swap_enabled else ""))
+        # Only the private test copy substitutes literal operating-system paths.
+        # The shipped script has no environment switch bypassing either guard.
+        script = root / "fleet-crypto-under-test.sh"
+        script.write_text((CHART / "fleet-crypto.sh").read_text()
+                          .replace("/proc/swaps", str(swaps))
+                          .replace("/tmp", str(temporary_path or temporary)))
+        return script, recovery, temporary
+
     def test_real_crypto_rewrap_and_decrypt_on_destination(self):
-        bundle_dir, scratch = self.root / "bundle", self.root / "scratch"
+        script, scratch, _ = self.crypto_memory_fixture()
+        bundle_dir = self.root / "bundle"
         bundle_dir.mkdir()
-        scratch.mkdir()
         shutil.copyfile(CHART / "fleet.py", scratch / "fleet.py")
-        source = self.root / "payload.tar.gz"
+        source = scratch.parent / "payload.tar.gz"
         with tarfile.open(source, "w:gz") as archive:
             for name, value in (("keys/client", b"original private key"),
                                 ("tondb/config.json", b'{"addrs":[{"ip":-1,"port":30001}]}'),
@@ -408,7 +434,8 @@ main "$@"
         # Simulate the Vault API only; run real OpenSSL, JSON and tar processing.
         curl = self.root / "bin/curl"
         curl.write_text('''#!/usr/bin/env python3
-import json, sys
+import json, resource, sys
+assert resource.getrlimit(resource.RLIMIT_CORE)[0] == 0, 'recovery process permits core dumps'
 payload = json.load(sys.stdin)
 if sys.argv[-1].endswith('/encrypt/new-transit'):
     print(json.dumps({'data': {'ciphertext': 'vault:v9:' + payload['plaintext']}}))
@@ -420,7 +447,7 @@ else:
         subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256",
                         "-pass", "env:DATA_KEY_B64", "-in", str(source), "-out", str(encrypted)],
                        env=env, capture_output=True, check=True)
-        crypto = ["sh", str(CHART / "fleet-crypto.sh")]
+        crypto = ["sh", str(script)]
         result = subprocess.run([*crypto, "restore", "203.0.113.10", "30001"], input=KEY + "\n",
                                 text=True, capture_output=True, env=env, check=True)
         self.assertNotIn(KEY, result.stdout + result.stderr)
@@ -436,6 +463,47 @@ else:
         with tarfile.open(source) as archive:
             self.assertEqual(archive.extractfile("keys/client").read(), b"original private key")
             self.assertEqual(json.load(archive.extractfile("tondb/config.json"))["addrs"][0]["ip"], -889163510)
+
+    def test_crypto_rejects_swap_before_unwrap_or_restore(self):
+        script, recovery, _ = self.crypto_memory_fixture(swap_enabled=True)
+        for operation in ("unwrap", "restore"):
+            with self.subTest(operation=operation):
+                result = subprocess.run(["sh", str(script), operation, "203.0.113.10", "30001"],
+                                        input=KEY + "\n", text=True, capture_output=True,
+                                        env=dict(self.env, FLEET_RECOVERY_DIR=str(recovery)))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("swap enabled", result.stderr)
+                self.assertNotIn(KEY, result.stdout + result.stderr)
+                self.assertEqual(list(recovery.iterdir()), [])
+
+    def test_crypto_rejects_disk_or_symlink_staging_before_plaintext(self):
+        disk_temp = tempfile.TemporaryDirectory(prefix="kubeton-fleet-disk-", dir="/var/tmp")
+        self.addCleanup(disk_temp.cleanup)
+        disk = Path(disk_temp.name)
+        filesystem = subprocess.run(["stat", "-f", "-c", "%T", str(disk)], text=True,
+                                    capture_output=True, check=True).stdout.strip()
+        if filesystem == "tmpfs":
+            self.skipTest("disk staging refusal requires a disk-backed /var/tmp fixture")
+        for location in ("recovery", "temporary"):
+            for kind in ("disk", "symlink"):
+                with self.subTest(location=location, kind=kind):
+                    script, recovery, temporary = self.crypto_memory_fixture()
+                    unsafe = disk
+                    if kind == "symlink":
+                        unsafe = recovery.parent / "memory-link"
+                        unsafe.symlink_to(temporary if location == "temporary" else recovery, target_is_directory=True)
+                    if location == "temporary":
+                        script.write_text(script.read_text().replace(str(temporary), str(unsafe)))
+                    else:
+                        recovery = unsafe
+                    result = subprocess.run(["sh", str(script), "restore", "203.0.113.10", "30001"],
+                                            input=KEY + "\n", text=True, capture_output=True,
+                                            env=dict(self.env, FLEET_RECOVERY_DIR=str(recovery)))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("required memory mount is absent", result.stderr)
+                    self.assertNotIn(KEY, result.stdout + result.stderr)
+                    self.assertFalse((recovery / "plain.tar.gz").exists())
+                    self.assertFalse((temporary / "plain.tar.gz").exists())
 
 
 if __name__ == "__main__":

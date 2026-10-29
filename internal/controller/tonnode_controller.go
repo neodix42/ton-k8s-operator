@@ -91,7 +91,7 @@ const (
 
 	readyConditionType = "Ready"
 
-	holdOnFailureEntrypointScript = `/opt/mytonctrl/venv/bin/python /usr/local/lib/mytonctrl/entrypoint.py "$@"; rc=$?; if [ "$rc" -ne 0 ]; then echo "ton-node entrypoint exited with rc=${rc}; sleeping for debug because spec.debug.holdOnFailure=true"; sleep infinity; fi; exit "$rc"`
+	holdOnFailureEntrypointScript = `ulimit -c 0; /opt/mytonctrl/venv/bin/python /usr/local/lib/mytonctrl/entrypoint.py "$@"; rc=$?; if [ "$rc" -ne 0 ]; then echo "ton-node entrypoint exited with rc=${rc}; sleeping for debug because spec.debug.holdOnFailure=true"; sleep infinity; fi; exit "$rc"`
 
 	// kubetonPauseReplicasAnnotationKey stores the pre-pause replica count on TonNode/StatefulSet.
 	// When present with a parseable integer value, reconciliation keeps StatefulSet replicas at 0.
@@ -629,6 +629,11 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	stickyNodeHostnames []string,
 ) corev1.PodTemplateSpec {
 	env := mergeEnvVars(defaultTonEnv(tonNode, publicIP), tonNode.Spec.Env)
+	if keyManagementEnabled(tonNode) {
+		// Generic Python/cloud-tool scratch must not escape the checked RAM
+		// mount through a user-supplied TMPDIR or SDK configuration directory.
+		env = mergeEnvVars(env, []corev1.EnvVar{{Name: "TMPDIR", Value: "/tmp"}, {Name: "CLOUDSDK_CONFIG", Value: "/tmp/gcloud"}})
+	}
 	containerPorts := []corev1.ContainerPort{
 		{
 			Name:          "validator-udp",
@@ -669,8 +674,12 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 	}
 	if keyManagementEnabled(tonNode) {
 		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{Name: controllerTmpfsVolume, MountPath: "/var/ton-work/controller"},
 			corev1.VolumeMount{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
 			corev1.VolumeMount{Name: walletsTmpfsVolume, MountPath: controllerWalletsPath},
+			corev1.VolumeMount{Name: keyringTmpfsVolume, MountPath: "/var/ton-work/db/keyring"},
+			corev1.VolumeMount{Name: secretScratchVolume, MountPath: "/tmp"},
+			corev1.VolumeMount{Name: runtimeRunVolume, MountPath: "/run"},
 			corev1.VolumeMount{Name: keyBundleClaim, MountPath: keyBundleMountPath},
 		)
 	}
@@ -710,6 +719,8 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		},
 	}
 	if keyManagementEnabled(tonNode) {
+		podSpec.Volumes = append(podSpec.Volumes, desiredSecretMemoryVolumes(tonNode)...)
+		podSpec.TerminationGracePeriodSeconds = ptr.To[int64](120)
 		podSpec.Volumes = append(podSpec.Volumes,
 			corev1.Volume{
 				Name: keysTmpfsVolume,
@@ -732,6 +743,20 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 		)
 		podSpec.InitContainers = append(podSpec.InitContainers, desiredKeyRestoreInitContainer(tonNode))
 		podSpec.Containers = append(podSpec.Containers, desiredKeyBackupSidecar(tonNode))
+		podSpec.Containers[0].ReadinessProbe.Exec.Command[2] = strings.TrimSpace(podSpec.Containers[0].ReadinessProbe.Exec.Command[2]) + fmt.Sprintf(
+			" && test -s '%s' && test -s '%s'\n",
+			strings.ReplaceAll("/var/ton-key-bundle/"+desiredKeyBundleFileName(tonNode), "'", "'\"'\"'"),
+			strings.ReplaceAll("/var/ton-key-bundle/"+desiredKeyBundleMetaFileName(tonNode), "'", "'\"'\"'"))
+		podSpec.Containers[0].Lifecycle = &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{Command: []string{"sh", "-ec", "ulimit -c 0; systemctl stop mytoncore validator || true\ndate -u > /tmp/key-runtime.quiesced\n" + requestSecretCheckpointScript}},
+		}}
+		// Prevent process core files from spilling private memory onto the work PVC.
+		if !holdOnFailureEnabled(tonNode) {
+			podSpec.Containers[0].Command = []string{"sh", "-ec", "ulimit -c 0; rm -f /tmp/key-runtime.quiesced /tmp/key-backup.shutdown.done; exec /opt/mytonctrl/venv/bin/python /usr/local/lib/mytonctrl/entrypoint.py \"$@\"", "mytonctrl"}
+			podSpec.Containers[0].Args = append([]string{"run"}, tonNode.Spec.Args...)
+		} else {
+			podSpec.Containers[0].Args[0] = "rm -f /tmp/key-runtime.quiesced /tmp/key-backup.shutdown.done; " + podSpec.Containers[0].Args[0]
+		}
 	}
 
 	if tonNode.Spec.ConfigRef != nil {
@@ -750,6 +775,11 @@ func (r *TonNodeReconciler) desiredPodTemplate(
 				{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
 			},
 		})
+		if keyManagementEnabled(tonNode) {
+			podSpec.InitContainers[len(podSpec.InitContainers)-1].VolumeMounts = append(
+				podSpec.InitContainers[len(podSpec.InitContainers)-1].VolumeMounts,
+				corev1.VolumeMount{Name: secretScratchVolume, MountPath: "/tmp"})
+		}
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
 			Name: bootstrapConfigVolume,
 			VolumeSource: corev1.VolumeSource{
@@ -1059,6 +1089,8 @@ func desiredKeyAgentEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
 		{Name: "KEY_PROVIDER", Value: desiredKeyProvider(tonNode)},
 		{Name: "KEY_BUNDLE_FILE", Value: desiredKeyBundleFileName(tonNode)},
 		{Name: "KEY_BUNDLE_META_FILE", Value: desiredKeyBundleMetaFileName(tonNode)},
+		{Name: "TMPDIR", Value: "/tmp"},
+		{Name: "CLOUDSDK_CONFIG", Value: "/tmp/gcloud"},
 	}
 	if value := desiredVaultTransitKey(tonNode); value != "" {
 		env = append(env, corev1.EnvVar{Name: "VAULT_TRANSIT_KEY", Value: value})
@@ -1075,8 +1107,11 @@ func desiredKeyAgentEnv(tonNode *tonv1alpha1.TonNode) []corev1.EnvVar {
 func desiredKeyAgentVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
 		{Name: tonWorkClaimName, MountPath: "/var/ton-work"},
+		{Name: controllerTmpfsVolume, MountPath: "/var/ton-work/controller"},
 		{Name: keysTmpfsVolume, MountPath: "/var/ton-work/keys"},
 		{Name: walletsTmpfsVolume, MountPath: controllerWalletsPath},
+		{Name: keyringTmpfsVolume, MountPath: "/var/ton-work/db/keyring"},
+		{Name: secretScratchVolume, MountPath: "/tmp"},
 		{Name: keyBundleClaim, MountPath: keyBundleMountPath},
 	}
 }
@@ -1097,6 +1132,10 @@ func desiredPersistentLayoutInitContainer(tonNode *tonv1alpha1.TonNode) corev1.C
 		},
 	}
 	if keyManagementEnabled(tonNode) {
+		container.Env = []corev1.EnvVar{
+			{Name: "KEY_BUNDLE_FILE", Value: desiredKeyBundleFileName(tonNode)},
+			{Name: "KEY_BUNDLE_META_FILE", Value: desiredKeyBundleMetaFileName(tonNode)},
+		}
 		container.VolumeMounts = append(container.VolumeMounts,
 			corev1.VolumeMount{Name: keyBundleClaim, MountPath: "/mnt/keybundle", ReadOnly: true},
 		)
@@ -1110,11 +1149,12 @@ func desiredKeyRestoreInitContainer(tonNode *tonv1alpha1.TonNode) corev1.Contain
 		Image:                    desiredKeyAgentImage(tonNode),
 		ImagePullPolicy:          desiredKeyAgentImagePullPolicy(tonNode),
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
-		Command:                  []string{"sh", "-ec", keyRestoreScript},
+		Command:                  []string{"sh", "-ec", keyMigrationPrepareScript + keyRestoreScript + keyMigrationCleanupScript},
 		Env:                      desiredKeyAgentEnv(tonNode),
 		EnvFrom:                  desiredKeyAgentEnvFrom(tonNode),
 		Resources:                desiredKeyAgentResources(tonNode),
-		VolumeMounts:             desiredKeyAgentVolumeMounts(),
+		VolumeMounts: append(desiredKeyAgentVolumeMounts(),
+			corev1.VolumeMount{Name: tonWorkClaimName, MountPath: "/mnt/ton-work"}),
 	}
 }
 
@@ -1129,6 +1169,18 @@ func desiredKeyBackupSidecar(tonNode *tonv1alpha1.TonNode) corev1.Container {
 		EnvFrom:                  desiredKeyAgentEnvFrom(tonNode),
 		Resources:                desiredKeyAgentResources(tonNode),
 		VolumeMounts:             desiredKeyAgentVolumeMounts(),
+		Lifecycle: &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{Command: []string{"sh", "-ec", keyBundlePublicationScript + keyMemoryGuardScript + keyBackupFunctionsScript + `
+# Regular containers have no guaranteed shutdown order. Keep the backup
+# process alive while the main preStop stops its writers, then flush once.
+for attempt in $(seq 1 80); do
+  [ ! -f /tmp/key-runtime.quiesced ] || break
+  sleep 1
+done
+perform_backup allow-initializing
+date -u > /tmp/key-backup.shutdown.done
+`}},
+		}},
 	}
 }
 
@@ -1197,7 +1249,7 @@ publish_key_bundle() {
 }
 `
 
-const keyRestoreScript = keyBundlePublicationScript + `
+const keyRestoreScript = keyBundlePublicationScript + keyMemoryGuardScript + `
 set -eu
 umask 077
 
@@ -1228,92 +1280,7 @@ read_meta_value() {
   awk -F= -v wanted="$key" '$1 == wanted {print substr($0, index($0, "=") + 1); exit}' "$META_FILE"
 }
 
-vault_decrypt() {
-  wrapped="$1"
-  need_bin curl
-  need_bin jq
-  if [ -z "${VAULT_ADDR:-}" ] || [ -z "${VAULT_TOKEN:-}" ] || [ -z "${VAULT_TRANSIT_KEY:-}" ]; then
-    echo "vault provider requires VAULT_ADDR, VAULT_TOKEN and VAULT_TRANSIT_KEY" >&2
-    return 1
-  fi
-
-  payload="$(printf '{"ciphertext":"%s"}' "$wrapped")"
-  if [ -n "${VAULT_NAMESPACE:-}" ]; then
-    resp="$(curl -fsS \
-      -H "X-Vault-Token: ${VAULT_TOKEN}" \
-      -H "X-Vault-Namespace: ${VAULT_NAMESPACE}" \
-      -H "Content-Type: application/json" \
-      --request POST \
-      --data "$payload" \
-      "${VAULT_ADDR%/}/v1/transit/decrypt/${VAULT_TRANSIT_KEY}")"
-  else
-    resp="$(curl -fsS \
-      -H "X-Vault-Token: ${VAULT_TOKEN}" \
-      -H "Content-Type: application/json" \
-      --request POST \
-      --data "$payload" \
-      "${VAULT_ADDR%/}/v1/transit/decrypt/${VAULT_TRANSIT_KEY}")"
-  fi
-
-  printf '%s' "$resp" | jq -r '.data.plaintext' | base64 -d
-}
-
-kms_decrypt() {
-  wrapped="$1"
-  case "${KMS_VENDOR:-}" in
-    aws)
-      need_bin aws
-      if [ -z "${KMS_KEY_ID:-}" ]; then
-        echo "kms provider requires KMS_KEY_ID for aws" >&2
-        return 1
-      fi
-      blob_file="$(mktemp)"
-      printf '%s' "$wrapped" | base64 -d >"$blob_file"
-      plaintext_b64="$(aws kms decrypt --key-id "$KMS_KEY_ID" --ciphertext-blob "fileb://${blob_file}" --query Plaintext --output text)"
-      rm -f "$blob_file"
-      printf '%s' "$plaintext_b64" | base64 -d
-      ;;
-    gcp)
-      need_bin gcloud
-      if [ -z "${KMS_PROJECT_ID:-}" ] || [ -z "${KMS_LOCATION:-}" ] || [ -z "${KMS_KEY_RING:-}" ] || [ -z "${KMS_KEY_ID:-}" ]; then
-        echo "gcp kms requires KMS_PROJECT_ID, KMS_LOCATION, KMS_KEY_RING and KMS_KEY_ID" >&2
-        return 1
-      fi
-      cipher_file="$(mktemp)"
-      plain_file="$(mktemp)"
-      printf '%s' "$wrapped" | base64 -d >"$cipher_file"
-      gcloud kms decrypt \
-        --project "$KMS_PROJECT_ID" \
-        --location "$KMS_LOCATION" \
-        --keyring "$KMS_KEY_RING" \
-        --key "$KMS_KEY_ID" \
-        --ciphertext-file "$cipher_file" \
-        --plaintext-file "$plain_file" >/dev/null
-      cat "$plain_file"
-      rm -f "$cipher_file" "$plain_file"
-      ;;
-    *)
-      echo "unsupported KMS_VENDOR=${KMS_VENDOR:-}" >&2
-      return 1
-      ;;
-  esac
-}
-
-unwrap_data_key() {
-  wrapped="$1"
-  case "${KEY_PROVIDER:-}" in
-    vault)
-      vault_decrypt "$wrapped"
-      ;;
-    kms)
-      kms_decrypt "$wrapped"
-      ;;
-    *)
-      echo "unsupported KEY_PROVIDER=${KEY_PROVIDER:-}" >&2
-      return 1
-      ;;
-  esac
-}
+` + keyUnwrapScript + `
 
 fix_validator_ownership() {
   if ! command -v id >/dev/null 2>&1; then
@@ -1357,7 +1324,7 @@ mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$TON_DB_D
 recover_key_bundle_publication
 
 if [ ! -s "$BUNDLE_FILE" ] || [ ! -s "$META_FILE" ]; then
-  if [ -f "$FORCE_RESTORE_FILE" ]; then
+  if [ -f "$FORCE_RESTORE_FILE" ] || [ -s "$DB_CONFIG_FILE" ]; then
     echo "explicit key restore requested but encrypted bundle files are missing; node state was preserved" >&2
     exit 1
   fi
@@ -1378,7 +1345,7 @@ if [ -z "$DATA_KEY_B64" ]; then
 fi
 export DATA_KEY_B64
 
-work_dir="$(mktemp -d)"
+work_dir="$(mktemp -d /tmp/kubeton-keys.XXXXXX)"
 trap 'rm -rf "$work_dir"' EXIT
 
 openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 \
@@ -1386,10 +1353,15 @@ openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 \
   -in "$BUNDLE_FILE" \
   -out "$work_dir/bundle.tar.gz"
 
+` + validateKeyArchiveScript + `
+validate_key_archive "$work_dir/bundle.tar.gz"
 mkdir -p "$work_dir/unpacked"
 tar -xzf "$work_dir/bundle.tar.gz" -C "$work_dir/unpacked"
 
-if ! bundle_has_complete_bootstrap "$work_dir/unpacked"; then
+if [ "$(read_meta_value bootstrap_state)" = initializing ] \
+  && [ -f "$work_dir/unpacked/controller/.initializing" ] && [ ! -f "$FORCE_RESTORE_FILE" ]; then
+  echo "Restoring encrypted interrupted-initialization checkpoint"
+elif ! bundle_has_complete_bootstrap "$work_dir/unpacked"; then
   echo "encrypted key bundle lacks complete MyTonCtrl controller state; legacy ton-docker-ctrl bundles require migration with a native MyTonCtrl backup. Existing bundle and node state were preserved." >&2
   exit 1
 fi
@@ -1402,7 +1374,7 @@ if [ -f "$FORCE_RESTORE_FILE" ]; then
   find "$MYTONCORE_DIR" -mindepth 1 -maxdepth 1 ! -name wallets -exec rm -rf {} +
   find "$CONTROLLER_DIR" -mindepth 1 -maxdepth 1 ! -name mytoncore ! -name .container.lock -exec rm -rf {} +
   rm -f "$DB_CONFIG_FILE"
-  rm -rf "$DB_KEYRING_DIR"
+  find "$DB_KEYRING_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 fi
 
 if [ -d "$work_dir/unpacked/keys" ]; then
@@ -1410,14 +1382,17 @@ if [ -d "$work_dir/unpacked/keys" ]; then
 fi
 # Existing committed settings and interrupted installation checkpoints are
 # authoritative. Restore only the tmpfs payload on an ordinary Pod restart.
+restore_controller=false
 if [ -f "$FORCE_RESTORE_FILE" ] \
   || { ! current_bootstrap_complete && [ ! -f "$CONTROLLER_DIR/.initializing" ]; }; then
+  restore_controller=true
   cp -a "$work_dir/unpacked/controller/." "$CONTROLLER_DIR/"
 fi
 if [ -d "$work_dir/unpacked/controller/mytoncore/wallets" ]; then
   cp -a "$work_dir/unpacked/controller/mytoncore/wallets/." "$WALLETS_DIR/"
 fi
-if [ ! -s "$DB_CONFIG_FILE" ]; then
+if [ "${_KEY_MIGRATION_SEED:-0}" != 1 ] && [ -s "$work_dir/unpacked/tondb/config.json" ] \
+  && { [ ! -s "$DB_CONFIG_FILE" ] || [ "$restore_controller" = true ]; }; then
   cp -a "$work_dir/unpacked/tondb/config.json" "$DB_CONFIG_FILE"
 fi
 if [ -d "$work_dir/unpacked/tondb/keyring" ]; then
@@ -1436,7 +1411,7 @@ rm -f "$FORCE_RESTORE_FILE"
 echo "encrypted key bundle restored"
 `
 
-const keyBackupScript = keyBundlePublicationScript + `
+const keyBackupFunctionsScript = keyUnwrapScript + secretStateFingerprintScript + validateKeyArchiveScript + `
 set -eu
 umask 077
 
@@ -1606,37 +1581,63 @@ bundle_present() {
 }
 
 auto_backup_ready() {
-  backup_sources_present
+  backup_sources_present || { [ -f "$CONTROLLER_DIR/.initializing" ] && key_material_present; }
 }
 
 perform_backup() {
+  need_bin flock
+  exec 9>/tmp/key-backup.lock
+  flock -w 45 9 || return 1
+  backup_status=0
+  perform_backup_unlocked "${1:-complete}" || backup_status=$?
+  flock -u 9
+  return "$backup_status"
+}
+
+perform_backup_unlocked() {
   need_bin tar
   need_bin openssl
   need_bin base64
   mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$MYTONCTRL_DIR" "$TON_DB_DIR" "$BUNDLE_DIR" || return 1
   recover_key_bundle_publication || return 1
 
+  bootstrap_state=complete
   if ! backup_sources_present; then
+    if [ "${1:-complete}" = allow-initializing ] && auto_backup_ready; then
+      bootstrap_state=initializing
+    else
     echo "complete bootstrap state not present yet; backup skipped" >&2
     return 1
+    fi
   fi
 
-  work_dir="$(mktemp -d)" || return 1
+  source_snapshot="$(secret_state_fingerprint)" || return 1
+  work_dir="$(mktemp -d /tmp/kubeton-keys.XXXXXX)" || return 1
 
   # This function is called from an if condition, where POSIX shells disable
   # errexit. Check every mandatory step before publishing any bundle files.
   if ! { mkdir -p "$work_dir/stage/keys" "$work_dir/stage/controller" "$work_dir/stage/tondb" \
     && cp -a "$KEYS_DIR/." "$work_dir/stage/keys/" \
     && cp -a "$CONTROLLER_DIR/." "$work_dir/stage/controller/" \
-    && rm -f "$work_dir/stage/controller/.container.lock" \
-    && cp -a "$DB_CONFIG_FILE" "$work_dir/stage/tondb/config.json"; }; then
+    && rm -f "$work_dir/stage/controller/.container.lock"; }; then
     rm -rf "$work_dir"
     return 1
+  fi
+  if [ -s "$DB_CONFIG_FILE" ]; then
+    cp -a "$DB_CONFIG_FILE" "$work_dir/stage/tondb/config.json" || { rm -rf "$work_dir"; return 1; }
   fi
   if [ -d "$DB_KEYRING_DIR" ]; then
     cp -a "$DB_KEYRING_DIR" "$work_dir/stage/tondb/keyring" || { rm -rf "$work_dir"; return 1; }
   fi
   tar -czf "$work_dir/bundle.tar.gz" -C "$work_dir/stage" . || { rm -rf "$work_dir"; return 1; }
+  validate_key_archive "$work_dir/bundle.tar.gz" || { rm -rf "$work_dir"; return 1; }
+  staged_snapshot="$(secret_state_fingerprint "$work_dir/stage/keys" "$work_dir/stage/controller" \
+    "$work_dir/stage/tondb/keyring" "$work_dir/stage/tondb/config.json")" || { rm -rf "$work_dir"; return 1; }
+  if [ "$staged_snapshot" != "$source_snapshot" ]; then
+    echo "secret state changed while copying checkpoint; previous encrypted bundle preserved" >&2
+    rm -rf "$work_dir"
+    return 1
+  fi
 
   DATA_KEY_B64="$(openssl rand -base64 48)" || { rm -rf "$work_dir"; return 1; }
   export DATA_KEY_B64
@@ -1648,45 +1649,101 @@ perform_backup() {
     return 1
   fi
 
+  # Verify the root of trust can decrypt this wrapped key before replacing a
+  # previous valid bundle (especially during plaintext-to-memory migration).
+  verified_key="$(unwrap_data_key "$wrapped_key")" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
+  if [ "$verified_key" != "$DATA_KEY_B64" ]; then
+    echo "wrapped-key verification failed; previous encrypted bundle preserved" >&2
+    unset DATA_KEY_B64 verified_key
+    rm -rf "$work_dir"
+    return 1
+  fi
+  unset verified_key
+
   openssl enc -aes-256-cbc -pbkdf2 -md sha256 \
     -pass env:DATA_KEY_B64 \
     -in "$work_dir/bundle.tar.gz" \
     -out "$work_dir/bundle.enc" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
+
+  if ! { openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 -pass env:DATA_KEY_B64 \
+      -in "$work_dir/bundle.enc" -out "$work_dir/verified.tar.gz" \
+      && cmp -s "$work_dir/bundle.tar.gz" "$work_dir/verified.tar.gz"; }; then
+    unset DATA_KEY_B64
+    rm -rf "$work_dir"
+    return 1
+  fi
 
   {
     echo "provider=${KEY_PROVIDER}"
     echo "wrapped_key=${wrapped_key}"
     echo "algorithm=aes-256-cbc-pbkdf2"
     echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "bootstrap_state=$bootstrap_state"
   } >"$work_dir/bundle.meta" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
 
+  final_snapshot="$(secret_state_fingerprint)" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
+  if [ "$source_snapshot" != "$final_snapshot" ]; then
+    echo "secret state changed during checkpoint; previous encrypted bundle preserved, retry required" >&2
+    unset DATA_KEY_B64
+    rm -rf "$work_dir"
+    return 1
+  fi
   publish_key_bundle "$work_dir" || { unset DATA_KEY_B64; rm -rf "$work_dir"; return 1; }
+  COMMITTED_FINGERPRINT="$source_snapshot"
   unset DATA_KEY_B64
   rm -rf "$work_dir"
   echo "encrypted key bundle updated"
 }
 
+`
+
+const keyBackupScript = keyBundlePublicationScript + keyMemoryGuardScript + keyBackupFunctionsScript + `
 mkdir -p "$KEYS_DIR" "$WALLETS_DIR" "$MYTONCORE_DIR" "$TON_DB_DIR" "$BUNDLE_DIR"
+mkdir -p /tmp/key-backup.requests /tmp/key-backup.acks
 recover_key_bundle_publication
-rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
-echo "manual backup mode enabled"
+rm -f "$DONE_FILE" "$FAIL_FILE"
+echo "encrypted memory-state checkpointing enabled"
 auto_backup_retries=0
+last_snapshot=""
 if is_true "$AUTO_BOOTSTRAP_FLAG"; then
   echo "automatic bootstrap backup mode enabled"
 fi
 
 while true; do
-  if [ -f "$REQUEST_FILE" ]; then
+  # Capture the batch BEFORE reading state. A request arriving during backup
+  # must wait for a later snapshot, never receive an acknowledgement for stale state.
+  checkpoint_requests=$(find /tmp/key-backup.requests -mindepth 1 -maxdepth 1 -type f -printf '%f\n')
+  if [ -n "$checkpoint_requests" ]; then
+    checkpoint_result=failed
+    if perform_backup allow-initializing; then
+      last_snapshot="$COMMITTED_FINGERPRINT"
+      checkpoint_result=ok
+    fi
+    for request_id in $checkpoint_requests; do
+      case "$request_id" in *[!a-f0-9-]*|'') continue;; esac
+      printf '%s\n' "$checkpoint_result" > "/tmp/key-backup.acks/$request_id"
+      rm -f "/tmp/key-backup.requests/$request_id"
+    done
+  elif [ -f "$REQUEST_FILE" ]; then
     rm -f "$REQUEST_FILE" "$DONE_FILE" "$FAIL_FILE"
     if perform_backup; then
+      last_snapshot="$COMMITTED_FINGERPRINT"
       date -u +%Y-%m-%dT%H:%M:%SZ >"$DONE_FILE"
     else
       echo "backup failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$FAIL_FILE"
     fi
-  elif is_true "$AUTO_BOOTSTRAP_FLAG" && ! bundle_present && auto_backup_ready; then
-    if perform_backup; then
+  elif auto_backup_ready && { bundle_present || is_true "$AUTO_BOOTSTRAP_FLAG"; }; then
+    current_snapshot="$(secret_state_fingerprint)" || { sleep 2; continue; }
+    if [ "$current_snapshot" = "$last_snapshot" ] && bundle_present; then
+      sleep 2 &
+      wait $!
+      continue
+    fi
+    if perform_backup allow-initializing; then
       auto_backup_retries=0
-      echo "automatic bootstrap backup completed"
+      last_snapshot="$COMMITTED_FINGERPRINT"
+      rm -f "$FAIL_FILE"
+      echo "automatic encrypted memory-state checkpoint completed"
     else
       auto_backup_retries=$((auto_backup_retries + 1))
       if [ "$auto_backup_retries" -eq 1 ] || [ $((auto_backup_retries % 30)) -eq 0 ]; then

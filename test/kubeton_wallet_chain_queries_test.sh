@@ -447,6 +447,7 @@ resolve_lite_client_bin() { printf '%s/lite-client' "$BUDGET_BIN"; }
 wallet_wait_for_seqno "0:$(printf '%064d' 1)" 19
 '''
 env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+           MAIN_WALLET_DIR=str(root / "runtime"),
            BUDGET_BIN=str(binary), BUDGET_EVENTS=str(events))
 started = time.monotonic()
 process = subprocess.Popen(["bash", "-euo", "pipefail", "-c", body, "_", str(helper)],

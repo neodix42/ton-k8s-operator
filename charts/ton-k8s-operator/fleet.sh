@@ -81,6 +81,7 @@ fleet_prompt_passphrase() {
 }
 
 fleet_gpg() {
+  ulimit -c 0
   gpg --no-options --batch --yes --pinentry-mode loopback --no-symkey-cache \
     --passphrase-fd 3 "$@" 3<<< "$fleet_passphrase"
 }
@@ -185,7 +186,7 @@ spec:
   containers:
     - name: tools
       image: $(yaml_quote "$KUBETON_FLEET_TOOLS_IMAGE")
-      command: ["bash", "-c", "mkdir -p /tmp/gnupg; chmod 700 /tmp/gnupg; exec sleep 86400"]
+      command: ["bash", "-ec", "ulimit -c 0; test \"\$(stat -f -c %T /tmp)\" = tmpfs; awk 'NR > 1 { used = 1 } END { exit used }' /proc/swaps || { echo 'Fleet tools require a worker with swap disabled' >&2; exit 1; }; mkdir -p /tmp/gnupg; chmod 700 /tmp/gnupg; exec sleep 86400"]
       resources:
         requests: {cpu: 100m, memory: 128Mi}
         limits: {memory: $(yaml_quote "${KUBETON_FLEET_TOOLS_MEMORY:-2Gi}")}

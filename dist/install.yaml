@@ -343,9 +343,24 @@ spec:
                   inMemory:
                     description: InMemory configures tmpfs mounts for live key files.
                     properties:
+                      controllerSizeLimit:
+                        default: 512Mi
+                        description: ControllerSizeLimit bounds memory-backed MyTonCtrl
+                          state and credentials.
+                        type: string
+                      keyringSizeLimit:
+                        default: 128Mi
+                        description: KeyringSizeLimit bounds the validator's memory-backed
+                          private keyring.
+                        type: string
                       keysSizeLimit:
                         default: 128Mi
                         description: KeysSizeLimit is the tmpfs size limit for /var/ton-work/keys.
+                        type: string
+                      stagingSizeLimit:
+                        default: 2Gi
+                        description: StagingSizeLimit bounds each memory-backed /tmp
+                          and /run volume.
                         type: string
                       walletsSizeLimit:
                         default: 512Mi

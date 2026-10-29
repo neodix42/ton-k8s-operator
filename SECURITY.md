@@ -3,7 +3,7 @@
 This document describes the implemented key protection workflow in `ton-k8s-operator`:
 
 - external root of trust (`Vault Transit` or cloud `KMS`)
-- live keys in pod memory (`emptyDir{medium: Memory}`)
+- live controller state, signing keys, validator keyring and staging in pod memory (`emptyDir{medium: Memory}`)
 - encrypted key bundle at rest (dedicated PVC)
 
 It also documents cluster-level controls (`etcd` encryption with KMS provider) and residual risks.
@@ -12,25 +12,34 @@ It also documents cluster-level controls (`etcd` encryption with KMS provider) a
 
 ### 1.1 Where plaintext keys are exposed
 
-Even with this model, plaintext key material exists in controlled windows:
+With key management enabled, normal managed operations handle plaintext in
+memory. Restore decrypts and unpacks archives on memory-backed `/tmp`, then
+restores controller state, wallet files, console keys and the validator keyring
+into tmpfs. Runtime processes read those files and keep key material in process
+memory. Backup copies and compresses that state in memory before encryption;
+only encrypted recovery data and wrapped-key metadata are published to the
+bundle PVC.
 
-1. During restore init container:
-- the encrypted bundle is decrypted in memory/tmp files inside the init container.
-- plaintext keys are written into tmpfs mounts:
-  - `/var/ton-work/keys`
-  - `/var/ton-work/controller/mytoncore/wallets`
+Fresh keys are generated in memory before their first encrypted checkpoint.
+An abrupt failure in that interval can lose them. Subsequent changes become
+durable only after a successful checkpoint, so this is not a zero-loss storage
+system. Graceful shutdown quiesces services and attempts a final checkpoint.
 
-2. During node runtime:
-- validator and supporting processes keep keys in process memory.
-- key files remain plaintext in tmpfs only (not on PVC by default).
+Secret operations check the required tmpfs mounts and reject workers with
+active swap. Managed entrypoints and the collection driver disable process
+core dumps. Host crash-dump collectors, hibernation and other privileged host
+mechanisms require separate administration.
 
-3. During the backup sidecar operation:
-- sidecar reads plaintext keys from tmpfs.
-- creates a short-lived plaintext tarball in sidecar filesystem (`/tmp`) before encrypting.
+The main-wallet helper also checks its tmpfs runtime and worker swap state.
+Its plaintext archives and generic temporary files stay under its memory-backed
+runtime; `/tmp` is a separate memory volume. Its persistent public `.outbox`
+contains signed BOCs and payment journals, not wallet private keys, and remains
+durable for duplicate-payment prevention.
 
-4. During the first boot key generation (no bundle yet):
-- TON container generates keys directly into tmpfs.
-- the backup sidecar then encrypts and stores a bundle.
+Public `/var/ton-work/db/config.json` remains on the work PVC. It contains
+advertised addresses and key identifiers rather than private signing keys.
+Blockchain databases and dump files also stay on that PVC. With key management
+disabled, live controller state and private keys use the work PVC as before.
 
 ### 1.2 Fleet migration recovery keys
 
@@ -76,24 +85,45 @@ This model significantly reduces accidental exposure and at-rest leakage, but it
 
 When `spec.keyManagement.enabled=true`, operator configures:
 
-1. In-memory key mounts:
-- `emptyDir{medium: Memory}` on `/var/ton-work/keys`
-- `emptyDir{medium: Memory}` on `/var/ton-work/controller/mytoncore/wallets`
+1. Memory-backed runtime mounts:
+
+| Path | Default limit | `spec.keyManagement.inMemory` setting |
+|---|---|---|
+| `/var/ton-work/controller` | `512Mi` | `controllerSizeLimit` |
+| `/var/ton-work/keys` | `128Mi` | `keysSizeLimit` |
+| `/var/ton-work/controller/mytoncore/wallets` | `512Mi` | `walletsSizeLimit` |
+| `/var/ton-work/db/keyring` | `128Mi` | `keyringSizeLimit` |
+| `/tmp` | `2Gi` | `stagingSizeLimit` |
+| `/run` | `2Gi` | `stagingSizeLimit` |
+
+The controller mount includes `mytoncore.db`, its local backup copies,
+configuration, credentials, service units, wallet metadata and collection
+journals. `/run` also contains the selected TON artifact snapshot. These limits
+bound use; they do not reserve worker memory. Budget container and worker
+memory for live files, artifact copies, plaintext staging, compressed archives
+and encryption verification.
 
 2. Encrypted bundle persistence:
 - dedicated PVC claim template: `keybundle`
 - mounted at `/var/ton-key-bundle`
-- stores only encrypted artifacts (`keys.bundle.enc`, `keys.bundle.meta`)
+- stores encrypted archives, wrapped-key metadata and public recovery/control markers
 
 3. Init restore container (`key-restore`):
 - decrypts existing encrypted bundle
 - restores plaintext key files into tmpfs mounts before TON starts
 
 4. Backup sidecar (`key-backup`):
-- packages current tmpfs keys
+- packages controller state and keys from tmpfs
 - envelope-encrypts bundle
 - persists only encrypted files to `keybundle` PVC
-- runs in manual mode only and performs backup only when explicitly triggered
+- checks for changed state about every two seconds and automatically checkpoints it
+- preserves resumable partial initialization in encrypted checkpoints
+- also handles explicit checkpoint requests and graceful shutdown
+
+Readiness requires committed initialization, active validator/MyTonCore services
+and an encrypted recovery bundle. Readiness does not establish an off-cluster
+backup. Snapshot duration, changing files or Vault/KMS outages can delay later
+checkpoints; failures preserve the previous committed bundle.
 
 ## 3. CRD Configuration
 
@@ -112,6 +142,9 @@ spec:
     inMemory:
       keysSizeLimit: 128Mi
       walletsSizeLimit: 512Mi
+      controllerSizeLimit: 512Mi
+      keyringSizeLimit: 128Mi
+      stagingSizeLimit: 2Gi
     encryptedBundle:
       pvcSize: 5Gi
       storageClassName: encrypted-sc
@@ -119,8 +152,6 @@ spec:
         - ReadWriteOnce
       fileName: keys.bundle.enc
       metaFileName: keys.bundle.meta
-    agent:
-      image: ghcr.io/neodix42/mytonctrl:v1.0.0
 ```
 
 Minimal KMS example:
@@ -206,7 +237,9 @@ Authentication should be done via Workload Identity or by mounting a service acc
 - KMS CLI decrypt.
 4. Decrypts encrypted tarball (`openssl`).
 5. Restores plaintext key files to tmpfs mounts.
-   Restores MyTonCtrl state to `/var/ton-work/controller` and TON DB key files to `/var/ton-work/db`.
+   Restores MyTonCtrl state to memory-backed `/var/ton-work/controller` and
+   validator private keys to memory-backed `/var/ton-work/db/keyring`.
+   Public validator configuration remains on the work PVC.
 6. TON main container starts.
 
 Bundles from the former `ton-docker-ctrl` layout contain `mytoncore/` and `mytonctrl/`
@@ -215,20 +248,35 @@ migration instructions and preserves the existing state. Import a native
 MyTonCtrl backup into a fresh work volume, then create a new encrypted bundle;
 renaming archive directories does not reconstruct the required controller state.
 
-### 5.2 Backup path (manual trigger)
+### 5.2 Automatic and explicit checkpoints
 
 1. `key-backup` gathers tmpfs keys, MyTonCtrl controller state, and selected TON DB key files.
-2. Creates tarball in sidecar temp storage.
+2. Copies and compresses the state on memory-backed `/tmp`.
 3. Generates random data key.
 4. Wraps data key with Vault/KMS.
-5. Encrypts tarball with data key.
+5. Verifies provider unwrap, encrypts the archive, and verifies decryption.
 6. Publishes encrypted bundle + metadata using a durable rollback journal on
    the keybundle PVC. Interrupted publication is recovered before backup or restore;
    plaintext staging is never placed in that journal.
-7. Sidecar stays idle until an explicit backup trigger file is created.
+7. The sidecar polls for changed state and explicit requests. It publishes only
+   a stable source revision and retries changing state or provider failures.
 
-`kubeton stop` now issues this explicit trigger for each running TON pod before scaling TON down
-(unless `SKIP_STOP_KEY_BACKUP=true` is set).
+Initialization checkpoints may contain `.initializing` before the final
+`initialized.json` commit. They allow an ordinary Pod replacement to resume
+initialization without persisting controller secrets in plaintext. A manual
+`backup-keys` export requires complete initialization.
+
+Collection journals live in the controller memory volume. Before a new `mg`
+payment, `kubeton wallet collect` waits for a uniquely identified encrypted
+checkpoint acknowledgement. Missing support, failure or a 60-second timeout
+prevents signing. An unresolved collection retains its pending identity for
+receipt verification without another payment submission.
+
+Managed Pod termination quiesces MyTonCore and validator services and attempts a
+final encrypted checkpoint. `kubeton stop` also supports an explicit pre-stop
+backup with `SKIP_STOP_KEY_BACKUP=false`; this is skipped by default. Neither
+mechanism can guarantee a final write after forced deletion, power loss or a
+process crash.
 
 ### 5.3 Manual admin backup (required)
 
@@ -259,9 +307,12 @@ Exact exported files per replica (`<output-dir>/<namespace>/<statefulset>/<ordin
 - if `spec.keyManagement.encryptedBundle.fileName` / `metaFileName` are customized, backup uses those exact filenames instead of defaults.
 
 Mandatory operation rules:
-- run `./kubeton backup-keys` immediately after initial node setup (first key generation)
+- run `./kubeton backup-keys` immediately after successful `./kubeton start` to create an exported recovery copy, then move it off-cluster
 - run `./kubeton backup-keys` after every validator/wallet key change or rotation
 - keep using `./kubeton backup-keys` before destructive operations (`drop`, `uninstall`, PVC deletion) to keep an exported offline copy
+
+Automatic checkpoints provide in-cluster persistence only. They neither copy
+bundles off-cluster nor preserve the root of trust if Vault/KMS is lost.
 
 ### 5.4 Manual admin restore
 
@@ -285,6 +336,34 @@ Operational note about `drop`/`uninstall`:
 - local-path host cleanup uses exact PV paths captured from live PVC/PV objects by default; wildcard stale-directory cleanup by PVC name is opt-in with `KUBETON_LOCAL_PATH_PATTERN_CLEANUP=true`.
 - if Kubernetes is still terminating resources or a cleanup step errors, uninstall reports leftovers and asks you to rerun `./kubeton uninstall`.
 - If admins manually delete Vault data (or the whole cluster), Transit key history is lost and encrypted bundles cannot be decrypted.
+
+### 5.5 Adopting memory-backed state on an existing deployment
+
+Take and verify an external encrypted backup before rollout and preserve its
+Vault/KMS root of trust. Disable swap on eligible workers and provide enough
+memory for runtime and checkpoint staging. Apply the updated operator and
+bundled CRD, then apply TonNode values with the matching chart/CLI. Updating
+only `kubeton` does not replace existing Pod mounts.
+
+For the current native MyTonCtrl layout, the restore init container reads the
+underlying work PVC through a separate mount. It copies known controller,
+console-key and validator-keyring paths into memory. Existing encrypted bundles
+supply wallets and console keys already kept in RAM by earlier versions;
+current persistent controller settings are merged into that state. Conflicting
+private files stop migration and preserve both sources for explicit recovery.
+It encrypts the merged state and verifies
+provider unwrap and actual archive decryption before unlinking the known
+plaintext originals. If preservation cannot be verified, startup stops and
+the original files remain available. Legacy `ton-docker-ctrl` layouts remain
+blocked and preserved rather than being silently converted.
+
+The bundle PVC records `.historical-plaintext-exposure` and startup warns when
+old plaintext was encountered. **Unlinking files is not secure erasure.**
+Previously written blocks, storage snapshots, backups and deprecated PVCs can
+still contain plaintext. They are not automatically wiped. For historical
+plaintext assurance, restore onto fresh storage and arrange secure retirement
+or sanitization of all old copies through the storage provider. Capture a new
+off-cluster backup after rollout.
 
 ## 6. Storage Encryption for Keys Only
 
@@ -361,9 +440,19 @@ Note: this is outside the operator scope and must be implemented by cluster admi
 ## 9. Current Limitations
 
 1. Node/cluster admin with high privilege can still extract plaintext.
-2. Sidecar uses a temporary plaintext archive during backup inside container ephemeral FS.
-3. KMS mode depends on required CLI/tooling present in `keyManagement.agent.image`.
-4. This model protects key files at rest and in regular runtime flows, not memory forensics or kernel compromise.
+2. Sudden failure can lose changes since the last successful checkpoint,
+   including a newly generated key before its first checkpoint. Automatic
+   snapshots and graceful shutdown are not synchronous, zero-loss persistence.
+3. Historical plaintext on old storage, snapshots and backups is not securely
+   erased by migration. Optional services and user-selected export/backup paths
+   can write outside the managed secret mounts.
+4. Kubernetes Secrets/etcd encryption, Vault storage, host crash-dump collectors,
+   application logs and administrative exports need separate controls. The
+   plaintext `fleet.json` manifest may include literal environment values.
+5. KMS mode depends on required CLI/tooling present in `keyManagement.agent.image`.
+6. This model protects standard managed key files and staging paths; it does
+   not protect against memory forensics, kernel compromise or privileged
+   administrators who bypass these paths and process limits.
 
 ## 10. Bare-Metal Auto Bootstrap
 
