@@ -254,7 +254,7 @@ Commands:
   backup-fleet         Back up fleet specifications, replica bundles, and passphrase-protected recovery keys.
   restore-fleet        Restore a fleet onto fresh destination storage and Vault: see README for options.
   wallet               Run wallet utilities: kubeton wallet <create|deploy|activate|send|collect|show|export> [args...]
-  stop                 Stop TON fleet (sets TonNode replicas to 0; keeps operator/TonNode/StatefulSet/PVC). Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
+  stop                 Stop TON fleet and pause managed Prometheus/Grafana; retain configuration, credentials and PVCs. Backup is skipped by default; set SKIP_STOP_KEY_BACKUP=false to run stop-time backup.
   drop                 Stop TON fleet + delete TonNode resources + delete TON PVCs (with confirmation).
   uninstall            Full best-effort cleanup of kubeton-managed resources (with confirmation; keeps TonNode CRD).
   purge                Full best-effort cleanup + delete TonNode CRD (separate to avoid accidental cluster-wide CRD removal).
@@ -3993,6 +3993,7 @@ spec:
       labels:
         app.kubernetes.io/name: kubeton-prometheus
         app.kubernetes.io/instance: ${deploy_name}
+        app.kubernetes.io/managed-by: kubeton
       annotations:
         ton.ton.org/exporter-address: ${exporter_address}
         ton.ton.org/auth-secret-version: $(yaml_quote "$auth_revision")
@@ -4384,6 +4385,32 @@ port_forward_process_matches() {
 
 wait_prometheus_http_ready() {
   wait_dashboard_http_authenticated prometheus "$@"
+}
+
+kubectl_proxy_process_matches() {
+  local pid="$1" port="$2" arg cmdline pending="" actual_port="" address=""
+  local proc_root="${KUBETON_PROCESS_PROC_ROOT:-/proc}"
+  local -a args=()
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$port" =~ ^[0-9]+$ ]] || return 1
+  if [[ -r "$proc_root/$pid/cmdline" ]]; then
+    while IFS= read -r -d '' arg; do args+=("$arg"); done <"$proc_root/$pid/cmdline"
+  else
+    cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    read -r -a args <<<"$cmdline"
+  fi
+  (( ${#args[@]} >= 2 )) || return 1
+  [[ "${args[0]##*/}" == kubectl && "${args[1]}" == proxy ]] || return 1
+  for arg in "${args[@]:2}"; do
+    if [[ -n "$pending" ]]; then
+      case "$pending" in port) actual_port="$arg";; address) address="$arg";; esac
+      pending=""; continue
+    fi
+    case "$arg" in
+      --port) pending=port;; --port=*) actual_port="${arg#*=}";;
+      --address) pending=address;; --address=*) address="${arg#*=}";;
+    esac
+  done
+  [[ -z "$pending" && "$actual_port" == "$port" && "$address" == 127.0.0.1 ]]
 }
 
 wait_dashboard_http_authenticated() {
@@ -5245,6 +5272,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: kubeton-grafana
+        app.kubernetes.io/managed-by: kubeton
       annotations:
         ton.ton.org/provisioned-by: kubeton
         ton.ton.org/datasources-checksum: $(yaml_quote "$datasources_hash")
@@ -8279,30 +8307,234 @@ delete_vault_pvcs_and_backing_volumes() {
   delete_pvc_rows_and_backing_volumes pvc_rows "cleanup"
 }
 
-cleanup_vault_force() {
-  echo "[uninstall] Forcing Vault cleanup ..."
+storage_list_helm_releases() {
+  local ns="$1" helm_help
+  local -a list_cmd=(helm list -n "$ns" --short)
+  # Helm 3 needs --all for failed/pending releases; Helm 4 lists all release
+  # states by default and rejects that removed flag.
+  helm_help="$(helm list --help 2>/dev/null)" || return 1
+  if printf '%s\n' "$helm_help" | grep -Eq '(^|[[:space:]])--all([[:space:]]|$)'; then
+    list_cmd+=(--all)
+  fi
+  "${list_cmd[@]}"
+}
 
-  if ! kubectl get namespace "$VAULT_NAMESPACE" >/dev/null 2>&1; then
-    return 0
+storage_release_present() {
+  local release="$1" ns="$2" rows row
+  if ! rows="$(storage_list_helm_releases "$ns" 2>/dev/null)"; then
+    echo "Error: cannot inspect Helm releases in ${ns}." >&2
+    return 2
+  fi
+  while IFS= read -r row; do
+    [[ "$row" == "$release" ]] && return 0
+  done <<<"$rows"
+  return 1
+}
+
+storage_namespace_is_release_owned() {
+  local ns="$1" release="$2" component="$3"
+  local marker resources resource rows name instance release_label helm_release helm_ns app app_name helm_owner helm_name longhorn_owner service_name selector_owner selector_app
+  if ! marker="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot inspect storage namespace ${ns}." >&2
+    return 1
+  fi
+  [[ -n "$(trim_whitespace "$marker")" ]] || return 0
+  if ! rows="$(storage_list_helm_releases "$ns" 2>/dev/null)"; then
+    echo "Error: cannot verify whether storage namespace ${ns} is shared with other Helm releases." >&2
+    return 1
+  fi
+  while IFS= read -r name; do
+    [[ -z "$name" || "$name" == "$release" ]] && continue
+    echo "Error: retaining shared namespace ${ns}: Helm release ${name} is not ${release}." >&2
+    return 1
+  done <<<"$rows"
+  if ! resources="$(kubectl api-resources --verbs=list,delete --namespaced=true -o name 2>/dev/null)"; then
+    echo "Error: cannot inventory namespace ${ns} before forced storage cleanup." >&2
+    return 1
+  fi
+  while IFS= read -r resource; do
+    [[ -n "$resource" ]] || continue
+    case "$resource" in events|events.events.k8s.io) continue ;; esac
+    if ! rows="$(kubectl -n "$ns" get "$resource" --ignore-not-found --no-headers \
+        -o custom-columns='NAME:.metadata.name,INSTANCE:.metadata.labels.app\.kubernetes\.io/instance,RELEASE:.metadata.labels.release,HELM:.metadata.annotations.meta\.helm\.sh/release-name,HELMNS:.metadata.annotations.meta\.helm\.sh/release-namespace,APP:.metadata.labels.app,APPNAME:.metadata.labels.app\.kubernetes\.io/name,OWNER:.metadata.labels.owner,HELMNAME:.metadata.labels.name,LONGHORN:.metadata.labels.longhorn\.io/managed-by,SERVICE:.metadata.labels.kubernetes\.io/service-name,SELECTOROWNER:.spec.selector.matchLabels.longhorn\.io/managed-by,SELECTORAPP:.spec.selector.matchLabels.app' 2>/dev/null)"; then
+      echo "Error: cannot inspect ${resource} in ${ns}; refusing namespace-wide storage cleanup." >&2
+      return 1
+    fi
+    while read -r name instance release_label helm_release helm_ns app app_name helm_owner helm_name longhorn_owner service_name selector_owner selector_app; do
+      [[ -n "$name" ]] || continue
+      [[ "$helm_owner" == helm && "$helm_name" == "$release" ]] && continue
+      [[ "$instance" == "$release" || "$release_label" == "$release" ]] && continue
+      [[ "$helm_release" == "$release" && "$helm_ns" == "$ns" ]] && continue
+      case "${resource}/${name}" in
+        serviceaccounts/default|configmaps/kube-root-ca.crt) continue ;;
+      esac
+      if [[ "$component" == vault ]]; then
+        # Legacy standalone Vault PVCs and the kubeton initialization Secret
+        # predate release labels. Their identities are tied to this release.
+        if [[ "$resource" == persistentvolumeclaims && "$name" == "data-${release}-"* && "${name#"data-${release}-"}" =~ ^[0-9]+$ ]]; then continue; fi
+        [[ "$resource" == secrets && "$name" == "$VAULT_BOOTSTRAP_SECRET" ]] && continue
+      elif [[ "$component" == longhorn ]]; then
+        [[ "$resource" == *.longhorn.io || "$longhorn_owner" == longhorn-manager ]] && continue
+        if [[ "$resource" == poddisruptionbudgets.policy ]]; then
+          [[ "$selector_owner" == longhorn-manager ]] && continue
+          case "$selector_app" in csi-attacher|csi-provisioner|csi-resizer|csi-snapshotter) continue ;; esac
+        fi
+        case "${resource}/${name}" in
+          secrets/longhorn-webhook-ca|secrets/longhorn-webhook-tls|secrets/longhorn-grpc-tls|leases.coordination.k8s.io/longhorn-manager-upgrade-lock|leases.coordination.k8s.io/longhorn-manager-webhook-lock|leases.coordination.k8s.io/driver-longhorn-io|leases.coordination.k8s.io/external-attacher-leader-driver-longhorn-io|leases.coordination.k8s.io/external-resizer-driver-longhorn-io|leases.coordination.k8s.io/external-snapshotter-leader-driver-longhorn-io) continue ;;
+        esac
+        if [[ "$resource" == endpointslices.discovery.k8s.io ]]; then
+          case "$service_name" in longhorn-admission-webhook|longhorn-conversion-webhook|longhorn-recovery-backend) continue ;; esac
+        fi
+        case "$app" in
+          longhorn-manager|longhorn-driver-deployer|longhorn-ui|csi-attacher|csi-provisioner|csi-resizer|csi-snapshotter|longhorn-csi-plugin) continue ;;
+        esac
+        [[ "$app_name" == longhorn ]] && continue
+        [[ "$resource" == secrets && "$name" == "$LONGHORN_CRYPTO_SECRET_NAME" ]] && continue
+      fi
+      echo "Error: retaining shared namespace ${ns}: ownership of ${resource}/${name} by ${release} is not proven." >&2
+      return 1
+    done <<<"$rows"
+  done <<<"$resources"
+}
+
+longhorn_storage_is_unused() {
+  local rows marker name driver ns claim sc provisioner
+  local -A classes=()
+  if ! rows="$(kubectl get daemonsets -A -l app=longhorn-manager --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null)"; then
+    echo "Error: cannot inspect Longhorn managers before uninstall." >&2
+    return 1
+  fi
+  while read -r ns name; do
+    if [[ -n "$ns" && "$ns" != "$LONGHORN_NAMESPACE" ]]; then
+      echo "Error: retaining shared Longhorn infrastructure: manager ${ns}/${name} is outside ${LONGHORN_NAMESPACE}." >&2
+      return 1
+    fi
+  done <<<"$rows"
+  if ! rows="$(kubectl get pv --no-headers -o custom-columns='NAME:.metadata.name,DRIVER:.spec.csi.driver' 2>/dev/null)"; then
+    echo "Error: cannot inspect PersistentVolumes before Longhorn uninstall." >&2
+    return 1
+  fi
+  while read -r name driver; do
+    if [[ "$driver" == driver.longhorn.io ]]; then
+      echo "Error: retaining Longhorn: PersistentVolume ${name} still uses it. Remove only the intended claims and retry." >&2
+      return 1
+    fi
+  done <<<"$rows"
+  if ! rows="$(kubectl get storageclass --no-headers -o custom-columns='NAME:.metadata.name,PROVISIONER:.provisioner' 2>/dev/null)"; then
+    echo "Error: cannot inspect StorageClasses before Longhorn uninstall." >&2
+    return 1
+  fi
+  while read -r sc provisioner; do
+    [[ "$provisioner" == driver.longhorn.io ]] && classes["$sc"]=1
+  done <<<"$rows"
+  if ! rows="$(kubectl get pvc -A --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,CLASS:.spec.storageClassName' 2>/dev/null)"; then
+    echo "Error: cannot inspect PersistentVolumeClaims before Longhorn uninstall." >&2
+    return 1
+  fi
+  while read -r ns claim sc; do
+    if [[ -n "$sc" && -n "${classes[$sc]:-}" ]]; then
+      echo "Error: retaining Longhorn: PVC ${ns}/${claim} still requests Longhorn storage." >&2
+      return 1
+    fi
+  done <<<"$rows"
+  if ! marker="$(kubectl get crd volumes.longhorn.io --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot inspect the Longhorn volume API before uninstall." >&2
+    return 1
+  fi
+  [[ -n "$(trim_whitespace "$marker")" ]] || return 0
+  if ! rows="$(kubectl get volumes.longhorn.io -A -o name 2>/dev/null)"; then
+    echo "Error: cannot verify that Longhorn backend volumes are gone." >&2
+    return 1
+  fi
+  if [[ -n "$(trim_whitespace "$rows")" ]]; then
+    echo "Error: retaining Longhorn while backend volumes remain; deleting its CRDs could strand or destroy shared storage." >&2
+    return 1
+  fi
+}
+
+collect_storage_release_cluster_rows() {
+  local component="$1" release="$2" ns="$3" rows_name="$4"
+  local -n cluster_rows_ref="$rows_name"
+  local rows kind name owner owner_ns marker reference other_manager=0
+  if ! rows="$(kubectl get clusterrole,clusterrolebinding,csidriver,validatingwebhookconfiguration,mutatingwebhookconfiguration,storageclass,priorityclass --no-headers \
+      -o custom-columns='KIND:.kind,NAME:.metadata.name,RELEASE:.metadata.annotations.meta\.helm\.sh/release-name,NS:.metadata.annotations.meta\.helm\.sh/release-namespace' 2>/dev/null)"; then
+    echo "Error: cannot inventory cluster resources for storage release ${ns}/${release}." >&2
+    return 1
+  fi
+  while read -r kind name owner owner_ns; do
+    [[ "$owner" == "$release" && "$owner_ns" == "$ns" ]] || continue
+    append_unique_item "${kind}/${name}" cluster_rows_ref
+  done <<<"$rows"
+  [[ "$component" == longhorn ]] || return 0
+
+  if ! rows="$(kubectl get daemonsets -A -l app=longhorn-manager --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null)"; then return 1; fi
+  while read -r owner_ns name; do
+    [[ -z "$owner_ns" || "$owner_ns" == "$ns" ]] || other_manager=1
+  done <<<"$rows"
+  # These objects are created dynamically without Helm annotations in 1.10.
+  # Another installation's manager excludes them from this release's scope.
+  (( other_manager == 0 )) || return 0
+  if ! marker="$(kubectl get csidriver driver.longhorn.io --ignore-not-found -o name 2>/dev/null)"; then return 1; fi
+  [[ -z "$(trim_whitespace "$marker")" ]] || append_unique_item "${marker}" cluster_rows_ref
+  if ! marker="$(kubectl get storageclass longhorn --ignore-not-found -o jsonpath='{.provisioner}' 2>/dev/null)"; then return 1; fi
+  [[ "$marker" != driver.longhorn.io ]] || append_unique_item "storageclass/longhorn" cluster_rows_ref
+  for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+    if [[ "$kind" == validatingwebhookconfiguration ]]; then name=longhorn-webhook-validator; else name=longhorn-webhook-mutator; fi
+    if ! rows="$(kubectl get "$kind" "$name" --ignore-not-found \
+        -o jsonpath='{range .webhooks[*]}{.clientConfig.service.namespace}{"\n"}{end}' 2>/dev/null)"; then return 1; fi
+    marker=0
+    while IFS= read -r reference; do
+      [[ -n "$reference" ]] || continue
+      if [[ "$reference" != "$ns" ]]; then marker=2; break; fi
+      marker=1
+    done <<<"$rows"
+    (( marker != 1 )) || append_unique_item "${kind}/${name}" cluster_rows_ref
+  done
+}
+
+cleanup_vault_force() {
+  local marker resources resource rows object rc=0
+  local -a cluster_rows=()
+  echo "[uninstall] Cleaning remaining Vault release resources ..."
+  if ! marker="$(kubectl get namespace "$VAULT_NAMESPACE" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot inspect Vault namespace ${VAULT_NAMESPACE}." >&2
+    return 1
+  fi
+  if [[ -z "$(trim_whitespace "$marker")" ]]; then
+    collect_storage_release_cluster_rows vault "$VAULT_RELEASE_NAME" "$VAULT_NAMESPACE" cluster_rows || return 1
+    for object in "${cluster_rows[@]}"; do
+      kubectl delete "$object" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+    done
+    return "$rc"
+  fi
+  storage_namespace_is_release_owned "$VAULT_NAMESPACE" "$VAULT_RELEASE_NAME" vault || return 1
+  if declare -F refuse_guarded_namespace_deletion_if_needed >/dev/null \
+      && refuse_guarded_namespace_deletion_if_needed "$VAULT_NAMESPACE"; then
+    return 1
   fi
 
-  # Ensure workload references are gone so pvc-protection can clear.
-  kubectl -n "$VAULT_NAMESPACE" delete statefulset vault --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  kubectl -n "$VAULT_NAMESPACE" delete pod --all --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
+  # Ownership was checked before removing any namespace-wide resources.
+  kubectl -n "$VAULT_NAMESPACE" delete statefulset "$VAULT_RELEASE_NAME" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+  kubectl -n "$VAULT_NAMESPACE" delete pod --all --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || rc=1
   if ! delete_vault_pvcs_and_backing_volumes; then
     echo "Error: Vault backing storage cleanup did not complete; keeping ${VAULT_NAMESPACE} for a safe retry." >&2
     return 1
   fi
-
-  local resource
-  for resource in $(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null || true); do
-    kubectl -n "$VAULT_NAMESPACE" get "$resource" -o name 2>/dev/null \
-      | xargs -r -I{} kubectl -n "$VAULT_NAMESPACE" patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    kubectl -n "$VAULT_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  (( rc == 0 )) || return "$rc"
+  if ! resources="$(kubectl api-resources --verbs=list,delete --namespaced=true -o name 2>/dev/null)"; then return 1; fi
+  for resource in $resources; do
+    if ! rows="$(kubectl -n "$VAULT_NAMESPACE" get "$resource" -o name 2>/dev/null)"; then rc=1; continue; fi
+    while IFS= read -r object; do
+      [[ -n "$object" ]] || continue
+      kubectl -n "$VAULT_NAMESPACE" patch "$object" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || rc=1
+    done <<<"$rows"
+    kubectl -n "$VAULT_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
   done
-
-  force_finalize_namespace "$VAULT_NAMESPACE"
-  wait_namespace_gone "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
+  collect_storage_release_cluster_rows vault "$VAULT_RELEASE_NAME" "$VAULT_NAMESPACE" cluster_rows || return 1
+  for object in "${cluster_rows[@]}"; do
+    kubectl delete "$object" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+  done
+  return "$rc"
 }
 
 recover_stuck_vault_namespace() {
@@ -8323,41 +8555,66 @@ recover_stuck_vault_namespace() {
 delete_namespace_with_progress() {
   local ns="$1"
   local timeout_seconds="${2:-$NAMESPACE_DELETE_PROGRESS_TIMEOUT}"
-  local start_ts now_ts elapsed phase pods
+  local start_ts now_ts elapsed phase pods marker
   local force_attempts=0
   local max_force_attempts=3
 
-  if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
+  if ! marker="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot inspect namespace ${ns} before deletion." >&2
+    return 1
+  fi
+  if [[ -z "$(trim_whitespace "$marker")" ]]; then
     echo "[uninstall] Namespace ${ns} already absent."
     return 0
   fi
 
+  # Some bootstrap recovery callers also use this helper after a failed
+  # cleanup attempt. Recheck storage ownership here so a swallowed caller
+  # error cannot turn into deletion of a shared namespace.
+  if [[ "$ns" == "$LONGHORN_NAMESPACE" ]]; then
+    longhorn_storage_is_unused || return 1
+    storage_namespace_is_release_owned "$ns" "$LONGHORN_RELEASE_NAME" longhorn || return 1
+  elif [[ "$ns" == "$VAULT_NAMESPACE" ]]; then
+    storage_namespace_is_release_owned "$ns" "$VAULT_RELEASE_NAME" vault || return 1
+  fi
+  if declare -F refuse_guarded_namespace_deletion_if_needed >/dev/null \
+      && refuse_guarded_namespace_deletion_if_needed "$ns"; then
+    return 1
+  fi
+
   echo "[uninstall] Deleting namespace ${ns} ..."
-  kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if ! kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1; then
+    echo "Error: failed to request deletion of namespace ${ns}." >&2
+    return 1
+  fi
 
   start_ts="$(date +%s)"
-  while kubectl get namespace "$ns" >/dev/null 2>&1; do
+  while true; do
+    if ! marker="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+      echo "Error: cannot verify deletion of namespace ${ns}; retry cleanup when the Kubernetes API is reachable." >&2
+      return 1
+    fi
+    [[ -n "$(trim_whitespace "$marker")" ]] || break
     now_ts="$(date +%s)"
     elapsed=$((now_ts - start_ts))
     phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    pods="$(kubectl -n "$ns" get pods --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')"
-    [[ -z "$pods" ]] && pods="0"
-    echo "[progress] namespace ${ns}: phase=${phase:-unknown}, pods=${pods} (elapsed ${elapsed}s)"
+    pods="$(kubectl -n "$ns" get pods --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')" || pods=unknown
+    echo "[progress] namespace ${ns}: phase=${phase:-unknown}, pods=${pods:-unknown} (elapsed ${elapsed}s)"
 
     if (( elapsed >= timeout_seconds )); then
       if (( force_attempts >= max_force_attempts )); then
-        echo "Warning: namespace ${ns} still exists after ${max_force_attempts} forced cleanup attempts; continuing uninstall." >&2
-        return 0
+        echo "Error: namespace ${ns} still exists after ${max_force_attempts} forced cleanup attempts; uninstall is incomplete." >&2
+        return 1
       fi
       ((force_attempts+=1))
-      echo "Warning: namespace ${ns} still exists after ${timeout_seconds}s; forcing cleanup attempt." >&2
+      echo "Warning: namespace ${ns} still exists after ${timeout_seconds}s; retrying cleanup." >&2
       if [[ "$ns" == "$LONGHORN_NAMESPACE" ]]; then
-        recover_stuck_longhorn_namespace || true
+        cleanup_longhorn_force || return 1
       elif [[ "$ns" == "$VAULT_NAMESPACE" ]]; then
-        recover_stuck_vault_namespace || true
+        cleanup_vault_force || return 1
       else
-        kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || true
-        kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || return 1
+        kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || return 1
       fi
       start_ts="$(date +%s)"
     fi
@@ -18108,6 +18365,8 @@ run_start() {
   local -a start_scrape_rows=()
   ensure_victoria_metrics_scrape_resources start_scrape_rows || return 1
 
+  resume_stopped_dashboard_workloads || return 1
+
   if is_true "$KUBETON_START_WAIT_FOR_BOOTSTRAP"; then
     local target_ns target_name
     target_ns="$(resolve_tonnode_namespace_from_values)"
@@ -18991,7 +19250,109 @@ run_stop() {
     echo "Error: usage: kubeton stop" >&2
     exit 1
   fi
-  run_stop_fleet
+  run_stop_fleet || return $?
+  stop_managed_dashboard_workloads
+}
+
+# Dashboard shutdown preserves provisioned configuration and login Secrets.
+# Only deployments carrying both kubeton ownership and a dashboard component
+# label are eligible. Record replicas on the resource so another CLI machine
+# can resume the same dashboards without local state or creating new ones.
+managed_dashboard_deployment_rows() {
+  kubectl get deployments -A \
+    -l 'app.kubernetes.io/managed-by=kubeton,app.kubernetes.io/name in (kubeton-prometheus,kubeton-grafana)' \
+    -o 'jsonpath={range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.spec.replicas}{"|"}{.metadata.annotations.ton\.ton\.org/kubeton-dashboard-paused-replicas}{"|"}{.metadata.uid}{"|"}{.metadata.resourceVersion}{"|"}{.metadata.labels.app\.kubernetes\.io/name}{"\n"}{end}'
+}
+
+wait_managed_dashboard_stopped() {
+  local ns="$1" name="$2" component="$3" selector pod_names pod
+  local -a wait_args=()
+  selector="app.kubernetes.io/name=${component}"
+  if [[ "$component" == kubeton-prometheus ]]; then
+    selector+=",app.kubernetes.io/instance=${name}"
+  fi
+  # Wait for the controller to observe replicas=0 before taking the final
+  # Pod inventory. Include older Pods whose templates lack managed-by labels.
+  kubectl -n "$ns" rollout status "deployment/${name}" --timeout=180s >/dev/null || return 1
+  pod_names="$(kubectl -n "$ns" get pods -l "$selector" \
+    -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')" || return 1
+  while IFS= read -r pod; do
+    [[ -n "$pod" ]] && wait_args+=("pod/$pod")
+  done <<<"$pod_names"
+  if (( ${#wait_args[@]} > 0 )); then
+    kubectl -n "$ns" wait --for=delete "${wait_args[@]}" --timeout=180s >/dev/null || return 1
+  fi
+}
+
+stop_managed_dashboard_workloads() {
+  local inventory ns name replicas saved uid version component patch rc=0 count=0
+  cleanup_prometheus_port_forwards
+  cleanup_grafana_port_forwards
+  inventory="$(managed_dashboard_deployment_rows)" || {
+    echo "Error: cannot inventory managed dashboards; shutdown could not be verified." >&2
+    return 1
+  }
+  while IFS='|' read -r ns name replicas saved uid version component; do
+    [[ -n "$ns" && -n "$name" ]] || continue
+    replicas="${replicas:-1}"
+    if [[ ! "$replicas" =~ ^[0-9]+$ || -z "$uid" || -z "$version" \
+      || ! "$component" =~ ^kubeton-(prometheus|grafana)$ \
+      || ( -n "$saved" && ! "$saved" =~ ^[0-9]+$ ) ]]; then
+      echo "Error: invalid dashboard shutdown state for ${ns}/${name}; no change made." >&2
+      rc=1; continue
+    fi
+    if (( replicas > 0 )); then saved="$replicas"; fi
+    if [[ -n "$saved" ]]; then
+      printf -v patch '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":{"ton.ton.org/kubeton-dashboard-paused-replicas":"%s"}},"spec":{"replicas":0}}' "$uid" "$version" "$saved"
+      if ! kubectl -n "$ns" patch deployment "$name" --type=merge -p "$patch" >/dev/null; then
+        echo "Error: could not pause managed dashboard ${ns}/${name}." >&2
+        rc=1; continue
+      fi
+    fi
+    if ! wait_managed_dashboard_stopped "$ns" "$name" "$component"; then
+      echo "Error: managed dashboard ${ns}/${name} still has running or terminating Pods." >&2
+      rc=1; continue
+    fi
+    ((count+=1))
+  done <<<"$inventory"
+  if (( rc == 0 )); then
+    echo "[stop] Paused ${count} managed Prometheus/Grafana deployment(s); credentials and configuration retained, local dashboard listeners closed."
+  fi
+  return "$rc"
+}
+
+resume_stopped_dashboard_workloads() {
+  local inventory ns name replicas saved uid version component patch rc=0 count=0
+  inventory="$(managed_dashboard_deployment_rows)" || {
+    echo "Error: cannot inventory paused dashboards for restart." >&2
+    return 1
+  }
+  while IFS='|' read -r ns name replicas saved uid version component; do
+    [[ -n "$ns" && -n "$name" && -n "$saved" ]] || continue
+    if [[ ! "$saved" =~ ^[0-9]+$ || -z "$uid" || -z "$version" \
+      || ! "$component" =~ ^kubeton-(prometheus|grafana)$ ]]; then
+      echo "Error: invalid saved dashboard replicas for ${ns}/${name}; no change made." >&2
+      rc=1; continue
+    fi
+    printf -v patch '{"metadata":{"uid":"%s","resourceVersion":"%s"},"spec":{"replicas":%s}}' "$uid" "$version" "$saved"
+    if ! kubectl -n "$ns" patch deployment "$name" --type=merge -p "$patch" >/dev/null \
+      || ! kubectl -n "$ns" rollout status "deployment/${name}" --timeout=180s >/dev/null; then
+      echo "Error: could not resume managed dashboard ${ns}/${name}." >&2
+      rc=1; continue
+    fi
+    # Keep the resume record until readiness succeeds, so a failed start can
+    # be retried. Tests prevent erasing a concurrent new stop or replacement.
+    printf -v patch '[{"op":"test","path":"/metadata/uid","value":"%s"},{"op":"test","path":"/spec/replicas","value":%s},{"op":"test","path":"/metadata/annotations/ton.ton.org~1kubeton-dashboard-paused-replicas","value":"%s"},{"op":"remove","path":"/metadata/annotations/ton.ton.org~1kubeton-dashboard-paused-replicas"}]' "$uid" "$saved" "$saved"
+    if ! kubectl -n "$ns" patch deployment "$name" --type=json -p "$patch" >/dev/null; then
+      echo "Error: dashboard ${ns}/${name} changed during restart; resume state retained." >&2
+      rc=1; continue
+    fi
+    ((count+=1))
+  done <<<"$inventory"
+  if (( count > 0 )); then
+    echo "[start] Resumed ${count} previously paused Prometheus/Grafana deployment(s). Use 'kubeton prometheus start' or 'kubeton grafana start' to open dashboard access."
+  fi
+  return "$rc"
 }
 
 run_stop_fleet() {
@@ -19004,18 +19365,23 @@ run_stop_fleet() {
   if is_true "$SKIP_STOP_KEY_BACKUP"; then
     echo "SKIP_STOP_KEY_BACKUP=true, skipping stop-time key backup."
   else
-    run_stop_backup
+    run_stop_backup || return $?
   fi
 
   local -a sts_rows=()
-  mapfile -t sts_rows < <(list_ton_statefulsets)
+  local sts_inventory
+  sts_inventory="$(list_ton_statefulsets)" || {
+    echo "Error: cannot inventory TON StatefulSets; fleet shutdown could not be verified." >&2
+    return 1
+  }
+  mapfile -t sts_rows <<<"$sts_inventory"
   if [[ ${#sts_rows[@]} -eq 0 || -z "${sts_rows[0]}" ]]; then
     echo "No TON StatefulSets found."
     return
   fi
 
   local row ns sts replicas
-  local pause_annotation existing_pause_annotation tonnode_exists
+  local pause_annotation existing_pause_annotation tonnode_exists tonnode_marker
   local node_map_annotation node_map_patch
   local tonnodes_paused=0
   local fallback_statefulsets_scaled=0
@@ -19041,7 +19407,11 @@ run_stop_fleet() {
     fi
 
     tonnode_exists=0
-    if kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" >/dev/null 2>&1; then
+    tonnode_marker="$(kubectl -n "$ns" get tonnodes.ton.ton.org "$sts" --ignore-not-found -o name)" || {
+      echo "Error: cannot inspect TonNode ${ns}/${sts}; fleet shutdown was stopped." >&2
+      return 1
+    }
+    if [[ -n "$(trim_whitespace "$tonnode_marker")" ]]; then
       tonnode_exists=1
       existing_pause_annotation="$(get_annotation_value tonnodes.ton.ton.org "$ns" "$sts" "$KUBETON_PAUSE_ANNOTATION_KEY")"
     else
@@ -19057,7 +19427,7 @@ run_stop_fleet() {
 
     if (( tonnode_exists == 1 )); then
       kubectl -n "$ns" patch tonnodes.ton.ton.org "$sts" --type=merge \
-        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\",${node_map_patch}}}}" >/dev/null
+        -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\",${node_map_patch}}}}" >/dev/null || return 1
       ((tonnodes_paused+=1))
       kubectl -n "$ns" patch statefulset "$sts" --type=merge \
         -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\",${node_map_patch}}}}" >/dev/null 2>&1 || true
@@ -19065,13 +19435,13 @@ run_stop_fleet() {
       echo "Warning: TonNode ${ns}/${sts} not found; using StatefulSet scale fallback." >&2
       kubectl -n "$ns" patch statefulset "$sts" --type=merge \
         -p "{\"metadata\":{\"annotations\":{\"${KUBETON_PAUSE_ANNOTATION_KEY}\":\"${pause_annotation}\",${node_map_patch}}}}" >/dev/null 2>&1 || true
-      set_ton_replicas "$ns" "$sts" 0
+      set_ton_replicas "$ns" "$sts" 0 || return 1
       ((fallback_statefulsets_scaled+=1))
     fi
   done
 
   echo "Waiting for TON pods to terminate ..."
-  wait_statefulset_rows_pods_gone sts_rows
+  wait_statefulset_rows_pods_gone sts_rows || return 1
 
   echo "Stop summary: tonnodes_stopped=${tonnodes_paused}, fallback_statefulsets_scaled=${fallback_statefulsets_scaled}, operator_scaled_to_zero=0"
 }
@@ -19260,57 +19630,68 @@ cleanup_kubectl_debug_pods() {
 }
 
 cleanup_longhorn_force() {
-  echo "[uninstall] Forcing Longhorn cleanup ..."
-
-  cleanup_longhorn_webhook_configs
-
-  if kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
-    echo "[uninstall] Deleting Longhorn uninstall/install jobs ..."
-    kubectl -n "$LONGHORN_NAMESPACE" delete job longhorn-uninstall longhorn-install --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    echo "[uninstall] Deleting Longhorn namespaced workload resources ..."
-    kubectl -n "$LONGHORN_NAMESPACE" delete all --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  local marker resources resource rows object rc=0
+  local -a cluster_rows=()
+  echo "[uninstall] Cleaning remaining Longhorn release resources ..."
+  longhorn_storage_is_unused || return 1
+  storage_namespace_is_release_owned "$LONGHORN_NAMESPACE" "$LONGHORN_RELEASE_NAME" longhorn || return 1
+  if declare -F refuse_guarded_namespace_deletion_if_needed >/dev/null \
+      && refuse_guarded_namespace_deletion_if_needed "$LONGHORN_NAMESPACE"; then
+    return 1
   fi
 
-  local resource
-  for resource in $(kubectl api-resources --api-group=longhorn.io --namespaced=true -o name 2>/dev/null || true); do
-    kubectl -n "$LONGHORN_NAMESPACE" get "$resource" -o name 2>/dev/null \
-      | xargs -r -I{} kubectl -n "$LONGHORN_NAMESPACE" patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    kubectl -n "$LONGHORN_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  collect_storage_release_cluster_rows longhorn "$LONGHORN_RELEASE_NAME" "$LONGHORN_NAMESPACE" cluster_rows || return 1
+  for object in "${cluster_rows[@]}"; do
+    case "$object" in
+      validatingwebhookconfiguration/*|mutatingwebhookconfiguration/*|ValidatingWebhookConfiguration/*|MutatingWebhookConfiguration/*)
+        kubectl delete "$object" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1 ;;
+    esac
   done
+  (( rc == 0 )) || return "$rc"
 
-  for resource in $(kubectl api-resources --api-group=longhorn.io --namespaced=false -o name 2>/dev/null || true); do
-    kubectl get "$resource" -o name 2>/dev/null \
-      | xargs -r -I{} kubectl patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    kubectl delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done
-
-  kubectl get crd -o name 2>/dev/null \
-    | grep 'longhorn.io' \
-    | xargs -r -n1 kubectl delete --ignore-not-found --wait=false >/dev/null 2>&1 || true
-
-  kubectl get crd -o name 2>/dev/null \
-    | grep 'longhorn.io' \
-    | xargs -r -I{} kubectl patch {} --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-
-  if kubectl get namespace "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
-    echo "[uninstall] Removing Helm release metadata in ${LONGHORN_NAMESPACE} ..."
-    kubectl -n "$LONGHORN_NAMESPACE" delete secret,configmap -l "owner=helm,name=${LONGHORN_RELEASE_NAME}" --ignore-not-found >/dev/null 2>&1 || true
-    force_finalize_namespace "$LONGHORN_NAMESPACE"
-    wait_namespace_gone "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || true
+  if ! marker="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o name 2>/dev/null)"; then return 1; fi
+  if [[ -n "$(trim_whitespace "$marker")" ]]; then
+    kubectl -n "$LONGHORN_NAMESPACE" delete job longhorn-uninstall longhorn-install --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+    kubectl -n "$LONGHORN_NAMESPACE" delete all --all --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
   fi
+  if ! resources="$(kubectl api-resources --api-group=longhorn.io --namespaced=true -o name 2>/dev/null)"; then return 1; fi
+  for resource in $resources; do
+    if ! rows="$(kubectl -n "$LONGHORN_NAMESPACE" get "$resource" -o name 2>/dev/null)"; then rc=1; continue; fi
+    while IFS= read -r object; do
+      [[ -n "$object" ]] || continue
+      kubectl -n "$LONGHORN_NAMESPACE" patch "$object" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || rc=1
+    done <<<"$rows"
+    kubectl -n "$LONGHORN_NAMESPACE" delete "$resource" --all --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+  done
+  (( rc == 0 )) || return "$rc"
+  if ! rows="$(kubectl get crd -o name 2>/dev/null)"; then return 1; fi
+  while IFS= read -r object; do
+    [[ "$object" == *.longhorn.io ]] || continue
+    kubectl delete "$object" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+  done <<<"$rows"
+  for object in "${cluster_rows[@]}"; do
+    kubectl delete "$object" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+  done
+  return "$rc"
 }
 
 uninstall_longhorn() {
   local rc=0
-  if ! helm status "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" >/dev/null 2>&1; then
-    return 0
+  if storage_release_present "$LONGHORN_RELEASE_NAME" "$LONGHORN_NAMESPACE"; then
+    :
+  else
+    rc=$?
+    (( rc == 1 )) && return 0
+    return "$rc"
   fi
+  longhorn_storage_is_unused || return 1
   echo "[uninstall] Running Helm uninstall for Longhorn release ${LONGHORN_RELEASE_NAME} ..."
   kubectl -n "$LONGHORN_NAMESPACE" patch settings.longhorn.io deleting-confirmation-flag --type=merge -p '{"value":"true"}' >/dev/null 2>&1 || true
   if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE"; then
     return 0
+  else
+    rc=$?
   fi
-  rc=$?
   if [[ "$rc" -eq 124 ]]; then
     echo "Warning: Longhorn Helm uninstall timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; retrying with --no-hooks." >&2
   else
@@ -19318,8 +19699,9 @@ uninstall_longhorn() {
   fi
   if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" --no-hooks >/dev/null 2>&1; then
     return 0
+  else
+    rc=$?
   fi
-  rc=$?
   if [[ "$rc" -eq 124 ]]; then
     echo "Warning: Longhorn Helm uninstall --no-hooks timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; running forced cleanup fallback." >&2
   else
@@ -19330,14 +19712,19 @@ uninstall_longhorn() {
 
 uninstall_vault() {
   local rc=0
-  if ! helm status "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" >/dev/null 2>&1; then
-    return 0
+  if storage_release_present "$VAULT_RELEASE_NAME" "$VAULT_NAMESPACE"; then
+    :
+  else
+    rc=$?
+    (( rc == 1 )) && return 0
+    return "$rc"
   fi
   echo "[uninstall] Running Helm uninstall for Vault release ${VAULT_RELEASE_NAME} ..."
   if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE"; then
     return 0
+  else
+    rc=$?
   fi
-  rc=$?
   if [[ "$rc" -eq 124 ]]; then
     echo "Warning: Vault Helm uninstall timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; retrying with --no-hooks." >&2
   else
@@ -19345,8 +19732,9 @@ uninstall_vault() {
   fi
   if run_with_timeout "$HELM_UNINSTALL_CMD_TIMEOUT" helm uninstall "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" --no-hooks >/dev/null 2>&1; then
     return 0
+  else
+    rc=$?
   fi
-  rc=$?
   if [[ "$rc" -eq 124 ]]; then
     echo "Warning: Vault Helm uninstall --no-hooks timed out after ${HELM_UNINSTALL_CMD_TIMEOUT}; running forced cleanup fallback." >&2
   else
@@ -19383,6 +19771,11 @@ cleanup_dashboard_port_forwards() {
       if port_forward_process_matches "$pid" "$ns" "$service_name" "$local_port" "$remote_port" ''; then
         kill "$pid" >/dev/null 2>&1 || true
       fi
+    elif [[ "$filename" =~ ^proxy-([0-9]+)\.pid$ ]]; then
+      local_port="${BASH_REMATCH[1]}"
+      if kubectl_proxy_process_matches "$pid" "$local_port"; then
+        kill "$pid" >/dev/null 2>&1 || true
+      fi
     fi
     rm -f "$pid_file" >/dev/null 2>&1 || true
   done
@@ -19391,61 +19784,54 @@ cleanup_dashboard_port_forwards() {
 }
 
 cleanup_victoria_metrics_port_forwards() {
-  local state_dir="${VICTORIA_METRICS_PORT_FORWARD_DIR}"
-  local pid_file pid
-
-  if [[ ! -d "$state_dir" ]]; then
-    return 0
-  fi
-
-  for pid_file in "$state_dir"/*.pid; do
-    [[ -f "$pid_file" ]] || continue
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then
-      kill "$pid" >/dev/null 2>&1 || true
-    fi
-    rm -f "$pid_file" >/dev/null 2>&1 || true
-  done
-
-  rm -rf "$state_dir" >/dev/null 2>&1 || true
+  cleanup_dashboard_port_forwards "$VICTORIA_METRICS_PORT_FORWARD_DIR" "$VICTORIA_METRICS_AUTH_PORT"
 }
 
 cleanup_victoria_logs_port_forwards() {
-  local state_dir="${VICTORIA_LOGS_PORT_FORWARD_DIR}"
-  local pid_file pid
+  cleanup_dashboard_port_forwards "$VICTORIA_LOGS_PORT_FORWARD_DIR" "$VICTORIA_LOGS_PORT"
+}
 
-  if [[ ! -d "$state_dir" ]]; then
-    return 0
+cleanup_owned_namespaced_kinds() {
+  local selector="$1" kinds="$2" ns="${3:-}" inventory kind resource rc=0
+  local -a scope=(-A)
+  [[ -z "$ns" ]] || scope=(-n "$ns")
+  if ! inventory="$(kubectl api-resources --verbs=list --namespaced=true -o name)"; then
+    echo "Error: cannot discover resource types during owned-resource cleanup." >&2
+    return 1
   fi
-
-  for pid_file in "$state_dir"/*.pid; do
-    [[ -f "$pid_file" ]] || continue
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then
-      kill "$pid" >/dev/null 2>&1 || true
+  if [[ -z "$(trim_whitespace "$inventory")" ]]; then
+    echo "Error: resource discovery returned no namespaced resource types during cleanup." >&2
+    return 1
+  fi
+  for kind in $kinds; do
+    resource="$(printf '%s\n' "$inventory" | awk -F. -v kind="$kind" '$1 == kind {print; exit}')"
+    [[ -n "$resource" ]] || continue
+    if ! kubectl "${scope[@]}" delete "$resource" -l "$selector" --ignore-not-found --cascade=foreground --wait=true --timeout=60s >/dev/null; then
+      echo "Error: cleanup of ${resource} matching ${selector} did not complete." >&2
+      rc=1
     fi
-    rm -f "$pid_file" >/dev/null 2>&1 || true
   done
-
-  rm -rf "$state_dir" >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 cleanup_prometheus_resources() {
   local selector='app.kubernetes.io/name=kubeton-prometheus,app.kubernetes.io/managed-by=kubeton'
+  local rc=0
 
   echo "[uninstall] Deleting kubeton-managed Prometheus resources ..."
-  kubectl delete deployment,service,configmap,secret -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete pod -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
+  cleanup_owned_namespaced_kinds "$selector" 'deployments replicasets pods services configmaps secrets' || rc=1
   cleanup_prometheus_port_forwards
+  return "$rc"
 }
 
 cleanup_grafana_resources() {
   local selector='app.kubernetes.io/name=kubeton-grafana,app.kubernetes.io/managed-by=kubeton'
+  local rc=0
 
   echo "[uninstall] Deleting kubeton-managed Grafana resources ..."
-  kubectl delete deployment,service,configmap,secret -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete pod -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
+  cleanup_owned_namespaced_kinds "$selector" 'deployments replicasets pods services configmaps secrets' || rc=1
   cleanup_grafana_port_forwards
+  return "$rc"
 }
 
 collect_pvc_rows_by_prefix() {
@@ -19554,12 +19940,21 @@ collect_victoria_logs_release_rows() {
 }
 
 cleanup_main_wallet_resources() {
-  local ns
+  local ns inventory wallet_ns wallet_pvc rc=0
   local pvc_is_kubeton=0
   local -a pvc_rows=()
 
   ns="$(trim_whitespace "$TON_NAMESPACE")"
   [[ -z "$ns" ]] && ns="default"
+  if ! inventory="$(kubectl get pvc -A -l 'app.kubernetes.io/name=kubeton-main-wallet,app.kubernetes.io/managed-by=kubeton' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}')"; then
+    echo "Error: cannot inventory managed main-wallet storage across namespaces." >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r wallet_ns wallet_pvc; do
+    [[ -n "$wallet_ns" && -n "$wallet_pvc" ]] || continue
+    append_unique_item "$wallet_ns"$'\t'"$wallet_pvc" pvc_rows
+  done <<<"$inventory"
 
   if kubectl -n "$ns" get pvc "$MAIN_WALLET_BUNDLE_PVC" >/dev/null 2>&1; then
     if pvc_has_kubeton_attribution "$ns" "$MAIN_WALLET_BUNDLE_PVC" \
@@ -19573,36 +19968,45 @@ cleanup_main_wallet_resources() {
   fi
 
   echo "[uninstall] Deleting kubeton main-wallet helper resources ..."
-  kubectl -n "$ns" delete pod -l 'app.kubernetes.io/name=kubeton-main-wallet,app.kubernetes.io/managed-by=kubeton' --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kubectl delete pod -A -l 'app.kubernetes.io/name=kubeton-main-wallet,app.kubernetes.io/managed-by=kubeton' --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || rc=1
   kubectl -n "$ns" delete configmap "$MAIN_WALLET_SCRIPT_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
 
   if (( pvc_is_kubeton == 1 )); then
-    pvc_rows+=("$ns"$'\t'"$MAIN_WALLET_BUNDLE_PVC")
+    append_unique_item "$ns"$'\t'"$MAIN_WALLET_BUNDLE_PVC" pvc_rows
   fi
-  delete_pvc_rows_and_backing_volumes pvc_rows "uninstall" || true
+  (( rc == 0 )) || return "$rc"
+  delete_pvc_rows_and_backing_volumes pvc_rows "uninstall"
 }
 
 delete_labeled_resources_all_namespaces() {
   local selector="$1"
   local label="${2:-uninstall}"
-  local resource effective_selector
+  local resource effective_selector namespaced_resources cluster_resources rc=0
 
   selector="$(trim_whitespace "$selector")"
   [[ -n "$selector" ]] || return 0
+  namespaced_resources="$(kubectl api-resources --verbs=list,delete --namespaced=true -o name)" || return 1
+  cluster_resources="$(kubectl api-resources --verbs=list,delete --namespaced=false -o name)" || return 1
 
   while IFS= read -r resource; do
     resource="$(trim_whitespace "$resource")"
     [[ -z "$resource" ]] && continue
+    # PVC deletion must first record backing volumes in the durable ledger.
+    # Each component's storage cleanup handles its claims before this sweep.
+    [[ "$resource" != persistentvolumeclaims* ]] || continue
     effective_selector="$selector"
+    if [[ "${KUBETON_RETAIN_VICTORIA_METRICS_STATE:-0}" == 1 && "$resource" == configmaps* ]]; then
+      effective_selector="${effective_selector},app.kubernetes.io/name!=kubeton-victoria-metrics"
+    fi
     if (( KUBETON_RETAIN_VICTORIA_LOGS_GUARDS == 1 )); then
       case "$resource" in
         configmaps|configmaps.*|networkpolicies|networkpolicies.*)
-          effective_selector="${selector},app.kubernetes.io/part-of!=kubeton-victoria-logs"
+          effective_selector="${effective_selector},app.kubernetes.io/part-of!=kubeton-victoria-logs"
           ;;
       esac
     fi
-    kubectl delete "$resource" -A -l "$effective_selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done < <(kubectl api-resources --verbs=list --namespaced=true -o name 2>/dev/null || true)
+    kubectl delete "$resource" -A -l "$effective_selector" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+  done <<<"$namespaced_resources"
 
   while IFS= read -r resource; do
     resource="$(trim_whitespace "$resource")"
@@ -19612,10 +20016,11 @@ delete_labeled_resources_all_namespaces() {
         continue
         ;;
     esac
-    kubectl delete "$resource" -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  done < <(kubectl api-resources --verbs=list --namespaced=false -o name 2>/dev/null || true)
+    kubectl delete "$resource" -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || rc=1
+  done <<<"$cluster_resources"
 
   echo "[${label}] Requested deletion for resources matching ${selector}."
+  return "$rc"
 }
 
 cleanup_kubeton_managed_labeled_resources() {
@@ -19623,17 +20028,72 @@ cleanup_kubeton_managed_labeled_resources() {
   delete_labeled_resources_all_namespaces 'app.kubernetes.io/managed-by=kubeton' "uninstall"
 }
 
+cleanup_victoria_metrics_operator_policy() {
+  local ns="$1" name="$2" component="$3" proof
+  proof="$(kubectl -n "$ns" get networkpolicy "$name" --ignore-not-found \
+    -o 'jsonpath={.metadata.labels.app\.kubernetes\.io/name}{"|"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"|"}{.spec.podSelector.matchLabels.app\.kubernetes\.io/name}{"|"}{.spec.podSelector.matchLabels.control-plane}')" || return 1
+  [[ -n "$proof" ]] || return 0
+  if [[ "$proof" != "${component}|kustomize|${component}|controller-manager" ]]; then
+    echo "[uninstall] Retaining NetworkPolicy ${ns}/${name}: it does not match the recorded upstream operator policy."
+    return 0
+  fi
+  kubectl -n "$ns" delete networkpolicy "$name" --ignore-not-found --wait=true --timeout=60s >/dev/null
+}
+
 cleanup_victoria_metrics_operator() {
   local ns="$1"
   local operator_selector='app.kubernetes.io/name=victoria-metrics-operator'
+  local resources resource remaining crds binding_ns other_operator_ns operator_rows rc=0 shared_operator=0
+
+  resources="$(kubectl api-resources --api-group=operator.victoriametrics.com --verbs=list --namespaced=true -o name)" || return 1
+  for resource in $resources; do
+    remaining="$(kubectl get "$resource" -A --ignore-not-found -o name)" || return 1
+    if [[ -n "$(trim_whitespace "$remaining")" ]]; then
+      echo "[uninstall] Retaining shared VictoriaMetrics operator and CRDs: ${resource} resources remain."
+      return 0
+    fi
+  done
+  operator_rows="$(kubectl get deployments -A -l "$operator_selector" \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}')" || return 1
+  while IFS= read -r other_operator_ns; do
+    [[ -z "$other_operator_ns" || "$other_operator_ns" == "$ns" ]] || shared_operator=1
+  done <<<"$operator_rows"
 
   echo "[uninstall] Deleting VictoriaMetrics operator workloads ..."
-  kubectl -n "$ns" delete deployment,service,serviceaccount,role,rolebinding,configmap,secret -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete clusterrole,clusterrolebinding -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete validatingwebhookconfiguration,mutatingwebhookconfiguration -l "$operator_selector" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl get crd -o name 2>/dev/null \
-    | grep 'operator.victoriametrics.com' \
-    | xargs -r kubectl delete --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  cleanup_owned_namespaced_kinds "$operator_selector" 'deployments replicasets pods services serviceaccounts roles rolebindings configmaps secrets' "$ns" || rc=1
+  # The pinned upstream manifest gives its ServiceAccount a different label,
+  # and leaves these RBAC objects unlabelled. The installation ledger provides
+  # their scope; do not rely on a label-only sweep to find them.
+  cleanup_owned_namespaced_kinds 'app.kubernetes.io/name=vm-operator' 'serviceaccounts' "$ns" || rc=1
+  kubectl -n "$ns" delete role vm-leader-election-role --ignore-not-found --wait=true --timeout=60s >/dev/null || rc=1
+  kubectl -n "$ns" delete rolebinding vm-leader-election-rolebinding --ignore-not-found --wait=true --timeout=60s >/dev/null || rc=1
+  cleanup_victoria_metrics_operator_policy "$ns" vm-allow-metrics-traffic test || rc=1
+  cleanup_victoria_metrics_operator_policy "$ns" vm-allow-webhook-traffic vm-operator || rc=1
+  (( rc == 0 )) || return "$rc"
+  if (( shared_operator == 1 )); then
+    echo "[uninstall] Retaining shared VictoriaMetrics cluster RBAC and CRDs: another operator installation remains."
+    return 0
+  fi
+  binding_ns="$(kubectl get clusterrolebinding vm-operator --ignore-not-found \
+    -o jsonpath='{range .subjects[*]}{.namespace}{"\n"}{end}')" || return 1
+  while IFS= read -r other_operator_ns; do
+    if [[ -n "$other_operator_ns" && "$other_operator_ns" != "$ns" ]]; then
+      echo "[uninstall] Retaining VictoriaMetrics cluster RBAC and CRDs referenced from ${other_operator_ns}."
+      return 0
+    fi
+  done <<<"$binding_ns"
+  kubectl delete clusterrolebinding vm-operator --ignore-not-found --wait=true --timeout=60s >/dev/null || rc=1
+  kubectl delete clusterrole vm-operator --ignore-not-found --wait=true --timeout=60s >/dev/null || rc=1
+  for resource in clusterrole clusterrolebinding validatingwebhookconfiguration mutatingwebhookconfiguration; do
+    kubectl delete "$resource" -l "$operator_selector" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || rc=1
+  done
+  (( rc == 0 )) || return "$rc"
+  crds="$(kubectl get crd -o name)" || return 1
+  while IFS= read -r resource; do
+    [[ "$resource" == *'.operator.victoriametrics.com' ]] || continue
+    kubectl delete "$resource" --ignore-not-found --wait=true --timeout=60s >/dev/null || rc=1
+  done <<<"$crds"
+  return "$rc"
 }
 
 wait_victoria_logs_backend_gone() {
@@ -19899,44 +20359,176 @@ cleanup_victoria_logs_resources() {
     && all_helm_releases_gone == 1 && storage_cleanup_complete == 1 ))
 }
 
+cleanup_empty_observability_namespace() {
+  local ns="$1" marker resources resource remaining item
+  case "$ns" in ''|default|kube-*) return 0 ;; esac
+  marker="$(kubectl get namespace "$ns" --ignore-not-found -o name)" || return 1
+  [[ -n "$marker" ]] || return 0
+  resources="$(kubectl api-resources --verbs=list,delete --namespaced=true -o name)" || return 1
+  [[ -n "$(trim_whitespace "$resources")" ]] || return 1
+  for resource in $resources; do
+    case "$resource" in events|events.*) continue ;; esac
+    if [[ "$resource" == configmaps* ]]; then
+      remaining="$(kubectl -n "$ns" get "$resource" --ignore-not-found \
+        -l 'app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by!=kubeton' -o name)" || return 1
+      if [[ -n "$(trim_whitespace "$remaining")" ]]; then
+        echo "[uninstall] Retaining shared observability namespace ${ns}: externally managed metrics ConfigMaps remain."
+        return 0
+      fi
+      remaining="$(kubectl -n "$ns" get "$resource" --ignore-not-found \
+        -l 'app.kubernetes.io/name!=kubeton-victoria-metrics' -o name)" || return 1
+    else
+      remaining="$(kubectl -n "$ns" get "$resource" --ignore-not-found -o name)" || return 1
+    fi
+    while IFS= read -r item; do
+      case "$item" in ''|configmap/kube-root-ca.crt|serviceaccount/default) continue ;; esac
+      echo "[uninstall] Retaining shared observability namespace ${ns}: ${item} remains."
+      return 0
+    done <<<"$remaining"
+  done
+  echo "[uninstall] Deleting empty recorded observability namespace ${ns} ..."
+  kubectl delete namespace "$ns" --ignore-not-found --wait=true --timeout=60s >/dev/null
+}
+
+report_untracked_victoria_metrics_operator() {
+  local resources="$1" candidate resource remaining operators ns name
+  candidate="$(kubectl -n "$VICTORIA_METRICS_OPERATOR_NAMESPACE" get deployment "$VICTORIA_METRICS_OPERATOR_DEPLOYMENT" \
+    --ignore-not-found -o name)" || {
+    echo "Error: cannot inspect the configured VictoriaMetrics operator for untracked leftovers." >&2
+    return 1
+  }
+  [[ -n "$(trim_whitespace "$candidate")" ]] || return 0
+  for resource in $resources; do
+    remaining="$(kubectl get "$resource" -A --ignore-not-found -o name)" || return 1
+    if [[ -n "$(trim_whitespace "$remaining")" ]]; then
+      echo "[uninstall] Retaining untracked shared VictoriaMetrics operator: ${resource} resources remain."
+      return 0
+    fi
+  done
+  operators="$(kubectl get deployments -A -l 'app.kubernetes.io/name=victoria-metrics-operator' \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"\n"}{end}')" || return 1
+  while IFS='|' read -r ns name; do
+    [[ -n "$ns" && -n "$name" ]] || continue
+    if [[ "$ns" != "$VICTORIA_METRICS_OPERATOR_NAMESPACE" || "$name" != "$VICTORIA_METRICS_OPERATOR_DEPLOYMENT" ]]; then
+      echo "[uninstall] Retaining untracked VictoriaMetrics operator and shared cluster resources: another operator installation remains."
+      return 0
+    fi
+  done <<<"$operators"
+  echo "Error: unverified VictoriaMetrics operator remains at ${VICTORIA_METRICS_OPERATOR_NAMESPACE}/${VICTORIA_METRICS_OPERATOR_DEPLOYMENT}; its kubeton installation ledger and owned stack resources are missing. Ownership cannot be proven, so it was not deleted. Review this orphaned installation before retrying uninstall." >&2
+  return 1
+}
+
 cleanup_victoria_metrics_resources() {
-  local ns="${VICTORIA_METRICS_NAMESPACE}"
-  local operator_ns="${VICTORIA_METRICS_OPERATOR_NAMESPACE}"
-  local stack_name state_stack_ns state_operator_ns
-  local rc=0
+  local ns operator_ns stack_name state_ns state_name state_rows resources resource row component pvc pvc_inventory pv
+  local rc=0 state_selector='app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton'
   local selector='app.kubernetes.io/part-of=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton'
+  local -a stacks=() operators=() namespaces=() vm_pvc_rows=() vm_exact_rows=() vm_pv_rows=()
 
-  state_operator_ns="$(read_victoria_metrics_state_value "$operator_ns" "operatorNamespace")"
-  state_operator_ns="$(trim_whitespace "$state_operator_ns")"
-  if [[ -n "$state_operator_ns" ]]; then
-    operator_ns="$state_operator_ns"
+  # Inventory all recorded installations before deleting any ledger. Current
+  # environment defaults may differ from a previous invocation's namespaces.
+  if ! state_rows="$(kubectl get configmap -A -l "$state_selector" \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.data.stackNamespace}{"|"}{.data.stackName}{"|"}{.data.operatorNamespace}{"\n"}{end}')"; then
+    echo "Error: cannot inventory VictoriaMetrics cleanup state; retaining it for retry." >&2
+    KUBETON_RETAIN_VICTORIA_METRICS_STATE=1
+    return 1
   fi
-
-  state_stack_ns="$(read_victoria_metrics_state_value "$operator_ns" "stackNamespace")"
-  state_stack_ns="$(trim_whitespace "$state_stack_ns")"
-  if [[ -n "$state_stack_ns" ]]; then
-    ns="$state_stack_ns"
-  fi
-
-  stack_name="$(read_victoria_metrics_state_value "$operator_ns" "stackName")"
-  stack_name="$(trim_whitespace "$stack_name")"
-  if [[ -z "$stack_name" ]]; then
-    stack_name="$(victoria_metrics_stack_name)"
-  fi
-
-  echo "[uninstall] Deleting kubeton-managed VictoriaMetrics scrape resources ..."
-  kubectl delete vmservicescrape,service -A -l "$selector" --ignore-not-found >/dev/null 2>&1 || true
-
-  echo "[uninstall] Deleting kubeton-managed VictoriaMetrics stack resources ..."
-  kubectl delete vmuser,vmauth,vmagent,vmsingle -A -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  kubectl delete secret,configmap,service -A -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  kubectl -n "$ns" delete vmuser,vmauth,vmagent,vmsingle "$stack_name" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "$ns" delete secret "vmuser-${stack_name}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "$operator_ns" delete configmap "$VICTORIA_METRICS_STATE_CONFIGMAP" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete configmap -A -l 'app.kubernetes.io/name=kubeton-victoria-metrics,app.kubernetes.io/managed-by=kubeton' --ignore-not-found >/dev/null 2>&1 || true
+  while IFS='|' read -r state_ns state_name ns stack_name operator_ns; do
+    [[ -n "$state_ns" ]] || continue
+    if [[ -z "$ns" || -z "$stack_name" ]]; then
+      echo "Error: incomplete VictoriaMetrics cleanup record ${state_ns}/${state_name}; retaining it for review." >&2
+      KUBETON_RETAIN_VICTORIA_METRICS_STATE=1
+      return 1
+    fi
+    append_unique_item "$ns"$'\t'"$stack_name" stacks
+    append_unique_item "${operator_ns:-$state_ns}" operators
+    append_unique_item "$ns" namespaces
+    append_unique_item "${operator_ns:-$state_ns}" namespaces
+  done <<<"$state_rows"
+  resources="$(kubectl api-resources --api-group=operator.victoriametrics.com --verbs=list --namespaced=true -o name)" || {
+    KUBETON_RETAIN_VICTORIA_METRICS_STATE=1; return 1;
+  }
+  for resource in $resources; do
+    case "$resource" in vmusers.*|vmauths.*|vmagents.*|vmsingles.*) ;; *) continue ;; esac
+    if ! row="$(kubectl get "$resource" -A -l "$selector" \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}')"; then
+      KUBETON_RETAIN_VICTORIA_METRICS_STATE=1; return 1
+    fi
+    while IFS=$'\t' read -r ns stack_name; do
+      [[ -n "$ns" && -n "$stack_name" ]] || continue
+      append_unique_item "$ns"$'\t'"$stack_name" stacks
+      # A previous CLI can lose its state ConfigMap while its explicitly owned
+      # CRs still prove that a kubeton stack used the configured operator.
+      append_unique_item "$VICTORIA_METRICS_OPERATOR_NAMESPACE" operators
+      append_unique_item "$ns" namespaces
+      append_unique_item "$VICTORIA_METRICS_OPERATOR_NAMESPACE" namespaces
+    done <<<"$row"
+  done
   cleanup_victoria_metrics_port_forwards
   cleanup_victoria_logs_resources || rc=1
-  cleanup_victoria_metrics_operator "$operator_ns" || rc=1
+  echo "[uninstall] Deleting kubeton-managed VictoriaMetrics resources ..."
+  for row in "${stacks[@]}"; do
+    IFS=$'\t' read -r ns stack_name <<<"$row"
+    if pvc_inventory="$(kubectl -n "$ns" get pvc -l "app.kubernetes.io/name=vmsingle,app.kubernetes.io/instance=${stack_name}" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"; then
+      while IFS= read -r pvc; do
+        [[ -n "$pvc" ]] || continue
+        append_unique_item "$ns"$'\t'"$pvc" vm_pvc_rows
+        if ! pv="$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.spec.volumeName}')"; then
+          rc=1
+        elif [[ -n "$pv" ]]; then
+          append_pv_cleanup_ledger_row_for_pv "$pv" "$ns/$pvc" vm_pv_rows || rc=1
+          append_local_path_exact_cleanup_rows_for_pv "$pv" "$ns/$pvc" vm_exact_rows || rc=1
+        fi
+      done <<<"$pvc_inventory"
+    else
+      echo "Error: cannot inventory VictoriaMetrics storage in ${ns} for ${stack_name}." >&2
+      rc=1
+    fi
+  done
+  if (( ${#vm_pv_rows[@]} > 0 || ${#vm_exact_rows[@]} > 0 )); then
+    record_local_path_cleanup_ledger vm_exact_rows vm_pv_rows || rc=1
+  fi
+  if (( rc != 0 )); then
+    KUBETON_RETAIN_VICTORIA_METRICS_STATE=1
+    echo "Error: VictoriaMetrics storage inventory or logging cleanup is incomplete; retaining metrics resources and cleanup state." >&2
+    return 1
+  fi
+  cleanup_owned_namespaced_kinds "$selector" 'vmservicescrapes vmusers vmauths vmagents vmsingles services secrets' || rc=1
+  for row in "${stacks[@]}"; do
+    IFS=$'\t' read -r ns stack_name <<<"$row"
+    for component in vmagent vmauth vmsingle; do
+      # Children created by the VM operator carry its labels rather than
+      # managed-by=kubeton. The recorded stack identity authorizes this scope.
+      cleanup_owned_namespaced_kinds "app.kubernetes.io/name=${component},app.kubernetes.io/instance=${stack_name}" \
+        'deployments statefulsets replicasets pods services configmaps secrets serviceaccounts' "$ns" || rc=1
+    done
+  done
+  if (( rc == 0 )); then
+    delete_pvc_rows_and_backing_volumes vm_pvc_rows "uninstall" || rc=1
+  fi
+  if (( ${#stacks[@]} == 0 && ${#operators[@]} == 0 )); then
+    # Older teardown code could erase all ownership records before removing
+    # the operator. Report that ambiguity instead of claiming full cleanup or
+    # inferring permission to delete an independently installed operator.
+    report_untracked_victoria_metrics_operator "$resources" || rc=1
+  fi
+  if (( rc == 0 )); then
+    for operator_ns in "${operators[@]}"; do
+      cleanup_victoria_metrics_operator "$operator_ns" || rc=1
+    done
+  fi
+  if (( rc == 0 )); then
+    for ns in "${namespaces[@]}"; do
+      cleanup_empty_observability_namespace "$ns" || rc=1
+    done
+  fi
+  if (( rc == 0 )); then
+    kubectl delete configmap -A -l "$state_selector" --ignore-not-found --wait=true --timeout=60s >/dev/null || rc=1
+  fi
+  if (( rc != 0 )); then
+    KUBETON_RETAIN_VICTORIA_METRICS_STATE=1
+    echo "Error: VictoriaMetrics cleanup is incomplete; its installation state was retained for retry." >&2
+  fi
   return "$rc"
 }
 
@@ -20007,17 +20599,58 @@ cleanup_operator_release() {
 
 cleanup_vault_release() {
   local rc=0
-  uninstall_vault || true
+  storage_namespace_is_release_owned "$VAULT_NAMESPACE" "$VAULT_RELEASE_NAME" vault || return 1
+  if refuse_guarded_namespace_deletion_if_needed "$VAULT_NAMESPACE"; then return 1; fi
+  uninstall_vault || rc=$?
+  # A failed Helm request can still be recovered, but only a verified cleanup
+  # may replace its failed status with success.
   cleanup_vault_force || return 1
-  if refuse_guarded_namespace_deletion_if_needed "$VAULT_NAMESPACE"; then
-    return 1
-  fi
-  delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
-  return "$rc"
+  delete_namespace_with_progress "$VAULT_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || return 1
+  storage_release_present "$VAULT_RELEASE_NAME" "$VAULT_NAMESPACE" && return 1
+  rc=$?
+  (( rc == 1 )) || return 1
+  return 0
 }
 
 cleanup_encrypted_storage_class() {
-  kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  local marker rows ns name storage_class
+  if ! marker="$(kubectl get storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot inspect StorageClass ${ENCRYPTED_SC_NAME} before cleanup." >&2
+    return 1
+  fi
+  [[ -n "$(trim_whitespace "$marker")" ]] || return 0
+  if ! rows="$(kubectl get pvc -A --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,CLASS:.spec.storageClassName' 2>/dev/null)"; then
+    echo "Error: cannot verify PVC users of StorageClass ${ENCRYPTED_SC_NAME}." >&2
+    return 1
+  fi
+  while read -r ns name storage_class; do
+    if [[ "$storage_class" == "$ENCRYPTED_SC_NAME" ]]; then
+      echo "Error: retaining StorageClass ${ENCRYPTED_SC_NAME}: PVC ${ns}/${name} still uses it." >&2
+      return 1
+    fi
+  done <<<"$rows"
+  if ! rows="$(kubectl get pv --no-headers -o custom-columns='NAME:.metadata.name,CLASS:.spec.storageClassName' 2>/dev/null)"; then
+    echo "Error: cannot verify PV users of StorageClass ${ENCRYPTED_SC_NAME}." >&2
+    return 1
+  fi
+  while read -r name storage_class; do
+    if [[ "$storage_class" == "$ENCRYPTED_SC_NAME" ]]; then
+      echo "Error: retaining StorageClass ${ENCRYPTED_SC_NAME}: PersistentVolume ${name} still uses it." >&2
+      return 1
+    fi
+  done <<<"$rows"
+  if ! kubectl delete storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found --wait=false >/dev/null 2>&1; then
+    echo "Error: failed to delete StorageClass ${ENCRYPTED_SC_NAME}." >&2
+    return 1
+  fi
+  if ! marker="$(kubectl get storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found -o name 2>/dev/null)"; then
+    echo "Error: cannot verify deletion of StorageClass ${ENCRYPTED_SC_NAME}." >&2
+    return 1
+  fi
+  if [[ -n "$(trim_whitespace "$marker")" ]]; then
+    echo "Error: StorageClass ${ENCRYPTED_SC_NAME} still exists; retry cleanup after deletion completes." >&2
+    return 1
+  fi
 }
 
 cleanup_longhorn_release() {
@@ -20039,20 +20672,25 @@ cleanup_longhorn_release() {
     return 1
   fi
 
-  uninstall_longhorn || true
-  cleanup_longhorn_force || true
-  delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || rc=1
-  return "$rc"
+  longhorn_storage_is_unused || return 1
+  storage_namespace_is_release_owned "$LONGHORN_NAMESPACE" "$LONGHORN_RELEASE_NAME" longhorn || return 1
+  uninstall_longhorn || rc=$?
+  cleanup_longhorn_force || return 1
+  delete_namespace_with_progress "$LONGHORN_NAMESPACE" "$NAMESPACE_DELETE_PROGRESS_TIMEOUT" || return 1
+  storage_release_present "$LONGHORN_RELEASE_NAME" "$LONGHORN_NAMESPACE" && return 1
+  rc=$?
+  (( rc == 1 )) || return 1
+  return 0
 }
 
 cleanup_observability_resources() {
   local rc=0
 
-  cleanup_prometheus_resources || true
-  cleanup_grafana_resources || true
+  cleanup_prometheus_resources || rc=1
+  cleanup_grafana_resources || rc=1
   cleanup_victoria_metrics_resources || rc=1
-  cleanup_main_wallet_resources || true
-  cleanup_kubeton_managed_labeled_resources || true
+  cleanup_main_wallet_resources || rc=1
+  cleanup_kubeton_managed_labeled_resources || rc=1
   return "$rc"
 }
 
@@ -20060,65 +20698,91 @@ collect_labeled_resource_leftovers() {
   local selector="$1"
   local rows_name="$2"
   local -n rows_ref="$rows_name"
-  local resource ns name
+  local resource ns name inventory resource_rows
 
   selector="$(trim_whitespace "$selector")"
   [[ -n "$selector" ]] || return 0
 
-  while IFS= read -r resource; do
-    resource="$(trim_whitespace "$resource")"
-    [[ -z "$resource" ]] && continue
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      ns="${line%%[[:space:]]*}"
-      name="${line#*[[:space:]]}"
-      ns="$(trim_whitespace "$ns")"
-      name="$(trim_whitespace "$name")"
-      [[ -z "$name" || "$name" == "<none>" ]] && continue
-      append_unique_item "${resource} ${ns}/${name}" rows_ref
-    done < <(
-      kubectl get "$resource" -A -l "$selector" --no-headers \
-        -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null || true
-    )
-  done < <(kubectl api-resources --verbs=list --namespaced=true -o name 2>/dev/null || true)
+  if inventory="$(kubectl api-resources --verbs=list,delete --namespaced=true -o name 2>/dev/null)"; then
+    if [[ -z "$(trim_whitespace "$inventory")" ]]; then
+      append_unique_item "Namespaced resource discovery unavailable: empty inventory" rows_ref
+    fi
+    while IFS= read -r resource; do
+      resource="$(trim_whitespace "$resource")"
+      [[ -n "$resource" ]] || continue
+      if ! resource_rows="$(kubectl get "$resource" -A -l "$selector" --no-headers \
+          -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null)"; then
+        append_unique_item "Managed-resource inventory unavailable: ${resource} across namespaces" rows_ref
+        continue
+      fi
+      while read -r ns name; do
+        [[ -n "$ns" && -n "$name" && "$name" != "<none>" ]] || continue
+        append_unique_item "${resource} ${ns}/${name}" rows_ref
+      done <<<"$resource_rows"
+    done <<<"$inventory"
+  else
+    append_unique_item "Namespaced resource discovery unavailable" rows_ref
+  fi
 
-  while IFS= read -r resource; do
-    resource="$(trim_whitespace "$resource")"
-    [[ -z "$resource" ]] && continue
-    while IFS= read -r name; do
-      name="$(trim_whitespace "$name")"
-      [[ -z "$name" || "$name" == "<none>" ]] && continue
-      append_unique_item "${resource} ${name}" rows_ref
-    done < <(
-      kubectl get "$resource" -l "$selector" --no-headers \
-        -o custom-columns='NAME:.metadata.name' 2>/dev/null || true
-    )
-  done < <(kubectl api-resources --verbs=list --namespaced=false -o name 2>/dev/null || true)
+  if inventory="$(kubectl api-resources --verbs=list,delete --namespaced=false -o name 2>/dev/null)"; then
+    if [[ -z "$(trim_whitespace "$inventory")" ]]; then
+      append_unique_item "Cluster resource discovery unavailable: empty inventory" rows_ref
+    fi
+    while IFS= read -r resource; do
+      resource="$(trim_whitespace "$resource")"
+      [[ -n "$resource" ]] || continue
+      if ! resource_rows="$(kubectl get "$resource" -l "$selector" --no-headers \
+          -o custom-columns='NAME:.metadata.name' 2>/dev/null)"; then
+        append_unique_item "Managed-resource inventory unavailable: ${resource} at cluster scope" rows_ref
+        continue
+      fi
+      while IFS= read -r name; do
+        name="$(trim_whitespace "$name")"
+        [[ -n "$name" && "$name" != "<none>" ]] || continue
+        append_unique_item "${resource} ${name}" rows_ref
+      done <<<"$resource_rows"
+    done <<<"$inventory"
+  else
+    append_unique_item "Cluster resource discovery unavailable" rows_ref
+  fi
 }
 
 collect_uninstall_leftovers() {
   local rows_name="$1"
   local -n rows_ref="$rows_name"
-  local ns name row release collector service_name pvc
+  local ns name row release collector service_name pvc marker inventory_rc=0
   local -a candidate_pvcs=()
   local -a existing_pvcs=()
   local -a single_release_rows=()
   local -a collector_release_rows=()
   local -a vlogs_pvc_rows=()
+  local -a storage_cluster_rows=()
 
-  while IFS=$'\t' read -r ns name; do
-    ns="$(trim_whitespace "$ns")"
-    name="$(trim_whitespace "$name")"
-    [[ -n "$ns" && -n "$name" ]] && append_unique_item "TonNode ${ns}/${name}" rows_ref
-  done < <(
-    kubectl get tonnodes.ton.ton.org -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
-  )
+  # Purge removes this CRD; an absent API is an idempotent success. A
+  # discovery/list error is not proof that all TonNode instances disappeared.
+  if marker="$(kubectl get crd tonnodes.ton.ton.org --ignore-not-found -o name 2>/dev/null)"; then
+    if [[ -n "$(trim_whitespace "$marker")" ]]; then
+      if row="$(kubectl get tonnodes.ton.ton.org -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+        while IFS=$'\t' read -r ns name; do
+          [[ -n "$ns" && -n "$name" ]] || continue
+          append_unique_item "TonNode ${ns}/${name}" rows_ref
+        done <<<"$row"
+      else
+        append_unique_item "TonNode instance inventory unavailable" rows_ref
+      fi
+    fi
+  else
+    append_unique_item "TonNode CRD inventory unavailable" rows_ref
+  fi
 
-  while IFS=$'\t' read -r ns name; do
-    ns="$(trim_whitespace "$ns")"
-    name="$(trim_whitespace "$name")"
-    [[ -n "$ns" && -n "$name" ]] && append_unique_item "StatefulSet ${ns}/${name}" rows_ref
-  done < <(list_ton_statefulsets 2>/dev/null || true)
+  if row="$(list_ton_statefulsets 2>/dev/null)"; then
+    while IFS=$'\t' read -r ns name; do
+      [[ -n "$ns" && -n "$name" ]] || continue
+      append_unique_item "StatefulSet ${ns}/${name}" rows_ref
+    done <<<"$row"
+  else
+    append_unique_item "TON StatefulSet inventory unavailable" rows_ref
+  fi
 
   collect_expected_ton_pvc_rows_from_values candidate_pvcs
   collect_labeled_ton_pvc_rows candidate_pvcs
@@ -20137,19 +20801,31 @@ collect_uninstall_leftovers() {
   for ns in "$OP_NAMESPACE" "$VAULT_NAMESPACE" "$LONGHORN_NAMESPACE"; do
     ns="$(trim_whitespace "$ns")"
     [[ -z "$ns" ]] && continue
-    if kubectl get namespace "$ns" >/dev/null 2>&1; then
-      append_unique_item "Namespace ${ns}" rows_ref
+    if marker="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+      [[ -z "$(trim_whitespace "$marker")" ]] || append_unique_item "Namespace ${ns}" rows_ref
+    else
+      append_unique_item "Namespace inventory unavailable: ${ns}" rows_ref
     fi
   done
 
-  if kubectl get storageclass "$ENCRYPTED_SC_NAME" >/dev/null 2>&1; then
-    append_unique_item "StorageClass ${ENCRYPTED_SC_NAME}" rows_ref
+  if marker="$(kubectl get storageclass "$ENCRYPTED_SC_NAME" --ignore-not-found -o name 2>/dev/null)"; then
+    [[ -z "$(trim_whitespace "$marker")" ]] || append_unique_item "StorageClass ${ENCRYPTED_SC_NAME}" rows_ref
+  else
+    append_unique_item "StorageClass inventory unavailable: ${ENCRYPTED_SC_NAME}" rows_ref
   fi
 
   if command -v helm >/dev/null 2>&1; then
-    helm status "$RELEASE_NAME" -n "$OP_NAMESPACE" >/dev/null 2>&1 && append_unique_item "HelmRelease ${OP_NAMESPACE}/${RELEASE_NAME}" rows_ref
-    helm status "$VAULT_RELEASE_NAME" -n "$VAULT_NAMESPACE" >/dev/null 2>&1 && append_unique_item "HelmRelease ${VAULT_NAMESPACE}/${VAULT_RELEASE_NAME}" rows_ref
-    helm status "$LONGHORN_RELEASE_NAME" -n "$LONGHORN_NAMESPACE" >/dev/null 2>&1 && append_unique_item "HelmRelease ${LONGHORN_NAMESPACE}/${LONGHORN_RELEASE_NAME}" rows_ref
+    for row in "$OP_NAMESPACE"$'\t'"$RELEASE_NAME" "$VAULT_NAMESPACE"$'\t'"$VAULT_RELEASE_NAME" "$LONGHORN_NAMESPACE"$'\t'"$LONGHORN_RELEASE_NAME"; do
+      IFS=$'\t' read -r ns release <<<"$row"
+      if storage_release_present "$release" "$ns"; then
+        append_unique_item "HelmRelease ${ns}/${release}" rows_ref
+      else
+        inventory_rc=$?
+        if (( inventory_rc != 1 )); then append_unique_item "Helm inventory unavailable: ${ns}/${release}" rows_ref; fi
+      fi
+    done
+  else
+    append_unique_item "Helm inventory unavailable: helm is not installed" rows_ref
   fi
 
   if ! collect_victoria_logs_release_rows single_release_rows collector_release_rows; then
@@ -20183,10 +20859,27 @@ collect_uninstall_leftovers() {
     [[ -n "$ns" && -n "$pvc" ]] && append_unique_item "PVC ${ns}/${pvc}" rows_ref
   done
 
-  while IFS= read -r name; do
-    name="$(trim_whitespace "$name")"
-    [[ -n "$name" ]] && append_unique_item "CRD ${name#customresourcedefinition.apiextensions.k8s.io/}" rows_ref
-  done < <(kubectl get crd -o name 2>/dev/null | grep 'operator.victoriametrics.com' || true)
+  # Shared VictoriaMetrics CRDs are intentionally retained when another app
+  # uses them. Its cleanup step reports unresolved owned state separately.
+  if marker="$(kubectl get crd -o name 2>/dev/null)"; then
+    while IFS= read -r name; do
+      [[ "$name" == *.longhorn.io ]] || continue
+      append_unique_item "CRD ${name#customresourcedefinition.apiextensions.k8s.io/}" rows_ref
+    done <<<"$marker"
+  else
+    append_unique_item "Storage CRD inventory unavailable" rows_ref
+  fi
+
+  for row in vault$'\t'"$VAULT_NAMESPACE"$'\t'"$VAULT_RELEASE_NAME" longhorn$'\t'"$LONGHORN_NAMESPACE"$'\t'"$LONGHORN_RELEASE_NAME"; do
+    IFS=$'\t' read -r name ns release <<<"$row"
+    storage_cluster_rows=()
+    if ! collect_storage_release_cluster_rows "$name" "$release" "$ns" storage_cluster_rows; then
+      append_unique_item "Storage cluster-resource inventory unavailable: ${ns}/${release}" rows_ref
+    fi
+    for marker in "${storage_cluster_rows[@]}"; do
+      append_unique_item "Storage resource ${marker}" rows_ref
+    done
+  done
 
   collect_labeled_resource_leftovers 'app.kubernetes.io/managed-by=kubeton' "$rows_name"
 }
@@ -20214,6 +20907,9 @@ run_uninstall_core() {
   local -a uninstall_sts_rows=()
   local -a uninstall_failures=()
   local item
+
+  KUBETON_RETAIN_VICTORIA_LOGS_GUARDS=0
+  KUBETON_RETAIN_VICTORIA_METRICS_STATE=0
 
   mapfile -t uninstall_sts_rows < <(list_ton_statefulsets 2>/dev/null || true)
 
@@ -20286,11 +20982,16 @@ run_purge() {
   confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
   local uninstall_rc=0
   local purge_rc=0
+  local crd_remaining
   run_uninstall_core || uninstall_rc=$?
   echo "[purge] Deleting CRD tonnodes.ton.ton.org ..."
-  kubectl delete crd tonnodes.ton.ton.org --ignore-not-found || true
+  kubectl delete crd tonnodes.ton.ton.org --ignore-not-found --wait=true \
+    --timeout="${NAMESPACE_DELETE_PROGRESS_TIMEOUT}s" || purge_rc=1
 
-  if kubectl get crd tonnodes.ton.ton.org >/dev/null 2>&1; then
+  if ! crd_remaining="$(kubectl get crd tonnodes.ton.ton.org --ignore-not-found -o name)"; then
+    echo "Error: cannot verify TonNode CRD deletion after purge." >&2
+    purge_rc=1
+  elif [[ -n "$(trim_whitespace "$crd_remaining")" ]]; then
     echo "Warning: TonNode CRD tonnodes.ton.ton.org still exists after purge attempted to delete it." >&2
     purge_rc=1
   fi
@@ -20302,7 +21003,7 @@ run_purge() {
   fi
 
   if (( purge_rc != 0 )); then
-    echo "Warning: purge removed as much as possible, but leftovers remain. Run './kubeton uninstall' again after Kubernetes finishes terminating resources." >&2
+    echo "Warning: purge cleanup is incomplete or could not be verified. Resolve the reported errors and rerun './kubeton purge'." >&2
     return "$purge_rc"
   fi
   echo "[purge] Completed."

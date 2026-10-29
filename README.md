@@ -901,9 +901,9 @@ The ephemeral main-wallet helper uses the deployed official TON artifact image f
 ./kubeton del   # always removes the highest ordinal (tail) replica
 ./kubeton recreate tonnode-10 ./key-backups/<timestamp>  # recreates one pod data PVCs and restores its backup bundle
 
-# temporarily stop TON pods (keeps TonNode/STS/PVC resources)
+# pause TON pods and managed Prometheus/Grafana; retain data, configuration and credentials
 ./kubeton stop
-./kubeton start             # restore previous TON replicas
+./kubeton start             # restore TON and previously paused managed dashboards
 
 # verify
 ./kubeton verify
@@ -918,6 +918,56 @@ The ephemeral main-wallet helper uses the deployed official TON artifact image f
 # kept separate from uninstall because CRD deletion is cluster-scoped
 ./kubeton purge
 ```
+
+`kubeton stop` saves the replica counts of kubeton-managed Prometheus and
+Grafana Deployments, scales them to zero, closes their local background
+port-forwards, and waits for their controlled Pods to disappear. It retains
+their configuration and credential Secrets. Dashboard cleanup also runs when
+there are no TON StatefulSets left to stop.
+
+`kubeton start` resumes only dashboards previously paused by `kubeton stop`,
+after restoring TON and refreshing metrics setup. It does not install
+Prometheus or Grafana merely because `start` was run. Use
+`./kubeton prometheus start` or `./kubeton grafana start` to print access
+credentials and start a local dashboard port-forward again.
+
+VictoriaLogs, VictoriaMetrics, Vault and Longhorn continue running during
+`kubeton stop` so historical logs, storage and key recovery remain available.
+Use `kubeton uninstall` or `kubeton purge` for destructive teardown. The
+dedicated `kubeton prometheus stop` and `kubeton grafana stop` subcommands remove
+those dashboards' managed resources instead of preserving them for a resume.
+
+`kubeton uninstall` removes the managed fleet, dashboards, logging stack and
+helper resources, then tears down eligible Vault/Longhorn infrastructure. It
+keeps the TonNode CRD; `kubeton purge` additionally removes that CRD. Both
+commands report incomplete cleanup as a failure instead of treating a deletion
+request as proof that the resource is gone.
+
+Earlier versions could leave components behind because some Kubernetes/Helm
+errors were ignored, VictoriaMetrics discovery depended on the current
+namespace settings, and generated resources did not always carry kubeton's
+labels. Cleanup now follows recorded stack/operator identities across custom
+namespaces and includes generated VictoriaMetrics workloads, service accounts
+and RBAC. It also checks Longhorn's CSI, webhook and RBAC resources. PVC cleanup
+records backing-volume identity before deleting claims; a generic label sweep
+does not bypass that storage ledger.
+
+Deletion failures, Helm failures and namespace timeouts return non-zero and
+retain the relevant cleanup records for retry. VictoriaLogs ingress protection
+stays until its unauthenticated backend is proven gone. Empty recorded
+observability namespaces are removed; shared namespaces are preserved.
+VictoriaMetrics operators/CRDs used by other applications are retained. A shared
+Vault namespace, remaining Longhorn users/backend volumes, or an in-use
+encrypted StorageClass blocks that dependency's removal and is reported.
+If an older teardown erased VictoriaMetrics ownership records but left its
+operator running, cleanup reports that unverified installation for review.
+
+For an earlier incomplete teardown, run the updated CLI's
+`./kubeton uninstall` or `./kubeton purge` again. Resolve the reported API/RBAC,
+finalizer, ownership or active-storage issue before retrying. Do not remove
+unrelated applications or their data merely to make a shared dependency
+disappear. Successful cleanup is limited to verified managed resources;
+provider snapshots and external backups require separate handling.
 
 </details>
 
@@ -2006,7 +2056,9 @@ For `kubeton`-based full destructive cleanup (including CRD), use:
 ./kubeton purge
 ```
 
-`kubeton purge` includes full uninstall of kubeton-managed resources, then deletes TonNode CRD.
+`kubeton purge` includes uninstall of kubeton-managed resources, then deletes
+the TonNode CRD. Cleanup failures or shared infrastructure that cannot safely
+be removed are reported; rerun the updated CLI after resolving them.
 
 </details>
 
@@ -2157,8 +2209,8 @@ memory or mounted keys. See [SECURITY.md](SECURITY.md) for the trust boundaries.
 
 Manual encrypted bundle backup is available with:
 - `./kubeton backup-keys [output-dir]`
-- `./kubeton stop` scales TON StatefulSets to `0` (keeps TonNode/StatefulSet/PVC resources)
-- `./kubeton start` restores TON replicas from stop metadata (and also performs normal start/upgrade flow when no stop metadata exists)
+- `./kubeton stop` scales TON StatefulSets and kubeton-managed Prometheus/Grafana Deployments to `0`, retaining TON resources/PVCs and dashboard configuration/credentials; it also stops their local port-forwards and waits for controlled Pods to terminate
+- `./kubeton start` restores TON replicas and previously paused managed dashboards from stop metadata (and also performs normal start/upgrade flow when no stop metadata exists); VictoriaLogs, VictoriaMetrics, Vault and Longhorn remain running during a stop
 - TON StatefulSets are created with parallel pod management; `kubeton start` restores stopped replicas in parallel after preapplying saved node placement metadata. Set `KUBETON_SEQUENTIAL_TON_START=true` only as a compatibility fallback.
 - stop-time backup is skipped by default; enable it with: `SKIP_STOP_KEY_BACKUP=false ./kubeton stop`
 - restore from a backup directory with `./kubeton restore-keys <input-dir>` (overwrites encrypted bundle PVC content and restarts TON pods)
@@ -2193,9 +2245,10 @@ Manual backup is still needed for a current external/off-cluster copy:
   move its output outside the cluster for off-cluster recovery.
 
 `kubeton upgrade` refreshes the in-cluster bundle before replacing initialized
-pods for image changes, but does not export a copy. `kubeton stop` skips backup
-by default; `SKIP_STOP_KEY_BACKUP=false` enables an in-cluster refresh, also
-without export. Neither replaces an external backup.
+pods for image changes, but does not export a copy. `kubeton stop` skips the
+explicit pre-stop backup by default; `SKIP_STOP_KEY_BACKUP=false` enables that
+extra in-cluster refresh. Managed Pod shutdown still attempts its final
+quiescent checkpoint. None of these mechanisms exports an external backup.
 
 Exported `backup-keys` bundles still require the original Vault Transit key or
 cloud KMS key to decrypt. Before deleting that root of trust, use
@@ -2214,10 +2267,11 @@ Restore prerequisites:
 - Vault mode: same Vault Transit key history/material (same logical key with old versions available).
 - KMS mode: same cloud KMS key resource still exists and is usable for decrypt.
 - `kubeton drop` removes TON resources/PVCs, verified local-path backing directories, and supported CSI/Longhorn backing volumes.
-- `kubeton uninstall` is a full cleanup: it removes TON resources/PVCs, verified local-path backing directories, supported CSI/Longhorn backing volumes, kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, main-wallet/debug helper resources, operator release/namespace, Longhorn release/namespace, Vault release/namespace, and `encrypted-sc` StorageClass, but keeps `TonNode` CRD.
+- `kubeton uninstall` removes TON resources/PVCs, verified local-path backing directories, supported CSI/Longhorn backing volumes, managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, helpers and operator resources. It also removes eligible Vault/Longhorn releases, their generated cluster resources and namespaces, and the unused `encrypted-sc` StorageClass. Shared or still-used infrastructure is preserved and reported; the TonNode CRD is kept.
 - for an explicit `kubeton uninstall` or `kubeton drop`, legacy TON claim-template names are also recognized when their ownership labels are missing. This covers all per-ordinal claims, including `mytoncore-...`, so a partial `mytoncore.db` cannot survive a successful cleanup merely because it was created by an older controller. The fallback is limited to an exact configured or captured TON StatefulSet claim-template identity; it does not delete PVCs merely because they share a prefix.
 - before deleting a PVC, `kubeton` stores the bound PV/PVC UIDs; local-path host paths and Longhorn CSI volume handles are recorded as well. A later `./kubeton uninstall` can therefore retry storage cleanup even after Kubernetes has deleted the PVC object.
 - if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and exits non-zero rather than claiming completion while a cleanup ledger remains. `Retain`, static, or unknown backing storage is intentionally left in the ledger for manual removal rather than being force-deleted. Rerun `./kubeton uninstall` after resolving the reported issue.
+- VictoriaMetrics cleanup uses recorded stack/operator identities across namespaces, removes their generated child workloads and RBAC, and retains its ledger after a failed deletion. Its shared operators/CRDs and non-empty shared namespaces are preserved. Vault namespace ownership, Longhorn PVC/PV/backend users and encrypted StorageClass users are checked before removing those dependencies.
 - `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 

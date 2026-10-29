@@ -663,6 +663,7 @@ if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
     source "$1"
     ensure_start_victoria_metrics() { :; }
     ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
     event_log="$2"
     selector_path="$3"
     require_bin() { :; }
@@ -711,6 +712,7 @@ if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
     source "$1"
     ensure_start_victoria_metrics() { :; }
     ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
     event_log="$2"
     selector_path="$3"
     require_bin() { :; }
@@ -757,6 +759,7 @@ PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
     source "$1"
     ensure_start_victoria_metrics() { :; }
     ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
     event_log="$2"
     require_bin() { :; }
     resolve_ton_replicas_from_values_file() { printf "3"; }
@@ -806,6 +809,7 @@ if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
     source "$1"
     ensure_start_victoria_metrics() { :; }
     ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
     event_log="$2"
     selector_path="$3"
     require_bin() { :; }
@@ -851,6 +855,7 @@ if PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" \
     source "$1"
     ensure_start_victoria_metrics() { :; }
     ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
     event_log="$2"
     require_bin() { :; }
     resolve_ton_replicas_from_values_file() { printf "3"; }
@@ -1054,6 +1059,7 @@ PATH="$fake_bin:$PATH" KUBETON_TEST_HELM_LOG="$test_dir/helm.log" KUBETON_TEST_H
     source "$1"
     ensure_start_victoria_metrics() { :; }
     ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
     event_log="$2"
     csi_call_count=0
     require_bin() { :; }

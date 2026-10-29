@@ -66,6 +66,9 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/main_wallet_memory_test.sh
 	bash test/kubeton_check_test.sh
 	bash test/kubeton_cleanup_test.sh
+	bash test/kubeton_uninstall_observability_test.sh
+	bash test/kubeton_storage_uninstall_test.sh
+	bash test/kubeton_purge_test.sh
 	bash test/kubeton_launch_logging_test.sh
 	bash test/kubeton_upgrade_test.sh
 	python3 test/kubeton_add_test.py
@@ -84,6 +87,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_port_forward_test.sh
 	bash test/kubeton_logs_recovery_test.sh
 	bash test/kubeton_observability_test.sh
+	python3 test/kubeton_dashboard_lifecycle_test.py
 	bash test/kubeton_wallet_network_test.sh
 	bash test/kubeton_wallet_lookup_test.sh
 	bash test/kubeton_wallet_activate_test.sh

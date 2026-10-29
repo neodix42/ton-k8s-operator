@@ -1248,6 +1248,7 @@ test_tonnode_crd_schema_is_established_before_install_and_start_helm() (
   validate_external_key_prereqs() { :; }
   ensure_start_victoria_metrics() { :; }
   ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
   ensure_start_victoria_logs() { :; }
   delete_stale_ton_pvcs_before_fresh_start() { :; }
   verify_start_victoria_logs_collection_ready() { :; }
@@ -2513,6 +2514,7 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
   ensure_auto_bootstrap_stack() { record_prebootstrap_event storage-bootstrap; }
   ensure_start_victoria_metrics() { :; }
   ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
   ensure_start_victoria_logs() {
     record_prebootstrap_event full-logging-stack
     KUBETON_VICTORIA_LOGS_APPLIED_NODES="$(victoria_logs_eligible_nodes_csv)"
@@ -3531,6 +3533,7 @@ test_sequential_run_start_waits_for_final_controller_convergence() (
   validate_external_key_prereqs() { :; }
   ensure_start_victoria_metrics() { :; }
   ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
   ensure_start_victoria_logs() { :; }
   delete_stale_ton_pvcs_before_fresh_start() { :; }
   verify_start_victoria_logs_collection_ready() { :; }
@@ -3608,6 +3611,7 @@ test_run_start_rechecks_log_coverage_immediately_before_helm() (
   }
   ensure_start_victoria_metrics() { :; }
   ensure_victoria_metrics_scrape_resources() { :; }
+  resume_stopped_dashboard_workloads() { :; }
   ensure_start_victoria_logs() {
     logging_reconcile_count=$((logging_reconcile_count + 1))
     printf 'logging-reconcile-%s eligible=%s\n' \

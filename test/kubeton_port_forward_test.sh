@@ -37,6 +37,13 @@ for fixture_case in namespace service local-port remote-port executable argument
   if matches 127.0.0.1; then fail "$fixture_case incorrectly matched a different endpoint"; fi
 done
 
+# Saved API-proxy processes need the same PID-reuse protection during teardown.
+set_fixture_args kubectl proxy --disable-filter --address 127.0.0.1 --port 18427
+kubectl_proxy_process_matches 4242 18427 || fail 'managed API proxy did not match'
+if kubectl_proxy_process_matches 4242 18428; then fail 'API proxy matched another port'; fi
+set_fixture_args bash -c 'kubectl proxy --address 127.0.0.1 --port 18427'
+if kubectl_proxy_process_matches 4242 18427; then fail 'API proxy matched another executable'; fi
+
 # Keep a conservative ps fallback for platforms without Linux /proc.
 KUBETON_PROCESS_PROC_ROOT="$test_dir/no-proc"
 ps() { printf '%s\n' '/usr/local/bin/kubectl --namespace vm port-forward --address=127.0.0.1 svc/vmauth-kubeton 8427:8427'; }
@@ -116,5 +123,14 @@ if ensure_victoria_metrics_port_forward vm vmauth-kubeton "$test_port" 8427 127.
   fail 'a new listener unexpectedly acquired the already occupied port'
 fi
 kill -0 "$unrelated_pid" >/dev/null 2>&1 || fail 'stale PID handling killed an unrelated process'
+printf '%s\n' "$unrelated_pid" >"$VICTORIA_METRICS_PORT_FORWARD_DIR/proxy-18427.pid"
+cleanup_victoria_metrics_port_forwards
+kill -0 "$unrelated_pid" >/dev/null 2>&1 || fail 'VM teardown killed a reused PID'
+VICTORIA_LOGS_PORT_FORWARD_DIR="$test_dir/stale-log-state"
+mkdir -p "$VICTORIA_LOGS_PORT_FORWARD_DIR"
+printf '%s\n' "$unrelated_pid" >"$VICTORIA_LOGS_PORT_FORWARD_DIR/vm__vlogs__9428.pid"
+printf '%s\n' "$unrelated_pid" >"$VICTORIA_LOGS_PORT_FORWARD_DIR/proxy-19428.pid"
+cleanup_victoria_logs_port_forwards
+kill -0 "$unrelated_pid" >/dev/null 2>&1 || fail 'VictoriaLogs teardown killed a reused PID'
 
 echo 'kubeton port-forward tests passed'

@@ -51,12 +51,13 @@ test_start_lifecycle() (
   helm() { record fleet; }
   repair_pending_ton_placement_after_start() { :; }
   ensure_victoria_metrics_scrape_resources() { record scrape; }
+  resume_stopped_dashboard_workloads() { record dashboards; }
 
   local rc=0
   run_start >"$test_dir/start-$mode.out" 2>&1 || rc=$?
   if [[ "$mode" == ready ]]; then
     [[ "$rc" == 0 ]] || fail 'automatic observability start failed'
-    [[ "$(cat "$events")" == $'preflight\nlogging\nmetrics\ncleanup\ncoverage\nfleet\nscrape' ]] \
+    [[ "$(cat "$events")" == $'preflight\nlogging\nmetrics\ncleanup\ncoverage\nfleet\nscrape\ndashboards' ]] \
       || fail 'logging/metrics/fleet/scrape order changed'
   else
     [[ "$rc" != 0 ]] || fail "start ignored $mode"
