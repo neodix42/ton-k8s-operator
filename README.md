@@ -6,7 +6,7 @@ Bootstrap a local installation bundle from a pinned release for your existing
 Kubernetes cluster:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.7/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.8/install.sh" | bash
 cd ./ton-k8s-operator-0.5.5
 ./kubeton
 ```
@@ -195,7 +195,7 @@ For deployment to an existing Kubernetes cluster:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.7/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.8/install.sh" | bash
 ```
 
 The script:
@@ -1605,7 +1605,7 @@ kubectl config current-context
 kubectl get nodes -o wide
 kubectl get storageclass
 
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.7/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.8/install.sh" | bash
 cd ton-k8s-operator-0.5.5
 ```
 
@@ -2051,7 +2051,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.7/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.8/install.sh" | bash
 cd ./ton-k8s-operator-0.5.5
 
 # review values before upgrade
@@ -2414,9 +2414,9 @@ Restore prerequisites:
 - `kubeton uninstall` removes TON resources/PVCs, verified local-path backing directories, supported CSI/Longhorn backing volumes, managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs resources, helpers and operator resources. It also removes eligible Vault/Longhorn releases, their generated cluster resources and namespaces, and the unused `encrypted-sc` StorageClass. Shared or still-used infrastructure is preserved and reported; the TonNode CRD is kept.
 - for an explicit `kubeton uninstall` or `kubeton drop`, legacy TON claim-template names are also recognized when their ownership labels are missing. This covers all per-ordinal claims, including `mytoncore-...`, so a partial `mytoncore.db` cannot survive a successful cleanup merely because it was created by an older controller. The fallback is limited to an exact configured or captured TON StatefulSet claim-template identity; it does not delete PVCs merely because they share a prefix.
 - before deleting a PVC, `kubeton` stores the bound PV/PVC UIDs; local-path host paths and Longhorn CSI volume handles are recorded as well. A later `./kubeton uninstall` can therefore retry storage cleanup even after Kubernetes has deleted the PVC object.
-- if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and exits non-zero rather than claiming completion while a cleanup ledger remains. `Retain`, static, or unknown backing storage is intentionally left in the ledger for manual removal rather than being force-deleted. Rerun `./kubeton uninstall` after resolving the reported issue.
+- if Kubernetes is still terminating resources or a cleanup step errors, `kubeton uninstall` continues with the remaining steps, reports leftovers, and exits non-zero rather than claiming completion while a cleanup ledger remains. Ordinary `uninstall` and `drop` preserve `Retain` storage. Static or unverifiable backing storage also remains protected. Rerun the command after resolving the reported issue.
 - VictoriaMetrics cleanup uses recorded stack/operator identities across namespaces, removes their generated child workloads and RBAC, and retains its ledger after a failed deletion. Its shared operators/CRDs and non-empty shared namespaces are preserved. Vault namespace ownership, Longhorn PVC/PV/backend users and encrypted StorageClass users are checked before removing those dependencies.
-- `kubeton purge` runs full uninstall and also deletes CRD `tonnodes.ton.ton.org`; this is separated from `uninstall` because CRD deletion is cluster-scoped/destructive.
+- `kubeton purge` runs full uninstall, removes verified retained TON recovery volumes for the configured fleet, and deletes CRD `tonnodes.ton.ton.org`. Its confirmation explicitly includes those retained recovery copies. Targeted `restore-keys ... --to-node ...` deliberately leaves old PVs with `Retain`; several old PVs can therefore refer to different lifetimes of the same claim name. Purge checks each PV/PVC UID and backing volume separately, records its exact identity before deletion, and preserves that record if cleanup needs a retry. Legacy-volume recovery refuses adoption while a same-name PVC still exists, and protects mounted or shared storage, foreign ownership, static volumes and Helm `keep` resources. Repeated claim names alone do not block cleanup, and rejection messages identify the field or check that prevents deletion.
 - if Vault is reinitialized or Vault data is lost, old bundles become undecryptable even if key name is reused.
 
 `kubeton add` checks one additional, unoccupied worker against the live

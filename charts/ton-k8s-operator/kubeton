@@ -61,6 +61,8 @@ KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT_SECONDS="${KUBETON_LOCAL_PATH_CLEANUP_TIMEOUT
 KUBETON_LOCAL_PATH_PATTERN_CLEANUP="${KUBETON_LOCAL_PATH_PATTERN_CLEANUP:-false}"
 KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME="${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAME:-}"
 KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE="${KUBETON_LOCAL_PATH_CLEANUP_LEDGER_NAMESPACE:-}"
+# Internal dynamic scope; environment variables cannot authorize retained-data deletion.
+KUBETON_RETAIN_PURGE_CONFIRMED=false
 KUBETON_SEQUENTIAL_TON_START="${KUBETON_SEQUENTIAL_TON_START:-false}"
 KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START="${KUBETON_AUTO_SEQUENTIAL_LOCAL_PATH_START:-true}"
 KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS="${KUBETON_VOLUME_STAGE_TIMEOUT_SECONDS:-600}"
@@ -10708,6 +10710,62 @@ collect_pv_cleanup_ledger_rows() {
   done <<<"$locations"
 }
 
+# This separate protected-ledger key authorizes only exact retained TON
+# identities explicitly discovered during a confirmed purge. It is never an
+# instruction to erase arbitrary Retain rows already present in older ledgers.
+collect_retained_purge_authorization_rows() {
+  local -n rows_ref="$1"
+  local locations ns name contents row pv pvc_ref pv_uid pvc_uid reclaim driver handle backend_uid node path extra separators
+  locations="$(list_local_path_cleanup_ledger_locations)" || return 1
+  [[ -n "$locations" ]] || return 0
+  while IFS=$'\t' read -r ns name; do
+    [[ -n "$ns" && -n "$name" ]] || continue
+    if ! contents="$(kubectl -n "$ns" get configmap "$name" -o jsonpath='{.data.retained-purge-targets}' 2>/dev/null)"; then
+      echo "Error: could not read retained-volume purge authorization from ${ns}/${name}." >&2
+      return 1
+    fi
+    while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      IFS='|' read -r pv pvc_ref pv_uid pvc_uid reclaim driver handle backend_uid node path extra <<<"$row"
+      separators="${row//[^|]/}"
+      if [[ ${#separators} -ne 9 || "$row" == *$'\t'* || "$row" == *$'\r'* || -n "$extra" || -z "$pv_uid" || -z "$pvc_uid" || "$pv" != "pvc-${pvc_uid}" || "$reclaim" != Retain ]] \
+        || ! pvc_is_configured_ton_claim_template "${pvc_ref%%/*}" "${pvc_ref#*/}" \
+        || { [[ "$driver" == driver.longhorn.io ]] && [[ -z "$handle" || -n "$node$path" ]]; } \
+        || { [[ "$driver" != driver.longhorn.io ]] && [[ -n "$driver$handle$backend_uid" || -z "$node" || -z "$path" ]]; } \
+        || { [[ -z "$driver" ]] && { ! local_path_safe_name_component "$node" || ! local_path_absolute_target "$path" >/dev/null; }; }; then
+        echo "Error: invalid retained-volume purge authorization in ${ns}/${name}." >&2
+        return 1
+      fi
+      append_unique_item "$row" rows_ref
+    done <<<"$contents"
+  done <<<"$locations"
+}
+
+retained_purge_record_is_authorized() {
+  [[ "${KUBETON_RETAIN_PURGE_CONFIRMED:-false}" == true ]] || return 1
+  local pv="$1" pvc_ref="$2" pv_uid="$3" pvc_uid="$4" driver="${5:-}" handle="${6:-}" backend_uid="${7:-}" node="${8:-}" path="${9:-}"
+  local row expected
+  local -a authorization_rows=()
+  pvc_is_configured_ton_claim_template "${pvc_ref%%/*}" "${pvc_ref#*/}" || return 1
+  expected="${pv}|${pvc_ref}|${pv_uid}|${pvc_uid}|Retain|${driver}|${handle}|${backend_uid}|${node}|${path}"
+  collect_retained_purge_authorization_rows authorization_rows || return 1
+  for row in "${authorization_rows[@]}"; do
+    [[ "$row" == "$expected" ]] && return 0
+  done
+  return 1
+}
+
+retained_purge_longhorn_is_detached() {
+  local handle="$1" expected_uid="$2" identity uid state node current_node namespace_uid
+  namespace_uid="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o jsonpath='{.metadata.uid}' 2>/dev/null)" || return 1
+  [[ -n "$namespace_uid" ]] || return 0
+  identity="$(kubectl -n "$LONGHORN_NAMESPACE" get volumes.longhorn.io "$handle" --ignore-not-found \
+    -o jsonpath='{.metadata.uid}{"|"}{.status.state}{"|"}{.spec.nodeID}{"|"}{.status.currentNodeID}' 2>/dev/null)" || return 1
+  IFS='|' read -r uid state node current_node <<<"$identity"
+  [[ -z "$uid" ]] && return 0
+  [[ "$uid" == "$expected_uid" && "$state" == detached && -z "$node$current_node" ]]
+}
+
 storage_cleanup_ledger_has_pending_longhorn_targets() {
   local -a pv_rows=()
   local row pv pvc_ref pv_uid pvc_uid reclaim_policy csi_driver volume_handle longhorn_uid
@@ -10724,13 +10782,23 @@ storage_cleanup_ledger_has_pending_longhorn_targets() {
 record_local_path_cleanup_ledger() {
   local exact_rows_name="$1"
   local pv_rows_name="${2:-}"
+  local authorization_rows_name="${3:-}"
   local -n exact_rows_ref="$exact_rows_name"
+  local -a retained_authorization_rows=()
   local -a ledger_rows=()
   local -a pv_ledger_rows=()
-  local row ledger_ns ledger_name targets_file pv_targets_file ledger_id existing_name existing_purpose existing_id
+  local row ledger_ns ledger_name targets_file pv_targets_file authorization_file ledger_id existing_name existing_purpose existing_id
 
   collect_local_path_cleanup_ledger_rows ledger_rows || return 1
   collect_pv_cleanup_ledger_rows pv_ledger_rows || return 1
+  collect_retained_purge_authorization_rows retained_authorization_rows || return 1
+  if [[ -n "$authorization_rows_name" ]]; then
+    [[ "${KUBETON_RETAIN_PURGE_CONFIRMED:-false}" == true ]] || return 1
+    local -n requested_authorization_rows_ref="$authorization_rows_name"
+    for row in "${requested_authorization_rows_ref[@]}"; do
+      [[ -n "$row" ]] && append_unique_item "$row" retained_authorization_rows
+    done
+  fi
   for row in "${exact_rows_ref[@]}"; do
     [[ -n "$row" ]] && append_unique_item "$row" ledger_rows
   done
@@ -10751,10 +10819,15 @@ record_local_path_cleanup_ledger() {
     rm -f "$targets_file"
     return 1
   }
+  authorization_file="$(mktemp "${TMPDIR:-/tmp}/kubeton-retained-purge-ledger.XXXXXX")" || {
+    rm -f "$targets_file" "$pv_targets_file" "${authorization_file:-}"
+    return 1
+  }
+  printf '%s\n' "${retained_authorization_rows[@]}" >"$authorization_file"
   printf '%s\n' "${ledger_rows[@]}" >"$targets_file"
   printf '%s\n' "${pv_ledger_rows[@]}" >"$pv_targets_file"
   if ! existing_name="$(kubectl -n "$ledger_ns" get configmap "$ledger_name" --ignore-not-found -o jsonpath='{.metadata.name}' 2>/dev/null)"; then
-    rm -f "$targets_file" "$pv_targets_file"
+    rm -f "$targets_file" "$pv_targets_file" "${authorization_file:-}"
     echo "Error: could not inspect local-path cleanup ledger ${ledger_ns}/${ledger_name}; leaving PVCs intact." >&2
     return 1
   fi
@@ -10763,33 +10836,33 @@ record_local_path_cleanup_ledger() {
     existing_purpose="$(kubectl -n "$ledger_ns" get configmap "$ledger_name" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)"
     existing_id="$(kubectl -n "$ledger_ns" get configmap "$ledger_name" -o jsonpath='{.metadata.labels.ton\.ton\.org/kubeton-storage-cleanup}' 2>/dev/null || true)"
     if [[ "$existing_purpose" != "kubeton-local-path-cleanup-ledger" || "$existing_id" != "$ledger_id" ]]; then
-      rm -f "$targets_file" "$pv_targets_file"
+      rm -f "$targets_file" "$pv_targets_file" "${authorization_file:-}"
       echo "Error: refusing to overwrite non-kubeton ConfigMap ${ledger_ns}/${ledger_name} with cleanup state." >&2
       return 1
     fi
-  elif kubectl -n "$ledger_ns" create configmap "$ledger_name" --from-file=targets="$targets_file" --from-file=pv-targets="$pv_targets_file" --dry-run=client -o yaml \
+  elif kubectl -n "$ledger_ns" create configmap "$ledger_name" --from-file=targets="$targets_file" --from-file=pv-targets="$pv_targets_file" --from-file=retained-purge-targets="$authorization_file" --dry-run=client -o yaml \
     | kubectl label --local -f - \
       app.kubernetes.io/name=kubeton-local-path-cleanup-ledger \
       "ton.ton.org/kubeton-storage-cleanup=${ledger_id}" --overwrite -o yaml \
     | kubectl -n "$ledger_ns" create -f - >/dev/null; then
-    rm -f "$targets_file" "$pv_targets_file"
+    rm -f "$targets_file" "$pv_targets_file" "${authorization_file:-}"
     return 0
   else
-    rm -f "$targets_file" "$pv_targets_file"
+    rm -f "$targets_file" "$pv_targets_file" "${authorization_file:-}"
     echo "Error: could not create local-path cleanup ledger ${ledger_ns}/${ledger_name}; leaving PVCs intact." >&2
     return 1
   fi
 
-  if ! kubectl -n "$ledger_ns" create configmap "$ledger_name" --from-file=targets="$targets_file" --from-file=pv-targets="$pv_targets_file" --dry-run=client -o yaml \
+  if ! kubectl -n "$ledger_ns" create configmap "$ledger_name" --from-file=targets="$targets_file" --from-file=pv-targets="$pv_targets_file" --from-file=retained-purge-targets="$authorization_file" --dry-run=client -o yaml \
     | kubectl label --local -f - \
       app.kubernetes.io/name=kubeton-local-path-cleanup-ledger \
       "ton.ton.org/kubeton-storage-cleanup=${ledger_id}" --overwrite -o yaml \
     | kubectl apply -f - >/dev/null; then
-    rm -f "$targets_file" "$pv_targets_file"
+    rm -f "$targets_file" "$pv_targets_file" "${authorization_file:-}"
     echo "Error: could not persist local-path cleanup ledger ${ledger_ns}/${ledger_name}; leaving PVCs intact." >&2
     return 1
   fi
-  rm -f "$targets_file" "$pv_targets_file"
+  rm -f "$targets_file" "$pv_targets_file" "${authorization_file:-}"
 }
 
 # Make sure a recorded directory is not referenced by any other current
@@ -10836,6 +10909,7 @@ local_path_recorded_pv_can_be_deleted() {
   local expected_pv_uid="$4"
   local expected_pvc_uid="$5"
   local expected_node="$6"
+  local discovery_reclaim="${7:-}"
   local actual_path actual_identity actual_pv_uid actual_reclaim_policy expected_ns expected_pvc actual_ns actual_pvc actual_pvc_uid live_pvc_uid namespace_marker claim_ref node
   local -a pv_nodes=()
 
@@ -10854,9 +10928,16 @@ local_path_recorded_pv_can_be_deleted() {
     echo "Error: refusing to delete PV ${pv}: its UID no longer matches the cleanup ledger." >&2
     return 1
   fi
-  if [[ "$actual_reclaim_policy" != "Delete" ]]; then
-    echo "Error: refusing local-path cleanup for PV ${pv}: reclaimPolicy is ${actual_reclaim_policy:-unknown}, not Delete." >&2
-    return 1
+  if [[ "$actual_reclaim_policy" != Delete ]]; then
+    if [[ "$actual_reclaim_policy" != Retain ]] || {
+      ! retained_purge_record_is_authorized "$pv" "$pvc_ref" "$expected_pv_uid" "$expected_pvc_uid" "" "" "" "$expected_node" "$expected_path" && {
+        [[ "$discovery_reclaim" != Retain || "${KUBETON_RETAIN_PURGE_CONFIRMED:-false}" != true ]] ||
+          ! pvc_is_configured_ton_claim_template "${pvc_ref%%/*}" "${pvc_ref#*/}"
+      }
+    }; then
+      echo "Error: refusing local-path cleanup for PV ${pv}: reclaimPolicy ${actual_reclaim_policy:-unknown} lacks exact confirmed-purge authorization." >&2
+      return 1
+    fi
   fi
   if ! actual_path="$(local_path_pv_host_path "$pv")"; then
     return 1
@@ -10970,9 +11051,9 @@ verify_no_pod_references_for_pvc() {
   return 0
 }
 
-# Host data is destructive to remove, so a local-path target is eligible only
-# when the same PV cleanup record says reclaimPolicy=Delete. Older ledgers that
-# lack that record may proceed only while the still-live PV proves Delete.
+# Host data is destructive to remove, so a local-path target requires a Delete
+# record or exact retained-volume authorization from a confirmed purge. Older
+# ledgers without a PV record require the still-live PV to prove Delete.
 verify_recorded_local_path_targets_use_delete_reclaim_policy() {
   local exact_rows_name="$1"
   local pv_rows_name="$2"
@@ -11019,8 +11100,10 @@ verify_recorded_local_path_targets_use_delete_reclaim_policy() {
       return 1
     fi
     if (( matching_rows == 1 )); then
-      if [[ "$recorded_reclaim" != "Delete" ]]; then
-        echo "Error: refusing local-path cleanup for PV ${pv}: cleanup ledger recorded reclaimPolicy ${recorded_reclaim:-unknown}, not Delete." >&2
+      if [[ "$recorded_reclaim" != Delete ]] && {
+        [[ "$recorded_reclaim" != Retain ]] || ! retained_purge_record_is_authorized "$pv" "$pvc_ref" "$pv_uid" "$pvc_uid" "" "" "" "$node" "$path";
+      }; then
+        echo "Error: refusing local-path cleanup for PV ${pv}: cleanup ledger recorded reclaimPolicy ${recorded_reclaim:-unknown} without exact confirmed-purge authorization." >&2
         return 1
       fi
       continue
@@ -11361,8 +11444,12 @@ delete_recorded_pv_cleanup_targets() {
       continue
     fi
 
-    if [[ "$reclaim_policy" != "Delete" ]]; then
-      echo "Error: PV ${pv} uses reclaimPolicy ${reclaim_policy}; retaining its cleanup ledger for manual storage removal." >&2
+    if [[ "$reclaim_policy" != Delete ]] && {
+      [[ "$reclaim_policy" != Retain || "$csi_driver" != driver.longhorn.io ]] ||
+        ! retained_purge_record_is_authorized "$pv" "$pvc_ref" "$pv_uid" "$pvc_uid" "$csi_driver" "$volume_handle" "$longhorn_uid" ||
+        ! retained_purge_longhorn_is_detached "$volume_handle" "$longhorn_uid";
+    }; then
+      echo "Error: cleanup of PV ${pv} with reclaimPolicy ${reclaim_policy} requires exact confirmed-purge authorization and a verified detached Longhorn backend; retaining its cleanup ledger for retry or manual storage removal." >&2
       rc=1
       continue
     fi
@@ -11439,6 +11526,11 @@ delete_recorded_pv_cleanup_targets() {
           continue
         fi
         if [[ -n "$actual_longhorn_uid" ]]; then
+          if [[ "$reclaim_policy" == Retain ]] && ! retained_purge_longhorn_is_detached "$volume_handle" "$longhorn_uid"; then
+            echo "Error: retained Longhorn volume ${volume_handle} is no longer verified detached; keeping its purge authorization for retry." >&2
+            rc=1
+            continue
+          fi
           echo "[${label}] Deleting verified Longhorn volume ${volume_handle} ..."
           kubectl -n "$LONGHORN_NAMESPACE" delete volumes.longhorn.io "$volume_handle" --ignore-not-found --wait=false >/dev/null 2>&1 || true
         fi
@@ -11560,6 +11652,9 @@ delete_pvc_rows_and_backing_volumes() {
   # PVC object after a UID-bound PV ledger was persisted and no pod references
   # the claim.  The unresolved storage record remains in that ledger.
   local force_unresolved_local_pvcs="${3:-false}"
+  # Confirmed fleet purge may discover retained recovery PVs after deleting
+  # their claims, before ordinary ledger reconciliation would reject Retain.
+  local legacy_sts_rows_name="${4:-}"
   local -n pvc_rows_ref="$pvc_rows_name"
   local -a local_path_exact_rows=()
   local -a recorded_pv_rows=()
@@ -11710,6 +11805,15 @@ delete_pvc_rows_and_backing_volumes() {
     fi
   done
 
+  if [[ -n "$legacy_sts_rows_name" ]]; then
+    if [[ "${KUBETON_RETAIN_PURGE_CONFIRMED:-false}" != true || "$label" != uninstall ]]; then
+      echo "Error: retained-volume discovery requires a confirmed fleet purge." >&2
+      cleanup_rc=1
+    elif ! cleanup_legacy_ton_pvs_for_statefulsets "$legacy_sts_rows_name" "$label"; then
+      cleanup_rc=1
+    fi
+  fi
+
   # The PVC is gone now, so no Kubernetes pod can still mount its RWO
   # filesystem.  The persisted ledger makes this retryable if the privileged
   # cleanup pod cannot remove the host directory on this attempt.
@@ -11837,8 +11941,8 @@ pvc_row_has_trusted_ton_statefulset_provenance() {
 }
 
 # A previous uninstall can remove both the PVC and StatefulSet before their
-# PVs are deleted. Recover only dynamically provisioned, Delete-policy TON
-# claims from that partial teardown. Exact claimRef names are an explicit
+# PVs are deleted. Recover dynamically provisioned TON claims from that
+# partial teardown; Retain copies require an explicitly confirmed purge. Exact claimRef names are an explicit
 # uninstall/drop fallback; ordinary start/repair must never adopt these PVs.
 cleanup_legacy_ton_pvs_for_statefulsets() {
   local trusted_sts_rows_name="$1"
@@ -11846,8 +11950,9 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
   local -n trusted_sts_rows_ref="$trusted_sts_rows_name"
   local snapshot row rechecked pv pv_uid ns pvc pvc_uid reclaim driver handle provisioner managed_by app_name resource_policy extra
   local sts_row sts_ns sts_name prefix ordinal trusted live_uid path node longhorn_identity longhorn_uid longhorn_state longhorn_node longhorn_current_node rc=0
-  local -a exact_rows=() pv_rows=() local_nodes=()
-  local -A matching_claim_counts=()
+  local -a exact_rows=() pv_rows=() local_nodes=() retained_authorizations=()
+  local rejection_reason field_separators claim_identity
+  local -A pv_snapshot_counts=() pv_snapshot_uids=() conflicting_pv_names=() claim_uid_pvs=() conflicting_claim_uids=() pv_uid_names=() conflicting_pv_uids=()
   local snapshot_path='{.metadata.name}{"|"}{.metadata.uid}{"|"}{.spec.claimRef.namespace}{"|"}{.spec.claimRef.name}{"|"}{.spec.claimRef.uid}{"|"}{.spec.persistentVolumeReclaimPolicy}{"|"}{.spec.csi.driver}{"|"}{.spec.csi.volumeHandle}{"|"}{.metadata.annotations.pv\.kubernetes\.io/provisioned-by}{"|"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"|"}{.metadata.labels.app\.kubernetes\.io/name}{"|"}{.metadata.annotations.helm\.sh/resource-policy}'
   local -a candidate_rows=()
 
@@ -11859,6 +11964,29 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     IFS='|' read -r pv pv_uid ns pvc pvc_uid reclaim driver handle provisioner managed_by app_name resource_policy extra <<<"$row"
+    # A PVC name may have several historical lifetimes. Their immutable UIDs
+    # and distinct backend identities decide whether they can be recovered;
+    # counting namespace/name alone incorrectly retained legitimate old PVs.
+    if [[ -n "$pv" ]]; then
+      pv_snapshot_counts["$pv"]=$(( ${pv_snapshot_counts["$pv"]:-0} + 1 ))
+      if [[ -n "${pv_snapshot_uids["$pv"]+present}" && "${pv_snapshot_uids["$pv"]}" != "$pv_uid" ]]; then
+        conflicting_pv_names["$pv"]=true
+      fi
+      pv_snapshot_uids["$pv"]="$pv_uid"
+      if [[ -n "$pvc_uid" ]]; then
+        claim_identity="${pv}|${pv_uid}"
+        if [[ -n "${claim_uid_pvs["$pvc_uid"]+present}" && "${claim_uid_pvs["$pvc_uid"]}" != "$claim_identity" ]]; then
+          conflicting_claim_uids["$pvc_uid"]=true
+        fi
+        claim_uid_pvs["$pvc_uid"]="$claim_identity"
+      fi
+      if [[ -n "$pv_uid" ]]; then
+        if [[ -n "${pv_uid_names["$pv_uid"]+present}" && "${pv_uid_names["$pv_uid"]}" != "$pv" ]]; then
+          conflicting_pv_uids["$pv_uid"]=true
+        fi
+        pv_uid_names["$pv_uid"]="$pv"
+      fi
+    fi
     [[ -n "$pv" && -n "$ns" && -n "$pvc" ]] || continue
     trusted=false
     if pvc_is_configured_ton_claim_template "$ns" "$pvc"; then
@@ -11877,7 +12005,6 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
     fi
     [[ "$trusted" == true ]] || continue
     candidate_rows+=("$row")
-    matching_claim_counts["$ns/$pvc"]=$(( ${matching_claim_counts["$ns/$pvc"]:-0} + 1 ))
   done <<<"$snapshot"
 
   for row in "${candidate_rows[@]}"; do
@@ -11890,12 +12017,38 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
     # Live claims belong to the normal PVC cleanup path. In particular, never
     # adopt an old PV when a same-name claim has since been recreated.
     [[ -z "$live_uid" ]] || continue
-    if [[ -n "$extra" || -z "$pv_uid" || -z "$pvc_uid" || "$pv" != "pvc-${pvc_uid}" \
-      || "$reclaim" != Delete || "$resource_policy" == keep \
-      || ( -n "$managed_by" && "$managed_by" != kubeton && "$managed_by" != ton-k8s-operator ) \
-      || ( -n "$app_name" && "$app_name" != ton-node ) \
-      || "${matching_claim_counts["$ns/$pvc"]}" != 1 ]]; then
-      echo "Error: retaining legacy TON PV ${pv} (${ns}/${pvc}): static, Retain, foreign or ambiguous storage identity." >&2
+    rejection_reason=""
+    field_separators="${row//[^|]/}"
+    if [[ ${#field_separators} -ne 11 || -n "$extra" ]]; then
+      rejection_reason="malformed PV inventory: expected 12 fields, received $(( ${#field_separators} + 1 ))"
+    elif [[ -z "$pv_uid" ]]; then
+      rejection_reason="metadata.uid is empty"
+    elif [[ -z "$pvc_uid" ]]; then
+      rejection_reason="spec.claimRef.uid is empty"
+    elif [[ "${conflicting_pv_names["$pv"]:-false}" == true ]]; then
+      rejection_reason="metadata.uid conflicts between inventory entries for PV ${pv}"
+    elif [[ "${pv_snapshot_counts["$pv"]:-0}" != 1 ]]; then
+      rejection_reason="malformed PV inventory: metadata.name ${pv} appears more than once"
+    elif [[ "${conflicting_pv_uids["$pv_uid"]:-false}" == true ]]; then
+      rejection_reason="metadata.uid ${pv_uid} is shared by different PV names"
+    elif [[ "${conflicting_claim_uids["$pvc_uid"]:-false}" == true ]]; then
+      rejection_reason="spec.claimRef.uid ${pvc_uid} is shared by different PV identities"
+    elif [[ "$pv" != "pvc-${pvc_uid}" ]]; then
+      rejection_reason="metadata.name ${pv} does not match dynamically provisioned claim UID ${pvc_uid} (expected pvc-${pvc_uid})"
+    elif [[ "$reclaim" != Delete ]] && {
+      [[ "$reclaim" != Retain || "${KUBETON_RETAIN_PURGE_CONFIRMED:-false}" != true ]] ||
+        ! pvc_is_configured_ton_claim_template "$ns" "$pvc";
+    }; then
+      rejection_reason="spec.persistentVolumeReclaimPolicy is '${reclaim:-<empty>}' (Retain requires confirmed purge of the configured fleet)"
+    elif [[ "$resource_policy" == keep ]]; then
+      rejection_reason="metadata.annotations[helm.sh/resource-policy] is keep"
+    elif [[ -n "$managed_by" && "$managed_by" != kubeton && "$managed_by" != ton-k8s-operator ]]; then
+      rejection_reason="metadata.labels[app.kubernetes.io/managed-by] is '${managed_by}'"
+    elif [[ -n "$app_name" && "$app_name" != ton-node ]]; then
+      rejection_reason="metadata.labels[app.kubernetes.io/name] is '${app_name}'"
+    fi
+    if [[ -n "$rejection_reason" ]]; then
+      echo "Error: retaining legacy TON PV ${pv} (${ns}/${pvc}): ${rejection_reason}." >&2
       rc=1
       continue
     fi
@@ -11907,7 +12060,7 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
       rc=1
       continue
     fi
-    if ! recorded_pv_matches_cleanup_ledger "$pv" "$ns/$pvc" "$pv_uid" "$pvc_uid" Delete "$driver" "$handle" \
+    if ! recorded_pv_matches_cleanup_ledger "$pv" "$ns/$pvc" "$pv_uid" "$pvc_uid" "$reclaim" "$driver" "$handle" \
       || ! wait_volume_attachments_gone "$pv" 1; then
       echo "Error: retaining legacy TON PV ${pv}: its absent claim and detached state could not be verified." >&2
       rc=1
@@ -11915,6 +12068,7 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
     fi
 
     path=""
+    node=""
     longhorn_uid=""
     if [[ "$driver" == driver.longhorn.io && "$provisioner" == driver.longhorn.io && -n "$handle" ]]; then
       if ! csi_volume_handle_is_exclusive_to_recorded_pv "$pv" "$pv_uid" "$driver" "$handle" "$pv_uid"; then
@@ -11948,15 +12102,19 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
         continue
       fi
       node="${local_nodes[0]}"
-      if ! local_path_recorded_pv_can_be_deleted "$pv" "$path" "$ns/$pvc" "$pv_uid" "$pvc_uid" "$node"; then
+      if ! local_path_recorded_pv_can_be_deleted "$pv" "$path" "$ns/$pvc" "$pv_uid" "$pvc_uid" "$node" "$reclaim"; then
         rc=1
         continue
       fi
       append_unique_item "$node"$'\t'"$path"$'\t'"$pv"$'\t'"$ns/$pvc"$'\t'"$pv_uid"$'\t'"$pvc_uid" exact_rows
     else
-      echo "Error: retaining legacy TON PV ${pv}: dynamic Longhorn/local-path provisioning could not be proven." >&2
+      echo "Error: retaining legacy TON PV ${pv}: dynamic Longhorn/local-path provisioning could not be proven (spec.csi.driver='${driver:-<empty>}', spec.csi.volumeHandle='${handle:-<empty>}', metadata.annotations[pv.kubernetes.io/provisioned-by]='${provisioner:-<empty>}')." >&2
       rc=1
       continue
+    fi
+    if [[ "$reclaim" == Retain ]]; then
+      retained_authorizations+=("${pv}|${ns}/${pvc}|${pv_uid}|${pvc_uid}|Retain|${driver}|${handle}|${longhorn_uid}|${node}|${path}")
+      echo "[purge] Including verified retained TON recovery volume ${pv}, formerly ${ns}/${pvc}."
     fi
     echo "[${label}] Recovering cleanup state for legacy TON PV ${pv}, formerly ${ns}/${pvc}."
     append_unique_item "$pv"$'\t'"$ns/$pvc"$'\t'"$pv_uid"$'\t'"$pvc_uid"$'\t'"$reclaim"$'\t'"$driver"$'\t'"$handle"$'\t'"$longhorn_uid" pv_rows
@@ -11965,7 +12123,11 @@ cleanup_legacy_ton_pvs_for_statefulsets() {
   if [[ ${#pv_rows[@]} -gt 0 ]]; then
     # Persist before either a host directory or a CSI backend is deleted, then
     # use the same retry/UID/handle checks as ordinary PVC cleanup.
-    record_local_path_cleanup_ledger exact_rows pv_rows || return 1
+    if [[ ${#retained_authorizations[@]} -gt 0 ]]; then
+      record_local_path_cleanup_ledger exact_rows pv_rows retained_authorizations || return 1
+    else
+      record_local_path_cleanup_ledger exact_rows pv_rows || return 1
+    fi
     cleanup_recorded_local_path_data "$label" || rc=1
   fi
   return "$rc"
@@ -14168,7 +14330,11 @@ delete_ton_pvcs_for_statefulsets() {
       force_unresolved_local_pvcs=true
       ;;
   esac
-  delete_pvc_rows_and_backing_volumes pvc_rows "$label" "$force_unresolved_local_pvcs" || cleanup_rc=1
+  if [[ "${KUBETON_RETAIN_PURGE_CONFIRMED:-false}" == true && "$label" == uninstall ]]; then
+    delete_pvc_rows_and_backing_volumes pvc_rows "$label" "$force_unresolved_local_pvcs" "$1" || cleanup_rc=1
+  else
+    delete_pvc_rows_and_backing_volumes pvc_rows "$label" "$force_unresolved_local_pvcs" || cleanup_rc=1
+  fi
   cleanup_legacy_ton_pvs_for_statefulsets "$1" "$label" || cleanup_rc=1
   return "$cleanup_rc"
 }
@@ -21173,7 +21339,10 @@ run_uninstall() {
 run_purge() {
   require_bin helm
   require_bin kubectl
-  confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs cleanup) and also deletes CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
+  confirm_or_exit "DANGER: purge runs full uninstall (including kubeton-managed Prometheus/Grafana/VictoriaMetrics/VictoriaLogs cleanup) and deletes verified retained TON recovery volumes belonging to the configured fleet, plus CRD tonnodes.ton.ton.org (cluster-scoped). This is separated from uninstall to avoid accidental cluster-wide CRD removal. Continue?"
+  # Dynamic local scope ends on every return; later uninstall/drop cannot
+  # inherit permission to remove retained recovery copies.
+  local KUBETON_RETAIN_PURGE_CONFIRMED=true
   local uninstall_rc=0
   local purge_rc=0
   local crd_remaining
