@@ -3,10 +3,10 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: ./upgrade-ton-docker-ctrl-only.sh <mytonctrl-tag>' \
+    'Usage: ./upgrade-mytonctrl-only.sh <mytonctrl-tag>' \
     '' \
     'Example:' \
-    '  ./upgrade-ton-docker-ctrl-only.sh v1.0.0' \
+    '  ./upgrade-mytonctrl-only.sh v1.0.0' \
     '' \
     'Updates only the MyTonCtrl image tag in the chart values files.'
 }

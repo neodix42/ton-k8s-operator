@@ -7,6 +7,13 @@
 bin/*
 Dockerfile.cross
 
+# Locally packaged Helm charts (CI packages the selected release).
+/dist/charts/
+
+# Python runtime/test caches.
+__pycache__/
+*.py[cod]
+
 # Test binary, built with `go test -c`
 *.test
 

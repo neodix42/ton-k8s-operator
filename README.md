@@ -1922,7 +1922,7 @@ Use the dedicated scripts to update the operator release or an individual runtim
 ./upgrade-ton-operator.sh 0.3.1
 
 # B) Update only the MyTonCtrl image tag
-./upgrade-ton-docker-ctrl-only.sh v1.0.0
+./upgrade-mytonctrl-only.sh v1.0.0
 
 # C) Update only the official TON image tag
 ./upgrade-ton-image-only.sh v2026.08-amd64
