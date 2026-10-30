@@ -67,6 +67,7 @@ test-kubeton: ## Run kubeton CLI shell tests.
 	python3 test/kubeton_jemalloc_profile_test.py
 	bash test/main_wallet_memory_test.sh
 	bash test/kubeton_check_test.sh
+	python3 test/kubeton_storage_class_query_test.py
 	bash test/kubeton_cleanup_test.sh
 	bash test/kubeton_legacy_pv_cleanup_test.sh
 	bash test/kubeton_retained_purge_test.sh

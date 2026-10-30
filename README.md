@@ -6,7 +6,7 @@ Bootstrap a local installation bundle from a pinned release for your existing
 Kubernetes cluster:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.9/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
 cd ./ton-k8s-operator-0.5.5
 ./kubeton
 ```
@@ -195,7 +195,7 @@ For deployment to an existing Kubernetes cluster:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.9/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
 ```
 
 The script:
@@ -1605,7 +1605,7 @@ kubectl config current-context
 kubectl get nodes -o wide
 kubectl get storageclass
 
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.9/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
 cd ton-k8s-operator-0.5.5
 ```
 
@@ -1879,7 +1879,9 @@ Production deployments should use release artifacts/charts, not this dev-repo fl
 The test environments cover different behavior:
 
 - `make test-kubeton` runs CLI regression tests with synthetic files and mocked
-  Kubernetes calls. It does not start containers or modify a Kubernetes cluster.
+  Kubernetes responses. StorageClass query tests also run the actual `kubectl`
+  renderer against an isolated local HTTP API fixture with an empty kubeconfig.
+  It does not start containers or modify a Kubernetes cluster.
 - `make test-main-wallet-runtime` uses the published TON Docker image with real
   Fift signing and synthetic keys on temporary container filesystems. Network
   access is disabled and only RPC/HTTP responses are mocked. It checks ACK
@@ -2051,7 +2053,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.9/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
 cd ./ton-k8s-operator-0.5.5
 
 # review values before upgrade

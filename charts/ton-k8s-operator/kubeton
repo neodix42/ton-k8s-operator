@@ -2098,12 +2098,19 @@ resolve_ton_replicas_for_node_check() {
   printf '%s' "$replicas"
 }
 
+# Both TON preflight and VictoriaLogs inspect every class, including generated
+# non-default classes with no annotations. Go template index fails on a nil
+# annotations map; guard each lookup and preserve its empty delimited field.
+list_storage_class_default_rows() {
+  kubectl get storageclass -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.provisioner}}{{"|"}}{{with .metadata.annotations}}{{index . "storageclass.kubernetes.io/is-default-class"}}{{end}}{{"|"}}{{with .metadata.annotations}}{{index . "storageclass.beta.kubernetes.io/is-default-class"}}{{end}}{{"\n"}}{{end}}'
+}
+
 # Match the operator's selection order when the configured data StorageClass is
 # omitted: preferred local classes, Longhorn, sorted defaults, sorted fallback.
 node_check_autodetect_storage_class() {
   local rows name provisioner stable_default legacy_default preferred
   local -a names=() defaults=()
-  if ! rows="$(kubectl get storageclass -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.provisioner}}{{"|"}}{{index .metadata.annotations "storageclass.kubernetes.io/is-default-class"}}{{"|"}}{{index .metadata.annotations "storageclass.beta.kubernetes.io/is-default-class"}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+  if ! rows="$(list_storage_class_default_rows)"; then
     echo "Error: cannot list StorageClasses to resolve TON data storage for node preflight." >&2
     return 1
   fi
@@ -6777,7 +6784,7 @@ resolve_victoria_logs_backend_storage() {
   local preferred_row="" configured_row=""
   local -a defaults=()
 
-  if ! rows="$(kubectl get storageclass -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.provisioner}}{{"|"}}{{index .metadata.annotations "storageclass.kubernetes.io/is-default-class"}}{{"|"}}{{index .metadata.annotations "storageclass.beta.kubernetes.io/is-default-class"}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+  if ! rows="$(list_storage_class_default_rows)"; then
     echo "Error: cannot read StorageClasses to resolve VictoriaLogs backend storage; Helm was not started." >&2
     return 1
   fi
