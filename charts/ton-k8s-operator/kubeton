@@ -8694,11 +8694,11 @@ recover_stuck_vault_namespace() {
 delete_namespace_with_progress() {
   local ns="$1"
   local timeout_seconds="${2:-$NAMESPACE_DELETE_PROGRESS_TIMEOUT}"
-  local start_ts now_ts elapsed phase pods marker
+  local start_ts now_ts elapsed phase pods marker state blockers last_blockers="" last_progress=-10
   local force_attempts=0
   local max_force_attempts=3
 
-  if ! marker="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+  if ! marker="$(kubectl get namespace "$ns" --ignore-not-found -o name --request-timeout="$STATUS_EXEC_TIMEOUT")"; then
     echo "Error: cannot inspect namespace ${ns} before deletion." >&2
     return 1
   fi
@@ -8722,23 +8722,34 @@ delete_namespace_with_progress() {
   fi
 
   echo "[uninstall] Deleting namespace ${ns} ..."
-  if ! kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1; then
+  start_ts="$(date +%s)"
+  if ! kubectl delete namespace "$ns" --ignore-not-found --wait=false --request-timeout="$STATUS_EXEC_TIMEOUT" >/dev/null; then
     echo "Error: failed to request deletion of namespace ${ns}." >&2
     return 1
   fi
 
-  start_ts="$(date +%s)"
   while true; do
-    if ! marker="$(kubectl get namespace "$ns" --ignore-not-found -o name 2>/dev/null)"; then
+    # One bounded GET both proves presence and explains termination blockers.
+    # --ignore-not-found handles a namespace disappearing between polls.
+    if ! state="$(kubectl get namespace "$ns" --ignore-not-found \
+        -o jsonpath='{.status.phase}{"|"}{range .status.conditions[?(@.status=="True")]}{.type}{": "}{.reason}{": "}{.message}{"; "}{end}' \
+        --request-timeout="$STATUS_EXEC_TIMEOUT")"; then
       echo "Error: cannot verify deletion of namespace ${ns}; retry cleanup when the Kubernetes API is reachable." >&2
       return 1
     fi
-    [[ -n "$(trim_whitespace "$marker")" ]] || break
+    [[ -n "$state" ]] || break
+    IFS='|' read -r phase blockers <<<"$state"
     now_ts="$(date +%s)"
     elapsed=$((now_ts - start_ts))
-    phase="$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    pods="$(kubectl -n "$ns" get pods --no-headers 2>/dev/null | awk 'NF{c++} END{print c+0}')" || pods=unknown
-    echo "[progress] namespace ${ns}: phase=${phase:-unknown}, pods=${pods:-unknown} (elapsed ${elapsed}s)"
+    if (( elapsed - last_progress >= 10 )); then
+      pods="$(kubectl -n "$ns" get pods --no-headers --request-timeout="$STATUS_EXEC_TIMEOUT" 2>/dev/null | awk 'NF{c++} END{print c+0}')" || pods=unknown
+      echo "[progress] namespace ${ns}: phase=${phase:-unknown}, pods=${pods:-unknown} (elapsed ${elapsed}s)"
+      last_progress="$elapsed"
+    fi
+    if [[ -n "$blockers" && "$blockers" != "$last_blockers" ]]; then
+      echo "[progress] namespace ${ns} blocking conditions: ${blockers}"
+    fi
+    last_blockers="$blockers"
 
     if (( elapsed >= timeout_seconds )); then
       if (( force_attempts >= max_force_attempts )); then
@@ -8752,12 +8763,15 @@ delete_namespace_with_progress() {
       elif [[ "$ns" == "$VAULT_NAMESPACE" ]]; then
         cleanup_vault_force || return 1
       else
-        kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' >/dev/null 2>&1 || return 1
-        kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || return 1
+        kubectl patch namespace "$ns" --type=merge -p '{"spec":{"finalizers":[]}}' --request-timeout="$STATUS_EXEC_TIMEOUT" >/dev/null || return 1
+        kubectl delete namespace "$ns" --ignore-not-found --wait=false --request-timeout="$STATUS_EXEC_TIMEOUT" >/dev/null || return 1
       fi
       start_ts="$(date +%s)"
+      last_progress=-10
+      # Cleanup can finish deletion immediately; recheck before sleeping.
+      continue
     fi
-    sleep 10
+    sleep 2
   done
 
   echo "[uninstall] Namespace ${ns} removed."
@@ -21247,13 +21261,15 @@ run_uninstall_step() {
   local description="$2"
   shift 2
   local -n failures_ref="$failures_name"
+  local started="$SECONDS"
 
   echo "[uninstall] ${description}"
   if "$@"; then
+    echo "[uninstall] ${description%%:*} finished in $((SECONDS - started))s."
     return 0
   fi
 
-  echo "Warning: uninstall step failed: ${description}; continuing with remaining cleanup." >&2
+  echo "Warning: uninstall step failed: ${description} (elapsed $((SECONDS - started))s); continuing with remaining cleanup." >&2
   failures_ref+=("$description")
   return 0
 }

@@ -51,6 +51,71 @@ bash -c '
 grep -Fq 'Namespace vault removed.' "$test_dir/ns-ok"
 grep -Fq 'Namespace vault already absent.' "$test_dir/ns-ok"
 
+# A namespace disappearing asynchronously is detected at the short poll interval,
+# with bounded requests and actionable conditions rather than a silent wait.
+bash -euo pipefail -c '
+  source "$1"
+  namespace_fixture_state="$2" calls="$3"
+  printf pending >"$namespace_fixture_state"
+  storage_namespace_is_release_owned() { :; }
+  kubectl() {
+    [[ "$*" == *"--request-timeout=20s"* ]] || return 91
+    printf "%s\n" "$*" >>"$calls"
+    case "$*" in
+      "get namespace vault "*"-o name"*) echo namespace/vault ;;
+      "delete namespace vault "*) : ;;
+      "get namespace vault "*".status.phase"*)
+        if [[ -s "$namespace_fixture_state" ]]; then
+          printf "Terminating|NamespaceDeletionDiscoveryFailure: DiscoveryFailed: stale API group; "
+          : >"$namespace_fixture_state"
+        fi
+        ;;
+      "-n vault get pods "*) : ;;
+      *) return 92 ;;
+    esac
+  }
+  sleep() { [[ "$1" == 2 ]] || return 93; printf "sleep %s\n" "$1" >>"$calls"; }
+  delete_namespace_with_progress vault 60
+' _ "$kubeton" "$test_dir/async-state" "$test_dir/async-calls" >"$test_dir/async.out" 2>&1
+grep -Fq 'blocking conditions: NamespaceDeletionDiscoveryFailure: DiscoveryFailed: stale API group' "$test_dir/async.out"
+grep -Fq 'Namespace vault removed.' "$test_dir/async.out"
+[[ "$(grep -c '^sleep ' "$test_dir/async-calls")" == 1 ]]
+
+# Forced cleanup may finish immediately. Do not add a full polling sleep before
+# checking its result, and do not interpret a failed status GET as absence.
+for mode in cleared read-error; do
+  rc=0
+  bash -euo pipefail -c '
+    source "$1"
+    mode="$2" namespace_fixture_state="$3"
+    printf present >"$namespace_fixture_state"
+    storage_namespace_is_release_owned() { :; }
+    cleanup_vault_force() { : >"$namespace_fixture_state"; }
+    sleep() { echo "unexpected sleep after immediate cleanup" >&2; return 94; }
+    kubectl() {
+      case "$*" in
+        "get namespace vault "*"-o name"*) echo namespace/vault ;;
+        "delete namespace vault "*) : ;;
+        "get namespace vault "*".status.phase"*)
+          [[ "$mode" != read-error ]] || return 17
+          [[ ! -s "$namespace_fixture_state" ]] || echo "Terminating|"
+          ;;
+        "-n vault get pods "*) : ;;
+        *) return 95 ;;
+      esac
+    }
+    delete_namespace_with_progress vault 0
+  ' _ "$kubeton" "$mode" "$test_dir/$mode.state" >"$test_dir/$mode.out" 2>&1 || rc=$?
+  if [[ "$mode" == cleared ]]; then
+    [[ "$rc" == 0 ]]
+    grep -Fq 'Namespace vault removed.' "$test_dir/$mode.out"
+  else
+    [[ "$rc" != 0 ]]
+    grep -Fq 'cannot verify deletion' "$test_dir/$mode.out"
+    ! grep -Fq 'Namespace vault removed.' "$test_dir/$mode.out"
+  fi
+done
+
 # The exact failed command status must survive if/else handling and fallback.
 for component in longhorn vault; do
   if bash -c '
