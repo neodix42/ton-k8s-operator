@@ -220,6 +220,8 @@ declare -A KUBETON_NODE_CHECK_FREE_MEMORY_BYTES=()
 declare -A KUBETON_NODE_CHECK_FREE_DISK_BYTES=()
 declare -A KUBETON_NODE_CHECK_USED_CPU_MILLI=()
 declare -A KUBETON_NODE_CHECK_USED_MEMORY_BYTES=()
+declare -A KUBETON_NODE_CHECK_PLANNED_GKE_LONGHORN_NODES=()
+KUBETON_NODE_CHECK_USE_LONGHORN=false
 declare -a KUBETON_NODE_CHECK_REQUIRED_HOST_PORTS=()
 declare -A KUBETON_NODE_CHECK_HOST_PORT_CONFLICTS=()
 declare -a KUBETON_NODE_CHECK_LONGHORN_DAEMONSETS=()
@@ -2446,12 +2448,34 @@ node_check_selector_is_all_compatible() {
   return 0
 }
 
+node_check_plan_gke_longhorn_cpu() {
+  local rows node provider namespace
+  KUBETON_NODE_CHECK_PLANNED_GKE_LONGHORN_NODES=()
+  is_true "${KUBETON_NODE_CHECK_USE_LONGHORN:-false}" || return 0
+  is_true "${KUBETON_ADD_MODE:-false}" && return 0
+  should_bootstrap_baremetal || return 0
+  # This estimate is specific to the bundled chart's fresh default. Existing
+  # installations use their actual Pod requests, including any CPU tuning;
+  # never add another reservation or alter the live Longhorn CPU settings.
+  [[ "$LONGHORN_CHART" == longhorn/longhorn && "$LONGHORN_CHART_VERSION" == 1.10.0 ]] || return 0
+  rows="$(kubectl get nodes -l cloud.google.com/gke-nodepool \
+    -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.spec.providerID}}{{"\n"}}{{end}}' 2>/dev/null)" || return 0
+  [[ -n "$rows" ]] || return 0
+  namespace="$(kubectl get namespace "$LONGHORN_NAMESPACE" --ignore-not-found -o name 2>/dev/null)" || return 0
+  [[ -z "$namespace" ]] || return 0
+  while IFS='|' read -r node provider; do
+    [[ -n "$node" && "$provider" == gce://* ]] || continue
+    KUBETON_NODE_CHECK_PLANNED_GKE_LONGHORN_NODES["$node"]=1
+  done <<<"$rows"
+}
+
 run_node_prerequisite_check() {
   local required_nodes="$1"
   local selector="${2:-}"
   local node_rows row node unschedulable alloc_cpu alloc_memory conditions taints
   local basic_reason reason disk_bytes alloc_cpu_milli alloc_memory_bytes used_cpu used_memory free_cpu free_memory
   local target result cpu_display memory_display disk_display host_port_reason host_port_display
+  local planned_cpu required_cpu cpu_shortage=false
 
   # Clear placement evidence before every attempt. Only the point after every
   # node row has been evaluated marks a conclusive result, including zero PASS.
@@ -2484,6 +2508,7 @@ run_node_prerequisite_check() {
   node_check_scope_nodes "$selector" || return 1
   collect_node_requested_resources || return 1
   node_check_collect_host_port_conflicts || return 1
+  node_check_plan_gke_longhorn_cpu || return 1
 
   KUBETON_NODE_CHECK_RESULT=()
   KUBETON_NODE_CHECK_REASON=()
@@ -2506,6 +2531,10 @@ run_node_prerequisite_check() {
     echo "Node prerequisites from ${TON_VALUES_FILE}:"
   fi
   echo "  per TON pod: cpu >= $(node_check_format_cpu "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI") cores, memory >= $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES")"
+  if (( ${#KUBETON_NODE_CHECK_PLANNED_GKE_LONGHORN_NODES[@]} > 0 )); then
+    echo "  fresh GKE Longhorn bootstrap: CPU need also includes the default instance-manager reservation (12% of allocatable CPU on GKE workers)."
+    echo "  Other bootstrap requests are additional; live resource checks run again after bootstrap."
+  fi
   echo "  TON data storage: ${KUBETON_NODE_CHECK_STORAGE_DESCRIPTION}"
   if is_true "${KUBETON_ADD_MODE:-false}"; then
     echo "  local TON PVC capacity: $(node_check_format_bytes "$KUBETON_NODE_CHECK_LOCAL_DATA_BYTES") of $(node_check_format_bytes "$KUBETON_NODE_CHECK_TON_DATA_BYTES") new claim capacity"
@@ -2569,8 +2598,17 @@ run_node_prerequisite_check() {
     if ! [[ "$disk_bytes" =~ ^[0-9]+$ ]]; then
       basic_reason="${basic_reason:+${basic_reason}, }unreadable node filesystem"
     fi
-    if (( free_cpu < KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI )); then
+    planned_cpu=0
+    if [[ -n "${KUBETON_NODE_CHECK_PLANNED_GKE_LONGHORN_NODES[$node]:-}" && "$alloc_cpu_milli" =~ ^[0-9]+$ ]]; then
+      planned_cpu=$((alloc_cpu_milli * 12 / 100))
+    fi
+    required_cpu=$((KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI + planned_cpu))
+    if (( free_cpu < required_cpu )); then
       basic_reason="${basic_reason:+${basic_reason}, }insufficient CPU"
+      if (( planned_cpu > 0 )); then
+        basic_reason+=" (includes $(node_check_format_cpu "$planned_cpu") cores planned for Longhorn)"
+      fi
+      node_check_scope_contains "$node" && cpu_shortage=true
     fi
     if (( free_memory < KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES )); then
       basic_reason="${basic_reason:+${basic_reason}, }insufficient memory"
@@ -2595,7 +2633,7 @@ run_node_prerequisite_check() {
     KUBETON_NODE_CHECK_FREE_DISK_BYTES["$node"]="${disk_bytes:-0}"
     target="no"
     node_check_scope_contains "$node" && target="yes"
-    cpu_display="$(node_check_format_cpu "$free_cpu") / $(node_check_format_cpu "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI")"
+    cpu_display="$(node_check_format_cpu "$free_cpu") / $(node_check_format_cpu "$required_cpu")"
     memory_display="$(node_check_format_bytes "$free_memory") / $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_MEMORY_BYTES")"
     disk_display="$(node_check_format_bytes "$disk_bytes") / $(node_check_format_bytes "$KUBETON_NODE_CHECK_REQUIRED_DISK_BYTES")"
 
@@ -2630,6 +2668,14 @@ run_node_prerequisite_check() {
   if (( ${#KUBETON_NODE_CHECK_COMPATIBLE_NODES[@]} < required_nodes )); then
     echo "Error: not enough compatible nodes for ${required_nodes} TON replica(s)." >&2
     echo "Each TON replica requires a distinct node because TON pods use required hostname anti-affinity." >&2
+    if is_true "$cpu_shortage"; then
+      echo "CPU free means allocatable CPU minus assigned Pod requests, not current CPU utilization." >&2
+      if is_true "${KUBETON_NODE_CHECK_USE_LONGHORN:-false}"; then
+        echo "Longhorn instance managers reserve CPU in addition to TON, even when TON data uses a different StorageClass." >&2
+      fi
+      echo "Use workers with more CPU headroom, or lower tonNode.resources.requests.cpu and KUBETON_CHECK_MIN_CPU together." >&2
+      echo "Lowering only KUBETON_CHECK_MIN_CPU does not lower the TON Pod CPU request." >&2
+    fi
     return 1
   fi
   return 0
@@ -2817,6 +2863,7 @@ resolve_workload_node_prerequisite_scope() {
   local force_new_longhorn_placement="${3:-false}"
   local daemonset selector
 
+  KUBETON_NODE_CHECK_USE_LONGHORN="$use_longhorn"
   KUBETON_NODE_CHECK_TON_VALUES_SELECTOR="$(resolve_effective_tonnode_node_selector)"
   KUBETON_NODE_CHECK_SCOPE_SELECTOR="$KUBETON_NODE_CHECK_TON_VALUES_SELECTOR"
   KUBETON_NODE_CHECK_REQUIRED_NODES="$replicas"

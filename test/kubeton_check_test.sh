@@ -22,6 +22,13 @@ set -euo pipefail
 mode="${KUBETON_TEST_MODE:-healthy}"
 args="$*"
 
+if [[ "${1:-}" == get && "${2:-}" == namespace ]]; then
+  case "$mode" in
+    gke-cpu-fresh|onprem-cpu-fresh) exit 0 ;;
+    gke-cpu-existing) printf '%s\n' namespace/longhorn-system; exit 0 ;;
+  esac
+fi
+
 if [[ "${1:-}" == "get" && "${2:-}" == "--raw" ]]; then
   available_bytes=2199023255552
   if [[ "$mode" == "storage-control" ]]; then
@@ -126,6 +133,13 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
     printf 'node-good-1\x1fRunning\x1f\x1f\x1f17000m,70Gi;\n'
   elif [[ "$mode" == "add-current-fleet-load" ]]; then
     printf 'node-good-3\x1fRunning\x1fton-node\x1f\x1f17000m,70Gi;\n'
+  elif [[ "$mode" == gke-cpu-fresh || "$mode" == gke-cpu-existing || "$mode" == onprem-cpu-fresh ]]; then
+    for node in node-good-1 node-good-2 node-good-3; do
+      printf '%s\x1fRunning\x1f\x1f\x1f600m,1Gi;\n' "$node"
+      if [[ "$mode" == gke-cpu-existing ]]; then
+        printf '%s\x1fRunning\x1f\x1f\x1f2000m,128Mi;\n' "$node"
+      fi
+    done
   fi
   # Other modes have no existing assigned workloads.
   exit 0
@@ -185,7 +199,19 @@ if [[ "${1:-}" == "get" && "${2:-}" == "tonnodes.ton.ton.org" ]]; then
 fi
 
 if [[ "${1:-}" == "get" && "${2:-}" == "nodes" ]]; then
+  if [[ "$args" == *"cloud.google.com/gke-nodepool"* && "$args" == *".spec.providerID"* ]]; then
+    if [[ "$mode" == gke-cpu-* ]]; then
+      for node in node-good-1 node-good-2 node-good-3; do printf '%s|gce://project/zone/%s\n' "$node" "$node"; done
+    fi
+    exit 0
+  fi
   if [[ "$args" == *"go-template="* ]]; then
+    if [[ "$mode" == gke-cpu-* || "$mode" == onprem-cpu-fresh ]]; then
+      for node in node-good-1 node-good-2 node-good-3; do
+        printf '%s\t<no value>\t16\t134217728Ki\tMemoryPressure=False,DiskPressure=False,PIDPressure=False,Ready=True,\t\n' "$node"
+      done
+      exit 0
+    fi
     printf '%s\n' \
       $'node-good-1\t<no value>\t32\t134217728Ki\tMemoryPressure=False,DiskPressure=False,PIDPressure=False,Ready=True,\t' \
       $'node-good-2\t<no value>\t32\t134217728Ki\tMemoryPressure=False,DiskPressure=False,PIDPressure=False,Ready=True,\t'
@@ -1211,5 +1237,73 @@ for add_mode in host-port-current-fleet add-current-fleet-load; do
     fi
   ' _ "$kubeton" >"$test_dir/$add_mode-add.out"
 done
+
+# A 15-core request fits a fresh 16-core worker before Longhorn starts, but
+# cannot fit alongside its default instance manager. Reject before bootstrap
+# and Helm, without changing admission for the same on-premises capacity.
+cpu_values="$test_dir/gke-cpu-values.yaml"
+cat >"$cpu_values" <<'EOF'
+tonNode:
+  replicas: 3
+  storage:
+    storageClassName: premium-rwo
+  resources:
+    requests:
+      cpu: 15000m
+      memory: 64Gi
+EOF
+gke_cpu_output="$test_dir/gke-cpu-fresh.out"
+: >"$test_dir/gke-cpu-helm.log"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=gke-cpu-fresh \
+  KUBETON_TEST_HELM_LOG="$test_dir/gke-cpu-helm.log" TON_VALUES_FILE="$cpu_values" \
+  KUBETON_CHECK_MIN_CPU=15 FORCE_BAREMETAL_BOOTSTRAP=true \
+  "$kubeton" install >"$gke_cpu_output" 2>&1; then
+  echo "fresh GKE install ignored planned Longhorn CPU" >&2; exit 1
+fi
+assert_contains 'default instance-manager reservation (12%' "$gke_cpu_output"
+assert_contains '15.40 / 16.92' "$gke_cpu_output"
+assert_contains 'includes 1.92 cores planned for Longhorn' "$gke_cpu_output"
+[[ ! -s "$test_dir/gke-cpu-helm.log" ]] || { echo 'Helm ran despite the GKE CPU budget failure' >&2; exit 1; }
+
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=onprem-cpu-fresh TON_VALUES_FILE="$cpu_values" \
+  KUBETON_CHECK_MIN_CPU=15 FORCE_BAREMETAL_BOOTSTRAP=true \
+  "$kubeton" check >"$test_dir/onprem-cpu-fresh.out" 2>&1
+assert_contains '15.40 / 15.00' "$test_dir/onprem-cpu-fresh.out"
+assert_contains 'Compatible target nodes: 3/3 required.' "$test_dir/onprem-cpu-fresh.out"
+assert_not_contains 'fresh GKE Longhorn bootstrap' "$test_dir/onprem-cpu-fresh.out"
+
+gke_cpu_existing="$test_dir/gke-cpu-existing.out"
+if PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=gke-cpu-existing TON_VALUES_FILE="$cpu_values" \
+  KUBETON_CHECK_MIN_CPU=15 FORCE_BAREMETAL_BOOTSTRAP=true \
+  "$kubeton" check >"$gke_cpu_existing" 2>&1; then
+  echo 'existing GKE check ignored assigned Longhorn CPU requests' >&2; exit 1
+fi
+assert_contains '13.40 / 15.00' "$gke_cpu_existing"
+assert_not_contains 'fresh GKE Longhorn bootstrap' "$gke_cpu_existing"
+assert_contains 'Lowering only KUBETON_CHECK_MIN_CPU does not lower the TON Pod CPU request.' "$gke_cpu_existing"
+
+# Explicitly reduced requests must work both before and after bootstrap, and
+# the check minimum alone must never discount an unchanged 15-core request.
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=gke-cpu-existing TON_VALUES_FILE="$cpu_values" \
+  KUBETON_CHECK_MIN_CPU=13 FORCE_BAREMETAL_BOOTSTRAP=true \
+  bash -euo pipefail -c '
+    source "$1"
+    if run_node_prerequisite_check_readonly; then exit 23; fi
+    [[ "$KUBETON_NODE_CHECK_REQUIRED_CPU_MILLI" == 15000 ]]
+  ' _ "$kubeton" >"$test_dir/gke-cpu-floor.out" 2>&1
+sed 's/cpu: 15000m/cpu: 13000m/' "$cpu_values" >"$test_dir/gke-cpu-13.yaml"
+PATH="$fake_bin:$PATH" KUBETON_TEST_MODE=gke-cpu-fresh TON_VALUES_FILE="$test_dir/gke-cpu-13.yaml" \
+  KUBETON_CHECK_MIN_CPU=13 FORCE_BAREMETAL_BOOTSTRAP=true \
+  bash -euo pipefail -c '
+    source "$1"
+    run_node_prerequisite_check_readonly
+    [[ "${#KUBETON_NODE_CHECK_PLANNED_GKE_LONGHORN_NODES[@]}" == 3 ]]
+    export KUBETON_TEST_MODE=gke-cpu-existing
+    run_node_prerequisite_check_readonly
+    [[ "${#KUBETON_NODE_CHECK_PLANNED_GKE_LONGHORN_NODES[@]}" == 0 ]]
+    [[ "${KUBETON_NODE_CHECK_FREE_CPU_MILLI[node-good-1]}" == 13400 ]]
+  ' _ "$kubeton" >"$test_dir/gke-cpu-13.out" 2>&1
+assert_contains '15.40 / 14.92' "$test_dir/gke-cpu-13.out"
+assert_contains '13.40 / 13.00' "$test_dir/gke-cpu-13.out"
 
 echo "kubeton node prerequisite checks: PASS"

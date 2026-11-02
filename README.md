@@ -1610,6 +1610,54 @@ the request alone leaves the 16-core check in place. Keep this export for
 resources, so the nodes must still have enough free CPU after Longhorn, Vault
 and logging are running.
 
+Longhorn 1.10 reserves **12% of allocatable CPU per instance manager** by
+default, roughly 1.9 cores on a 16-vCPU worker. Its managers, the GKE helper,
+Vault and logging need additional resources. This reservation also applies
+when TON data uses `premium-rwo`, because Vault and encrypted key bundles use
+Longhorn. See [Guaranteed Instance Manager CPU](https://longhorn.io/docs/archives/1.10.0/references/settings/#guaranteed-instance-manager-cpu).
+
+For a pristine GKE installation of the bundled Longhorn chart, `check`,
+`install` and `start` include this planned instance-manager CPU reservation
+before bootstrap. The table's CPU need then includes TON plus that reservation.
+Existing Longhorn namespaces use the actual assigned Pod requests instead;
+the planned reservation is not added again. All installations retain the live
+checks after bootstrap. On-premises resource admission and Longhorn CPU
+settings are unchanged.
+
+**CPU shortfall after successful storage bootstrap.** If Longhorn and Vault
+are running but the check reports, for example, `13.34 / 15.00` CPU, the worker
+cannot fit a TON Pod requesting 15 cores. Waiting for low CPU utilization does
+not release those scheduling reservations. To keep a 15-core request, use
+larger workers with room for the full stack. To intentionally use a smaller
+TON reservation, merge a request that fits the reported free CPU into
+`tonnode-values.yaml`; for example, when every target has at least 13 cores
+available:
+
+```yaml
+tonNode:
+  resources:
+    requests:
+      cpu: 13000m
+      memory: 64Gi
+```
+
+Keep the other values, then run with the existing GKE bootstrap exports:
+
+```bash
+export KUBETON_CHECK_MIN_CPU=13
+./kubeton check
+./kubeton start
+```
+
+Both the request and check minimum must fit. Changing only the minimum cannot
+make an unchanged 15-core Pod schedulable. This example lowers the CPU
+reservation below the default TON profile; it does not validate validator
+performance under load. A higher CPU limit still allows use of spare CPU,
+subject to the worker's capacity and competing workloads; see
+[Kubernetes requests and limits](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#requests-and-limits).
+The rerun reuses initialized Vault and existing storage; no uninstall or purge
+is needed to correct this CPU configuration.
+
 **Connect and download the installer.** Run these commands in Google Cloud
 Shell or an administration machine with `gcloud`, `gke-gcloud-auth-plugin`,
 `kubectl`, Helm, Bash, Python 3 and OpenSSL installed. The account needs
