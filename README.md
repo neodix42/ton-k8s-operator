@@ -497,8 +497,14 @@ zero before returning the TON failure; Helm state, PVC data, and bounded
 collector buffers are preserved. A conclusive zero-PASS result suspends the
 collector as well. An API/inventory failure that cannot prove a complete check
 does not perform this emergency mutation. The next successful reconcile restores
-the backend. Sequential local-volume staging rechecks coverage before each
-additional ordinal is created.
+the collector and backend. With Helm 4, these upgrades use `--server-side=true`
+and `--force-conflicts` when supported to reclaim fields changed by an earlier
+suspension, including legacy `kubectl-patch` ownership and releases previously
+managed with client-side apply. New suspension patches use Helm's field
+manager. Helm 3 upgrades keep their supported flags. Resume with the updated
+`./kubeton start`; an affinity ownership conflict does not require reinstalling
+the operator or deleting storage. Sequential local-volume staging rechecks
+coverage before each additional ordinal is created.
 
 `./kubeton start` runs a fresh node prerequisite preflight before installing
 or reconciling VictoriaLogs and the VictoriaMetrics access stack. Logging

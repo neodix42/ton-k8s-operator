@@ -6531,6 +6531,14 @@ install_victoria_logs_collector_release() {
   if [[ -n "$collector_chart_version" ]]; then
     vlc_cmd+=(--version "$collector_chart_version")
   fi
+  # Reclaim affinity changed by kubeton's fail-safe suspension, including
+  # releases suspended by older versions using the kubectl-patch manager.
+  # Explicitly select server-side apply as well: Helm 4's auto mode inherits
+  # client-side apply from older releases, which rejects --force-conflicts.
+  # Helm 3 does not support (or need) these flags.
+  if helm_upgrade_supports_force_conflicts; then
+    vlc_cmd+=(--server-side=true --force-conflicts)
+  fi
 
   echo "[victoria-metrics] Installing/updating VictoriaLogs collector (${collector_release_name}) on preflight-approved node(s): ${collector_allowed_nodes[*]}; host buffer: ${collector_buffer_path}" >&2
   if ! run_with_timeout "${helm_timeout_seconds}s" "${vlc_cmd[@]}" >/dev/null; then
@@ -6648,7 +6656,7 @@ suspend_existing_owned_victoria_logs_collector() {
   # one, while the leading test prevents patching a same-name replacement.
   patch="[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"${ds_uid}\"},{\"op\":\"add\",\"path\":\"/spec/template/spec/affinity\",\"value\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchFields\":[{\"key\":\"metadata.name\",\"operator\":\"In\",\"values\":[\"${sentinel}\"]}]}]}}}}]"
   echo "[launch] No node passed the completed TON preflight; suspending verified VictoriaLogs collector ${ns}/${daemonset_name}." >&2
-  if ! kubectl -n "$ns" patch daemonset "$daemonset_name" --type=json -p "$patch" >/dev/null; then
+  if ! kubectl -n "$ns" patch daemonset "$daemonset_name" --type=json --field-manager=helm -p "$patch" >/dev/null; then
     echo "Warning: failed to apply the no-node affinity to VictoriaLogs collector ${ns}/${daemonset_name}." >&2
     return 1
   fi
@@ -6730,7 +6738,7 @@ quiesce_existing_owned_victoria_logs_backend() {
   echo "[launch] TON preflight failed; scaling verified VictoriaLogs backend ${ns}/${service_name} to zero while collectors retain buffered logs." >&2
   # Make the scale-to-zero decision atomic with the UID/ownership proof above;
   # never mutate a same-name StatefulSet recreated between GET and PATCH.
-  if ! kubectl -n "$ns" patch statefulset "$service_name" --type=json \
+  if ! kubectl -n "$ns" patch statefulset "$service_name" --type=json --field-manager=helm \
       -p "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"${sts_uid}\"},{\"op\":\"add\",\"path\":\"/spec/replicas\",\"value\":0}]" >/dev/null; then
     echo "Warning: failed to scale VictoriaLogs backend StatefulSet ${ns}/${service_name} to zero." >&2
     return 1
@@ -7017,6 +7025,9 @@ ensure_victoria_logs_stack() {
   vls_cmd+=(-f "$vls_affinity_values_file")
   if [[ -n "$single_chart_version" ]]; then
     vls_cmd+=(--version "$single_chart_version")
+  fi
+  if helm_upgrade_supports_force_conflicts; then
+    vls_cmd+=(--server-side=true --force-conflicts)
   fi
 
   echo "[victoria-metrics] Installing/updating VictoriaLogs single (${release_name}) ..." >&2

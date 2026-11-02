@@ -1808,6 +1808,7 @@ test_victoria_logs_requires_ready_collector_per_selected_node() (
 )
 
 test_victoria_logs_helm_durability_settings() (
+  local helm_variant="$1"
   export VICTORIA_LOGS_STORAGE_CLASS=""
   export VICTORIA_LOGS_NODE_SELECTOR=""
   export VICTORIA_LOGS_COLLECTOR_NODE_SELECTOR=""
@@ -1838,6 +1839,14 @@ test_victoria_logs_helm_durability_settings() (
     "$@"
   }
   helm() {
+    if [[ "$*" == 'upgrade --help' ]]; then
+      if [[ "$helm_variant" == 4 ]]; then
+        printf '%s\n' '  --force-conflicts  if set server-side apply will force changes against conflicts'
+      else
+        printf '%s\n' '  --force  force resource updates through a replacement strategy'
+      fi
+      return 0
+    fi
     printf '%s\n' "$*" >>"$helm_log"
   }
   kubectl() {
@@ -1903,6 +1912,20 @@ test_victoria_logs_helm_durability_settings() (
   assert_contains "extraArgs.tmpDataPath=/var/lib/kubeton-vlogs-buffer-vm-collector" "$helm_log"
   assert_contains "persistence.volume.hostPath.path=/var/lib/kubeton-vlogs-buffer-vm-collector" "$helm_log"
   assert_contains "persistence.volume.hostPath.type=DirectoryOrCreate" "$helm_log"
+  if [[ "$helm_variant" == 4 ]]; then
+    grep -F 'upgrade --install collector ' "$helm_log" | grep -q -- '--server-side=true' \
+      || fail 'Helm 4 collector upgrade inherited client-side apply from an older release'
+    grep -F 'upgrade --install collector ' "$helm_log" | grep -q -- '--force-conflicts' \
+      || fail 'Helm 4 collector upgrade did not reclaim legacy suspension affinity'
+    grep -F 'upgrade --install vlogs ' "$helm_log" | grep -q -- '--server-side=true' \
+      || fail 'Helm 4 backend upgrade inherited client-side apply from an older release'
+    grep -F 'upgrade --install vlogs ' "$helm_log" | grep -q -- '--force-conflicts' \
+      || fail 'Helm 4 backend upgrade did not reclaim legacy scale-to-zero ownership'
+  else
+    assert_not_contains --force-conflicts "$helm_log"
+    assert_not_contains --server-side "$helm_log"
+  fi
+  assert_not_contains --force-replace "$helm_log"
   assert_contains "Ready only on the fresh preflight-approved nodes (2 node(s))" "$test_dir/victoria.stderr"
   assert_not_contains "nodeSelector" "$helm_log"
   if grep -F "upgrade --install collector " "$helm_log" | grep -Fq -- " --wait "; then
@@ -2560,6 +2583,9 @@ test_prebootstrap_collector_is_ready_before_storage_bootstrap() (
   }
   helm() {
     local args="$*"
+    if [[ "$args" == 'upgrade --help' ]]; then
+      return 0
+    fi
     if [[ "$args" == *"upgrade --install collector-release "* ]]; then
       record_prebootstrap_event collector-helm
       printf '%s\n' "$args" >>"$test_dir/prebootstrap-${mode}.helm"
@@ -3913,11 +3939,13 @@ test_completed_zero_pass_suspends_owned_victoria_logs_workloads() (
     2>"$test_dir/victoria-zero-pass.stderr"
 
   assert_contains 'patch daemonset collector-ds --type=json' "$kubectl_log"
+  assert_contains 'patch daemonset collector-ds --type=json --field-manager=helm' "$kubectl_log"
   assert_contains '"op":"test","path":"/metadata/uid","value":"collector-uid"' "$kubectl_log"
   assert_contains '"path":"/spec/template/spec/affinity"' "$kubectl_log"
   assert_contains '"key":"metadata.name"' "$kubectl_log"
   assert_contains 'kubeton-vlogs-suspended-collector-uid' "$kubectl_log"
   assert_contains 'patch statefulset backend-sts --type=json' "$kubectl_log"
+  assert_contains 'patch statefulset backend-sts --type=json --field-manager=helm' "$kubectl_log"
   assert_contains '"op":"test","path":"/metadata/uid","value":"backend-uid"' "$kubectl_log"
   assert_contains '"path":"/spec/replicas","value":0' "$kubectl_log"
   [[ "$(grep -c ' get pods -o go-template=' "$kubectl_log")" == 4 ]] \
@@ -4079,7 +4107,8 @@ test_bootstrap_wait_resets_status_read_error_count_after_successful_read
 test_bootstrap_wait_requires_every_replica
 test_bootstrap_wait_fails_repeated_crashloop
 test_victoria_logs_requires_ready_collector_per_selected_node
-test_victoria_logs_helm_durability_settings
+test_victoria_logs_helm_durability_settings 3
+test_victoria_logs_helm_durability_settings 4
 test_victoria_logs_autostart_storage_placement gke-pd
 test_victoria_logs_autostart_storage_placement gke-default-pd
 test_victoria_logs_autostart_storage_placement gke-default-longhorn
