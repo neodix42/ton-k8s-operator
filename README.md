@@ -6,7 +6,7 @@ Bootstrap a local installation bundle from a pinned release for your existing
 Kubernetes cluster:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.11/install.sh" | bash
 cd ./ton-k8s-operator-0.5.5
 ./kubeton
 ```
@@ -195,7 +195,7 @@ For deployment to an existing Kubernetes cluster:
 Bootstrap a local installation bundle from a pinned release:
 
 ```bash
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.11/install.sh" | bash
 ```
 
 The script:
@@ -1611,7 +1611,7 @@ kubectl config current-context
 kubectl get nodes -o wide
 kubectl get storageclass
 
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.11/install.sh" | bash
 cd ton-k8s-operator-0.5.5
 ```
 
@@ -2064,7 +2064,7 @@ Cluster upgrade workflow:
 
 ```bash
 # fetch new release installer and chart
-wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.10/install.sh" | bash
+wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.11/install.sh" | bash
 cd ./ton-k8s-operator-0.5.5
 
 # review values before upgrade
