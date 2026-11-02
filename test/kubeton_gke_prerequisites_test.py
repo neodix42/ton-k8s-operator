@@ -51,9 +51,10 @@ args = sys.argv[1:]
 with (root / "host-calls").open("a") as stream:
     stream.write(json.dumps([command] + args) + "\n")
 if command == "chroot":
+    target = pathlib.Path(args[0])
     args = args[1:]
     if args[:2] == ["mkdir", "-p"]:
-        (root / "host" / args[2].lstrip("/")).mkdir(parents=True, exist_ok=True)
+        (target / args[2].lstrip("/")).mkdir(parents=True, exist_ok=True)
         sys.exit(0)
     if args[:2] == ["/bin/bash", "-ec"]:
         # Execute the actual Ubuntu setup body with fake tools; redirect its
@@ -72,8 +73,38 @@ elif command == "modprobe":
     (root / "host/sys/module" / args[0]).mkdir(parents=True, exist_ok=True)
 elif command == "nsenter":
     args = args[args.index("--") + 1:]
-    if args[0] == "findmnt": sys.exit(1)
     if args[0] == "modprobe": sys.exit(subprocess.run(args).returncode)
+    data = "/var/lib/longhorn"
+    mounter = "/home/kubernetes/containerized_mounter/rootfs" + data
+    state = root / "mounts.json"
+    mounts = json.loads(state.read_text()) if state.exists() else {}
+    if args[0] == "findmnt":
+        if "--mountpoint" in args:
+            sys.exit(0 if args[-1] in mounts else 1)
+        print("fixture rw,noexec")
+    elif args[0] == "mount":
+        assert args[-1] in (data, mounter), args  # Never remount /var or /.
+        if "remount,bind,exec" in args:
+            if os.environ.get("MODE") == "remount-failed": sys.exit(23)
+            mounts[args[-1]] = "exec"
+        elif "--bind" in args:
+            mounts[args[-1]] = "noexec"
+        elif "--rbind" in args:
+            mounts[args[-1]] = mounts.get(data, "noexec")
+        state.write_text(json.dumps(mounts))
+    elif args[:2] == ["/bin/sh", "-ec"]:
+        directory = args[-1]
+        mountpoint = mounter if directory.startswith(mounter) else data
+        cos = "cos" in (root / "host/etc/os-release").read_text()
+        if os.environ.get("MODE") == "exec-failed" or (cos and mounts.get(mountpoint) != "exec"):
+            print("fixture: permission denied", file=sys.stderr)
+            sys.exit(126)
+        # Run the real temporary-program probe, including its cleanup trap.
+        mapped = directory.replace(mounter, data, 1) if directory.startswith(mounter) else directory
+        args[-1] = str(root / "host" / mapped.lstrip("/"))
+        sys.exit(subprocess.run(args).returncode)
+    else:
+        sys.exit("Unexpected nsenter command: " + repr(args))
 elif command == "pgrep":
     sys.exit(0 if (root / "iscsid").exists() else 1)
 elif command == "iscsid":
@@ -141,6 +172,7 @@ printf "PBKDF=%s\\n" "$KUBETON_LONGHORN_CRYPTO_PBKDF"
                 self.assertFalse(spec["automountServiceAccountToken"])
                 self.assertTrue(spec["hostPID"])
                 self.assertTrue(spec["containers"][0]["securityContext"]["privileged"])
+                self.assertEqual(spec["containers"][0]["volumeMounts"][0]["mountPropagation"], "HostToContainer")
 
     def test_api_and_apply_failures_and_missing_coverage_stop_bootstrap(self):
         for mode in ("denied", "unsupported", "apply-failed", "not-ready", "zero-coverage"):
@@ -161,6 +193,19 @@ ensure_gke_longhorn_prerequisites
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / "manifest.json").exists())
 
+    def test_on_premises_skips_host_repairs_and_engine_execs(self):
+        # Exercise both real GKE stages with an on-premises node inventory,
+        # including stale state from a previous call in the same shell.
+        result = self.shell('''
+KUBETON_GKE_LONGHORN_PREPARED_NODES=(stale-gke-worker)
+ensure_gke_longhorn_prerequisites
+ensure_gke_longhorn_engine_execution
+''', MODE="baremetal")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+        self.assertEqual(calls, [["get", "nodes", "-l", "cloud.google.com/gke-nodepool", "-o", "name"]])
+        self.assertFalse((self.root / "manifest.json").exists())
+
     def test_new_cos_secret_and_existing_secret_preservation(self):
         for existing in (False, True):
             result = self.shell('''
@@ -175,7 +220,7 @@ ensure_longhorn_crypto_secret
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual("Creating Longhorn encryption secret" in result.stdout, not existing)
 
-    def test_actual_host_script_handles_packages_services_and_failures(self):
+    def prepare_host_script(self):
         script = self.shell("gke_longhorn_prerequisite_script").stdout
         path = self.root / "entrypoint.sh"
         path.write_text(script.replace("/sbin/iscsid", str(self.bin / "iscsid")))
@@ -184,6 +229,10 @@ ensure_longhorn_crypto_secret
         for command in ("chroot", "dpkg-query", "apt-get", "modprobe", "systemctl", "iscsiadm",
                         "cryptsetup", "nsenter", "pgrep", "zypper", "iscsid", "sleep"):
             self.write_executable(command, FAKE_HOST_COMMAND)
+        return path, host_etc
+
+    def test_actual_host_script_handles_packages_services_and_failures(self):
+        path, host_etc = self.prepare_host_script()
         for distro in ("ubuntu", "cos"):
             with self.subTest(distro=distro):
                 if (self.root / "iscsid").exists():
@@ -205,6 +254,66 @@ ensure_longhorn_crypto_secret
         self.assertEqual(result.returncode, 23)
         result = subprocess.run(["bash", str(path)], env=dict(self.env, MODE="module-failed", PACKAGES_INSTALLED="true"), capture_output=True)
         self.assertEqual(result.returncode, 23)
+
+    def test_existing_cos_bind_is_repaired_and_readiness_detects_noexec(self):
+        path, host_etc = self.prepare_host_script()
+        (host_etc / "os-release").write_text("ID=cos\n")
+        data = "/var/lib/longhorn"
+        mounter = "/home/kubernetes/containerized_mounter/rootfs" + data
+        state = self.root / "mounts.json"
+        state.write_text(json.dumps({data: "noexec", mounter: "noexec"}))
+        result = subprocess.run(["bash", str(path)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(state.read_text()), {data: "exec", mounter: "exec"})
+        calls = [json.loads(line) for line in (self.root / "host-calls").read_text().splitlines()]
+        self.assertFalse(any("--rbind" in call for call in calls))
+        self.assertFalse(list((self.root / "host/var/lib/longhorn/engine-binaries").iterdir()))
+
+        # Service/module readiness must not hide a later noexec mount change.
+        for directory in (data, mounter):
+            with self.subTest(directory=directory):
+                state.write_text(json.dumps({data: "exec", mounter: "exec", directory: "noexec"}))
+                result = subprocess.run(["bash", str(path), "check"], env=self.env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Cannot execute a program", result.stderr)
+
+    def test_cos_remount_or_execution_failure_cannot_report_ready(self):
+        path, host_etc = self.prepare_host_script()
+        (host_etc / "os-release").write_text("ID=cos\n")
+        for mode in ("remount-failed", "exec-failed"):
+            with self.subTest(mode=mode):
+                result = subprocess.run(["bash", str(path)], env=dict(self.env, MODE=mode), capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("dependencies ready", result.stdout)
+
+    def test_engine_checks_are_scoped_and_stop_before_vault_on_failure(self):
+        for fail in (False, True):
+            result = self.shell('''
+KUBETON_GKE_LONGHORN_PREPARED_NODES=(worker-1 worker-2)
+kubectl() {
+  printf '%s\\n' "$*" >>"$FIXTURE/engine-calls"
+  case "$*" in
+    *'get pods'*) printf 'im-1|worker-1|Running\\nim-other|other-node|Running\\nim-old|worker-2|Failed\\nim-2|worker-2|Running\\n' ;;
+    *' exec im-1 '*) [[ "$EXEC_FAIL" != true ]] ;;
+    *' exec im-2 '*) return 0 ;;
+    *' wait '*) return 0 ;;
+    *) return 23 ;;
+  esac
+}
+ensure_gke_longhorn_engine_execution
+''', EXEC_FAIL=str(fail).lower())
+            calls = (self.root / "engine-calls").read_text()
+            self.assertNotIn("exec im-other", calls)
+            self.assertNotIn("wait --for=condition=Ready pod/im-old", calls)
+            if fail:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Vault bootstrap was not started", result.stderr)
+                # The calls file belongs only to this subcase.
+                self.assertNotIn("exec im-2", calls)
+            else:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("exec im-2", calls)
+            (self.root / "engine-calls").unlink()
 
 
 if __name__ == "__main__":

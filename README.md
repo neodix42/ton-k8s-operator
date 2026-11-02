@@ -1684,21 +1684,34 @@ A privileged `kubeton-gke-longhorn-prereqs` DaemonSet installs missing
 `open-iscsi`, `cryptsetup`, `dmsetup` and NFS client packages on Ubuntu,
 loads `iscsi_tcp` and `dm_crypt`, and enables `iscsid`. On GKE
 Container-Optimized OS (COS), the helper sets up the GKE mounter path and
-keeps a containerized iSCSI daemon running. It waits for every selected worker
-to be ready before starting Longhorn. Package repositories and the helper
+keeps a containerized iSCSI daemon running. It repairs executable mounts for
+`/var/lib/longhorn` and its mounter bind on every run, including existing
+mounts left by an interrupted bootstrap, and executes a temporary program
+from the engine directory before reporting readiness. It waits for every
+selected worker to be ready before starting Longhorn. Package repositories and the helper
 image registry must be reachable, and cluster policies must permit privileged
 host access.
 
 The helper covers the selected TON and Longhorn workers, including mixed
-Ubuntu/COS pools. It stays in the Longhorn namespace and checks service/module
-readiness; rerun `start` to prepare newly selected replacement workers. On COS,
+Ubuntu/COS pools. It stays in the Longhorn namespace and checks service, module
+and execution readiness; rerun `start` to prepare newly selected replacement workers. On COS,
 this setup uses the default Longhorn data path, `/var/lib/longhorn`. New
 Longhorn encryption Secrets use `pbkdf2` when COS workers are selected and
 `argon2i` otherwise; existing encryption Secrets and keys are preserved.
 
 Run `./kubeton start` with the same exports to resume a bootstrap interrupted
 by missing host dependencies. A failed Longhorn Helm release is retried in
-place. Node dependency errors are reported before the Longhorn Helm wait.
+place. Before Vault starts, kubeton also verifies the installed engine binary
+inside instance managers on the prepared GKE workers and repairs any retained
+`noexec` binary mounts there. It does this without restarting instance managers
+or deleting PVCs, replicas, or Vault state. An already faulted volume may need
+separate recovery after the execution problem is resolved; bootstrap preserves
+that volume. On-premises bootstrap skips these GKE mount and execution steps.
+Node dependency errors are reported before the Longhorn Helm wait.
+
+A Cloud Shell disconnect can interrupt the local bootstrap command; it does
+not stop Kubernetes controllers or cause worker-side engine permission errors.
+Use `tmux` in Cloud Shell to keep the command running across browser disconnects.
 
 `KUBETON_GKE_LONGHORN_PREREQ_IMAGE` selects the helper image (default
 `registry.suse.com/bci/bci-base:15.7`), and

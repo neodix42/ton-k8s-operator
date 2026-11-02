@@ -18,7 +18,7 @@ assert_failure() {
   [[ "$rc" == 23 ]] || fail "expected exit 23, got $rc: $*"
 }
 
-for failed_step in none host-prereqs longhorn crypto storage-class vault init transit; do
+for failed_step in none host-prereqs longhorn engine-execution crypto storage-class vault init transit; do
   (
     source "$kubeton"
     require_bin() { :; }
@@ -30,6 +30,7 @@ for failed_step in none host-prereqs longhorn crypto storage-class vault init tr
     }
     ensure_gke_longhorn_prerequisites() { step host-prereqs; }
     ensure_longhorn_installed() { step longhorn; }
+    ensure_gke_longhorn_engine_execution() { step engine-execution; }
     ensure_longhorn_crypto_secret() { step crypto; }
     ensure_encrypted_storage_class() { step storage-class; }
     ensure_vault_installed() { [[ "$1" == longhorn ]] || fail 'wrong Vault class'; step vault; }
@@ -37,10 +38,10 @@ for failed_step in none host-prereqs longhorn crypto storage-class vault init tr
     configure_vault_for_ton() { [[ "$1" == test-root-token ]] || fail 'wrong token'; step transit; }
     if [[ "$failed_step" == none ]]; then
       if ! ensure_baremetal_stack; then fail 'healthy bootstrap failed'; fi
-      expected=$'host-prereqs\nlonghorn\ncrypto\nstorage-class\nvault\ninit\ntransit'
+      expected=$'host-prereqs\nlonghorn\nengine-execution\ncrypto\nstorage-class\nvault\ninit\ntransit'
     else
       assert_failure ensure_baremetal_stack
-      expected="$(printf '%s\n' host-prereqs longhorn crypto storage-class vault init transit | sed "/^${failed_step}$/q")"
+      expected="$(printf '%s\n' host-prereqs longhorn engine-execution crypto storage-class vault init transit | sed "/^${failed_step}$/q")"
     fi
     [[ "$(cat "$calls")" == "$expected" ]] || fail "bootstrap continued past ${failed_step}"
   )

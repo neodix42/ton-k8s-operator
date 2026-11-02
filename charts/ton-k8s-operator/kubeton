@@ -9831,6 +9831,9 @@ gke_longhorn_prerequisite_script() {
 set -euo pipefail
 host_root="${HOST_ROOT:-/host}"
 ready_file="${READY_FILE:-/tmp/kubeton-longhorn-prereqs-ready}"
+rootfs=/home/kubernetes/containerized_mounter/rootfs
+data_path=/var/lib/longhorn
+engine_path=$data_path/engine-binaries
 host_os=""
 while IFS='=' read -r key value; do
   [[ "$key" == ID ]] || continue
@@ -9839,6 +9842,22 @@ while IFS='=' read -r key value; do
   break
 done < "$host_root/etc/os-release"
 host() { nsenter --mount="$host_root/proc/1/ns/mnt" --net="$host_root/proc/1/ns/net" -- "$@"; }
+check_execution() {
+  # Checking mode bits (test -x) does not detect a noexec mount. Execute a
+  # temporary program from the same filesystem as the Longhorn engines.
+  local path="$1"
+  if ! host /bin/sh -ec '
+    probe=$(mktemp "$1/.kubeton-exec-check.XXXXXX")
+    trap '\''rm -f "$probe"'\'' EXIT
+    printf "#!/bin/sh\nexit 0\n" > "$probe"
+    chmod 700 "$probe"
+    "$probe"
+  ' _ "$path"; then
+    echo "[bootstrap] Cannot execute a program from $path; Longhorn engines cannot start." >&2
+    host findmnt -T "$path" -o TARGET,OPTIONS >&2 || true
+    return 1
+  fi
+}
 check() {
   test -f "$ready_file"
   test -d "$host_root/sys/module/iscsi_tcp"
@@ -9848,8 +9867,11 @@ check() {
     cos) pgrep -x iscsid >/dev/null ;;
     *) return 1 ;;
   esac
+  check_execution "$engine_path"
+  if [[ "$host_os" == cos ]]; then check_execution "$rootfs$engine_path"; fi
 }
 if [[ "${1:-}" == check ]]; then check; exit; fi
+rm -f "$ready_file"
 case "$host_os" in
   ubuntu)
     chroot "$host_root" /bin/bash -ec '
@@ -9871,19 +9893,26 @@ case "$host_os" in
       iscsiadm --version
       cryptsetup --version
     '
+    chroot "$host_root" mkdir -p "$engine_path"
     ;;
   cos)
     # Follow Longhorn's GKE COS node-agent setup. The GKE mounter chroot
     # provides host utilities; iscsid itself runs in this privileged container.
-    rootfs=/home/kubernetes/containerized_mounter/rootfs
-    data_path=/var/lib/longhorn
-    if ! host findmnt --noheadings "$rootfs$data_path" >/dev/null; then
-      chroot "$host_root" mkdir -p "$data_path"
-      chroot "$host_root$rootfs" mkdir -p "$data_path"
-      host mount --rbind "$data_path" "$rootfs$data_path"
-      host mount --make-shared "$rootfs$data_path"
-      host mount -o remount,exec "$data_path"
+    chroot "$host_root" mkdir -p "$engine_path"
+    chroot "$host_root$rootfs" mkdir -p "$data_path"
+    # COS mounts /var noexec. Use a dedicated bind so only Longhorn's path
+    # becomes executable, even when it initially inherits /var's mount flags.
+    if ! host findmnt --noheadings --mountpoint "$data_path" >/dev/null; then
+      host mount --bind "$data_path" "$data_path"
     fi
+    host mount -o remount,bind,exec "$data_path"
+    if ! host findmnt --noheadings --mountpoint "$rootfs$data_path" >/dev/null; then
+      host mount --rbind "$data_path" "$rootfs$data_path"
+    fi
+    # Bind mounts retain their own flags. Repair both views on every run,
+    # including an existing mounter bind left by an interrupted bootstrap.
+    host mount -o remount,bind,exec "$rootfs$data_path"
+    host mount --make-shared "$rootfs$data_path"
     host modprobe iscsi_tcp
     host modprobe dm_crypt
     zypper --non-interactive install open-iscsi procps
@@ -9938,7 +9967,7 @@ build_gke_longhorn_prerequisite_manifest() {
           "startupProbe":{"exec":{"command":["/bin/bash","/scripts/entrypoint.sh","check"]},"periodSeconds":10,"timeoutSeconds":5,"failureThreshold":120},
           "readinessProbe":{"exec":{"command":["/bin/bash","/scripts/entrypoint.sh","check"]},"periodSeconds":10,"timeoutSeconds":5},
           "livenessProbe":{"exec":{"command":["/bin/bash","/scripts/entrypoint.sh","check"]},"periodSeconds":30,"timeoutSeconds":5},
-          "volumeMounts":[{"name":"host","mountPath":"/host"},{"name":"script","mountPath":"/scripts","readOnly":true}]
+          "volumeMounts":[{"name":"host","mountPath":"/host","mountPropagation":"HostToContainer"},{"name":"script","mountPath":"/scripts","readOnly":true}]
         }],
         "volumes":[{"name":"host","hostPath":{"path":"/","type":"Directory"}},
           {"name":"script","configMap":{"name":"kubeton-gke-longhorn-prereqs"}}]
@@ -9953,6 +9982,7 @@ ensure_gke_longhorn_prerequisites() {
   local rows scope node provider os has_cos=false desired ready observed generation
   local -A nodes=()
   local -a node_names=()
+  KUBETON_GKE_LONGHORN_PREPARED_NODES=()
   # Query only GKE nodes. Bare-metal and other cloud bootstrap behavior stays
   # unchanged, including environments with externally prepared host packages.
   if ! rows="$(kubectl get nodes -l cloud.google.com/gke-nodepool -o name)"; then return 1; fi
@@ -10005,6 +10035,72 @@ ensure_gke_longhorn_prerequisites() {
     echo "Error: GKE worker dependency preparation did not cover every selected worker." >&2
     return 1
   fi
+  KUBETON_GKE_LONGHORN_PREPARED_NODES=("${node_names[@]}")
+}
+
+gke_longhorn_engine_execution_script() {
+  cat <<'SCRIPT'
+set -eu
+# An existing instance manager can retain noexec in its own mount namespace
+# after the host is fixed. Repair only these binary directories, without
+# restarting storage processes or changing any volume/replica state.
+for directory in /host/var/lib/longhorn/engine-binaries /engine-binaries; do
+  options=$(findmnt --noheadings --output OPTIONS --target "$directory")
+  case ",$options," in
+    *,noexec,*)
+      echo "[bootstrap] Enabling Longhorn engine execution in $directory."
+      if ! findmnt --noheadings --mountpoint "$directory" >/dev/null; then
+        mount --bind "$directory" "$directory"
+      fi
+      mount -o remount,bind,exec "$directory"
+      ;;
+  esac
+done
+found=false
+for binary in /host/var/lib/longhorn/engine-binaries/*/longhorn; do
+  [ -f "$binary" ] || continue
+  found=true
+  if ! "$binary" --version; then
+    echo "Error: Longhorn engine execution failed: $binary" >&2
+    ls -l "$binary" >&2
+    findmnt -T "$binary" -o TARGET,OPTIONS >&2
+    exit 1
+  fi
+done
+if [ "$found" != true ]; then
+  echo "Error: no installed Longhorn engine binary is available to verify." >&2
+  exit 1
+fi
+SCRIPT
+}
+
+ensure_gke_longhorn_engine_execution() {
+  [[ -n "${KUBETON_GKE_LONGHORN_PREPARED_NODES[*]:-}" ]] || return 0
+  local rows pod node phase script count=0
+  local -A selected=()
+  for node in "${KUBETON_GKE_LONGHORN_PREPARED_NODES[@]}"; do selected["$node"]=1; done
+  rows="$(kubectl -n "$LONGHORN_NAMESPACE" get pods \
+    -l longhorn.io/component=instance-manager,longhorn.io/data-engine=v1 \
+    -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.spec.nodeName}}{{"|"}}{{.status.phase}}{{"\n"}}{{end}}')" || return 1
+  script="$(gke_longhorn_engine_execution_script)"
+  echo "[bootstrap] Verifying Longhorn engine execution inside selected GKE instance managers ..."
+  while IFS='|' read -r pod node phase; do
+    [[ -n "$pod" && -n "$node" && -n "${selected[$node]:-}" ]] || continue
+    # Completed managers are left behind during upgrades; only current pods
+    # can serve volumes. A pending current manager must become Ready first.
+    case "$phase" in Succeeded|Failed) continue ;; esac
+    kubectl -n "$LONGHORN_NAMESPACE" wait --for=condition=Ready "pod/$pod" \
+      --timeout="${KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS}s" >/dev/null || return 1
+    if ! kubectl -n "$LONGHORN_NAMESPACE" exec "$pod" -c instance-manager -- /bin/sh -ec "$script"; then
+      echo "Error: Longhorn engine execution failed in ${pod} on ${node}; Vault bootstrap was not started." >&2
+      return 1
+    fi
+    ((count+=1))
+  done <<<"$rows"
+  if (( count == 0 )); then
+    echo "Error: no Longhorn v1 instance managers found on the prepared GKE workers." >&2
+    return 1
+  fi
 }
 
 ensure_baremetal_stack() {
@@ -10016,6 +10112,7 @@ ensure_baremetal_stack() {
   KUBETON_LONGHORN_CRYPTO_PBKDF=argon2i
   ensure_gke_longhorn_prerequisites || return $?
   ensure_longhorn_installed || return $?
+  ensure_gke_longhorn_engine_execution || return $?
   ensure_longhorn_crypto_secret || return $?
   ensure_encrypted_storage_class || return $?
   ensure_vault_installed "longhorn" || return $?
