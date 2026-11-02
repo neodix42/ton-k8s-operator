@@ -315,7 +315,13 @@ Run this before installing or starting a fleet:
 ```
 
 `kubeton` reads the effective TON settings from `TON_VALUES_FILE` (by default
-`tonnode-values.yaml`); it does not source a `.env` file. With the defaults,
+`tonnode-values.yaml`); it does not source a `.env` file. Both `check` and `start`
+honor `tonNode.storage.storageClassName` from that file, falling back to chart
+values when omitted (`local-path` in the shipped defaults). An explicit
+`TON_STORAGE_CLASS_NAME=<class>` environment variable overrides the values file.
+`TON_STORAGE_CLASS_NAME=auto` disables that override, preserving the values-file
+class; an empty or null class in the values file enables operator auto-detection.
+With the defaults,
 each TON replica requests `760Gi` of data PVC capacity:
 
 ```yaml
@@ -1646,6 +1652,11 @@ tonNode:
       storageClassName: encrypted-sc
 ```
 
+These values select `premium-rwo` for both `./kubeton check` and
+`./kubeton start`. With kubeton 0.5.10, also run
+`export TON_STORAGE_CLASS_NAME=premium-rwo` before either command: that version's
+implicit `local-path` environment default overrides the values file.
+
 <details>
 <summary>GKE key management, Longhorn/Vault setup, networking and verification</summary>
 
@@ -1823,7 +1834,7 @@ Run them from repo root:
 - New TON StatefulSets use Kubernetes `Parallel` pod management so all replicas can start at once. If `kubeton start` finds an older stopped StatefulSet using immutable `OrderedReady` policy, it recreates that StatefulSet while replicas are `0`; PVCs are retained and reused.
 - Private cloud workers (no public node IP): provide per-node/per-replica public forwarding; one shared LB endpoint/port pair is not sufficient for many TON replicas.
 - Storage class: explicitly set `spec.storage.storageClassName` when you need deterministic storage behavior.
-- Bare metal: `kubeton start` sets TON data storage to `TON_STORAGE_CLASS_NAME` by default (`local-path`); set `TON_STORAGE_CLASS_NAME=<class>` to use another local class or `TON_STORAGE_CLASS_NAME=auto` to use operator auto-detection.
+- `kubeton check` and `kubeton start` honor `tonNode.storage.storageClassName` in the values file (`local-path` in the shipped defaults). Set `TON_STORAGE_CLASS_NAME=<class>` to override it. `TON_STORAGE_CLASS_NAME=auto` leaves the values-file selection in place; set the values-file class to empty or null to use operator auto-detection.
 - Operator auto-detection prefers known local classes (`local-path`, `local-storage`, `openebs-hostpath`, `hostpath`), then Longhorn, then the default StorageClass.
 - If no StorageClass exists in the cluster, `TonNode` will stay `Ready=False` with reason `StorageClassMissing`.
 - `tonnode-values.yaml` keeps the upstream CPU/RAM requirement check enabled. The chart's base `values.yaml` includes `-i` for lab startup; remove that flag to enable the upstream check there too. `kubeton check` independently verifies Kubernetes capacity.

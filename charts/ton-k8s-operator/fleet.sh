@@ -102,7 +102,7 @@ run_fleet_in_pod() (
   local action="$1"
   shift
   local backup_dir="" passphrase_file="${KUBETON_FLEET_PASSPHRASE_FILE:-}" fleet_passphrase=""
-  local data_class="$TON_STORAGE_CLASS_NAME" bundle_class="$ENCRYPTED_SC_NAME"
+  local data_class="${TON_STORAGE_CLASS_NAME:-local-path}" bundle_class="$ENCRYPTED_SC_NAME"
   local node_selector="" public_ips="" bootstrap=0
   fleet_parse_args "$action" "$@"
   require_bin kubectl
@@ -333,7 +333,7 @@ run_restore_fleet() (
   local backup_dir="" passphrase_file="${KUBETON_FLEET_PASSPHRASE_FILE:-}"
   local fleet_passphrase=""
   [[ -z "${KUBETON_FLEET_PID_FILE:-}" ]] || printf '%s\n' "$BASHPID" > "$KUBETON_FLEET_PID_FILE"
-  local data_class="$TON_STORAGE_CLASS_NAME" bundle_class="$ENCRYPTED_SC_NAME"
+  local data_class="${TON_STORAGE_CLASS_NAME:-local-path}" bundle_class="$ENCRYPTED_SC_NAME"
   local node_selector="" public_ips="" bootstrap=0
   fleet_parse_args restore "$@"
   fleet_require_tools

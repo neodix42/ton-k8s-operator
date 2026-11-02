@@ -28,7 +28,7 @@ if [[ "${1:-}" == "get" && "${2:-}" == "--raw" ]]; then
     available_bytes=1099511627776
   elif [[ "$mode" == "large-work" ]]; then
     available_bytes=3298534883328
-  elif [[ "$mode" == remote-small-root ]]; then
+  elif [[ "$mode" == remote-small-root || "$mode" == gke-values ]]; then
     available_bytes=53687091200
   elif [[ "$mode" == remote-low-headroom ]]; then
     available_bytes=10737418240
@@ -155,7 +155,9 @@ fi
 
 if [[ "${1:-}" == get && "${2:-}" == storageclass ]]; then
   case "${3:-}" in
-    local-path) printf '%s' rancher.io/local-path ;;
+    local-path)
+      [[ "$mode" == gke-values ]] || printf '%s' rancher.io/local-path
+      ;;
     premium-rwo) printf '%s' pd.csi.storage.gke.io ;;
     longhorn)
       [[ "$mode" == storage-rbac-longhorn ]] && exit 1
@@ -339,13 +341,38 @@ for remote_class in premium-rwo longhorn; do
   assert_contains 'insufficient disk' "$output"
 done
 
-# A custom values class is effective only with the normal CLI override disabled.
+# A configured class is honored without an environment override, including on
+# GKE where the bare-metal local-path class does not exist.
 remote_values="$test_dir/remote-values.yaml"
 cat >"$remote_values" <<'EOF'
 tonNode:
   storage:
     storageClassName: premium-rwo
 EOF
+env -u TON_STORAGE_CLASS_NAME PATH="$fake_bin:$PATH" TON_VALUES_FILE="$remote_values" KUBETON_TEST_MODE=gke-values \
+  "$kubeton" check >"$test_dir/gke-values.out" 2>&1
+assert_contains 'premium-rwo (pd.csi.storage.gke.io; attached Persistent Disk)' "$test_dir/gke-values.out"
+assert_contains 'node filesystem requirement: >= 20.00 Gi' "$test_dir/gke-values.out"
+assert_contains 'Compatible target nodes: 3/3 required.' "$test_dir/gke-values.out"
+
+# Start must validate and pass the same configured class to Helm, and must not
+# enable local-path sequential staging for Persistent Disk.
+env -u TON_STORAGE_CLASS_NAME PATH="$fake_bin:$PATH" TON_VALUES_FILE="$remote_values" KUBETON_TEST_MODE=gke-values \
+  bash -euo pipefail -c '
+    source "$1"
+    ensure_ton_storage_class_available
+    overrides=()
+    append_ton_storage_overrides overrides
+    printf "%s\n" "${overrides[@]}"
+    if ton_storage_class_requires_sequential_start; then
+      echo "unexpected local-path staging for GKE Persistent Disk" >&2
+      exit 1
+    fi
+  ' _ "$kubeton" >"$test_dir/gke-start-storage.out" 2>&1
+assert_contains 'tonNode.storage.storageClassName=premium-rwo' "$test_dir/gke-start-storage.out"
+
+# Explicit overrides, including auto (leave storage selection to values/the
+# operator), remain supported.
 PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$remote_values" KUBETON_TEST_MODE=remote-small-root \
   "$kubeton" check >"$test_dir/remote-values.out" 2>&1
 assert_contains 'premium-rwo (pd.csi.storage.gke.io; attached Persistent Disk)' "$test_dir/remote-values.out"
@@ -368,11 +395,11 @@ tonNode:
   storage:
     storageClassName: null
 EOF
-PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$auto_values" KUBETON_TEST_MODE=remote-small-root \
+env -u TON_STORAGE_CLASS_NAME PATH="$fake_bin:$PATH" TON_VALUES_FILE="$auto_values" KUBETON_TEST_MODE=remote-small-root \
   "$kubeton" check >"$test_dir/default-storage.out" 2>&1
 assert_contains 'premium-rwo (pd.csi.storage.gke.io' "$test_dir/default-storage.out"
 sed 's/storageClassName: null/storageClassName: ""/' "$auto_values" >"$test_dir/empty-class-values.yaml"
-PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$test_dir/empty-class-values.yaml" KUBETON_TEST_MODE=remote-small-root \
+env -u TON_STORAGE_CLASS_NAME PATH="$fake_bin:$PATH" TON_VALUES_FILE="$test_dir/empty-class-values.yaml" KUBETON_TEST_MODE=remote-small-root \
   "$kubeton" check >"$test_dir/empty-class-default-storage.out" 2>&1
 assert_contains 'premium-rwo (pd.csi.storage.gke.io' "$test_dir/empty-class-default-storage.out"
 PATH="$fake_bin:$PATH" TON_STORAGE_CLASS_NAME=auto TON_VALUES_FILE="$auto_values" KUBETON_TEST_MODE=storage-list-local-preferred \

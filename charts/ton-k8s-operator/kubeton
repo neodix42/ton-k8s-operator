@@ -8,7 +8,8 @@ OP_VALUES_FILE="${OP_VALUES_FILE:-$CHART_DIR/operator-values.yaml}"
 TON_VALUES_FILE="${TON_VALUES_FILE:-$CHART_DIR/tonnode-values.yaml}"
 TON_POD_LABEL="${TON_POD_LABEL:-app.kubernetes.io/name=ton-node}"
 TON_NAMESPACE="${TON_NAMESPACE:-default}"
-TON_STORAGE_CLASS_NAME="${TON_STORAGE_CLASS_NAME:-local-path}"
+# Optional override; otherwise honor tonNode.storage.storageClassName in values.
+TON_STORAGE_CLASS_NAME="${TON_STORAGE_CLASS_NAME:-}"
 KUBETON_FLEET_TOOLS_IMAGE="${KUBETON_FLEET_TOOLS_IMAGE:-ghcr.io/neodix42/ton-k8s-operator:fleet-tools-0.3.4}"
 KUBETON_FLEET_RUNTIME="${KUBETON_FLEET_RUNTIME:-pod}"
 
@@ -2134,41 +2135,46 @@ node_check_autodetect_storage_class() {
   fi
 }
 
+ton_storage_class_from_values() {
+  local storage_class="" values_file explicit
+  for values_file in "$TON_VALUES_FILE" "$CHART_DIR/values.yaml"; do
+    # Preserve an explicit empty/null scalar, which Helm uses to remove the
+    # chart default. The generic scalar reader treats empty values as absent.
+    explicit="$(awk '
+      /^[[:space:]]*#/ { next }
+      { sub(/[[:space:]]*#.*/, "") }
+      /^[[:space:]]*tonNode:[[:space:]]*$/ { ton=1; match($0,/[^[:space:]]/); ti=RSTART; next }
+      ton {
+        match($0,/[^[:space:]]/); indent=RSTART
+        if (!indent) next
+        if (indent <= ti) exit
+        if (storage && indent <= si) storage=0
+        if ($0 ~ /^[[:space:]]*storage:[[:space:]]*$/) { storage=1; si=indent; next }
+        if (storage && $0 ~ /^[[:space:]]*storageClassName:/) {
+          sub(/^[[:space:]]*storageClassName:[[:space:]]*/, "")
+          sub(/[[:space:]]*#.*/, "")
+          sub(/[[:space:]]*$/, "")
+          print "defined:" $0; exit
+        }
+      }
+    ' "$values_file" 2>/dev/null || true)"
+    if [[ "$explicit" == defined:* ]]; then
+      storage_class="${explicit#defined:}"
+      storage_class="${storage_class#\"}"; storage_class="${storage_class%\"}"
+      storage_class="${storage_class#\'}"; storage_class="${storage_class%\'}"
+      break
+    fi
+  done
+  case "$storage_class" in ''|null|'~'|'<no value>') printf '%s' auto ;; *) printf '%s' "$storage_class" ;; esac
+}
+
 node_check_configured_storage_class() {
-  local storage_class values_file explicit
+  local storage_class
   storage_class="$(ton_storage_class_name)"
   if [[ "$storage_class" == auto ]]; then
-    storage_class=""
-    for values_file in "$TON_VALUES_FILE" "$CHART_DIR/values.yaml"; do
-      # Preserve an explicit empty/null scalar, which Helm uses to remove the
-      # chart default. The generic scalar reader treats empty values as absent.
-      explicit="$(awk '
-        /^[[:space:]]*#/ { next }
-        { sub(/[[:space:]]*#.*/, "") }
-        /^[[:space:]]*tonNode:[[:space:]]*$/ { ton=1; match($0,/[^[:space:]]/); ti=RSTART; next }
-        ton {
-          match($0,/[^[:space:]]/); indent=RSTART
-          if (!indent) next
-          if (indent <= ti) exit
-          if (storage && indent <= si) storage=0
-          if ($0 ~ /^[[:space:]]*storage:[[:space:]]*$/) { storage=1; si=indent; next }
-          if (storage && $0 ~ /^[[:space:]]*storageClassName:/) {
-            sub(/^[[:space:]]*storageClassName:[[:space:]]*/, "")
-            sub(/[[:space:]]*#.*/, "")
-            sub(/[[:space:]]*$/, "")
-            print "defined:" $0; exit
-          }
-        }
-      ' "$values_file" 2>/dev/null || true)"
-      if [[ "$explicit" == defined:* ]]; then
-        storage_class="${explicit#defined:}"
-        storage_class="${storage_class#\"}"; storage_class="${storage_class%\"}"
-        storage_class="${storage_class#\'}"; storage_class="${storage_class%\'}"
-        break
-      fi
-    done
+    storage_class="$(ton_storage_class_from_values)"
   fi
-  case "$storage_class" in ''|null|'~'|'<no value>') node_check_autodetect_storage_class ;; *) printf '%s' "$storage_class" ;; esac
+  case "$storage_class" in ''|auto|null|'~'|'<no value>') node_check_autodetect_storage_class ;; *) printf '%s' "$storage_class" ;; esac
 }
 
 # Arguments are alternating StorageClass name / capacity bytes pairs, allowing
@@ -9897,7 +9903,11 @@ append_baremetal_key_overrides() {
 }
 
 ton_storage_class_name() {
-  trim_whitespace "${TON_STORAGE_CLASS_NAME:-local-path}"
+  if [[ -n "${TON_STORAGE_CLASS_NAME:-}" ]]; then
+    trim_whitespace "$TON_STORAGE_CLASS_NAME"
+  else
+    ton_storage_class_from_values
+  fi
 }
 
 ton_storage_class_auto() {
@@ -9913,7 +9923,7 @@ ensure_ton_storage_class_available() {
 
   storage_class="$(ton_storage_class_name)"
   if [[ -z "$storage_class" ]]; then
-    echo "Error: TON_STORAGE_CLASS_NAME is empty. Use a local StorageClass name such as local-path, or set TON_STORAGE_CLASS_NAME=auto." >&2
+    echo "Error: TON_STORAGE_CLASS_NAME is empty. Use a StorageClass name such as local-path or premium-rwo, or set TON_STORAGE_CLASS_NAME=auto." >&2
     return 1
   fi
 
@@ -9922,10 +9932,9 @@ ensure_ton_storage_class_available() {
   fi
 
   echo "Error: TON data StorageClass '${storage_class}' was not found." >&2
-  echo "/var/ton-work/db is stored in the ton-work PVC, so kubeton now requires a local TON StorageClass by default." >&2
-  echo "Install/provide a local provisioner, for example local-path, or override:" >&2
-  echo "  TON_STORAGE_CLASS_NAME=<your-local-storage-class> ./kubeton start" >&2
-  echo "Use TON_STORAGE_CLASS_NAME=auto only if you intentionally want operator auto-detection." >&2
+  echo "Set tonNode.storage.storageClassName in ${TON_VALUES_FILE} to an available StorageClass, or override:" >&2
+  echo "  TON_STORAGE_CLASS_NAME=<your-storage-class> ./kubeton start" >&2
+  echo "List available classes with: kubectl get storageclass" >&2
   return 1
 }
 
@@ -9934,7 +9943,7 @@ append_ton_storage_overrides() {
   local storage_class
 
   if ton_storage_class_auto; then
-    echo "[start] TON storageClassName override disabled (TON_STORAGE_CLASS_NAME=auto); operator will auto-detect storage." >&2
+    echo "[start] TON storageClassName override disabled; using values or operator auto-detection." >&2
     return 0
   fi
 
