@@ -241,7 +241,8 @@ Longhorn does not need to be installed before `./kubeton install` on bare metal.
 | --- | --- |
 | Bare metal | Longhorn, encrypted StorageClass `encrypted-sc`, Vault, its Transit key and TON credentials. Existing healthy Longhorn is reused. |
 | Local k3d | Vault and a local StorageClass fallback; Longhorn is skipped. This fallback does not provide Longhorn disk encryption. |
-| GKE / other cloud | Automatic bootstrap is off by default. Prepare the dependencies yourself or explicitly opt in with `FORCE_BAREMETAL_BOOTSTRAP=true`. |
+| GKE | Opt in with `FORCE_BAREMETAL_BOOTSTRAP=true`: selected Ubuntu/COS worker dependencies, Longhorn, `encrypted-sc`, Vault, Transit key and TON credentials. |
+| Other cloud | Prepare the dependencies yourself or explicitly opt in with `FORCE_BAREMETAL_BOOTSTRAP=true`; host packages remain administrator-managed. |
 
 `AUTO_BAREMETAL_BOOTSTRAP` defaults to `true`; setting it to `false` disables
 automatic bootstrap even when `FORCE_BAREMETAL_BOOTSTRAP=true`.
@@ -256,9 +257,9 @@ StorageClass preparation, before enabling bootstrap.
 With the default storage layout, Longhorn holds encrypted key bundles and
 Vault state; the validator database uses `local-path` on bare metal or the
 selected GKE Persistent Disk class. VictoriaLogs uses its separately selected
-storage class and may also use Longhorn. Worker requirements such as iSCSI,
-mount propagation and encryption tools remain administrator responsibilities;
-kubeton does not install host packages.
+storage class and may also use Longhorn. On GKE, the managed bootstrap prepares
+iSCSI and encryption tools on selected workers. Other environments require
+administrator-managed host packages, mount propagation and disk preparation.
 
 After a successful `./kubeton start`, **you must run `./kubeton backup-keys`**
 as part of this production deployment workflow. It refreshes each node's
@@ -660,7 +661,9 @@ Security note:
 Cloud behavior:
 - bare-metal bootstrap is skipped by default
 - local k3d bootstrap is enabled by default
-- before `./kubeton start`, configure prerequisites manually:
+- GKE bootstrap prepares selected worker dependencies, Longhorn and Vault when
+  `AUTO_BAREMETAL_BOOTSTRAP=true` and `FORCE_BAREMETAL_BOOTSTRAP=true`
+- with cloud bootstrap disabled, configure prerequisites before `./kubeton start`:
   - encrypted StorageClass named `encrypted-sc` (or adjust env/values)
   - Vault credential secret `ton-vault-creds` in TON namespace (`default` by default)
 
@@ -1158,6 +1161,8 @@ LONGHORN_CRYPTO_SECRET_NAME
 LOCALDEV_BASE_SC
 ALLOW_DESTRUCTIVE_LONGHORN_REPAIR
 LONGHORN_NODE_SELECTOR
+KUBETON_GKE_LONGHORN_PREREQ_IMAGE
+KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS
 
 VAULT_RELEASE_NAME
 VAULT_NAMESPACE
@@ -1597,6 +1602,14 @@ requires at least three compatible workers for its three storage replicas.
 Keep node preflight enabled; it checks resources, pressure, placement and host
 ports before deployment.
 
+If you intentionally set `tonNode.resources.requests.cpu: 15000m`, also export
+`KUBETON_CHECK_MIN_CPU=15` in the shell running kubeton. The CPU requirement is
+the larger of the request and `KUBETON_CHECK_MIN_CPU` (default `16`); reducing
+the request alone leaves the 16-core check in place. Keep this export for
+`check`, `install`, `bootstrap-baremetal` and `start`. Bootstrap consumes more
+resources, so the nodes must still have enough free CPU after Longhorn, Vault
+and logging are running.
+
 **Connect and download the installer.** Run these commands in Google Cloud
 Shell or an administration machine with `gcloud`, `gke-gcloud-auth-plugin`,
 `kubectl`, Helm, Bash, Python 3 and OpenSSL installed. The account needs
@@ -1612,7 +1625,7 @@ kubectl get nodes -o wide
 kubectl get storageclass
 
 wget -qO- "https://github.com/neodix42/ton-k8s-operator/releases/download/0.5.11/install.sh" | bash
-cd ton-k8s-operator-0.5.5
+cd ton-k8s-operator-0.5.11
 ```
 
 Review `operator-values.yaml` and `tonnode-values.yaml` before installing.
@@ -1657,24 +1670,44 @@ These values select `premium-rwo` for both `./kubeton check` and
 `export TON_STORAGE_CLASS_NAME=premium-rwo` before either command: that version's
 implicit `local-path` environment default overrides the values file.
 
-<details>
-<summary>GKE key management, Longhorn/Vault setup, networking and verification</summary>
+**Create the key-management dependencies.** `premium-rwo` provides the TON
+data volumes. With key management enabled, `start` also requires the separate
+`encrypted-sc` StorageClass, its Longhorn provisioner, and Vault credentials
+in `default/ton-vault-creds`. GKE advertises a cloud provider ID, so kubeton
+skips automatic Longhorn/Vault bootstrap unless you explicitly enable it.
+Setting `storageClassName: encrypted-sc` in the values file selects the class;
+the bootstrap below creates it together with its dependencies.
 
-**Prepare key management.** Longhorn's V1 engine needs `open-iscsi` with
-`iscsid` running, the `iscsi_tcp` module, mount propagation, and an ext4/XFS
-backing filesystem. Encrypted `encrypted-sc` volumes additionally need host
-`cryptsetup` with Argon2i support. Verify these on every worker that will mount
-or store a key-bundle volume; kubeton does not install host packages. See the
-pinned version's
+**Automatic worker preparation.** With the bootstrap flags below enabled,
+`kubeton start` prepares the selected GKE workers before installing Longhorn.
+A privileged `kubeton-gke-longhorn-prereqs` DaemonSet installs missing
+`open-iscsi`, `cryptsetup`, `dmsetup` and NFS client packages on Ubuntu,
+loads `iscsi_tcp` and `dm_crypt`, and enables `iscsid`. On GKE
+Container-Optimized OS (COS), the helper sets up the GKE mounter path and
+keeps a containerized iSCSI daemon running. It waits for every selected worker
+to be ready before starting Longhorn. Package repositories and the helper
+image registry must be reachable, and cluster policies must permit privileged
+host access.
+
+The helper covers the selected TON and Longhorn workers, including mixed
+Ubuntu/COS pools. It stays in the Longhorn namespace and checks service/module
+readiness; rerun `start` to prepare newly selected replacement workers. On COS,
+this setup uses the default Longhorn data path, `/var/lib/longhorn`. New
+Longhorn encryption Secrets use `pbkdf2` when COS workers are selected and
+`argon2i` otherwise; existing encryption Secrets and keys are preserved.
+
+Run `./kubeton start` with the same exports to resume a bootstrap interrupted
+by missing host dependencies. A failed Longhorn Helm release is retried in
+place. Node dependency errors are reported before the Longhorn Helm wait.
+
+`KUBETON_GKE_LONGHORN_PREREQ_IMAGE` selects the helper image (default
+`registry.suse.com/bci/bci-base:15.7`), and
+`KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS` controls its readiness timeout
+(default `600`). MyTonCtrl images do not need these packages: the dependencies
+are required on the worker hosts before TON pods start. The implementation
+follows the pinned
 [Longhorn prerequisites](https://longhorn.io/docs/archives/1.10.0/deploy/install/)
-and [GKE guidance](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/csi-on-gke/).
-
-Ubuntu is the straightforward choice for this bootstrap. Longhorn 1.10.0 also
-supports GKE Container-Optimized OS using an additional node-agent DaemonSet,
-but kubeton does not install that agent, and some COS images need a different
-encryption KDF from kubeton's `argon2i` default. Follow the
-[Longhorn COS procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/container-optimized-os-support/)
-if choosing that route.
+and [COS setup](https://longhorn.io/docs/archives/1.10.0/advanced-resources/os-distro-specific/container-optimized-os-support/).
 
 Provision persistent backing storage for key management and arrange for host
 prerequisites, disk mounts and labels to be restored when GKE replaces or
@@ -1683,9 +1716,10 @@ for key bundles and Vault state separately from the large TON data disks.
 Coordinate managed node upgrades with
 [Longhorn's GKE maintenance procedure](https://longhorn.io/docs/archives/1.10.0/advanced-resources/support-managed-k8s-service/upgrade-k8s-on-gke/).
 
-GKE advertises a cloud provider ID, so kubeton skips automatic bare-metal
-bootstrap by default. For a **fresh** installation where you intentionally want
-kubeton to provision Longhorn, encrypted storage and Vault, enable it explicitly:
+For a **fresh** installation, run the following in the same Cloud Shell session
+after configuring the values file, worker backing storage and networking.
+`start` prepares host dependencies and provisions Longhorn, encrypted storage
+and Vault before deploying TON:
 
 ```bash
 export TON_STORAGE_CLASS_NAME=premium-rwo
@@ -1701,10 +1735,33 @@ export FORCE_BAREMETAL_BOOTSTRAP=true
 ```
 
 The exports above remain active for every subsequent command in this shell.
+Repeat them when opening a new Cloud Shell session; kubeton does not save
+these settings or read them from a `.env` file. Both bootstrap flags must be
+`true`: `AUTO_BAREMETAL_BOOTSTRAP=false` disables automatic bootstrap even
+when `FORCE_BAREMETAL_BOOTSTRAP=true`.
 If you prefer to prepare Longhorn and Vault before installing the operator,
 run `./kubeton bootstrap-baremetal` after `check` and before `install`.
 Prefixing only `install` with `FORCE_BAREMETAL_BOOTSTRAP=true` neither installs
 these dependencies nor enables bootstrap for a later unprefixed `start`.
+
+**Recover from `Error: missing StorageClass encrypted-sc`.** If the operator
+is already installed and this is the initial key-management setup, export the
+settings above, including both bootstrap flags, and rerun:
+
+```bash
+./kubeton check
+./kubeton start
+```
+
+This uses the existing bootstrap path to create the missing dependencies;
+uninstalling the operator is unnecessary. After a successful start, verify the
+two storage classes and the credentials Secret without printing its contents:
+
+```bash
+kubectl get storageclass premium-rwo encrypted-sc
+kubectl -n default get secret ton-vault-creds -o name
+./kubeton backup-keys
+```
 
 The bootstrap uses the same Longhorn/Vault workflow as bare metal, including
 the default compatible-node selection and per-node CSI readiness checks.
@@ -1717,13 +1774,14 @@ management storage rather than the validator database.
 regression coverage; it is not a completed installation test on your GKE
 cluster. A successful `kubeton check` verifies Kubernetes resource/disk/placement
 requirements, not every Longhorn host prerequisite. Before `start`, confirm
-the Ubuntu workers have the iSCSI/encryption prerequisites above, enough
-persistent space for Longhorn replicas, and policies permitting its privileged
-host access. The invoking account needs CRD/RBAC/Secret/Helm permissions and
+the workers have enough persistent space for Longhorn replicas and policies
+permit the prerequisite helper and Longhorn to use privileged host access.
+The invoking account needs CRD/RBAC/Secret/Helm permissions and
 access to kubelet summary data (`kubectl auth can-i get nodes/proxy`). Private
 clusters also need working access to the chart/image registries and required
-TON network endpoints. The force flag opts into bootstrap; it does not prepare
-worker operating systems, cloud disks, firewall rules or permissions.
+TON network endpoints. The force flag opts into worker dependency preparation
+and bootstrap; cloud disks, firewall rules and permissions must be configured
+separately.
 
 Check control-plane access to Longhorn's conversion/admission webhooks as well.
 Where the GKE firewall does not already allow it, permit TCP `9501` and `9502`
@@ -1811,8 +1869,6 @@ dashboard host. Use the printed port-forward instructions or an authenticated
 HTTPS access layer for ongoing access.
 See [VictoriaLogs dashboard access](#victorialogs-dashboard-access) for the
 exposure command and browser login credentials.
-
-</details>
 
 ### Repo-Based Direct Deploy (advanced)
 

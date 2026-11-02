@@ -64,6 +64,7 @@ test: manifests generate fmt vet setup-envtest test-kubeton ## Run tests.
 .PHONY: test-kubeton
 test-kubeton: ## Run kubeton CLI shell tests.
 	bash test/kubeton_bootstrap_test.sh
+	python3 test/kubeton_gke_prerequisites_test.py
 	python3 test/kubeton_jemalloc_profile_test.py
 	bash test/main_wallet_memory_test.sh
 	bash test/kubeton_check_test.sh

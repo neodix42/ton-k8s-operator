@@ -33,6 +33,9 @@ LONGHORN_CRYPTO_SECRET_NAME="${LONGHORN_CRYPTO_SECRET_NAME:-longhorn-crypto}"
 LOCALDEV_BASE_SC="${LOCALDEV_BASE_SC:-local-path}"
 ALLOW_DESTRUCTIVE_LONGHORN_REPAIR="${ALLOW_DESTRUCTIVE_LONGHORN_REPAIR:-false}"
 LONGHORN_NODE_SELECTOR="${LONGHORN_NODE_SELECTOR:-node.longhorn.io/create-default-disk=true}"
+KUBETON_GKE_LONGHORN_PREREQ_IMAGE="${KUBETON_GKE_LONGHORN_PREREQ_IMAGE:-registry.suse.com/bci/bci-base:15.7}"
+KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS="${KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS:-600}"
+KUBETON_LONGHORN_CRYPTO_PBKDF=argon2i
 
 VAULT_RELEASE_NAME="${VAULT_RELEASE_NAME:-vault}"
 VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
@@ -9247,7 +9250,11 @@ ensure_longhorn_installed() {
 
   local lh_status=""
   lh_status="$(longhorn_release_status || true)"
-  if [[ -n "$lh_status" && "$lh_status" != "deployed" ]]; then
+  if [[ "$lh_status" == failed ]]; then
+    # Helm can upgrade a failed release in place. Host preparation may have
+    # fixed a first install with no deployed revision to roll back to.
+    echo "[baremetal] Retrying failed Longhorn release in place; preserving its resources and volumes."
+  elif [[ -n "$lh_status" && "$lh_status" != "deployed" ]]; then
     if recover_longhorn_release_non_destructive "$lh_status"; then
       lh_status="$(longhorn_release_status || true)"
     else
@@ -9378,7 +9385,7 @@ ensure_longhorn_crypto_secret() {
     --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
     --from-literal=CRYPTO_KEY_HASH=sha256 \
     --from-literal=CRYPTO_KEY_SIZE=256 \
-    --from-literal=CRYPTO_PBKDF=argon2i >/dev/null
+    --from-literal="CRYPTO_PBKDF=${KUBETON_LONGHORN_CRYPTO_PBKDF}" >/dev/null
 }
 
 ensure_encrypted_storage_class() {
@@ -9802,12 +9809,188 @@ configure_vault_for_ton() {
   return 0
 }
 
+# Host dependencies belong to the workers, not the TON application image. Keep
+# this agent alive on COS: its iscsid process is required by mounted volumes.
+gke_longhorn_prerequisite_script() {
+  cat <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+host_root="${HOST_ROOT:-/host}"
+ready_file="${READY_FILE:-/tmp/kubeton-longhorn-prereqs-ready}"
+host_os=""
+while IFS='=' read -r key value; do
+  [[ "$key" == ID ]] || continue
+  host_os="${value//\"/}"
+  host_os="${host_os//\'/}"
+  break
+done < "$host_root/etc/os-release"
+host() { nsenter --mount="$host_root/proc/1/ns/mnt" --net="$host_root/proc/1/ns/net" -- "$@"; }
+check() {
+  test -f "$ready_file"
+  test -d "$host_root/sys/module/iscsi_tcp"
+  test -d "$host_root/sys/module/dm_crypt"
+  case "$host_os" in
+    ubuntu) chroot "$host_root" systemctl is-active --quiet iscsid ;;
+    cos) pgrep -x iscsid >/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+if [[ "${1:-}" == check ]]; then check; exit; fi
+case "$host_os" in
+  ubuntu)
+    chroot "$host_root" /bin/bash -ec '
+      export DEBIAN_FRONTEND=noninteractive
+      missing=()
+      for package in open-iscsi cryptsetup dmsetup nfs-common; do
+        if ! dpkg-query -W -f="\${Status}" "$package" 2>/dev/null | grep -qx "install ok installed"; then
+          missing+=("$package")
+        fi
+      done
+      if (( ${#missing[@]} > 0 )); then
+        apt-get update
+        apt-get install -y "${missing[@]}"
+      fi
+      modprobe iscsi_tcp
+      modprobe dm_crypt
+      printf "%s\n" iscsi_tcp dm_crypt > /etc/modules-load.d/kubeton-longhorn.conf
+      systemctl enable --now iscsid
+      iscsiadm --version
+      cryptsetup --version
+    '
+    ;;
+  cos)
+    # Follow Longhorn's GKE COS node-agent setup. The GKE mounter chroot
+    # provides host utilities; iscsid itself runs in this privileged container.
+    rootfs=/home/kubernetes/containerized_mounter/rootfs
+    data_path=/var/lib/longhorn
+    if ! host findmnt --noheadings "$rootfs$data_path" >/dev/null; then
+      chroot "$host_root" mkdir -p "$data_path"
+      chroot "$host_root$rootfs" mkdir -p "$data_path"
+      host mount --rbind "$data_path" "$rootfs$data_path"
+      host mount --make-shared "$rootfs$data_path"
+      host mount -o remount,exec "$data_path"
+    fi
+    host modprobe iscsi_tcp
+    host modprobe dm_crypt
+    zypper --non-interactive install open-iscsi procps
+    if ! pgrep -x iscsid >/dev/null; then /sbin/iscsid; fi
+    ;;
+  *) echo "Unsupported GKE worker OS: $host_os" >&2; exit 1 ;;
+esac
+touch "$ready_file"
+check
+echo "[bootstrap] Longhorn worker dependencies ready ($host_os)."
+exec sleep infinity
+SCRIPT
+}
+
+build_gke_longhorn_prerequisite_manifest() {
+  local names_json="$1" script checksum
+  script="$(gke_longhorn_prerequisite_script)"
+  checksum="$(printf '%s' "$script" | cksum)"
+  cat <<EOF
+{"apiVersion":"v1","kind":"List","items":[
+  {"apiVersion":"v1","kind":"ConfigMap","metadata":{
+    "name":"kubeton-gke-longhorn-prereqs","namespace":$(json_quote "$LONGHORN_NAMESPACE"),
+    "labels":{"app.kubernetes.io/managed-by":"kubeton","app.kubernetes.io/instance":$(json_quote "$LONGHORN_RELEASE_NAME")}
+  },"data":{"entrypoint.sh":$(json_quote "$script")}},
+  {"apiVersion":"apps/v1","kind":"DaemonSet","metadata":{
+    "name":"kubeton-gke-longhorn-prereqs","namespace":$(json_quote "$LONGHORN_NAMESPACE"),
+    "labels":{"app.kubernetes.io/managed-by":"kubeton","app.kubernetes.io/instance":$(json_quote "$LONGHORN_RELEASE_NAME")}
+  },"spec":{
+    "selector":{"matchLabels":{"app":"kubeton-gke-longhorn-prereqs"}},
+    "template":{
+      "metadata":{"labels":{"app":"kubeton-gke-longhorn-prereqs"},
+        "annotations":{"ton.ton.org/prerequisite-script":$(json_quote "$checksum")}},
+      "spec":{
+        "automountServiceAccountToken":false,"hostPID":true,"hostNetwork":true,
+        "affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{
+          "nodeSelectorTerms":[{"matchFields":[{"key":"metadata.name","operator":"In","values":$names_json}]}]
+        }}},
+        "containers":[{
+          "name":"prepare-host","image":$(json_quote "$KUBETON_GKE_LONGHORN_PREREQ_IMAGE"),
+          "command":["/bin/bash","/scripts/entrypoint.sh"],
+          "securityContext":{"privileged":true},
+          "resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"memory":"512Mi"}},
+          "startupProbe":{"exec":{"command":["/bin/bash","/scripts/entrypoint.sh","check"]},"periodSeconds":10,"timeoutSeconds":5,"failureThreshold":120},
+          "readinessProbe":{"exec":{"command":["/bin/bash","/scripts/entrypoint.sh","check"]},"periodSeconds":10,"timeoutSeconds":5},
+          "livenessProbe":{"exec":{"command":["/bin/bash","/scripts/entrypoint.sh","check"]},"periodSeconds":30,"timeoutSeconds":5},
+          "volumeMounts":[{"name":"host","mountPath":"/host"},{"name":"script","mountPath":"/scripts","readOnly":true}]
+        }],
+        "volumes":[{"name":"host","hostPath":{"path":"/","type":"Directory"}},
+          {"name":"script","configMap":{"name":"kubeton-gke-longhorn-prereqs"}}]
+      }
+    }
+  }}
+]}
+EOF
+}
+
+ensure_gke_longhorn_prerequisites() {
+  local rows scope node provider os names_json="" has_cos=false desired ready observed generation
+  local -A nodes=()
+  # Query only GKE nodes. Bare-metal and other cloud bootstrap behavior stays
+  # unchanged, including environments with externally prepared host packages.
+  if ! rows="$(kubectl get nodes -l cloud.google.com/gke-nodepool -o name)"; then return 1; fi
+  [[ -n "$(trim_whitespace "$rows")" ]] || return 0
+  [[ "$KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: invalid GKE prerequisite timeout." >&2; return 1;
+  }
+  # Include both storage and TON workers; CSI also needs host dependencies on
+  # workers mounting volumes. A missing bounded selection cannot authorize a
+  # cluster-wide privileged agent, even if resource preflight was skipped.
+  for scope in "${LONGHORN_NODE_SELECTOR:-}" "${KUBETON_NODE_CHECK_TON_SELECTOR:-}"; do
+    [[ -n "$scope" ]] || continue
+    if ! rows="$(kubectl get nodes -l "cloud.google.com/gke-nodepool,${scope}" -o go-template='{{range .items}}{{.metadata.name}}{{"|"}}{{.spec.providerID}}{{"|"}}{{.status.nodeInfo.osImage}}{{"\n"}}{{end}}')"; then return 1; fi
+    while IFS='|' read -r node provider os; do
+      [[ -n "$node" ]] || continue
+      if [[ "$provider" != gce://* ]]; then
+        echo "Error: cannot verify GKE worker identity for ${node}." >&2; return 1
+      fi
+      case "$os" in
+        Ubuntu*) ;;
+        *Container-Optimized*|*Container\ Optimized*) has_cos=true ;;
+        *) echo "Error: unsupported GKE worker OS for ${node}: ${os}." >&2; return 1 ;;
+      esac
+      if [[ -z "${nodes[$node]:-}" ]]; then
+        nodes["$node"]=1
+        names_json+="${names_json:+,}$(json_quote "$node")"
+      fi
+    done <<<"$rows"
+  done
+  if [[ -z "$names_json" ]]; then
+    echo "Error: no selected GKE workers are available for Longhorn host preparation." >&2
+    return 1
+  fi
+  if is_true "$has_cos"; then KUBETON_LONGHORN_CRYPTO_PBKDF=pbkdf2; fi
+  echo "[bootstrap] Preparing iSCSI/encryption dependencies on ${#nodes[@]} selected GKE worker(s) ..."
+  ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240 || return $?
+  ensure_namespace "$LONGHORN_NAMESPACE" || return $?
+  build_gke_longhorn_prerequisite_manifest "[$names_json]" | kubectl apply -f - >/dev/null || return $?
+  if ! kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/kubeton-gke-longhorn-prereqs \
+      --timeout="${KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS}s"; then
+    kubectl -n "$LONGHORN_NAMESPACE" logs -l app=kubeton-gke-longhorn-prereqs \
+      -c prepare-host --prefix=true --tail=100 >&2 || true
+    echo "Error: GKE worker dependency preparation failed; Longhorn installation was not started." >&2
+    return 1
+  fi
+  rows="$(kubectl -n "$LONGHORN_NAMESPACE" get daemonset kubeton-gke-longhorn-prereqs \
+    -o jsonpath='{.status.desiredNumberScheduled}{"|"}{.status.numberReady}{"|"}{.status.observedGeneration}{"|"}{.metadata.generation}')" || return 1
+  IFS='|' read -r desired ready observed generation <<<"$rows"
+  if [[ "$desired" != "${#nodes[@]}" || "$ready" != "${#nodes[@]}" || -z "$generation" || "$observed" != "$generation" ]]; then
+    echo "Error: GKE worker dependency preparation did not cover every selected worker." >&2
+    return 1
+  fi
+}
+
 ensure_baremetal_stack() {
   require_bin kubectl
   require_bin helm
   require_bin openssl
   require_bin base64
 
+  KUBETON_LONGHORN_CRYPTO_PBKDF=argon2i
+  ensure_gke_longhorn_prerequisites || return $?
   ensure_longhorn_installed || return $?
   ensure_longhorn_crypto_secret || return $?
   ensure_encrypted_storage_class || return $?

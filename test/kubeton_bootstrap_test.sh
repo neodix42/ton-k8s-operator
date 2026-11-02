@@ -18,7 +18,7 @@ assert_failure() {
   [[ "$rc" == 23 ]] || fail "expected exit 23, got $rc: $*"
 }
 
-for failed_step in none longhorn crypto storage-class vault init transit; do
+for failed_step in none host-prereqs longhorn crypto storage-class vault init transit; do
   (
     source "$kubeton"
     require_bin() { :; }
@@ -28,6 +28,7 @@ for failed_step in none longhorn crypto storage-class vault init transit; do
       printf '%s\n' "$1" >>"$calls"
       [[ "$failed_step" != "$1" ]] || return 23
     }
+    ensure_gke_longhorn_prerequisites() { step host-prereqs; }
     ensure_longhorn_installed() { step longhorn; }
     ensure_longhorn_crypto_secret() { step crypto; }
     ensure_encrypted_storage_class() { step storage-class; }
@@ -36,10 +37,10 @@ for failed_step in none longhorn crypto storage-class vault init transit; do
     configure_vault_for_ton() { [[ "$1" == test-root-token ]] || fail 'wrong token'; step transit; }
     if [[ "$failed_step" == none ]]; then
       if ! ensure_baremetal_stack; then fail 'healthy bootstrap failed'; fi
-      expected=$'longhorn\ncrypto\nstorage-class\nvault\ninit\ntransit'
+      expected=$'host-prereqs\nlonghorn\ncrypto\nstorage-class\nvault\ninit\ntransit'
     else
       assert_failure ensure_baremetal_stack
-      expected="$(printf '%s\n' longhorn crypto storage-class vault init transit | sed "/^${failed_step}$/q")"
+      expected="$(printf '%s\n' host-prereqs longhorn crypto storage-class vault init transit | sed "/^${failed_step}$/q")"
     fi
     [[ "$(cat "$calls")" == "$expected" ]] || fail "bootstrap continued past ${failed_step}"
   )
@@ -153,6 +154,28 @@ for failed_check in wait multipath; do
     assert_absent 'CSI/storage are Ready; skipping Helm upgrade' "$test_dir/longhorn-${failed_check}.out"
   )
 done
+
+# Missing host tools can fail the very first Helm install, leaving no deployed
+# revision. Once dependencies are ready, retry that release without deleting it.
+(
+  source "$kubeton"
+  require_bin() { :; }
+  LONGHORN_NODE_SELECTOR=''
+  recover_stuck_longhorn_namespace() { :; }
+  ensure_namespace_not_terminating() { :; }
+  longhorn_release_status() { printf failed; }
+  repair_stale_longhorn_release() { fail 'failed install was destructively reset'; }
+  ensure_helm_repo() { :; }
+  run_with_namespace_progress() { shift 2; "$@"; }
+  apply_longhorn_post_start_settings() { :; }
+  ensure_longhorn_daemonsets_constrained() { :; }
+  wait_longhorn_storage_ready() { :; }
+  helm() { printf '%s\n' "$*" >>"$test_dir/failed-install-helm.calls"; }
+  ensure_longhorn_installed >"$test_dir/failed-install-retry.out"
+  assert_contains 'upgrade --install' "$test_dir/failed-install-helm.calls"
+  assert_absent 'uninstall' "$test_dir/failed-install-helm.calls"
+  assert_contains 'Retrying failed Longhorn release in place' "$test_dir/failed-install-retry.out"
+)
 
 (
   source "$kubeton"
