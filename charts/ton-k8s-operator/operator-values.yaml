@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/neodix42/ton-k8s-operator
-  tag: 0.5.15
+  tag: 0.5.16
   pullPolicy: IfNotPresent
 
 leaderElection:
