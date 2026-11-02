@@ -127,8 +127,16 @@ printf "PBKDF=%s\\n" "$KUBETON_LONGHORN_CRYPTO_PBKDF"
                 subprocess.run(["bash", "-n"], input=config["data"]["entrypoint.sh"], text=True, check=True)
                 spec = ds["spec"]["template"]["spec"]
                 affinity = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
-                names = affinity["nodeSelectorTerms"][0]["matchFields"][0]["values"]
-                self.assertEqual(set(names), {"worker-1", "worker-2"})
+                names = set()
+                for term in affinity["nodeSelectorTerms"]:
+                    for field in term.get("matchFields", []):
+                        # Kubernetes field selectors accept one value per In
+                        # or NotIn requirement, unlike label selectors.
+                        if field["operator"] in ("In", "NotIn"):
+                            self.assertEqual(len(field["values"]), 1)
+                        if field["key"] == "metadata.name":
+                            names.update(field["values"])
+                self.assertEqual(names, {"worker-1", "worker-2"})
                 self.assertNotIn("nodeSelector", spec)  # Exact bounded name affinity, not all GKE nodes.
                 self.assertFalse(spec["automountServiceAccountToken"])
                 self.assertTrue(spec["hostPID"])

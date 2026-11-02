@@ -9885,7 +9885,16 @@ SCRIPT
 }
 
 build_gke_longhorn_prerequisite_manifest() {
-  local names_json="$1" script checksum
+  local node terms_json="" script checksum
+  # Field selectors require one value per requirement. Terms are ORed, so
+  # use one metadata.name term per worker (hostname labels may differ).
+  for node in "$@"; do
+    terms_json+="${terms_json:+,}{\"matchFields\":[{\"key\":\"metadata.name\",\"operator\":\"In\",\"values\":[$(json_quote "$node")]}]}"
+  done
+  [[ -n "$terms_json" ]] || {
+    echo "Error: GKE worker dependency manifest requires selected workers." >&2
+    return 1
+  }
   script="$(gke_longhorn_prerequisite_script)"
   checksum="$(printf '%s' "$script" | cksum)"
   cat <<EOF
@@ -9905,7 +9914,7 @@ build_gke_longhorn_prerequisite_manifest() {
       "spec":{
         "automountServiceAccountToken":false,"hostPID":true,"hostNetwork":true,
         "affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{
-          "nodeSelectorTerms":[{"matchFields":[{"key":"metadata.name","operator":"In","values":$names_json}]}]
+          "nodeSelectorTerms":[$terms_json]
         }}},
         "containers":[{
           "name":"prepare-host","image":$(json_quote "$KUBETON_GKE_LONGHORN_PREREQ_IMAGE"),
@@ -9927,8 +9936,9 @@ EOF
 }
 
 ensure_gke_longhorn_prerequisites() {
-  local rows scope node provider os names_json="" has_cos=false desired ready observed generation
+  local rows scope node provider os has_cos=false desired ready observed generation
   local -A nodes=()
+  local -a node_names=()
   # Query only GKE nodes. Bare-metal and other cloud bootstrap behavior stays
   # unchanged, including environments with externally prepared host packages.
   if ! rows="$(kubectl get nodes -l cloud.google.com/gke-nodepool -o name)"; then return 1; fi
@@ -9954,11 +9964,11 @@ ensure_gke_longhorn_prerequisites() {
       esac
       if [[ -z "${nodes[$node]:-}" ]]; then
         nodes["$node"]=1
-        names_json+="${names_json:+,}$(json_quote "$node")"
+        node_names+=("$node")
       fi
     done <<<"$rows"
   done
-  if [[ -z "$names_json" ]]; then
+  if (( ${#node_names[@]} == 0 )); then
     echo "Error: no selected GKE workers are available for Longhorn host preparation." >&2
     return 1
   fi
@@ -9966,7 +9976,7 @@ ensure_gke_longhorn_prerequisites() {
   echo "[bootstrap] Preparing iSCSI/encryption dependencies on ${#nodes[@]} selected GKE worker(s) ..."
   ensure_namespace_not_terminating "$LONGHORN_NAMESPACE" 240 || return $?
   ensure_namespace "$LONGHORN_NAMESPACE" || return $?
-  build_gke_longhorn_prerequisite_manifest "[$names_json]" | kubectl apply -f - >/dev/null || return $?
+  build_gke_longhorn_prerequisite_manifest "${node_names[@]}" | kubectl apply -f - >/dev/null || return $?
   if ! kubectl -n "$LONGHORN_NAMESPACE" rollout status daemonset/kubeton-gke-longhorn-prereqs \
       --timeout="${KUBETON_GKE_LONGHORN_PREREQ_TIMEOUT_SECONDS}s"; then
     kubectl -n "$LONGHORN_NAMESPACE" logs -l app=kubeton-gke-longhorn-prereqs \
